@@ -346,7 +346,7 @@ Window {
                 readonly property bool corner: role.length === 2
                 // Blue-dot handle (selected state marker), white-ringed; the
                 // hit area extends past the visible dot for easy grabbing.
-                width: hma.containsMouse || hma.pressed ? 12 : 10
+                width: hma.pressed ? 12 : 10
                 height: width
                 radius: width / 2
                 color: hma.pressed ? "#7fc3ff" : "#5b9dff"
@@ -367,11 +367,10 @@ Window {
                     id: hma
                     anchors.fill: parent
                     anchors.margins: -4
-                    hoverEnabled: true
-                    cursorShape: role === "n" || role === "s" ? Qt.SizeVerCursor
-                               : role === "e" || role === "w" ? Qt.SizeHorCursor
-                               : (role === "nw" || role === "se") ? Qt.SizeFDiagCursor
-                               : Qt.SizeBDiagCursor
+                    // hoverEnabled OFF + cursorShape undefined: hover and
+                    // cursor decisions both belong to the canvas HoverHandler;
+                    // this area only handles the press for resizing.
+                    cursorShape: undefined
                     property rect startRect
                     property real px: 0
                     property real py: 0
@@ -404,6 +403,9 @@ Window {
             id: centerMa
             anchors.fill: parent
             hoverEnabled: false
+            // undefined: without it this area's default ArrowCursor shadows
+            // the canvas HoverHandler across the whole box interior.
+            cursorShape: undefined
             enabled: handles.moveEnabled && handles.moveFn !== null
                      && handles.bw > 0 && handles.bh > 0
             property rect startRect
@@ -451,8 +453,10 @@ Window {
             delegate: MouseArea {
                 required property var modelData
                 readonly property string role: modelData.role
-                hoverEnabled: true
-                cursorShape: modelData.shape
+                // hoverEnabled OFF — hover must reach the canvas HoverHandler
+                // (the single cursor authority); presses land here.
+                // cursorShape undefined — default Arrow would shadow it.
+                cursorShape: undefined
                 enabled: handles.resizeFn !== null && handles.bw > 0 && handles.bh > 0
                 z: 1
                 x: role === "e" ? handles.bx + handles.bw - 4
@@ -1099,38 +1103,9 @@ Window {
                 id: selDragMouse
                 anchors.fill: parent
                 hoverEnabled: true
-                cursorShape: {
-                    if (panMa.pressed)
-                        return Qt.ClosedHandCursor
-                    // Single source of truth for canvas cursors. Overlay
-                    // MouseAreas (dots/edge strips) DO receive presses but
-                    // their cursorShape never wins the cursor arbitration —
-                    // this bottom area's shape is the one that actually
-                    // applies, so everything is computed here from coords.
-                    const pad = view.pad
-                    const x = selDragMouse.mouseX - pad
-                    const y = selDragMouse.mouseY - pad
-                    if (root.selExists) {
-                        const c = boxCursor(x, y, root.selX, root.selY,
-                                            root.selW, root.selH)
-                        if (c >= 0)
-                            return c
-                    }
-                    if (layerHandles.visible) {
-                        const c = boxCursor(x, y, layerHandles.bx,
-                                            layerHandles.by,
-                                            layerHandles.bw, layerHandles.bh)
-                        if (c >= 0)
-                            return c
-                    }
-                    if (!root.selExists && bridge.image_width > 0) {
-                        const hit = topLayerAt(selDragMouse.mouseX,
-                                               selDragMouse.mouseY)
-                        if (hit !== null && !isLocked(hit))
-                            return Qt.SizeAllCursor
-                    }
-                    return Qt.CrossCursor
-                }
+                // undefined: MouseAreas default to ArrowCursor and shadow
+                // every cursor below; the canvas HoverHandler owns cursors.
+                cursorShape: undefined
                 property real startX: 0
                 property real startY: 0
                 property real curX: 0
@@ -1269,6 +1244,17 @@ Window {
                     lastW = w; lastH = h; lastX = x; lastY = y
                     bridge.scale_layer_update(w, h, x, y)
                 }
+            }
+
+            // Authoritative canvas cursor: a HoverHandler's cursorShape beats
+            // every MouseArea's (documented precedence), and one handler over
+            // the whole surface means no stacking conflicts. Coordinates are
+            // in canvasSurface space — image coords are offset by view.pad.
+            HoverHandler {
+                id: canvasHoverHandler
+                cursorShape: panMa.pressed ? Qt.ClosedHandCursor
+                                           : canvasCursor(point.position.x,
+                                                          point.position.y)
             }
         }
 
@@ -1419,12 +1405,13 @@ Window {
         anchors.left: parent.left
         anchors.right: parent.right
         acceptedButtons: Qt.MiddleButton
-        // No cursorShape here ON PURPOSE: a MouseArea with a cursor set wins
-        // over EVERY lower item (the window picks the topmost item that has
-        // any cursor shape, regardless of acceptedButtons), which would turn
-        // the whole viewport into the pan hand and mask the canvas cross /
-        // layer move / handle-resize cursors. The pan feedback cursor comes
-        // from selDragMouse instead (ClosedHand while this area is pressed).
+        // cursorShape: undefined is CRITICAL. A MouseArea's cursorShape
+        // defaults to ArrowCursor and Qt's cursor resolution picks the
+        // TOPMOST item that has any cursor — with the default, this area
+        // wins everywhere and masks every cursor below it (cross, resize,
+        // move). `undefined` removes it from cursor resolution entirely;
+        // the pan feedback cursor comes from the canvas HoverHandler.
+        cursorShape: undefined
         property real lastX: 0
         property real lastY: 0
         onPressed: (mouse) => {
@@ -2173,6 +2160,36 @@ Window {
     function snapDisplay(v) {
         const s = toDispScale()
         return s > 0 ? Math.round(v / s) * s : v
+    }
+
+    // Canvas cursor for a point in canvasSurface coordinates. selX/selY and
+    // the layer boxes live in preview-image coordinates, whose origin is
+    // view.pad to the right/bottom of canvasSurface — shift before comparing.
+    // topLayerAt() however expects canvasSurface coords directly.
+    // Fed to the canvasHoverHandler below — HoverHandler cursorShape
+    // overrides every MouseArea's cursorShape, so this is the single
+    // authoritative cursor decision.
+    function canvasCursor(x, y) {
+        const ix = x - view.pad
+        const iy = y - view.pad
+        if (root.selExists) {
+            const c = boxCursor(ix, iy, root.selX, root.selY,
+                                root.selW, root.selH)
+            if (c >= 0)
+                return c
+        }
+        if (layerHandles.visible) {
+            const c = boxCursor(ix, iy, layerHandles.bx, layerHandles.by,
+                                layerHandles.bw, layerHandles.bh)
+            if (c >= 0)
+                return c
+        }
+        if (!root.selExists && bridge.image_width > 0) {
+            const hit = topLayerAt(x, y)
+            if (hit !== null && !isLocked(hit))
+                return Qt.SizeAllCursor
+        }
+        return Qt.CrossCursor
     }
 
     // Cursor for hovering a box's border / interior (display px).
