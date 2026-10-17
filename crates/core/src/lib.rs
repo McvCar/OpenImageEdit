@@ -207,6 +207,8 @@ pub enum EditError {
     EmptySelection,
     #[error("crop rect is empty or outside the image")]
     EmptyCrop,
+    #[error("target size must be at least 1x1")]
+    InvalidCanvasSize,
     #[error("nothing to undo")]
     NothingToUndo,
     #[error("nothing to redo")]
@@ -288,10 +290,40 @@ fn transform_document(doc: &mut Document, transform: Transform) {
     }
 }
 
+/// Full document state taken before a pixel-modifying op, so undo can restore
+/// it exactly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentSnapshot {
+    pub canvas: Size,
+    pub base: RgbaImage,
+    pub view: Rect,
+    pub layers: Vec<Layer>,
+}
+
+impl Document {
+    pub fn snapshot(&self) -> DocumentSnapshot {
+        DocumentSnapshot {
+            canvas: self.canvas,
+            base: self.base.clone(),
+            view: self.view,
+            layers: self.layers.clone(),
+        }
+    }
+
+    /// Replace everything except history (used when undoing a pixel op).
+    pub fn restore(&mut self, snapshot: DocumentSnapshot) {
+        self.canvas = snapshot.canvas;
+        self.base = snapshot.base;
+        self.view = snapshot.view;
+        self.layers = snapshot.layers;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditOp {
     TransformDocument { transform: Transform },
     CropDocument { from: Rect, to: Rect },
+    ResizeDocument { from: DocumentSnapshot, to: Size },
     AddLayer { layer: Layer, index: usize },
     RemoveLayer { layer: Layer, index: usize },
     MoveLayer { from: usize, to: usize },
@@ -310,6 +342,10 @@ impl EditOp {
             }
             EditOp::CropDocument { to, .. } => {
                 apply_view(doc, *to);
+                Ok(())
+            }
+            EditOp::ResizeDocument { to, .. } => {
+                apply_resize(doc, *to);
                 Ok(())
             }
             EditOp::AddLayer { layer, index } => {
@@ -377,6 +413,10 @@ impl EditOp {
             }
             EditOp::CropDocument { from, .. } => {
                 apply_view(doc, *from);
+                Ok(())
+            }
+            EditOp::ResizeDocument { from, .. } => {
+                doc.restore(from.clone());
                 Ok(())
             }
             EditOp::AddLayer { index, .. } => {
@@ -467,6 +507,36 @@ fn apply_view(doc: &mut Document, view: Rect) {
     doc.canvas = Size::new(view.width, view.height);
 }
 
+fn apply_resize(doc: &mut Document, to: Size) {
+    // 以当前画布（所见）为参照缩放到 `to`：把当前可见内容重采样为新底图，
+    // 缩放后不再保留裁剪窗口（view 回到全尺寸）。
+    let sx = to.width as f64 / doc.canvas.width as f64;
+    let sy = to.height as f64 / doc.canvas.height as f64;
+    let visible = doc.flatten();
+    doc.base = image::imageops::resize(
+        &visible,
+        to.width,
+        to.height,
+        image::imageops::FilterType::Lanczos3,
+    );
+    doc.view = Rect::new(0, 0, to.width, to.height);
+    doc.canvas = to;
+    for layer in &mut doc.layers {
+        let ow = ((layer.image.width() as f64) * sx).round() as u32;
+        let oh = ((layer.image.height() as f64) * sy).round() as u32;
+        layer.image = image::imageops::resize(
+            &layer.image,
+            ow.max(1),
+            oh.max(1),
+            image::imageops::FilterType::Lanczos3,
+        );
+        layer.offset = (
+            ((layer.offset.0 as f64) * sx).round() as i32,
+            ((layer.offset.1 as f64) * sy).round() as i32,
+        );
+    }
+}
+
 impl Document {
     pub fn from_image(image: RgbaImage) -> Self {
         let canvas = Size::new(image.width(), image.height());
@@ -523,6 +593,18 @@ impl Document {
 
     pub fn apply_transform(&mut self, transform: Transform) -> Result<(), EditError> {
         self.execute(EditOp::TransformDocument { transform })
+    }
+
+    /// Resize the document to exactly `to`: the current canvas (what the user
+    /// sees) is resampled (Lanczos3) into a new base, any crop is dropped, and
+    /// layers are scaled proportionally. Full previous state is snapshotted for
+    /// undo.
+    pub fn resize(&mut self, to: Size) -> Result<(), EditError> {
+        if to.width < 1 || to.height < 1 {
+            return Err(EditError::InvalidCanvasSize);
+        }
+        let from = self.snapshot();
+        self.execute(EditOp::ResizeDocument { from, to })
     }
 
     pub fn add_layer(&mut self, layer: Layer) -> Result<usize, EditError> {
@@ -985,6 +1067,88 @@ mod tests {
         doc.apply_transform(Transform::Rotate90Ccw).unwrap();
         assert_eq!(doc.canvas, Size::new(20, 12));
         assert_eq!(doc.composite_pixel(0, 0).0, [10, 6, 0, 255]);
+    }
+
+    fn solid(width: u32, height: u32, color: [u8; 4]) -> RgbaImage {
+        RgbaImage::from_pixel(width, height, image::Rgba(color))
+    }
+
+    #[test]
+    fn resize_sets_canvas_and_drops_crop() {
+        let mut doc = Document::from_image(solid(64, 48, [10, 20, 30, 255]));
+        doc.crop(Rect::new(8, 6, 32, 24)).unwrap();
+        assert_eq!(doc.canvas, Size::new(32, 24));
+
+        doc.resize(Size::new(16, 12)).unwrap();
+        assert_eq!(doc.canvas, Size::new(16, 12));
+        assert_eq!(doc.view, Rect::new(0, 0, 16, 12));
+        assert_eq!(doc.base.dimensions(), (16, 12));
+        assert_eq!(doc.composite_pixel(0, 0).0, [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn resize_upscale_grows_dimensions() {
+        let mut doc = Document::from_image(solid(10, 5, [1, 2, 3, 255]));
+        doc.resize(Size::new(30, 15)).unwrap();
+        assert_eq!(doc.canvas, Size::new(30, 15));
+        assert_eq!(doc.base.dimensions(), (30, 15));
+        assert_eq!(doc.composite_pixel(29, 14).0, [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn resize_undo_restores_base_view_and_layers() {
+        let mut doc = Document::from_image(ramp(64, 48));
+        let mut layer = Layer::new(
+            "dot",
+            RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255])),
+        );
+        layer.offset = (6, 6);
+        doc.add_layer(layer).unwrap();
+        let original = doc.flatten();
+        let original_layers = doc.layers.clone();
+
+        doc.resize(Size::new(32, 24)).unwrap();
+        assert_eq!(doc.canvas, Size::new(32, 24));
+
+        doc.undo().unwrap();
+        assert_eq!(doc.canvas, Size::new(64, 48));
+        assert_eq!(doc.base.dimensions(), (64, 48));
+        assert_eq!(doc.layers, original_layers);
+        assert_eq!(doc.flatten(), original);
+
+        doc.redo().unwrap();
+        assert_eq!(doc.canvas, Size::new(32, 24));
+    }
+
+    #[test]
+    fn resize_rejects_zero_dimensions() {
+        let mut doc = Document::from_image(solid(16, 16, [0, 0, 0, 255]));
+        assert_eq!(
+            doc.resize(Size::new(0, 16)),
+            Err(EditError::InvalidCanvasSize)
+        );
+        assert_eq!(
+            doc.resize(Size::new(16, 0)),
+            Err(EditError::InvalidCanvasSize)
+        );
+        assert_eq!(doc.canvas, Size::new(16, 16));
+    }
+
+    #[test]
+    fn resize_scales_layer_offset_and_image() {
+        let mut doc = Document::from_image(solid(40, 20, [0, 0, 0, 255]));
+        let mut layer = Layer::new(
+            "dot",
+            RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255])),
+        );
+        layer.offset = (10, 5);
+        doc.add_layer(layer).unwrap();
+
+        doc.resize(Size::new(20, 10)).unwrap();
+        let l = &doc.layers[0];
+        assert_eq!(l.offset, (5, 3));
+        assert_eq!(l.image.dimensions(), (2, 2));
+        assert_eq!(doc.composite_pixel(5, 3).0, [255, 255, 255, 255]);
     }
 
     #[test]
