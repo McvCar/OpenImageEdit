@@ -8,6 +8,7 @@ use std::time::Instant;
 use cxx_qt_lib::{QString, QUrl};
 use decode::{decode_path, encode, format_from_path, DecodeOptions, Format};
 use editcore::{Document, Layer, Rect, Selection, Size, Transform};
+use image::RgbaImage;
 
 pub static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
@@ -161,6 +162,15 @@ pub mod qobject {
         fn reorder_layer(self: Pin<&mut Self>, from: i32, to: i32);
 
         #[qinvokable]
+        fn set_layer_locked(self: Pin<&mut Self>, index: i32, locked: bool);
+
+        #[qinvokable]
+        fn set_base_locked(self: Pin<&mut Self>, locked: bool);
+
+        #[qinvokable]
+        fn delete_base_layer(self: Pin<&mut Self>);
+
+        #[qinvokable]
         fn translate_selected(self: Pin<&mut Self>, dx: i32, dy: i32);
 
         // ---- 剪贴板（跨文档） ----
@@ -204,6 +214,24 @@ pub mod qobject {
 
         #[qinvokable]
         fn drag_translate_end(self: Pin<&mut Self>, commit: bool);
+
+        // ---- 图层缩放拖拽实时预览 ----
+
+        #[qinvokable]
+        fn scale_layer_begin(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn scale_layer_update(self: Pin<&mut Self>, w: i32, h: i32, ox: i32, oy: i32);
+
+        #[qinvokable]
+        fn scale_layer_end(
+            self: Pin<&mut Self>,
+            commit: bool,
+            w: i32,
+            h: i32,
+            ox: i32,
+            oy: i32,
+        );
     }
 }
 
@@ -228,9 +256,6 @@ pub struct BridgeRust {
     selected_layer: i32,
     layers_json: QString,
     dirty: bool,
-    /// Process-level clipboard holding a full `Layer`, so pixels survive
-    /// opening a different document (cross-image copy/paste).
-    clipboard: RefCell<Option<Layer>>,
     paste_counter: RefCell<u32>,
     /// Opacity of the selected layer before the current live slider drag, so
     /// the committed history op can record the true pre-drag value.
@@ -239,8 +264,20 @@ pub struct BridgeRust {
     /// dragging. `drag_translate_update` mutates the offset without touching
     /// history, `drag_translate_end` commits a single history op.
     drag_start_offset: RefCell<Option<(i32, i32)>>,
+    /// Image + offset of the selected layer when a handle-driven scale
+    /// started; live updates resample without history, end commits one op.
+    scale_start: RefCell<Option<(RgbaImage, (i32, i32))>>,
     session: RefCell<Option<Session>>,
     viewport: RefCell<Size>,
+}
+
+/// Process-global clipboard (per-window `RefCell` fields cannot share state
+/// across the multi-window Bridges). Holds a full `Layer`, so pixels survive
+/// opening a different document (cross-image copy/paste).
+fn clipboard() -> &'static std::sync::Mutex<Option<Layer>> {
+    static CLIPBOARD: std::sync::OnceLock<std::sync::Mutex<Option<Layer>>> =
+        std::sync::OnceLock::new();
+    CLIPBOARD.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 struct Session {
@@ -251,6 +288,8 @@ struct Session {
     fit: bool,
     render_count: u32,
     dirty: bool,
+    /// UI lock for the base row (blocks delete). Plain flag, not undoable.
+    base_locked: bool,
 }
 
 struct Rendered {
@@ -337,6 +376,7 @@ impl Session {
                 fit: true,
                 render_count: 0,
                 dirty: false,
+                base_locked: true,
             },
             ms,
         ))
@@ -366,17 +406,19 @@ impl Session {
             return Err("empty canvas".into());
         }
         let image = render::composite_for_preview(&self.doc, target);
-        let png = encode(&image, Format::Png, 90).map_err(|e| e.to_string())?;
+        // BMP on purpose: uncompressed means both the encode here and Qt's
+        // decode are near memcpy speed. PNG compression dominated each live
+        // drag tick (tens of ms); BMP keeps the preview path real-time. The
+        // URL keeps changing (forces Qt to re-read) while temp files stay
+        // bounded; the session id keeps concurrent windows separate.
+        let bytes = encode(&image, Format::Bmp, 90).map_err(|e| e.to_string())?;
         self.render_count = self.render_count.wrapping_add(1);
-        // Two rotating filenames per session: the URL keeps changing (forces
-        // Qt to re-read) while temp files stay bounded. The session id keeps
-        // concurrent windows from overwriting each other's preview.
         let path = std::env::temp_dir().join(format!(
-            "imageedit-preview-{}-{}.png",
+            "imageedit-preview-{}-{}.bmp",
             self.id,
             self.render_count % 2
         ));
-        std::fs::write(&path, png).map_err(|e| e.to_string())?;
+        std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
         Ok(Rendered {
             url: file_url(&path),
             display,
@@ -416,16 +458,19 @@ impl Session {
     }
 
     fn layers_json(&self) -> String {
+        let (base_deleted, base_locked) = (self.doc.base_deleted, self.base_locked);
         let mut parts: Vec<String> = Vec::new();
         for (i, layer) in self.doc.layers.iter().enumerate().rev() {
             let name = layer.name.replace('\\', "\\\\").replace('"', "\\\"");
             let bounds = layer.bounds();
             // o: opacity in percent (0-100); x/y/w/h: bounds in image pixels
-            // (the QML side uses them for the live layer outline while dragging).
+            // (the QML side uses them for the live layer outline while dragging);
+            // l: locked (blocks move / scale / delete in the UI).
             parts.push(format!(
-                "{{\"i\":{i},\"n\":\"{name}\",\"v\":{},\"o\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+                "{{\"i\":{i},\"n\":\"{name}\",\"v\":{},\"o\":{},\"l\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
                 layer.visible,
                 (layer.opacity * 100.0).round() as i32,
+                layer.locked,
                 bounds.x,
                 bounds.y,
                 bounds.width,
@@ -433,9 +478,12 @@ impl Session {
             ));
         }
         // The base image is listed last (display order = top first) as a
-        // locked row: not reorderable, not deletable (see §4.8 of the UX plan).
+        // locked-by-default row: not reorderable, not deletable while locked
+        // (see §4.8 of the UX plan). v reports base_deleted so the row can
+        // grey out after a delete.
         parts.push(format!(
-            "{{\"i\":-1,\"n\":\"背景\",\"v\":true,\"o\":100,\"x\":0,\"y\":0,\"w\":{},\"h\":{},\"base\":true}}",
+            "{{\"i\":-1,\"n\":\"背景\",\"v\":{},\"o\":100,\"l\":{},\"x\":0,\"y\":0,\"w\":{},\"h\":{},\"base\":true}}",
+            !base_deleted, base_locked,
             self.doc.canvas.width, self.doc.canvas.height
         ));
         format!("[{}]", parts.join(","))
@@ -1005,6 +1053,15 @@ session
         (ix < session.doc.layers.len()).then_some(ix)
     }
 
+    fn layer_locked(&self, ix: usize) -> bool {
+        self.session
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.doc.layers.get(ix))
+            .map(|l| l.locked)
+            .unwrap_or(false)
+    }
+
     pub fn extract_selection(mut self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32) {
         let viewport = *self.viewport.borrow();
         let Some(rect) = self.clamp_selection(x, y, w, h) else {
@@ -1064,6 +1121,11 @@ session
     }
 
     pub fn select_layer(mut self: Pin<&mut Self>, index: i32) {
+        if index < 0 {
+            // Negative index = deselect (Esc / clicking empty canvas).
+            self.as_mut().set_selected_layer(-1);
+            return;
+        }
         if self.selected_guard(index).is_none() {
             return;
         }
@@ -1153,6 +1215,11 @@ session
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
             return;
         };
+        if self.layer_locked(ix) {
+            self.as_mut()
+                .set_status(QString::from("图层已锁定，先解锁再删除"));
+            return;
+        }
         let result: Result<i32, String> = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
@@ -1256,6 +1323,11 @@ session
             return;
         }
         let viewport = *self.viewport.borrow();
+        if self.layer_locked(from as usize) || self.layer_locked(to as usize) {
+            self.as_mut()
+                .set_status(QString::from("已锁定的图层不能调整顺序"));
+            return;
+        }
         let result: Result<bool, String> = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
@@ -1282,7 +1354,7 @@ session
         self.apply_layer_edit(viewport, result);
     }
 
-    pub fn translate_selected(self: Pin<&mut Self>, dx: i32, dy: i32) {
+    pub fn translate_selected(mut self: Pin<&mut Self>, dx: i32, dy: i32) {
         if dx == 0 && dy == 0 {
             return;
         }
@@ -1290,6 +1362,11 @@ session
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
             return;
         };
+        if self.layer_locked(ix) {
+            self.as_mut()
+                .set_status(QString::from("图层已锁定，先解锁再移动"));
+            return;
+        }
         let result: Result<bool, String> = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
@@ -1329,7 +1406,7 @@ session
                     layer.image.width(),
                     layer.image.height()
                 );
-                *self.clipboard.borrow_mut() = Some(layer);
+                *clipboard().lock().unwrap() = Some(layer);
                 *self.paste_counter.borrow_mut() = 0;
                 self.as_mut().set_status(QString::from(text.as_str()));
                 println!(
@@ -1374,7 +1451,7 @@ session
                     layer.image.width(),
                     layer.image.height()
                 );
-                *self.clipboard.borrow_mut() = Some(layer);
+                *clipboard().lock().unwrap() = Some(layer);
                 *self.paste_counter.borrow_mut() = 0;
                 self.as_mut().set_status(QString::from(text.as_str()));
                 self.as_mut().refresh_preview();
@@ -1435,7 +1512,7 @@ session
             }
         };
         let text = format!("已复制图层「{}」（Ctrl+V 粘贴，可跨文档）", layer.name);
-        *self.clipboard.borrow_mut() = Some(layer);
+        *clipboard().lock().unwrap() = Some(layer);
         *self.paste_counter.borrow_mut() = 0;
         self.as_mut().set_status(QString::from(text.as_str()));
         println!("{{\"phase\":\"ui\",\"event\":\"copied-layer\",\"index\":{ix}}}");
@@ -1453,14 +1530,14 @@ session
                 None => return,
             }
         };
-        *self.clipboard.borrow_mut() = Some(layer);
+        *clipboard().lock().unwrap() = Some(layer);
         *self.paste_counter.borrow_mut() = 0;
         println!("{{\"phase\":\"ui\",\"event\":\"cut-layer\",\"index\":{ix}}}");
         self.as_mut().delete_selected_layer();
     }
 
     pub fn paste_clipboard(mut self: Pin<&mut Self>) {
-        let clipboard = self.clipboard.borrow().clone();
+        let clipboard = clipboard().lock().unwrap().clone();
         let Some(clip) = clipboard else {
             self.as_mut().set_status(QString::from("剪贴板为空"));
             return;
@@ -1586,7 +1663,7 @@ session
 
     /// Scale the selected layer to `width × height` (Lanczos3 via core
     /// `scale_layer`). keep_ratio: if either dimension is <= 0, derive it from
-    /// the other using the layer's current aspect.
+    /// the other using the layer's current aspect. The layer offset stays.
     pub fn scale_selected_layer(
         mut self: Pin<&mut Self>,
         width: i32,
@@ -1596,6 +1673,11 @@ session
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
             return;
         };
+        if self.layer_locked(ix) {
+            self.as_mut()
+                .set_status(QString::from("图层已锁定，先解锁再缩放"));
+            return;
+        }
         let result: Result<bool, String> = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
@@ -1603,6 +1685,7 @@ session
                 Some(session) => {
                     let layer = &session.doc.layers[ix];
                     let (ow, oh) = (layer.image.width() as i32, layer.image.height() as i32);
+                    let offset = layer.offset;
                     let (mut tw, mut th) = (width, height);
                     if keep_ratio && (tw <= 0 || th <= 0) {
                         // Derive the missing side from the current aspect.
@@ -1617,7 +1700,10 @@ session
                     } else if tw == ow && th == oh {
                         Ok(false)
                     } else {
-                        match session.doc.scale_layer(ix, Size::new(tw as u32, th as u32)) {
+                        match session
+                            .doc
+                            .scale_layer(ix, Size::new(tw as u32, th as u32), offset)
+                        {
                             Ok(()) => {
                                 session.dirty = true;
                                 Ok(true)
@@ -1639,12 +1725,177 @@ session
         }
     }
 
+    // ---- 图层缩放拖拽实时预览 ----
+
+    pub fn scale_layer_begin(self: Pin<&mut Self>) {
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            return;
+        };
+        if self.layer_locked(ix) {
+            return;
+        }
+        let guard = self.session.borrow();
+        if let Some(session) = guard.as_ref() {
+            if let Some(layer) = session.doc.layers.get(ix) {
+                *self.scale_start.borrow_mut() = Some((layer.image.clone(), layer.offset));
+            }
+        }
+    }
+
+    pub fn scale_layer_update(self: Pin<&mut Self>, w: i32, h: i32, ox: i32, oy: i32) {
+        let Some(_) = *self.scale_start.borrow() else {
+            return;
+        };
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            return;
+        };
+        if w < 1 || h < 1 || self.layer_locked(ix) {
+            return;
+        }
+        {
+            let mut guard = self.session.borrow_mut();
+            if let Some(session) = guard.as_mut() {
+                // Live preview: fast (Triangle) resample, no history entry.
+                let _ = session.doc.scale_layer_live(ix, Size::new(w as u32, h as u32), (ox, oy));
+            }
+        }
+        self.refresh_preview();
+    }
+
+    pub fn scale_layer_end(mut self: Pin<&mut Self>, commit: bool, w: i32, h: i32, ox: i32, oy: i32) {
+        let Some((image, offset)) = self.scale_start.borrow_mut().take() else {
+            return;
+        };
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            return;
+        };
+        let result: Result<bool, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => {
+                    // Roll the live preview back to the pre-drag state, then
+                    // re-apply once so the history op records the true start.
+                    if let Some(layer) = session.doc.layers.get_mut(ix) {
+                        layer.image = image;
+                        layer.offset = offset;
+                    }
+                    if !commit {
+                        Ok(false)
+                    } else {
+                        match session
+                            .doc
+                            .scale_layer(ix, Size::new(w.max(1) as u32, h.max(1) as u32), (ox, oy))
+                        {
+                            Ok(()) => {
+                                session.dirty = true;
+                                Ok(true)
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(true) => {
+                self.as_mut().refresh_preview();
+                self.as_mut().set_dirty(true);
+                println!("{{\"phase\":\"ui\",\"event\":\"layer-scaled\",\"index\":{ix}}}");
+            }
+            Ok(false) => self.as_mut().refresh_preview(),
+            Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
+        }
+    }
+
+    // ---- 图层锁定 ----
+
+    pub fn set_layer_locked(mut self: Pin<&mut Self>, index: i32, locked: bool) {
+        if index < 0 {
+            return;
+        }
+        {
+            let mut guard = self.session.borrow_mut();
+            if let Some(session) = guard.as_mut() {
+                if let Some(layer) = session.doc.layers.get_mut(index as usize) {
+                    layer.locked = locked;
+                }
+            }
+        }
+        self.as_mut().refresh_layers_only();
+    }
+
+    pub fn set_base_locked(mut self: Pin<&mut Self>, locked: bool) {
+        {
+            let mut guard = self.session.borrow_mut();
+            if let Some(session) = guard.as_mut() {
+                session.base_locked = locked;
+            }
+        }
+        self.as_mut().refresh_layers_only();
+    }
+
+    pub fn delete_base_layer(mut self: Pin<&mut Self>) {
+        let viewport = *self.viewport.borrow();
+        let result: Result<bool, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => {
+                    if session.base_locked {
+                        Err("背景已锁定，先点击锁图标解锁".into())
+                    } else if session.doc.base_deleted {
+                        Ok(false)
+                    } else {
+                        match session.doc.delete_base() {
+                            Ok(()) => {
+                                session.dirty = true;
+                                Ok(true)
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(true) => {
+                {
+                    let mut guard = self.session.borrow_mut();
+                    if let Some(s) = guard.as_mut() {
+                        s.refit_if_needed(viewport);
+                    }
+                }
+                self.as_mut().refresh_preview();
+                println!("{{\"phase\":\"ui\",\"event\":\"base-deleted\"}}");
+            }
+            Ok(false) => {}
+            Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
+        }
+    }
+
+    /// Re-publish `layers_json` (lock toggles change panel state only).
+    fn refresh_layers_only(mut self: Pin<&mut Self>) {
+        let json = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                Some(session) => session.layers_json(),
+                None => return,
+            }
+        };
+        self.as_mut()
+            .set_layers_json(QString::from(json.as_str()));
+    }
+
     // ---- 移动图层拖拽实时预览 ----
 
     pub fn drag_translate_begin(self: Pin<&mut Self>) {
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
             return;
         };
+        if self.layer_locked(ix) {
+            return;
+        }
         let guard = self.session.borrow();
         if let Some(session) = guard.as_ref() {
             if let Some(layer) = session.doc.layers.get(ix) {
@@ -1660,6 +1911,9 @@ session
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
             return;
         };
+        if self.layer_locked(ix) {
+            return;
+        }
         {
             let guard = self.session.borrow();
             match guard.as_ref() {

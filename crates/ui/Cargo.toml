@@ -13,6 +13,7 @@ path = "src/main.rs"
 imageedit-core = { workspace = true }
 imageedit-decode = { workspace = true }
 imageedit-render = { workspace = true }
+image = { workspace = true }
 
 cxx = "1.0.95"
 cxx-qt = "0.10"

@@ -445,6 +445,7 @@ dependencies = [
  "cxx-qt",
  "cxx-qt-build",
  "cxx-qt-lib",
+ "image",
  "imageedit-core",
  "imageedit-decode",
  "imageedit-render",

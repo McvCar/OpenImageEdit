@@ -155,16 +155,24 @@ Window {
                     property real px: 0
                     property real py: 0
 
+                    // Deltas MUST be measured in a stable coordinate frame:
+                    // the handle itself moves while dragging, so its local
+                    // mouse coords feed back into resizeFn and the box
+                    // oscillates (visible jitter). Map to the handles item,
+                    // which never moves during a drag.
                     onPressed: (mouse) => {
-                        px = mouse.x
-                        py = mouse.y
+                        const p = mapToItem(handles, mouse.x, mouse.y)
+                        px = p.x
+                        py = p.y
                         startRect = Qt.rect(handles.bx, handles.by, handles.bw, handles.bh)
                         handles.engaged = true
                     }
                     onPositionChanged: (mouse) => {
-                        if (pressed && handles.resizeFn)
-                            handles.resizeFn(startRect, role, mouse.x - px, mouse.y - py,
+                        if (pressed && handles.resizeFn) {
+                            const p = mapToItem(handles, mouse.x, mouse.y)
+                            handles.resizeFn(startRect, role, p.x - px, p.y - py,
                                              (mouse.modifiers & Qt.ShiftModifier) !== 0)
+                        }
                     }
                     onReleased: handles.engaged = false
                 }
@@ -354,8 +362,9 @@ Window {
     Shortcut { sequences: ["Ctrl+0", "Ctrl+1"]; onActivated: bridge.zoom_actual() }
     Shortcut { sequences: ["Ctrl+9"]; onActivated: bridge.zoom_fit() }
     Shortcut { sequences: [StandardKey.Undo]; onActivated: bridge.undo() }
-    // Preview ⇧⌘Z; Ctrl+Y stays as a Windows-friendly alias.
-    Shortcut { sequences: ["Ctrl+Shift+Z", StandardKey.Redo]; onActivated: bridge.redo() }
+    // Redo: explicit keys — StandardKey.Redo maps inconsistently across
+    // platforms/layouts, plain strings fire reliably (Ctrl+Y and ⇧Ctrl+Z).
+    Shortcut { sequences: ["Ctrl+Shift+Z", "Ctrl+Y"]; onActivated: bridge.redo() }
     Shortcut { sequences: [StandardKey.Save]; onActivated: bridge.save_edited() }
     Shortcut { sequences: [StandardKey.Copy]; onActivated: doCopy() }
     Shortcut { sequences: [StandardKey.Cut]; onActivated: doCut() }
@@ -365,6 +374,11 @@ Window {
     Shortcut { sequence: "Ctrl+Shift+R"; onActivated: bridge.rotate_ccw() }
     Shortcut { sequences: ["Delete", "Backspace"]
                enabled: root.selExists || bridge.selected_layer >= 0
+                        || (function () {
+                            const b = findBase()
+                            return b !== null && b.v === true && !isLocked(b)
+                                && bridge.layer_count > 0
+                        })()
                onActivated: onDeleteKey() }
     Shortcut { sequence: "Ctrl+A"
                enabled: bridge.image_width > 0 && root.renamingIndex < 0
@@ -419,7 +433,7 @@ Window {
             ToolButton { label: "删除选区像素"; active: root.selExists; onClicked: deleteSelectionPixels() }
             ToolButton {
                 label: "图层"
-                active: bridge.layer_count > 0
+                active: true
                 selected: root.panelVisible
                 onClicked: root.panelVisible = !root.panelVisible
             }
@@ -447,11 +461,41 @@ Window {
         anchors.right: parent.right
         clip: true
         boundsBehavior: Flickable.StopAtBounds
-        contentWidth: Math.max(width, previewImage.width)
-        contentHeight: Math.max(height, previewImage.height)
+        // PAD display px of slack around the image so layers pushed partially
+        // off-canvas stay visible and clickable (canvasSurface matches).
+        readonly property int pad: 64
+        contentWidth: Math.max(width, previewImage.width + 2 * pad)
+        contentHeight: Math.max(height, previewImage.height + 2 * pad)
 
         onWidthChanged: bridge.set_viewport(width, height)
         onHeightChanged: bridge.set_viewport(width, height)
+
+        // PS-style checkerboard behind the image: transparent pixels show
+        // the classic gray/white grid.
+        Canvas {
+            id: checkerboard
+            visible: bridge.preview_url.length > 0
+            x: previewImage.x
+            y: previewImage.y
+            width: previewImage.width
+            height: previewImage.height
+            onWidthChanged: requestPaint()
+            onHeightChanged: requestPaint()
+            onPaint: {
+                var ctx = getContext("2d")
+                ctx.clearRect(0, 0, width, height)
+                const cell = 8
+                ctx.fillStyle = "#cccccc"
+                ctx.fillRect(0, 0, width, height)
+                ctx.fillStyle = "#ffffff"
+                for (var gy = 0; gy < height; gy += cell) {
+                    for (var gx = 0; gx < width; gx += cell) {
+                        if (((gx / cell) | 0) % 2 === ((gy / cell) | 0) % 2)
+                            ctx.fillRect(gx, gy, cell, cell)
+                    }
+                }
+            }
+        }
 
         Image {
             id: previewImage
@@ -480,29 +524,63 @@ Window {
         // Hit priority: selected layer content drag (no active selection) →
         // selection move (center of the selection) → new selection rubber
         // band. Crop is applied to the live selection (Enter / Ctrl+K).
+        //
+        // The surface extends PAD display px beyond the image on every side
+        // (and the Flickable content grows to match), so layers pushed
+        // partially off-canvas remain reachable.
 
         Item {
             id: canvasSurface
             visible: bridge.image_width > 0
             z: 5
-            x: previewImage.x
-            y: previewImage.y
-            width: previewImage.width
-            height: previewImage.height
+            x: previewImage.x - view.pad
+            y: previewImage.y - view.pad
+            width: previewImage.width + 2 * view.pad
+            height: previewImage.height + 2 * view.pad
 
-            // Bottom layer: draw a new selection (rubber band). Pressing on
-            // empty canvas also settles a floating paste.
+            // Bottom layer: the single canvas interaction area. It is always
+            // enabled so hover coordinates never freeze (a disabled MouseArea
+            // stops receiving hover events, which deadlocks any cursor/enabled
+            // logic bound to them). Press behavior:
+            //   - no selection + hit on a layer → select it; moving >3px
+            //     starts a live drag of that layer (pick-and-move);
+            //   - otherwise → rubber-band selection; a click on empty canvas
+            //     clears both the selection and any layer selection.
+            // Cursor: SizeAll over an unlocked layer's content, CrossCursor
+            // elsewhere (the selection-move area shows its own SizeAll).
             MouseArea {
                 id: selDragMouse
                 anchors.fill: parent
-                cursorShape: Qt.CrossCursor
+                hoverEnabled: true
+                cursorShape: {
+                    if (!root.selExists && bridge.image_width > 0) {
+                        const hit = topLayerAt(selDragMouse.mouseX, selDragMouse.mouseY)
+                        if (hit !== null && !isLocked(hit))
+                            return Qt.SizeAllCursor
+                    }
+                    return Qt.CrossCursor
+                }
                 property real startX: 0
                 property real startY: 0
                 property real curX: 0
                 property real curY: 0
                 property bool dragging: false
+                // Layer pick-and-move gesture (no selection active).
+                property bool pickDrag: false
+                property bool pickMoved: false
 
                 onPressed: (mouse) => {
+                    const hit = root.selExists ? null : topLayerAt(mouse.x, mouse.y)
+                    if (hit !== null) {
+                        bridge.select_layer(hit.i)
+                        pickDrag = true
+                        pickMoved = false
+                        startX = mouse.x
+                        startY = mouse.y
+                        curX = mouse.x
+                        curY = mouse.y
+                        return
+                    }
                     startX = mouse.x
                     startY = mouse.y
                     curX = mouse.x
@@ -513,90 +591,81 @@ Window {
                     settlePaste()
                 }
                 onPositionChanged: (mouse) => {
+                    if (pickDrag) {
+                        curX = mouse.x
+                        curY = mouse.y
+                        if (!pickMoved
+                            && Math.abs(curX - startX) + Math.abs(curY - startY) > 3) {
+                            pickMoved = true
+                            bridge.drag_translate_begin()
+                        }
+                        if (pickMoved)
+                            liveTimer.restart()
+                        return
+                    }
                     if (!dragging)
                         return
                     curX = mouse.x
                     curY = mouse.y
-                    const x = Math.min(startX, curX)
-                    const y = Math.min(startY, curY)
+                    const x = Math.min(startX, curX) - view.pad
+                    const y = Math.min(startY, curY) - view.pad
                     root.selX = snapDisplay(x)
                     root.selY = snapDisplay(y)
                     root.selW = Math.max(snapDisplay(Math.abs(curX - startX)), toDispScale())
                     root.selH = Math.max(snapDisplay(Math.abs(curY - startY)), toDispScale())
                 }
                 onReleased: {
+                    if (pickDrag) {
+                        pickDrag = false
+                        if (pickMoved) {
+                            liveTimer.stop()
+                            const scale = toImageScale()
+                            bridge.drag_translate_update(
+                                Math.round((curX - startX) * scale),
+                                Math.round((curY - startY) * scale))
+                            bridge.drag_translate_end(true)
+                            if (root.pasteFloating)
+                                root.floatingOps += 1
+                        }
+                        return
+                    }
                     dragging = false
                     if (root.selW < 3 || root.selH < 3) {
-                        // Click on empty canvas: clear the selection.
+                        // Click on empty canvas: clear the selection and any
+                        // layer selection with it.
                         root.selW = 0
                         root.selH = 0
+                        if (bridge.selected_layer >= 0)
+                            bridge.select_layer(-1)
                     }
-                }
-            }
-
-            // Top layer: drag the selected layer's content to move it. Only
-            // reachable while no selection is active (selection owns the
-            // canvas while it exists).
-            MouseArea {
-                id: layerDragMouse
-                anchors.fill: parent
-                enabled: bridge.selected_layer >= 0 && root.selLayer !== null && !root.selExists
-                cursorShape: Qt.SizeAllCursor
-                property real startX: 0
-                property real startY: 0
-                property real curX: 0
-                property real curY: 0
-                property bool dragging: false
-
-                onPressed: (mouse) => {
-                    const b = root.selLayerBox
-                    const s = toDispScale()
-                    const inside = b !== null
-                        && mouse.x >= b.x * s && mouse.x <= (b.x + b.w) * s
-                        && mouse.y >= b.y * s && mouse.y <= (b.y + b.h) * s
-                    if (!inside) {
-                        mouse.accepted = false
-                        return
-                    }
-                    startX = mouse.x
-                    startY = mouse.y
-                    curX = mouse.x
-                    curY = mouse.y
-                    dragging = true
-                    bridge.drag_translate_begin()
-                }
-                onPositionChanged: (mouse) => {
-                    if (dragging) {
-                        curX = mouse.x
-                        curY = mouse.y
-                        liveTimer.restart()
-                    }
-                }
-                onReleased: {
-                    if (!dragging)
-                        return
-                    dragging = false
-                    liveTimer.stop()
-                    const scale = toImageScale()
-                    bridge.drag_translate_update(
-                        Math.round((curX - startX) * scale),
-                        Math.round((curY - startY) * scale))
-                    bridge.drag_translate_end(true)
-                    if (root.pasteFloating)
-                        root.floatingOps += 1
                 }
             }
 
             Timer {
                 id: liveTimer
-                interval: 70
+                interval: 33
                 onTriggered: {
-                    if (!layerDragMouse.dragging)
+                    if (!selDragMouse.pickMoved)
                         return
                     const scale = toImageScale()
                     bridge.drag_translate_update(
-                        Math.round((layerDragMouse.curX - layerDragMouse.startX) * scale),
-                        Math.round((layerDragMouse.curY - layerDragMouse.startY) * scale))
+                        Math.round((selDragMouse.curX - selDragMouse.startX) * scale),
+                        Math.round((selDragMouse.curY - selDragMouse.startY) * scale))
+                }
+            }
+
+            // Live scale preview throttle for the selected layer's handles.
+            Timer {
+                id: scaleTimer
+                interval: 60
+                onTriggered: {
+                    if (root.scaleW <= 0)
+                        return
+                    const s = toDispScale()
+                    bridge.scale_layer_update(
+                        Math.max(1, Math.round(root.scaleW / s)),
+                        Math.max(1, Math.round(root.scaleH / s)),
+                        Math.round(root.scaleX / s), Math.round(root.scaleY / s))
                 }
             }
         }
@@ -669,7 +738,8 @@ Window {
 
         EdgeHandles {
             id: layerHandles
-            visible: root.selLayer !== null && !root.selExists && bridge.image_width > 0
+            visible: root.selLayer !== null && root.selLayer.base !== true
+                     && !root.selExists && bridge.image_width > 0
             z: 8
             x: previewImage.x
             y: previewImage.y
@@ -689,8 +759,12 @@ Window {
                 resizeLayerFrom(startRect, role, dx, dy, free)
             }
             onEngagedChanged: {
-                if (!layerHandles.engaged && root.scaleW > 0)
+                if (layerHandles.engaged) {
+                    if (root.scaleW === 0)
+                        bridge.scale_layer_begin()
+                } else if (root.scaleW > 0) {
                     commitLayerScale()
+                }
             }
         }
 
@@ -738,14 +812,16 @@ Window {
             anchors.verticalCenter: parent.verticalCenter
             anchors.right: zoomLabel.left
             anchors.rightMargin: 10
-            visible: root.modeActive || root.selExists
+            visible: root.modeActive || root.selExists || bridge.selected_layer >= 0
             text: root.pasteFloating
                   ? "粘贴内容可拖动定位：Enter / 点击外部落定，Esc 撤销粘贴"
                   : root.selRubberBanding
                   ? "松手完成选区，随后可拖手柄精修、拖内部移动"
                   : root.scaleW > 0
                   ? "拖角/边调整图层大小（角点等比，Shift 自由）；松手应用，Esc 取消"
-                  : "已选区：拖手柄缩放 / 拖内部移动；Enter 或 Ctrl+K 应用裁剪，Esc 取消"
+                  : root.selExists
+                  ? "已选区：拖手柄缩放 / 拖内部移动；Enter 或 Ctrl+K 应用裁剪，Esc 取消"
+                  : "已选图层：点住拖动移动，拖手柄缩放；点击空白处或 Esc 取消选择"
             color: "#9fb6d8"
             font.pixelSize: 12
         }
@@ -889,7 +965,7 @@ Window {
                             reordering = false
                         }
                         onPositionChanged: (mouse) => {
-                            if (!pressed || layerRow.isBase)
+                            if (!pressed || layerRow.isBase || (layerRow.row && layerRow.row.l === true))
                                 return
                             if (!reordering && Math.abs(mouse.y - pressY) > 6) {
                                 reordering = true
@@ -913,6 +989,11 @@ Window {
                                 bridge.reorder_layer(docLen - 1 - fromPos,
                                                      docLen - 1 - toPos)
                             } else if (!reordering && layerRow.row && !layerRow.isBase) {
+                                // Selecting a layer takes over the canvas:
+                                // drop any active selection so the layer's
+                                // handles and drag become usable at once.
+                                root.selW = 0
+                                root.selH = 0
                                 bridge.select_layer(layerRow.row.i)
                             }
                             reordering = false
@@ -938,7 +1019,7 @@ Window {
                             width: 18
                             height: 18
                             property bool on: layerRow.vis
-                            readonly property bool disabled: layerRow.isBase
+                            readonly property bool disabled: layerRow.isBase && layerRow.row && layerRow.row.v !== true
                             onOnChanged: requestPaint()
                             onDisabledChanged: requestPaint()
                             onPaint: {
@@ -969,7 +1050,7 @@ Window {
                         MouseArea {
                             anchors.fill: parent
                             anchors.margins: -4
-                            enabled: !layerRow.isBase
+                            enabled: !(layerRow.isBase && layerRow.row && layerRow.row.v !== true)
                             cursorShape: Qt.PointingHandCursor
                             onClicked: if (layerRow.row)
                                 bridge.set_layer_visible_at(layerRow.row.i, !layerRow.row.v)
@@ -978,13 +1059,15 @@ Window {
 
                     Text {
                         x: 30
-                        width: parent.width - 38
+                        width: parent.width - 62
                         anchors.verticalCenter: parent.verticalCenter
                         elide: Text.ElideRight
                         visible: !renameInput.visible
                         text: layerRow.row
                               ? layerRow.row.n
-                                + (layerRow.isBase ? "（锁定）" : "")
+                                + (layerRow.isBase
+                                   ? (layerRow.row.l === true ? "（背景）" : "（已解锁，Delete 删除）")
+                                   : "")
                                 + (layerRow.row.o !== undefined && layerRow.row.o < 100 ? "  " + layerRow.row.o + "%" : "")
                                 + (isSel ? "  (选中)" : "")
                               : ""
@@ -995,7 +1078,7 @@ Window {
                     TextInput {
                         id: renameInput
                         x: 30
-                        width: parent.width - 38
+                        width: parent.width - 62
                         anchors.verticalCenter: parent.verticalCenter
                         visible: root.renamingIndex !== -1 && root.renamingIndex === (layerRow.row ? layerRow.row.i : -1)
                         text: layerRow.row ? layerRow.row.n : ""
@@ -1009,6 +1092,56 @@ Window {
                         }
                         onActiveFocusChanged: if (!activeFocus && visible)
                             root.renamingIndex = -1
+                    }
+
+                    // Lock icon (right side): click toggles the lock. Locked
+                    // layers reject move / scale / delete / reorder.
+                    Item {
+                        anchors.right: parent.right
+                        anchors.rightMargin: 4
+                        width: 22
+                        height: parent.height
+
+                        Canvas {
+                            id: lockIcon
+                            anchors.centerIn: parent
+                            width: 16
+                            height: 16
+                            property bool on: layerRow.row !== null && layerRow.row.l === true
+                            onOnChanged: requestPaint()
+                            onPaint: {
+                                var ctx = getContext("2d")
+                                ctx.clearRect(0, 0, width, height)
+                                ctx.lineWidth = 1.4
+                                ctx.strokeStyle = on ? "#e8b34a" : "#5a5f66"
+                                ctx.fillStyle = on ? "#e8b34a" : "#5a5f66"
+                                // Shackle.
+                                ctx.beginPath()
+                                if (on) {
+                                    ctx.arc(8, 7, 3.2, Math.PI, 0)
+                                } else {
+                                    ctx.arc(8, 7, 3.2, Math.PI * 0.85, Math.PI * 0.15, false)
+                                }
+                                ctx.stroke()
+                                // Body.
+                                ctx.beginPath()
+                                ctx.roundRect ? ctx.roundRect(4, 7, 8, 6.5, 1.5)
+                                              : ctx.rect(4, 7, 8, 6.5)
+                                ctx.fill()
+                            }
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            anchors.margins: -4
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: if (layerRow.row) {
+                                if (layerRow.isBase)
+                                    bridge.set_base_locked(!(layerRow.row.l === true))
+                                else
+                                    bridge.set_layer_locked(layerRow.row.i, !(layerRow.row.l === true))
+                            }
+                        }
                     }
                 }
                 }
@@ -1347,19 +1480,26 @@ Window {
         }
         root.scaleX = x; root.scaleY = y
         root.scaleW = Math.max(1, w); root.scaleH = Math.max(1, h)
+        scaleTimer.restart()
     }
 
     function commitLayerScale() {
+        scaleTimer.stop()
         const s = toDispScale()
         if (root.scaleW >= 1 && root.scaleH >= 1 && s > 0) {
-            bridge.scale_selected_layer(
+            bridge.scale_layer_end(
+                true,
                 Math.max(1, Math.round(root.scaleW / s)),
-                Math.max(1, Math.round(root.scaleH / s)), false)
+                Math.max(1, Math.round(root.scaleH / s)),
+                Math.round(root.scaleX / s), Math.round(root.scaleY / s))
         }
         root.scaleX = 0; root.scaleY = 0; root.scaleW = 0; root.scaleH = 0
     }
 
     function cancelLayerScale() {
+        scaleTimer.stop()
+        if (root.scaleW > 0)
+            bridge.scale_layer_end(false, 0, 0, 0, 0)
         root.scaleX = 0; root.scaleY = 0; root.scaleW = 0; root.scaleH = 0
     }
 
@@ -1387,14 +1527,22 @@ Window {
     }
 
     // Delete / Backspace: with a selection → erase selection pixels;
-    // otherwise delete the selected (non-base) layer.
+    // otherwise delete the selected unlocked layer; with nothing selected and
+    // an unlocked (deleted-pending) base → remove the background.
     function onDeleteKey() {
         if (root.selExists) {
             deleteSelectionPixels()
             return
         }
-        if (bridge.selected_layer >= 0 && !(root.selLayer && root.selLayer.base))
-            bridge.delete_selected_layer()
+        if (bridge.selected_layer >= 0) {
+            if (!isLocked(root.selLayer))
+                bridge.delete_selected_layer()
+            return
+        }
+        const base = findBase()
+        if (base !== null && base.v === true && !isLocked(base)
+            && bridge.layer_count > 0)
+            bridge.delete_base_layer()
     }
 
     // Ctrl+A: selection covering the whole canvas (Preview ⌘A).
@@ -1518,6 +1666,7 @@ Window {
             return
         }
         if (root.selExists) { root.selW = 0; root.selH = 0; return }
+        if (bridge.selected_layer >= 0) { bridge.select_layer(-1); return }
         if (root.panelVisible) { root.panelVisible = false; return }
         root.fullscreen = false
     }
@@ -1560,15 +1709,47 @@ Window {
 
     function findSelLayer() {
         for (var i = 0; i < layerList.length; i++)
-            if (layerList[i].i === bridge.selected_layer)
+            if (!layerList[i].base && layerList[i].i === bridge.selected_layer)
                 return layerList[i]
         return null
     }
 
     function findLayerBox() {
         for (var i = 0; i < layerList.length; i++)
-            if (layerList[i].i === bridge.selected_layer)
+            if (!layerList[i].base && layerList[i].i === bridge.selected_layer)
                 return layerList[i]
+        return null
+    }
+
+    function isLocked(item) {
+        return item !== null && item !== undefined && item.l === true
+    }
+
+    function findBase() {
+        for (var i = 0; i < layerList.length; i++)
+            if (layerList[i].base === true)
+                return layerList[i]
+        return null
+    }
+
+    // Topmost visible non-base layer whose content box contains the
+    // canvasSurface-space point (mx, my); null when the point is empty
+    // canvas. layerList is display-ordered (index 0 = top), so the first
+    // hit wins. Hidden layers and the base row are not pickable.
+    function topLayerAt(mx, my) {
+        const s = toDispScale()
+        if (s <= 0)
+            return null
+        const ix = (mx - view.pad) / s
+        const iy = (my - view.pad) / s
+        for (var k = 0; k < root.layerList.length; k++) {
+            const l = root.layerList[k]
+            if (l.base === true || l.v !== true)
+                continue
+            if (l.w > 0 && l.h > 0
+                && ix >= l.x && ix <= l.x + l.w && iy >= l.y && iy <= l.y + l.h)
+                return l
+        }
         return null
     }
 

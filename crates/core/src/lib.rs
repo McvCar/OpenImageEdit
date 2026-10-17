@@ -164,6 +164,9 @@ pub struct Layer {
     pub offset: (i32, i32),
     pub opacity: f32,
     pub visible: bool,
+    /// UI-only guard: locked layers reject move / scale / delete in the
+    /// bridge. Plain flag, not part of undo history.
+    pub locked: bool,
 }
 
 impl Layer {
@@ -174,6 +177,7 @@ impl Layer {
             offset: (0, 0),
             opacity: 1.0,
             visible: true,
+            locked: false,
         }
     }
 
@@ -196,6 +200,9 @@ pub struct Document {
     /// this rect (no pixel copy), so crop is O(1) and reversible.
     pub view: Rect,
     pub layers: Vec<Layer>,
+    /// True while the base layer has been "deleted" (fully transparent
+    /// canvas). Tracked so the panel can grey out the base row.
+    pub base_deleted: bool,
     /// Auto-naming counter: new layers (extract/paste) are named by their
     /// creation order ("1", "2", ...). Not part of snapshots on purpose, so
     /// names keep increasing across undo/redo.
@@ -217,6 +224,8 @@ pub enum EditError {
     NothingToUndo,
     #[error("nothing to redo")]
     NothingToRedo,
+    #[error("the base layer needs at least one other layer")]
+    BaseRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,6 +311,8 @@ pub struct DocumentSnapshot {
     pub base: RgbaImage,
     pub view: Rect,
     pub layers: Vec<Layer>,
+    /// True while the base has been "deleted" (fully transparent canvas).
+    pub base_deleted: bool,
 }
 
 impl Document {
@@ -311,6 +322,7 @@ impl Document {
             base: self.base.clone(),
             view: self.view,
             layers: self.layers.clone(),
+            base_deleted: self.base_deleted,
         }
     }
 
@@ -320,6 +332,7 @@ impl Document {
         self.base = snapshot.base;
         self.view = snapshot.view;
         self.layers = snapshot.layers;
+        self.base_deleted = snapshot.base_deleted;
     }
 }
 
@@ -339,10 +352,19 @@ pub enum EditOp {
     /// selection are made fully transparent while layers stay untouched. The
     /// pre-op snapshot makes undo exact (same pattern as `ResizeDocument`).
     EraseBasePixels { from: DocumentSnapshot, selection: Selection },
-    /// Scale a layer's image to `to` (Lanczos3). The offset (top-left corner)
-    /// is kept, so only the content size changes. The pre-op snapshot makes
-    /// undo exact (same pattern as `ResizeDocument`).
-    ScaleLayer { index: usize, from: DocumentSnapshot, to: Size },
+    /// Scale a layer's image to `to` (Lanczos3) and move its top-left corner
+    /// to `offset`, so handle-driven resizes anchor at the dragged corner /
+    /// edge instead of always growing toward the bottom-right. The pre-op
+    /// snapshot makes undo exact (same pattern as `ResizeDocument`).
+    ScaleLayer {
+        index: usize,
+        from: DocumentSnapshot,
+        to: Size,
+        offset: (i32, i32),
+    },
+    /// "Delete" the base layer: the canvas becomes fully transparent while
+    /// layers stay untouched. Undo restores the previous base pixels.
+    DeleteBase { from: DocumentSnapshot },
 }
 
 impl EditOp {
@@ -418,7 +440,7 @@ impl EditOp {
                 erase_base_pixels(doc, selection);
                 Ok(())
             }
-            EditOp::ScaleLayer { index, to, .. } => {
+            EditOp::ScaleLayer { index, to, offset, .. } => {
                 let layer = doc
                     .layers
                     .get_mut(*index)
@@ -432,6 +454,11 @@ impl EditOp {
                     to.height,
                     image::imageops::FilterType::Lanczos3,
                 );
+                layer.offset = *offset;
+                Ok(())
+            }
+            EditOp::DeleteBase { .. } => {
+                apply_delete_base(doc);
                 Ok(())
             }
         }
@@ -513,6 +540,10 @@ impl EditOp {
                 doc.restore(from.clone());
                 Ok(())
             }
+            EditOp::DeleteBase { from } => {
+                doc.restore(from.clone());
+                Ok(())
+            }
         }
     }
 }
@@ -549,8 +580,13 @@ fn apply_view(doc: &mut Document, view: Rect) {
 
 /// Make every base pixel under `selection` fully transparent. Selection
 /// coordinates are canvas coordinates and map into `base` through `view`.
-fn erase_base_pixels(doc: &mut Document, selection: &Selection) {
-    let canvas_rect = Rect::new(0, 0, doc.canvas.width, doc.canvas.height);
+/// "Delete" the base: replace it with a fully transparent canvas-sized image.
+fn apply_delete_base(doc: &mut Document) {
+    doc.base = RgbaImage::new(doc.canvas.width, doc.canvas.height);
+    doc.base_deleted = true;
+}
+
+fn erase_base_pixels(doc: &mut Document, selection: &Selection) {    let canvas_rect = Rect::new(0, 0, doc.canvas.width, doc.canvas.height);
     let Some(clipped) = selection.bounds().intersect(canvas_rect) else {
         return;
     };
@@ -613,6 +649,7 @@ impl Document {
             base: image,
             view: Rect::new(0, 0, canvas.width, canvas.height),
             layers: Vec::new(),
+            base_deleted: false,
             next_layer_seq: 0,
             history: History::new(256),
         }
@@ -744,10 +781,16 @@ impl Document {
         })
     }
 
-    /// Scale a layer's image to exactly `to` (Lanczos3). The layer offset
-    /// (top-left corner) is unchanged; only the content is resampled. Undo
-    /// restores the full previous state via snapshot.
-    pub fn scale_layer(&mut self, index: usize, to: Size) -> Result<(), EditError> {
+    /// Scale a layer's image to exactly `to` (Lanczos3) and place its
+    /// top-left corner at `offset`, so handle-driven resizes anchor at the
+    /// dragged corner / edge. Undo restores the full previous state via
+    /// snapshot.
+    pub fn scale_layer(
+        &mut self,
+        index: usize,
+        to: Size,
+        offset: (i32, i32),
+    ) -> Result<(), EditError> {
         if to.width < 1 || to.height < 1 {
             return Err(EditError::InvalidCanvasSize);
         }
@@ -755,7 +798,43 @@ impl Document {
             return Err(EditError::LayerIndex(index));
         }
         let from = self.snapshot();
-        self.execute(EditOp::ScaleLayer { index, from, to })
+        self.execute(EditOp::ScaleLayer { index, from, to, offset })
+    }
+
+    /// History-free live preview of [`Document::scale_layer`], using a fast
+    /// (Triangle) filter so handle drags render in real time. The committing
+    /// call re-does the work with Lanczos3 and full undo support.
+    pub fn scale_layer_live(
+        &mut self,
+        index: usize,
+        to: Size,
+        offset: (i32, i32),
+    ) -> Result<(), EditError> {
+        if to.width < 1 || to.height < 1 {
+            return Err(EditError::InvalidCanvasSize);
+        }
+        let layer = self
+            .layers
+            .get_mut(index)
+            .ok_or(EditError::LayerIndex(index))?;
+        layer.image = image::imageops::resize(
+            &layer.image,
+            to.width,
+            to.height,
+            image::imageops::FilterType::Triangle,
+        );
+        layer.offset = offset;
+        Ok(())
+    }
+
+    /// "Delete" the base layer: the canvas becomes fully transparent while
+    /// layers stay untouched. Requires at least one layer to remain.
+    pub fn delete_base(&mut self) -> Result<(), EditError> {
+        if self.layers.is_empty() {
+            return Err(EditError::BaseRequired);
+        }
+        let from = self.snapshot();
+        self.execute(EditOp::DeleteBase { from })
     }
 
     pub fn undo(&mut self) -> Result<(), EditError> {
@@ -1051,7 +1130,7 @@ mod tests {
             .unwrap();
         doc.translate_layer(index, 5, 3).unwrap();
 
-        doc.scale_layer(index, Size::new(16, 8)).unwrap();
+        doc.scale_layer(index, Size::new(16, 8), (5, 3)).unwrap();
         let layer = &doc.layers[index];
         assert_eq!(layer.image.width(), 16);
         assert_eq!(layer.image.height(), 8);
@@ -1072,11 +1151,11 @@ mod tests {
         let index = doc.add_layer(Layer::new("clip", checker(4, 4))).unwrap();
         let undo_depth = doc.history.undo.len();
         assert_eq!(
-            doc.scale_layer(index, Size::new(0, 4)),
+            doc.scale_layer(index, Size::new(0, 4), (0, 0)),
             Err(EditError::InvalidCanvasSize)
         );
         assert_eq!(
-            doc.scale_layer(9, Size::new(4, 4)),
+            doc.scale_layer(9, Size::new(4, 4), (0, 0)),
             Err(EditError::LayerIndex(9))
         );
         // Rejected calls must not touch the history stack.
@@ -1085,8 +1164,28 @@ mod tests {
     }
 
     #[test]
-    fn move_layer_is_single_reorder_op() {
-        // Drag-reorder in the panel relies on move_layer(from, to) being one
+    fn delete_base_requires_layers_and_roundtrips() {
+        let mut doc = Document::from_image(checker(16, 16));
+        // No layers yet: deleting the base is rejected.
+        assert_eq!(doc.delete_base(), Err(EditError::BaseRequired));
+
+        let index = doc.add_layer(Layer::new("top", checker(4, 4))).unwrap();
+        doc.delete_base().unwrap();
+        assert!(doc.base_deleted);
+        assert_eq!(doc.base.width(), 16);
+        assert_eq!(doc.base.get_pixel(0, 0).0, [0, 0, 0, 0]);
+        assert_eq!(doc.layers[index].image.width(), 4);
+
+        doc.undo().unwrap();
+        assert!(!doc.base_deleted);
+        assert_eq!(doc.base.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        doc.redo().unwrap();
+        assert!(doc.base_deleted);
+        assert_eq!(doc.base.get_pixel(15, 15).0, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn move_layer_is_single_reorder_op() {        // Drag-reorder in the panel relies on move_layer(from, to) being one
         // undoable step that lands the layer exactly at `to`.
         let mut doc = Document::from_image(checker(16, 16));
         doc.add_layer(Layer::new("a", checker(2, 2))).unwrap();

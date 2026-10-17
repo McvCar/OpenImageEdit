@@ -87,12 +87,62 @@ pub fn render_for_viewport(doc: &Document, viewport: Viewport) -> RgbaImage {
 /// Fast path for preview generation: when no layer contributes pixels the base
 /// image is resized directly (through the crop view), avoiding a full-resolution
 /// flatten.
+/// Preview composition done directly at `target` scale: the visible base
+/// (view crop) is resampled to `target`, then each visible layer is
+/// resampled by the same factor and blended at the scaled offset.
+///
+/// The previous implementation flattened at FULL canvas resolution and
+/// downscaled afterwards, which made every live-drag tick resample every
+/// layer at full size. This version keeps each tick O(preview pixels) per
+/// layer, so dragging stays real-time even on large canvases. Semantics
+/// mirror `Document::composite_pixel` (order, opacity, alpha math).
 pub fn composite_for_preview(doc: &Document, target: Size) -> RgbaImage {
-    if doc.layers.iter().any(|layer| layer.visible) {
-        resize_to(&doc.flatten(), target)
-    } else {
-        resize_to(&crop_region(&doc.base, doc.view), target)
+    if target.width == 0 || target.height == 0 || doc.canvas.width == 0 || doc.canvas.height == 0 {
+        return RgbaImage::new(target.width.max(1), target.height.max(1));
     }
+    let sx = target.width as f64 / doc.canvas.width as f64;
+    let sy = target.height as f64 / doc.canvas.height as f64;
+
+    let base_view = crop_region(&doc.base, doc.view);
+    let mut out = resize_to(&base_view, target);
+
+    for layer in &doc.layers {
+        if !layer.visible || layer.opacity <= 0.0 {
+            continue;
+        }
+        let nw = ((layer.image.width() as f64 * sx).round() as u32).max(1);
+        let nh = ((layer.image.height() as f64 * sy).round() as u32).max(1);
+        let scaled = resize_to(&layer.image, Size::new(nw, nh));
+        let ox = (layer.offset.0 as f64 * sx).round() as i32;
+        let oy = (layer.offset.1 as f64 * sy).round() as i32;
+
+        for ty in 0..target.height {
+            let ly = ty as i32 - oy;
+            if ly < 0 || ly >= nh as i32 {
+                continue;
+            }
+            for tx in 0..target.width {
+                let lx = tx as i32 - ox;
+                if lx < 0 || lx >= nw as i32 {
+                    continue;
+                }
+                let src = scaled.get_pixel(lx as u32, ly as u32).0;
+                let a = (src[3] as f32 / 255.0) * layer.opacity;
+                if a <= 0.0 {
+                    continue;
+                }
+                let inv = 1.0 - a;
+                let o = out.get_pixel(tx, ty).0;
+                let mut n = o;
+                for c in 0..3 {
+                    n[c] = (src[c] as f32 * a + o[c] as f32 * inv).round() as u8;
+                }
+                n[3] = ((a + o[3] as f32 / 255.0 * inv) * 255.0).round() as u8;
+                out.put_pixel(tx, ty, image::Rgba(n));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
