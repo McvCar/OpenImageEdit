@@ -19,7 +19,7 @@
 | 多窗口 | ⚠️ 部分 | 目前为「单进程单窗口」，多窗口 = 多次启动（尚未做同进程多窗口） |
 | 裁剪 (Crop) | ✅ | 工具栏「裁剪」进入拖框模式（交叉光标），松手按选区裁剪；「重置裁剪」还原底图；含 23 项 core 测试 |
 | 调整尺寸 (Resize) | ✅ | 「调整尺寸…」对话框：宽/高输入 + 保持比例 + 回车提交，Lanczos3 重采样；撤销栈可回滚 |
-| 选区图层（框选/提取/移动/跨图复制粘贴） | ⛔ 未开始 | `crates/core` 已有 `Selection`/`Layer`/剪贴板模型与测试，缺 UI |
+| 选区图层（框选/提取/移动/图层面板） | ✅ | 「框选」拖框 →「提取图层」生成图层；右侧图层面板（显示序=顶层在前）可 选择/显隐/上移/下移/删除；方向键 ±1、Shift+方向键 ±10 微调；跨图复制粘贴未做 |
 | 基础快捷键 | ✅ | 见 §3 |
 
 ## 2. 本次交付物
@@ -35,8 +35,8 @@
 
 ### 2.1 桥接接口（QML ↔ Rust）
 
-- 属性：`status`、`preview_url`、`image_width/height`、`display_width/height`、`zoom_percent`、`fit_mode`、`can_undo`、`can_redo`、`decode_ms`、`shown_ms`、`auto_quit`、`loadFailed`、`defaultSaveUrl`。
-- 方法：`start`、`image_shown`、`mark`、`open_file`、`set_viewport`、`zoom_in/out/fit/actual`、`rotate_cw/ccw`、`flip_horizontal/vertical`、`undo`、`redo`、`save_edited`、`save_as`、`crop_to(x,y,w,h)`、`resize_to(w,h)`、`reset_crop()`。
+- 属性：`status`、`preview_url`、`image_width/height`、`display_width/height`、`zoom_percent`、`fit_mode`、`can_undo`、`can_redo`、`decode_ms`、`shown_ms`、`auto_quit`、`loadFailed`、`defaultSaveUrl`、`layer_count`、`selected_layer`、`layers_json`（`[{"i":idx,"n":name,"v":visible}]`，顶层在前，QML 直接绑定的响应式图层列表）。
+- 方法：`start`、`image_shown`、`mark`、`open_file`、`set_viewport`、`zoom_in/out/fit/actual`、`rotate_cw/ccw`、`flip_horizontal/vertical`、`undo`、`redo`、`save_edited`、`save_as`、`crop_to(x,y,w,h)`、`resize_to(w,h)`、`reset_crop()`、`extract_selection(x,y,w,h)`、`select_layer(i)`、`layer_name(i)`、`layer_visible(i)`、`toggle_selected_visible()`、`move_selected_up/down()`、`translate_selected(dx,dy)`、`delete_selected_layer()`。
 - 会话状态（`Session`：文档 + 源路径 + 缩放 + 适应标志 + 渲染计数）通过 `RefCell<Option<Session>>` 持有——`Pin<&mut Self>` 没有 `DerefMut`，这是 cxx-qt 0.10 的硬约束。
 
 ### 2.2 裁剪 + 调整尺寸（2026-10-17 迭代）
@@ -50,6 +50,17 @@
 | `crates/ui/src/main.rs` | `qml-load-failed` 详情输出 errorMessage（定位 QML 创建失败） |
 | `scripts/env.ps1` | `CFLAGS/CXXFLAGS=/utf-8`（见 §5 第 10 条） |
 | `scripts/package.ps1` | 自检链路更新为 `crop:100,100,800,600;resize:400,300;undo;redo`（`script-done` 断言） |
+
+### 2.3 选区图层（2026-10-17 迭代）
+
+| 文件 | 变更 |
+| --- | --- |
+| `crates/core/src/lib.rs` | 无改动——`Selection::Rect`、`Layer`（name/visible/opacity/offset）、`extract_selection`/`remove_layer`/`move_layer`/`set_layer_visible`/`translate_layer` 均已就绪并有测试 |
+| `crates/ui/src/bridge.rs` | 新增 qproperty `layer_count`/`selected_layer`/`layers_json`；`Refresh::Ok` 增 `layer_count`+`layers_json`（`Session::layers_json()` 生成，顶层在前）；9 个 `#[qinvokable]`（extract/select/name/visible/toggle-visible/up/down/translate/delete）；`apply_layer_edit` 统一刷新；`run_script` 新增 `extract:`/`select-layer:`/`translate-selected:`/`toggle-visible-selected`/`delete-selected`/`layer-up`/`layer-down`；`script-done` 增 `layers`/`selected_layer`；`move_selected_up/down` 成功后 `selected_layer` 跟随被移动图层 |
+| `crates/ui/qml/main.qml` | `selectionMode` 拖框（`enabled:`）→ `selRect` pending →「提取图层」；`moveMode` 拖动移动选中图层（松手一次性 `translate_selected`，拖框反馈）；右侧图层面板（`Repeater` 绑定 `layers_json`，显示序自顶向下）含 显隐/上移/下移/删除；三模式互斥（`toggleMode`）；统一 `Esc` 分发（`onEscape`）；方向键 ±1px / Shift+方向键 ±10px 微调 |
+| `scripts/package.ps1` | 自检链路更新为 `crop:100,100,800,600;extract:100,100,300,200;resize:400,300;undo;redo`（`script-done` 断言） |
+
+设计决策：不做破坏性「删除选区像素」（core 无此 op），只做「提取到图层」；图层 Vec 末尾 = 顶层，面板反向显示；「上移」= Vec index +1。移动图层不做逐帧重渲染（松手一次性提交），避免拖拽卡顿。
 
 ## 3. 交互清单
 
@@ -65,6 +76,10 @@
 | 裁剪模式 | 工具栏「裁剪」进入；拖框选择后松手应用；`Esc` 取消（裁剪模式下 `Esc` 不退出全屏） |
 | 重置裁剪 | 工具栏「重置裁剪」，非破坏还原到底图全尺寸 |
 | 调整尺寸 | 工具栏「调整尺寸…」→ 对话框输入宽/高（可选保持比例）→ 确定 / 回车 |
+| 框选 | 工具栏「框选」→ 拖框松手产生选区（高亮）；点「提取图层」生成图层；`Esc` 取消选区 |
+| 提取图层 | 工具栏「提取图层」（有选区时可用），选区像素提为非破坏图层并选中 |
+| 移动图层 | 工具栏「移动图层」（有选中图层时可用）→ 拖动画面移动；**方向键 ±1px、Shift+方向键 ±10px** 微调；`Esc` 退出 |
+| 图层面板 | 工具栏「图层」开合：行点击选中该行图层；底部 上移/下移/显隐/删除 作用于选中图层；显示序自顶向下（首行=顶层） |
 
 状态栏显示：画布尺寸、缩放百分比、（预览降采样时）预览尺寸；工具栏按钮按可用性自动置灰（`can_undo`/`can_redo`/`fit_mode`）。
 
@@ -97,6 +112,8 @@
 | `crop:100,100,800,600;reset-crop` | 还原 1600×1200，状态 `crop reset`，`undo=true` | ✓ |
 | `resize:800,300;undo` | 800×300 → 撤销还原 1600×1200，`redo=true` | ✓ |
 | 缺失文件 | 551ms 内快速失败（而非等看门狗 10s），退出码 0 | ✓ |
+| `extract:100,100,300,200;extract:400,400,300,200;layer-down;translate-selected:10,10;toggle-visible-selected` | 两次 `layer-extracted`（idx 0、1）→ `layer-down` 后选中跟随到顶；`script-done layers=2 selected_layer=0` | ✓ |
+| `extract:100,100,300,200;delete-selected;undo` | 删除后 `layers=0` → 撤销还原 `layers=1`、`selected_layer=-1` | ✓ |
 
 （diff 为 JPEG 有损编码误差；未位移像素的 diff 在 200–475 量级，证明变换确实生效。）
 
@@ -126,13 +143,16 @@
 11. **本 Qt 6.8.3 + cxx-qt 0.10（qmlcachegen 编译 QML）的两个对象创建坑**：(a) 给内建 `MouseArea` 赋任何 `active:` 值都会 `objectCreationFailed`（exit 2），必须用 `enabled:` 替代；(b) 给 `TextInput` 赋内联 `background: Rectangle{}`（即使空对象）也会 `objectCreationFailed`，必须改用「兄弟 `Rectangle` 垫底 + 裸 `TextInput`」。两者都是合法运行时 QML，属 qmlcachegen 编译路径的缺陷，经约 15 轮 build+run 二分确认。
 12. **`run_script` 分隔符 `;`**：参数化 op（`crop:x,y,w,h`）与旧的 `,` 分隔冲突，改为 `split(';')`；参数之间仍用 `,`。
 13. **cxx-qt 变更信号/处理器命名沿用 snake_case**：`#[qproperty(i32, image_width)]` 的 QML 变更信号是 `image_widthChanged`，处理器写 `onImage_widthChanged`（首字母大写 + snake 原样 + `Changed`），**不做 camelCase**（同 §5 第 2 条）。
+14. **match 臂是表达式体**：`match guard.as_mut() { Some(s) => { ... } None => ... }` 的臂里不能用裸 `return` 或 `?`（会报类型错/E0308）。需要在臂内用 `if/else` 表达式或嵌套 `match` 把值算出来，`return`/`?` 放到外层函数体。
+15. **QML 图层数据必须走 qproperty 而非 invokable**：`Repeater` 的 delegate 若用 `bridge.layer_visible(i)`（invokable，非响应式）取值不会随状态刷新。改为暴露 `layers_json`（qproperty，JSON 数组），QML `readsonly property var layerList: JSON.parse(bridge.layers_json)` + `Repeater{model: layerList}`——qproperty 变化即重算 model、重建 delegate，天然响应。
+16. **跑 imageedit.exe 必须先 `. .\scripts\env.ps1`**（把 Qt `bin` 加进 PATH）。忘记加载时进程无输出直接崩 `0xC0000135`（0xC0000005/135 视缺 DLL 组合），极易误判为代码 bug；构建（`cargo build`）同样依赖此 PATH。
 
 ## 6. 已知限制
 
 1. **预览通道仍是「Rust 编码 PNG → 临时文件 → Qt 读回」**（阶段 0 技术债 #1）。预览长边上限 4096px，因此 50MP 图在缩放 >50% 时看到的是降采样结果，不是全分辨率像素。
 2. **大图解码无降采样优先**：50MP JPEG 全量解码约 600ms，占 large 冷启动的一半以上。
 3. **多窗口未实现**：同进程只能打开一个文档；打开新文件会替换当前文档（未加「未保存改动」确认）。
-4. **选区图层 UI 未实现**（core 侧 `Selection`/`Layer`/跨文档剪贴板模型与测试已就绪）。裁剪/调整尺寸 UI 已于本次迭代完成。
+4. **选区图层 UI**：框选提取、图层面板（选择/显隐/上下移/删除）、移动/方向键微调已实现；**剩**：跨图复制粘贴、非破坏性「删除选区像素」（core 侧无此 op）、移动图层拖拽的实时预览（当前松手一次性提交）、图层不透明度/重命名。
 5. **编辑器未提供「另存会覆盖原文件」的路径**：`save_as` 由用户在选择框里决定，覆盖原文件时无二次确认。
 6. **`Image` 同步加载**：变换操作是「同步重渲染 + 同步重载预览」，大图连点旋转会有可见卡顿（主线程阻塞）。
 7. **可视化验证缺失**：目前全部依赖像素采样与打点，未做截图目视确认（阶段 0 技术债 #7 仍未关闭）。
@@ -143,6 +163,6 @@
 1. **预览通道直传**：`QQuickImageProvider` 或 `QQmlImageProviderBase` 交付纹理，去掉临时 PNG 与二次解码（预期大图缩放交互明显变顺、冷启动再降几十毫秒）。
 2. **大图降采样优先解码**：接入 libjpeg-turbo scaled decode（`jpeg_decompress` 的 scale_num/scale_denom）与渐进显示——这是 large 突破 ≤1000ms 目标的唯一路径。
 3. **裁剪手柄精修**：当前拖框裁剪已可用；可加选区缩放手柄、9 点锚点、像素吸附与「取消已选」浮层（复用 §2.2 的 `crop_to`）。
-4. **选区图层 UI**：把已有的 `Selection`/`Layer`/跨文档剪贴板模型接上框选交互与图层面板。
+4. **选区图层增强**：框选/提取/图层面板/移动/方向键微调已交付（§2.3）；剩 **跨图复制粘贴**（`crates/core` 的跨文档剪贴板模型已就绪，缺 UI 与快捷键 `Ctrl+C/X/V`）、非破坏「删除选区像素」、图层不透明度/重命名、移动图层拖拽实时预览。
 5. **主线程解耦**：解码/渲染搬进工作线程（`queued` 信号回主线程），消除大图操作卡顿。
 6. **打包脚本纳入回归**：`scripts/package.ps1` 已含自检，建议连同 `imageedit-bench ui` 门槛检查一起接入 CI。

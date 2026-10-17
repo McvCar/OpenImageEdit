@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use cxx_qt_lib::{QString, QUrl};
 use decode::{decode_path, encode, format_from_path, DecodeOptions, Format};
-use editcore::{Document, Rect, Size, Transform};
+use editcore::{Document, Rect, Selection, Size, Transform};
 
 pub static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
@@ -56,6 +56,9 @@ pub mod qobject {
         #[qproperty(bool, auto_quit)]
         #[qproperty(bool, load_failed, cxx_name = "loadFailed")]
         #[qproperty(QString, default_save_url, cxx_name = "defaultSaveUrl")]
+        #[qproperty(i32, layer_count)]
+        #[qproperty(i32, selected_layer)]
+        #[qproperty(QString, layers_json)]
         #[namespace = "imageedit"]
         type Bridge = super::BridgeRust;
 
@@ -118,6 +121,35 @@ pub mod qobject {
 
         #[qinvokable]
         fn reset_crop(self: Pin<&mut Self>);
+
+        // ---- 选区图层 ----
+
+        #[qinvokable]
+        fn extract_selection(self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32);
+
+        #[qinvokable]
+        fn layer_name(self: Pin<&mut Self>, index: i32) -> QString;
+
+        #[qinvokable]
+        fn layer_visible(self: Pin<&mut Self>, index: i32) -> bool;
+
+        #[qinvokable]
+        fn select_layer(self: Pin<&mut Self>, index: i32);
+
+        #[qinvokable]
+        fn toggle_selected_visible(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn delete_selected_layer(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn move_selected_up(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn move_selected_down(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn translate_selected(self: Pin<&mut Self>, dx: i32, dy: i32);
     }
 }
 
@@ -138,6 +170,9 @@ pub struct BridgeRust {
     auto_quit: bool,
     load_failed: bool,
     default_save_url: QString,
+    layer_count: i32,
+    selected_layer: i32,
+    layers_json: QString,
     session: RefCell<Option<Session>>,
     viewport: RefCell<Size>,
 }
@@ -167,6 +202,8 @@ enum Refresh {
         can_undo: bool,
         can_redo: bool,
         save_url: String,
+        layer_count: i32,
+        layers_json: String,
     },
     Err(String),
 }
@@ -305,6 +342,18 @@ impl Session {
         std::fs::write(path, bytes).map_err(|e| e.to_string())
     }
 
+    fn layers_json(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for (i, layer) in self.doc.layers.iter().enumerate().rev() {
+            let name = layer.name.replace('\\', "\\\\").replace('"', "\\\"");
+            parts.push(format!(
+                "{{\"i\":{},\"n\":\"{name}\",\"v\":{}}}",
+                i, layer.visible
+            ));
+        }
+        format!("[{}]", parts.join(","))
+    }
+
     fn refresh(&mut self) -> Refresh {
         match self.render() {
             Ok(rendered) => Refresh::Ok {
@@ -317,6 +366,8 @@ impl Session {
                 can_undo: self.doc.can_undo(),
                 can_redo: self.doc.can_redo(),
                 save_url: file_url(&self.default_save_path().0),
+                layer_count: self.doc.layers.len() as i32,
+                layers_json: self.layers_json(),
             },
             Err(err) => Refresh::Err(err),
         }
@@ -360,6 +411,49 @@ impl qobject::Bridge {
                 "zoom-actual" => self.as_mut().zoom_actual(),
                 "save" => self.as_mut().save_edited(),
                 "reset-crop" => self.as_mut().reset_crop(),
+                "toggle-visible-selected" => self.as_mut().toggle_selected_visible(),
+                "delete-selected" => self.as_mut().delete_selected_layer(),
+                "layer-up" => self.as_mut().move_selected_up(),
+                "layer-down" => self.as_mut().move_selected_down(),
+                other if other.starts_with("extract:") => {
+                    let nums: Vec<i32> = other
+                        .strip_prefix("extract:")
+                        .unwrap_or("")
+                        .split(',')
+                        .map(str::trim)
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                    if nums.len() == 4 {
+                        self.as_mut()
+                            .extract_selection(nums[0], nums[1], nums[2], nums[3])
+                    } else {
+                        println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}")
+                    }
+                }
+                other if other.starts_with("select-layer:") => {
+                    let n: Option<i32> = other
+                        .strip_prefix("select-layer:")
+                        .and_then(|s| s.trim().parse().ok());
+                    if let Some(n) = n {
+                        self.as_mut().select_layer(n)
+                    } else {
+                        println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}")
+                    }
+                }
+                other if other.starts_with("translate-selected:") => {
+                    let nums: Vec<i32> = other
+                        .strip_prefix("translate-selected:")
+                        .unwrap_or("")
+                        .split(',')
+                        .map(str::trim)
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                    if nums.len() == 2 {
+                        self.as_mut().translate_selected(nums[0], nums[1])
+                    } else {
+                        println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}")
+                    }
+                }
                 other => match other.strip_prefix("crop:") {
                     Some(spec) => {
                         let nums: Vec<i32> = spec
@@ -395,17 +489,19 @@ impl qobject::Bridge {
                 },
             }
         }
-        println!(
-            "{{\"phase\":\"ui\",\"event\":\"script-done\",\"width\":{},\"height\":{},\"display\":\"{}x{}\",\"zoom\":{},\"undo\":{},\"redo\":{},\"status\":\"{}\"}}",
-            self.image_width(),
-            self.image_height(),
-            self.display_width(),
-            self.display_height(),
-            self.zoom_percent(),
-            self.can_undo(),
-            self.can_redo(),
-            self.status(),
-        );
+println!(
+                "{{\"phase\":\"ui\",\"event\":\"script-done\",\"width\":{},\"height\":{},\"display\":\"{}x{}\",\"zoom\":{},\"undo\":{},\"redo\":{},\"layers\":{},\"selected_layer\":{},\"status\":\"{}\"}}",
+                self.image_width(),
+                self.image_height(),
+                self.display_width(),
+                self.display_height(),
+                self.zoom_percent(),
+                self.can_undo(),
+                self.can_redo(),
+                self.layer_count(),
+                self.selected_layer(),
+                self.status(),
+            );
     }
 
     pub fn image_shown(mut self: Pin<&mut Self>) {
@@ -705,6 +801,264 @@ session
         }
     }
 
+    fn clamp_selection(&self, x: i32, y: i32, w: i32, h: i32) -> Option<Rect> {
+        let canvas = self
+            .session
+            .borrow()
+            .as_ref()
+            .map(|s| s.doc.canvas)?;
+        if canvas.pixels() == 0 {
+            return None;
+        }
+        let x = x.clamp(0, canvas.width as i32 - 1);
+        let y = y.clamp(0, canvas.height as i32 - 1);
+        let w = w.max(1).min(canvas.width as i32 - x) as u32;
+        let h = h.max(1).min(canvas.height as i32 - y) as u32;
+        Some(Rect::new(x, y, w, h))
+    }
+
+    fn selected_guard(&self, index: i32) -> Option<usize> {
+        let ix = index.max(0) as usize;
+        let guard = self.session.borrow();
+        let session = guard.as_ref()?;
+        (ix < session.doc.layers.len()).then_some(ix)
+    }
+
+    pub fn extract_selection(mut self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32) {
+        let viewport = *self.viewport.borrow();
+        let Some(rect) = self.clamp_selection(x, y, w, h) else {
+            return;
+        };
+        let result: Result<i32, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => session
+                    .doc
+                    .extract_selection(&Selection::Rect(rect))
+                    .map(|ix| ix as i32)
+                    .map_err(|e| e.to_string()),
+            }
+        };
+        match result {
+            Ok(ix) => {
+                self.as_mut().set_selected_layer(ix);
+                {
+                    let mut guard = self.session.borrow_mut();
+                    if let Some(s) = guard.as_mut() {
+                        s.refit_if_needed(viewport);
+                    }
+                }
+                self.as_mut().refresh_preview();
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"layer-extracted\",\"index\":{ix},\"rect\":\"{},{},{},{}\"}}",
+                    rect.x, rect.y, rect.width, rect.height
+                );
+            }
+            Err(message) => self
+                .as_mut()
+                .set_status(QString::from(message.as_str())),
+        }
+    }
+
+    pub fn layer_name(self: Pin<&mut Self>, index: i32) -> QString {
+        let name = self
+            .session
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.doc.layers.get(index.max(0) as usize))
+            .map(|l| l.name.clone())
+            .unwrap_or_default();
+        QString::from(name.as_str())
+    }
+
+    pub fn layer_visible(self: Pin<&mut Self>, index: i32) -> bool {
+        self.session
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.doc.layers.get(index.max(0) as usize))
+            .map(|l| l.visible)
+            .unwrap_or(false)
+    }
+
+    pub fn select_layer(mut self: Pin<&mut Self>, index: i32) {
+        if self.selected_guard(index).is_none() {
+            return;
+        }
+        self.as_mut().set_selected_layer(index);
+    }
+
+    pub fn toggle_selected_visible(mut self: Pin<&mut Self>) {
+        let viewport = *self.viewport.borrow();
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            return;
+        };
+        let result: Result<bool, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => {
+                    let cur = session.doc.layers[ix].visible;
+                    session
+                        .doc
+                        .set_layer_visible(ix, !cur)
+                        .map(|()| true)
+                        .map_err(|e| e.to_string())
+                }
+            }
+        };
+        match result {
+            Ok(true) => {
+                {
+                    let mut guard = self.session.borrow_mut();
+                    if let Some(s) = guard.as_mut() {
+                        s.refit_if_needed(viewport);
+                    }
+                }
+                self.as_mut().refresh_preview();
+            }
+            Ok(false) => {}
+            Err(message) => self
+                .as_mut()
+                .set_status(QString::from(message.as_str())),
+        }
+    }
+
+    pub fn delete_selected_layer(mut self: Pin<&mut Self>) {
+        let viewport = *self.viewport.borrow();
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            return;
+        };
+        let result: Result<i32, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => match session.doc.remove_layer(ix) {
+                        Ok(()) => {
+                            let new_count = session.doc.layers.len();
+                            Ok(if new_count == 0 {
+                                -1
+                            } else {
+                                (ix - 1).min(new_count - 1) as i32
+                            })
+                        }
+                        Err(e) => Err(e.to_string()),
+                    },
+            }
+        };
+        match result {
+            Ok(sel) => {
+                self.as_mut().set_selected_layer(sel);
+                {
+                    let mut guard = self.session.borrow_mut();
+                    if let Some(s) = guard.as_mut() {
+                        s.refit_if_needed(viewport);
+                    }
+                }
+                self.as_mut().refresh_preview();
+                println!("{{\"phase\":\"ui\",\"event\":\"layer-deleted\",\"index\":{ix}}}");
+            }
+            Err(message) => self
+                .as_mut()
+                .set_status(QString::from(message.as_str())),
+        }
+    }
+
+    pub fn move_selected_up(mut self: Pin<&mut Self>) {
+        let viewport = *self.viewport.borrow();
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            return;
+        };
+        let result: Result<bool, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => {
+                    if ix + 1 >= session.doc.layers.len() {
+                        Ok(false)
+                    } else {
+                        session
+                            .doc
+                            .move_layer(ix, ix + 1)
+                            .map(|()| true)
+                            .map_err(|e| e.to_string())
+                    }
+                }
+            }
+        };
+        if result.as_ref().ok().copied() == Some(true) {
+            self.as_mut().set_selected_layer((ix + 1) as i32);
+        }
+        self.apply_layer_edit(viewport, result);
+    }
+
+    pub fn move_selected_down(mut self: Pin<&mut Self>) {
+        let viewport = *self.viewport.borrow();
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            return;
+        };
+        let result: Result<bool, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => {
+                    if ix == 0 {
+                        Ok(false)
+                    } else {
+                        session
+                            .doc
+                            .move_layer(ix, ix - 1)
+                            .map(|()| true)
+                            .map_err(|e| e.to_string())
+                    }
+                }
+            }
+        };
+        if result.as_ref().ok().copied() == Some(true) {
+            self.as_mut().set_selected_layer((ix - 1) as i32);
+        }
+        self.apply_layer_edit(viewport, result);
+    }
+
+    pub fn translate_selected(self: Pin<&mut Self>, dx: i32, dy: i32) {
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        let viewport = *self.viewport.borrow();
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            return;
+        };
+        let result: Result<bool, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => session
+                    .doc
+                    .translate_layer(ix, dx, dy)
+                    .map(|()| true)
+                    .map_err(|e| e.to_string()),
+            }
+        };
+        self.apply_layer_edit(viewport, result);
+    }
+
+    fn apply_layer_edit(mut self: Pin<&mut Self>, viewport: Size, result: Result<bool, String>) {
+        match result {
+            Ok(true) => {
+                let mut guard = self.session.borrow_mut();
+                if let Some(s) = guard.as_mut() {
+                    s.refit_if_needed(viewport);
+                }
+                drop(guard);
+                self.refresh_preview();
+            }
+            Ok(false) => {}
+            Err(message) => self
+                .as_mut()
+                .set_status(QString::from(message.as_str())),
+        }
+    }
+
     fn report_save(mut self: Pin<&mut Self>, result: Result<PathBuf, String>) {
         match result {
             Ok(path) => {
@@ -791,6 +1145,8 @@ session
                 can_undo,
                 can_redo,
                 save_url,
+                layer_count,
+                layers_json,
             } => {
                 let status = if preview == display {
                     format!("{}x{}", canvas.width, canvas.height)
@@ -812,6 +1168,12 @@ session
                 self.as_mut().set_fit_mode(fit);
                 self.as_mut().set_can_undo(can_undo);
                 self.as_mut().set_can_redo(can_redo);
+                self.as_mut().set_layer_count(layer_count);
+                self.as_mut()
+                    .set_layers_json(QString::from(layers_json.as_str()));
+                if *self.selected_layer() < 0 || *self.selected_layer() >= layer_count {
+                    self.as_mut().set_selected_layer(-1);
+                }
                 self.as_mut().set_default_save_url(QString::from(save_url.as_str()));
                 self.as_mut().set_status(QString::from(status.as_str()));
                 println!(
