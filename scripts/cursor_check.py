@@ -56,9 +56,11 @@ IDC_RES = {"ARROW": 32512, "CROSS": 32515, "SIZEALL": 32646,
            "SIZENESW": 32643, "SIZENS": 32645, "SIZENWSE": 32642,
            "SIZEWE": 32644}
 # Load the stock cursors once; handles are deterministic for this session.
+# LoadCursorW's second parameter is a MAKEINTRESOURCE pointer, not a string.
 _BY_HANDLE = {}
 for _name, _rid in IDC_RES.items():
-    _BY_HANDLE[u.LoadCursorW(None, _rid) or 0] = _name
+    _h = u.LoadCursorW(None, ctypes.c_void_p(_rid))
+    _BY_HANDLE[_h or 0] = _name
 
 
 class CURSORINFO(ctypes.Structure):
