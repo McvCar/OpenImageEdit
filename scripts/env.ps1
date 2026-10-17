@@ -17,6 +17,13 @@ $env:QT_VERSION_MAJOR = '6'
 $env:IMAGEEDIT_QT_ROOT = $qtRoot
 $env:IMAGEEDIT_QT_BIN = Join-Path $qtRoot 'bin'
 
+# qmlcachegen emits UTF-8 Chinese string literals into .cpp; without /utf-8
+# MSVC reads them under the system code page (GBK) and breaks string literals.
+$env:CC = $null
+$env:CXX = $null
+$env:CFLAGS = '/utf-8'
+$env:CXXFLAGS = '/utf-8'
+
 $tools = Join-Path $repoRoot '.tools'
 $paths = @(
     (Join-Path $qtRoot 'bin'),

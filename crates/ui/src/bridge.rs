@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use cxx_qt_lib::{QString, QUrl};
 use decode::{decode_path, encode, format_from_path, DecodeOptions, Format};
-use editcore::{Document, Size, Transform};
+use editcore::{Document, Rect, Size, Transform};
 
 pub static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
@@ -109,6 +109,15 @@ pub mod qobject {
 
         #[qinvokable]
         fn save_as(self: Pin<&mut Self>, url: &QUrl);
+
+        #[qinvokable]
+        fn crop_to(self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32);
+
+        #[qinvokable]
+        fn resize_to(self: Pin<&mut Self>, width: i32, height: i32);
+
+        #[qinvokable]
+        fn reset_crop(self: Pin<&mut Self>);
     }
 }
 
@@ -337,7 +346,7 @@ impl qobject::Bridge {
     }
 
     fn run_script(mut self: Pin<&mut Self>, script: &str) {
-        for op in script.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        for op in script.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             match op {
                 "rotate-cw" => self.as_mut().rotate_cw(),
                 "rotate-ccw" => self.as_mut().rotate_ccw(),
@@ -350,9 +359,40 @@ impl qobject::Bridge {
                 "zoom-fit" => self.as_mut().zoom_fit(),
                 "zoom-actual" => self.as_mut().zoom_actual(),
                 "save" => self.as_mut().save_edited(),
-                other => println!(
-                    "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
-                ),
+                "reset-crop" => self.as_mut().reset_crop(),
+                other => match other.strip_prefix("crop:") {
+                    Some(spec) => {
+                        let nums: Vec<i32> = spec
+                            .split(',')
+                            .map(str::trim)
+                            .filter_map(|s| s.parse().ok())
+                            .collect();
+                        if nums.len() == 4 {
+                            self.as_mut().crop_to(nums[0], nums[1], nums[2], nums[3])
+                        } else {
+                            println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}")
+                        }
+                    }
+                    _ => match other.strip_prefix("resize:") {
+                        Some(spec) => {
+                            let nums: Vec<i32> = spec
+                                .split(',')
+                                .map(str::trim)
+                                .filter_map(|s| s.parse().ok())
+                                .collect();
+                            if nums.len() == 2 {
+                                self.as_mut().resize_to(nums[0], nums[1])
+                            } else {
+                                println!(
+                                    "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                                )
+                            }
+                        }
+                        None => println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        ),
+                    },
+                },
             }
         }
         println!(
@@ -531,6 +571,138 @@ impl qobject::Bridge {
             }
         };
         self.as_mut().report_save(result);
+    }
+
+    pub fn crop_to(mut self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32) {
+        let viewport = *self.viewport.borrow();
+        let canvas = self
+            .session
+            .borrow()
+            .as_ref()
+            .map(|s| s.doc.canvas);
+        let canvas = match canvas {
+            None => return,
+            Some(c) => c,
+        };
+        let x = x.clamp(0, canvas.width as i32 - 1);
+        let y = y.clamp(0, canvas.height as i32 - 1);
+        let w = w.max(1).min(canvas.width as i32 - x) as u32;
+        let h = h.max(1).min(canvas.height as i32 - y) as u32;
+        let rect = Rect::new(x, y, w, h);
+        let result = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Ok(false),
+                Some(session) => {
+                    session
+                        .doc
+                        .crop(rect)
+                        .map(|_| true)
+                        .map_err(|e| e.to_string())
+                }
+            }
+        };
+        match result {
+            Ok(true) => {
+                {
+                    let mut guard = self.session.borrow_mut();
+                    if let Some(s) = guard.as_mut() {
+                        s.refit_if_needed(viewport);
+                    }
+                }
+                self.as_mut().refresh_preview();
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"cropped\",\"rect\":\"{x},{y},{w},{h}\"}}"
+                );
+            }
+            Ok(false) => {}
+            Err(message) => self
+                .as_mut()
+                .set_status(QString::from(message.as_str())),
+        }
+    }
+
+    pub fn resize_to(mut self: Pin<&mut Self>, width: i32, height: i32) {
+        if width < 1 || height < 1 {
+            self.as_mut()
+                .set_status(QString::from("resize-error: size must be >= 1"));
+            return;
+        }
+        let viewport = *self.viewport.borrow();
+        let result = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Ok(false),
+                Some(session) => {
+                    let size = Size::new(width as u32, height as u32);
+                    let old = session.doc.canvas;
+session
+                        .doc
+                        .resize(size)
+                        .map(move |_| {
+                            println!(
+                                "{{\"phase\":\"ui\",\"event\":\"resized\",\"from\":\"{}x{}\",\"to\":\"{}x{}\"}}",
+                                old.width, old.height, size.width, size.height
+                            );
+                            true
+                        })
+                        .map_err(|e| e.to_string())
+                }
+            }
+        };
+        match result {
+            Ok(true) => {
+                {
+                    let mut guard = self.session.borrow_mut();
+                    if let Some(s) = guard.as_mut() {
+                        s.refit_if_needed(viewport);
+                    }
+                }
+                self.as_mut().refresh_preview();
+            }
+            Ok(false) => {}
+            Err(message) => self
+                .as_mut()
+                .set_status(QString::from(message.as_str())),
+        }
+    }
+
+    pub fn reset_crop(mut self: Pin<&mut Self>) {
+        let viewport = *self.viewport.borrow();
+        let result: Result<bool, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Ok(false),
+                Some(session) => {
+                    let base = session.doc.base.dimensions();
+                    let is_full =
+                        session.doc.view.x == 0
+                            && session.doc.view.y == 0
+                            && session.doc.view.width == base.0
+                            && session.doc.view.height == base.1;
+                    if is_full {
+                        Ok(false)
+                    } else {
+                        match session.doc.reset_crop() {
+                            Ok(()) => {
+                                session.refit_if_needed(viewport);
+                                Ok(true)
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(true) => {
+                self.as_mut().refresh_preview();
+                self.as_mut()
+                    .set_status(QString::from("crop reset"));
+            }
+            Ok(false) => {}
+            Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
+        }
     }
 
     fn report_save(mut self: Pin<&mut Self>, result: Result<PathBuf, String>) {

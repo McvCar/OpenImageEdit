@@ -103,7 +103,7 @@ if (-not $SkipVerify) {
     $env:Path = 'C:\Windows\System32;C:\Windows'
     try {
         if (Test-Path -LiteralPath $sample) {
-            $log = & (Join-Path $distDir 'imageedit.exe') $sample '--script=rotate-cw,rotate-cw,flip-h,undo,redo' '--selftest' *>&1 | Out-String
+            $log = & (Join-Path $distDir 'imageedit.exe') $sample '--script=crop:100,100,800,600;resize:400,300;undo;redo' '--selftest' *>&1 | Out-String
             if ($LASTEXITCODE -ne 0) { throw "packaged run failed with exit $LASTEXITCODE`n$log" }
             if ($log -notmatch 'script-done') { throw "packaged run produced no script-done`n$log" }
             Write-Host "verify: edit pipeline ok"

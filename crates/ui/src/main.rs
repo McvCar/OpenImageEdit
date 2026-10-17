@@ -41,8 +41,17 @@ fn main() {
 
     if let Some(engine) = engine.as_mut() {
         engine
-            .on_object_creation_failed(|_, _| {
-                eprintln!("{{\"phase\":\"ui\",\"error\":\"qml-load-failed\"}}");
+            .on_object_creation_failed(|_, error_message| {
+                let mut s = String::new();
+                for c in error_message.to_string().chars() {
+                    match c {
+                        '"' => s.push_str("\\\""),
+                        '\\' => s.push_str("\\\\"),
+                        '\n' | '\r' => s.push(' '),
+                        _ => s.push(c),
+                    }
+                }
+                eprintln!("{{\"phase\":\"ui\",\"error\":\"qml-load-failed\",\"detail\":\"{}\"}}", s);
                 std::process::exit(2);
             })
             .release();
