@@ -12,6 +12,9 @@ Window {
     minimumHeight: 320
     visible: Qt.application.arguments.indexOf("--hidden") === -1
     color: "#1b1c1e"
+    // Frameless: the custom title bar (in EditorContent) provides the drag
+    // area, window buttons and resize edges.
+    flags: Qt.Window | Qt.FramelessWindowHint
     visibility: content.fullscreen ? Window.FullScreen : Window.Windowed
     title: content.b.image_width > 0
            ? "ImageEdit — " + content.b.image_width + "×" + content.b.image_height
@@ -21,19 +24,25 @@ Window {
     onVisibleChanged: content.b.mark("window-visible")
     onClosing: (close) => content.requestClose(close)
 
+    WindowEdges {}
+
     EditorContent {
         id: content
         anchors.fill: parent
         primary: true
-        onRequestNewWindow: openNewWindow()
+        onRequestNewWindow: (fileUrl) => openNewWindow(fileUrl)
     }
 
     property int windowCascade: 0
 
-    function openNewWindow() {
+    function openNewWindow(fileUrl) {
         const offset = shell.windowCascade * 32
         shell.windowCascade = (shell.windowCascade + 1) % 8
-        docWindowFactory.createObject(null, { x: 80 + offset, y: 60 + offset, newWindowFn: openNewWindow })
+        docWindowFactory.createObject(null, {
+            x: 80 + offset, y: 60 + offset,
+            newWindowFn: openNewWindow,
+            fileUrl: fileUrl !== undefined ? fileUrl : ""
+        })
     }
 
     Component {
@@ -72,6 +81,152 @@ Window {
             cursorShape: Qt.PointingHandCursor
             onClicked: if (button.active) button.clicked()
         }
+    }
+
+    // Title-bar icon button (no QtQuick.Controls dependency: the tooltip is
+    // hand-rolled). `separator` renders a slim divider instead of a button.
+    component IconButton: Rectangle {
+        id: ib
+
+        property string glyph
+        property string tip
+        property bool active: true
+        property bool selected: false
+        property bool separator: false
+        signal clicked()
+
+        width: separator ? 9 : 30
+        height: 28
+        radius: 4
+        color: separator ? "transparent"
+               : (selected ? "#3d5a80"
+                  : (hover.containsMouse && active ? "#4a4e54" : "transparent"))
+        opacity: active ? 1.0 : 0.35
+
+        Rectangle {
+            visible: ib.separator
+            anchors.centerIn: parent
+            width: 1
+            height: 18
+            color: "#3c4043"
+        }
+        Text {
+            visible: !ib.separator
+            anchors.centerIn: parent
+            text: ib.glyph
+            color: "#e9eaec"
+            font.pixelSize: 14
+        }
+
+        Rectangle {
+            id: tipBox
+            visible: false
+            z: 1000
+            x: Math.max(-ib.x, (ib.width - width) / 2)
+            y: ib.height + 5
+            width: tipText.implicitWidth + 16
+            height: 22
+            radius: 4
+            color: "#111214"
+            border.color: "#3c4043"
+            Text {
+                id: tipText
+                anchors.centerIn: parent
+                text: ib.tip
+                color: "#d7dade"
+                font.pixelSize: 11
+            }
+        }
+        Timer {
+            id: tipDelay
+            interval: 500
+            onTriggered: tipBox.visible = true
+        }
+
+        MouseArea {
+            id: hover
+            anchors.fill: parent
+            hoverEnabled: !ib.separator
+            enabled: !ib.separator
+            cursorShape: Qt.PointingHandCursor
+            onContainsMouseChanged: {
+                if (!containsMouse) {
+                    tipBox.visible = false
+                    tipDelay.stop()
+                } else if (ib.active && ib.tip.length > 0) {
+                    tipDelay.restart()
+                }
+            }
+            onClicked: if (ib.active) ib.clicked()
+        }
+    }
+
+    // Text row inside the overflow "…" menu.
+    component MenuRow: Rectangle {
+        id: mr
+
+        property string label
+        property bool active: true
+        property bool separator: false
+        signal activated()
+
+        width: 218
+        height: separator ? 9 : 26
+        radius: 4
+        color: separator ? "transparent"
+               : (mh.containsMouse && active ? "#3d5a80" : "transparent")
+        opacity: active ? 1 : 0.35
+
+        Rectangle {
+            visible: mr.separator
+            anchors.centerIn: parent
+            width: parent.width - 16
+            height: 1
+            color: "#3c4043"
+        }
+        Text {
+            visible: !mr.separator
+            x: 10
+            anchors.verticalCenter: parent.verticalCenter
+            text: mr.label
+            color: "#e9eaec"
+            font.pixelSize: 12
+        }
+        MouseArea {
+            id: mh
+            anchors.fill: parent
+            hoverEnabled: !mr.separator
+            enabled: !mr.separator
+            cursorShape: Qt.PointingHandCursor
+            onClicked: if (mr.active) mr.activated()
+        }
+    }
+
+    // Single resize strip for the frameless windows (native system resize).
+    component EdgeGrab: MouseArea {
+        property int edges: 0
+        property int shape: Qt.SizeAllCursor
+        cursorShape: shape
+        onPressed: (mouse) => {
+            const w = Window.window
+            if (w && w.startSystemResize)
+                w.startSystemResize(edges)
+        }
+    }
+
+    // 4px resize strips for the frameless windows (native system resize).
+    component WindowEdges: Item {
+        anchors.fill: parent
+        z: 1000
+
+        EdgeGrab { anchors.top: parent.top; anchors.left: parent.left; anchors.right: parent.right; height: 4; edges: Qt.TopEdge; shape: Qt.SizeVerCursor }
+        EdgeGrab { anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.right: parent.right; height: 4; edges: Qt.BottomEdge; shape: Qt.SizeVerCursor }
+        EdgeGrab { anchors.top: parent.top; anchors.bottom: parent.bottom; anchors.left: parent.left; width: 4; edges: Qt.LeftEdge; shape: Qt.SizeHorCursor }
+        EdgeGrab { anchors.top: parent.top; anchors.bottom: parent.bottom; anchors.right: parent.right; width: 4; edges: Qt.RightEdge; shape: Qt.SizeHorCursor }
+        EdgeGrab { anchors.top: parent.top; anchors.left: parent.left; width: 10; height: 10; edges: Qt.TopEdge | Qt.LeftEdge; shape: Qt.SizeFDiagCursor }
+        EdgeGrab { anchors.top: parent.top; anchors.right: parent.right; width: 10; height: 10; edges: Qt.TopEdge | Qt.RightEdge; shape: Qt.SizeBDiagCursor }
+        EdgeGrab { anchors.bottom: parent.bottom; anchors.left: parent.left; width: 10; height: 10; edges: Qt.BottomEdge | Qt.LeftEdge; shape: Qt.SizeBDiagCursor }
+        EdgeGrab { anchors.bottom: parent.bottom; anchors.right: parent.right; width: 10; height: 10; edges: Qt.BottomEdge | Qt.RightEdge; shape: Qt.SizeFDiagCursor }
     }
 
     // Dashed rectangle outline (selection / layer boxes). rx/ry/rw/rh are in
@@ -221,6 +376,8 @@ Window {
         minimumHeight: 320
         color: "#1b1c1e"
         visible: true
+        // Frameless: same custom title bar as the shell window.
+        flags: Qt.Window | Qt.FramelessWindowHint
         visibility: content.fullscreen ? Window.FullScreen : Window.Windowed
         title: content.b.image_width > 0
                ? "ImageEdit — " + content.b.image_width + "×" + content.b.image_height
@@ -230,10 +387,15 @@ Window {
         onVisibleChanged: content.b.mark("window-visible")
         onClosing: (close) => content.requestClose(close)
 
+        WindowEdges {}
+
         EditorContent {
             id: content
             anchors.fill: parent
-            onRequestNewWindow: if (docWin.newWindowFn) docWin.newWindowFn()
+            onRequestNewWindow: (fileUrl) => {
+                if (docWin.newWindowFn)
+                    docWin.newWindowFn(fileUrl)
+            }
         }
     }
 
@@ -241,14 +403,18 @@ Window {
         id: root
 
         property bool primary: false
+        // File to open immediately in a non-primary document window (the
+        // "open in separate window" setting routes through here).
+        property url fileUrl: ""
         property bool forceClose: false
         // Set right before Qt.quit() (selftest flow): in Qt 6.8 quitting
         // delivers close events to visible windows, and the dirty-guard in
         // requestClose() must not reject an intentional programmatic quit.
         property bool quitting: false
         property var pendingOpenUrl: null
+        property int pendingNavDir: 0
         property string confirmMode: ""
-        signal requestNewWindow()
+        signal requestNewWindow(url fileUrl)
         property bool firstFrameSeen: false
         property bool imageRendered: false
         property bool imageFrameSeen: false
@@ -284,6 +450,8 @@ Window {
         readonly property var selLayer: findSelLayer()
         readonly property var selLayerBox: findLayerBox()
         readonly property bool probeDialog: Qt.application.arguments.indexOf("--probe-dialog") !== -1
+        readonly property bool probeSettings: Qt.application.arguments.indexOf("--probe-settings") !== -1
+        readonly property bool probeMenu: Qt.application.arguments.indexOf("--probe-menu") !== -1
         // Ids inside an inline component are invisible from outside, so the
         // shell / DocWindow wrappers reach the Bridge through this alias.
         readonly property alias b: bridge
@@ -343,6 +511,9 @@ Window {
     Shortcut { sequences: [StandardKey.SaveAs]; onActivated: saveDialog.open() }
     Shortcut { sequence: "F11"; onActivated: root.fullscreen = !root.fullscreen }
     Shortcut { sequence: "Escape"; onActivated: onEscape() }
+    // Browse images in the loaded file's folder (guard: no active gesture).
+    Shortcut { sequence: "Left"; enabled: canNavigate(); onActivated: navigateRel(-1) }
+    Shortcut { sequence: "Right"; enabled: canNavigate(); onActivated: navigateRel(1) }
     Shortcut { sequences: ["Return", "Enter"]
                enabled: root.pasteFloating || root.selExists
                onActivated: onEnter() }
@@ -371,12 +542,12 @@ Window {
     Shortcut { sequences: [StandardKey.Paste]; onActivated: doPaste() }
     Shortcut { sequence: "Ctrl+K"; enabled: root.selExists; onActivated: applyCrop() }
     Shortcut { sequence: "Ctrl+L"; onActivated: bridge.rotate_ccw() }
-    Shortcut { sequence: "Ctrl+Shift+R"; onActivated: bridge.rotate_ccw() }
+    Shortcut { sequence: "Ctrl+Shift+R"; onActivated: bridge.rotate_cw() }
     Shortcut { sequences: ["Delete", "Backspace"]
                enabled: root.selExists || bridge.selected_layer >= 0
                         || (function () {
                             const b = findBase()
-                            return b !== null && b.v === true && !isLocked(b)
+                            return b !== null && b.bd !== true && !isLocked(b)
                                 && bridge.layer_count > 0
                         })()
                onActivated: onDeleteKey() }
@@ -388,67 +559,284 @@ Window {
     Shortcut { sequence: "Ctrl+Q"; onActivated: requestQuit() }
     Shortcut { sequence: "Ctrl+R"; onActivated: bridge.rotate_cw() }
 
+    // ---- Custom title bar: title + icon toolbar + overflow "…" menu + ----
+    // ---- window buttons. The windows are frameless; this bar doubles as ----
+    // ---- the drag area (see WindowEdges / drag MouseArea below).        ----
     Rectangle {
         id: toolbar
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
         height: root.toolbarHeight
-        color: "#242628"
+        color: "#202225"
+        // Above the canvas view and layer panel (z 50), so the hover
+        // tooltips that hang below the bar are not painted over.
+        z: 60
+
+        // Icon actions shown in the bar. Whatever does not fit is hidden;
+        // the "…" menu always offers every command as text.
+        readonly property var barActions: [
+            { g: "↶", t: "撤销 (Ctrl+Z)", ok: bridge.can_undo,
+              run: function () { bridge.undo() } },
+            { g: "↷", t: "重做 (Ctrl+Shift+Z)", ok: bridge.can_redo,
+              run: function () { bridge.redo() } },
+            { g: "", t: "", ok: true, sep: true },
+            { g: "↺", t: "逆时针旋转 90° (Ctrl+L)", ok: true,
+              run: function () { bridge.rotate_ccw() } },
+            { g: "⇋", t: "水平翻转", ok: true,
+              run: function () { bridge.flip_horizontal() } },
+            { g: "⇅", t: "垂直翻转", ok: true,
+              run: function () { bridge.flip_vertical() } },
+            { g: "", t: "", ok: true, sep: true },
+            { g: "⛶", t: "应用裁剪 (Enter / Ctrl+K)", ok: root.selExists,
+              run: function () { applyCrop() } },
+            { g: "⤢", t: "调整尺寸…", ok: bridge.image_width > 0,
+              run: function () { openResizeDialog() } },
+            { g: "", t: "", ok: true, sep: true },
+            { g: "＋", t: "放大 (Ctrl+滚轮)", ok: true,
+              run: function () { bridge.zoom_in() } },
+            { g: "－", t: "缩小 (Ctrl+滚轮)", ok: true,
+              run: function () { bridge.zoom_out() } }
+        ]
+
+        // Everything the bar shows as icons, plus the full text-only set.
+        readonly property var menuActions: [
+            { l: "打开图片… (Ctrl+O)", ok: true, run: function () { openDialog.open() } },
+            { l: "新窗口 (Ctrl+N)", ok: true, run: function () { root.requestNewWindow() } },
+            { l: "", ok: true, sep: true },
+            { l: "撤销 (Ctrl+Z)", ok: bridge.can_undo, run: function () { bridge.undo() } },
+            { l: "重做 (Ctrl+Shift+Z)", ok: bridge.can_redo, run: function () { bridge.redo() } },
+            { l: "", ok: true, sep: true },
+            { l: "逆时针旋转 90° (Ctrl+L)", ok: true, run: function () { bridge.rotate_ccw() } },
+            { l: "顺时针旋转 90° (Ctrl+R)", ok: true, run: function () { bridge.rotate_cw() } },
+            { l: "水平翻转", ok: true, run: function () { bridge.flip_horizontal() } },
+            { l: "垂直翻转", ok: true, run: function () { bridge.flip_vertical() } },
+            { l: "", ok: true, sep: true },
+            { l: "应用裁剪 (Enter / Ctrl+K)", ok: root.selExists, run: function () { applyCrop() } },
+            { l: "重置裁剪", ok: bridge.image_width > 0, run: function () { bridge.reset_crop() } },
+            { l: "调整尺寸…", ok: bridge.image_width > 0, run: function () { openResizeDialog() } },
+            { l: "", ok: true, sep: true },
+            { l: "提取图层", ok: root.selExists, run: function () { commitExtract() } },
+            { l: "删除选区像素 (Delete)", ok: root.selExists, run: function () { deleteSelectionPixels() } },
+            { l: "图层面板", ok: true, run: function () { root.panelVisible = !root.panelVisible } },
+            { l: "", ok: true, sep: true },
+            { l: "放大 (Ctrl++)", ok: true, run: function () { bridge.zoom_in() } },
+            { l: "缩小 (Ctrl+-)", ok: true, run: function () { bridge.zoom_out() } },
+            { l: "适应窗口 (Ctrl+9)", ok: bridge.image_width > 0, run: function () { bridge.zoom_fit() } },
+            { l: "100% 实际大小 (Ctrl+0)", ok: bridge.image_width > 0, run: function () { bridge.zoom_actual() } },
+            { l: "", ok: true, sep: true },
+            { l: "另存副本 (Ctrl+S)", ok: bridge.image_width > 0, run: function () { bridge.save_edited() } },
+            { l: "另存为… (Ctrl+Shift+S)", ok: true, run: function () { saveDialog.open() } },
+            { l: "", ok: true, sep: true },
+            { l: "设置…", ok: true, run: function () { settingsOverlay.visible = true } },
+            { l: "", ok: true, sep: true },
+            { l: "关闭窗口 (Ctrl+W)", ok: true, run: function () { requestQuit() } }
+        ]
+
+        // How many icon slots fit between the title and the chrome.
+        property int capacity: barActions.length
+        function updateCapacity() {
+            // 30px icon + 2px spacing each; reserve title, layers/settings,
+            // "…", window buttons and margins.
+            const chrome = titleText.implicitWidth + 8 + 16 + menuBtn.width
+                           + layersBtn.width + settingsBtn.width + 8
+                           + winRow.width + 24
+            const avail = Math.max(0, toolbar.width - chrome)
+            const per = 32
+            capacity = Math.min(barActions.length, Math.floor(avail / per))
+        }
+        Component.onCompleted: updateCapacity()
+        onWidthChanged: updateCapacity()
+
+        // Drag-to-move (press anywhere on the bar that is not a button);
+        // double-click toggles maximize. Move starts only after a small
+        // threshold so double-click still registers.
+        MouseArea {
+            anchors.fill: parent
+            acceptedButtons: Qt.LeftButton
+            property real pressX: 0
+            property real pressY: 0
+            onPressed: (mouse) => {
+                pressX = mouse.x
+                pressY = mouse.y
+            }
+            onPositionChanged: (mouse) => {
+                if (!pressed)
+                    return
+                if (Math.abs(mouse.x - pressX) + Math.abs(mouse.y - pressY) < 6)
+                    return
+                const w = Window.window
+                if (w && w.startSystemMove)
+                    w.startSystemMove()
+            }
+            onDoubleClicked: (mouse) => {
+                const w = Window.window
+                if (!w)
+                    return
+                if (w.visibility === Window.Maximized)
+                    w.showNormal()
+                else if (w.visibility === Window.Windowed)
+                    w.showMaximized()
+            }
+        }
+
+        Text {
+            id: titleText
+            anchors.left: parent.left
+            anchors.leftMargin: 10
+            anchors.verticalCenter: parent.verticalCenter
+            width: Math.min(implicitWidth, 220)
+            elide: Text.ElideRight
+            text: bridge.image_width > 0
+                  ? "ImageEdit — " + bridge.image_width + "×" + bridge.image_height
+                  : "ImageEdit"
+            color: "#c9cdd2"
+            font.pixelSize: 12
+            onImplicitWidthChanged: toolbar.updateCapacity()
+        }
 
         Row {
+            id: iconRow
+            anchors.left: titleText.right
+            anchors.leftMargin: 10
             anchors.verticalCenter: parent.verticalCenter
-            anchors.left: parent.left
-            anchors.leftMargin: 8
-            spacing: 6
+            spacing: 2
 
-            ToolButton { label: "打开"; onClicked: openDialog.open() }
-            ToolButton { label: "新窗口"; onClicked: root.requestNewWindow() }
+            Repeater {
+                model: toolbar.barActions
 
-            Rectangle { width: 1; height: 20; color: "#3c4043" }
-
-            ToolButton { label: "撤销"; active: bridge.can_undo; onClicked: bridge.undo() }
-            ToolButton { label: "重做"; active: bridge.can_redo; onClicked: bridge.redo() }
-
-            Rectangle { width: 1; height: 20; color: "#3c4043" }
-
-            ToolButton { label: "左转 90°"; onClicked: bridge.rotate_ccw() }
-            ToolButton { label: "右转 90°"; onClicked: bridge.rotate_cw() }
-            ToolButton { label: "水平翻转"; onClicked: bridge.flip_horizontal() }
-            ToolButton { label: "垂直翻转"; onClicked: bridge.flip_vertical() }
-
-            Rectangle { width: 1; height: 20; color: "#3c4043" }
-
-            ToolButton {
-                label: "裁剪"
-                active: root.selExists
-                onClicked: applyCrop()
+                delegate: IconButton {
+                    required property var modelData
+                    required property int index
+                    // Read ok/sel through the model (not the captured
+                    // modelData) so enabled state stays reactive to
+                    // bridge.can_undo / panelVisible changes.
+                    glyph: modelData.g
+                    tip: modelData.t
+                    separator: modelData.sep === true
+                    active: modelData.sep === true
+                            || toolbar.barActions[index].ok === true
+                    selected: modelData.sel === true
+                              || (toolbar.barActions[index].sel === true)
+                    visible: modelData.sep === true || index < toolbar.capacity
+                    onClicked: modelData.run()
+                }
             }
-            ToolButton { label: "重置裁剪"; active: bridge.image_width > 0; onClicked: bridge.reset_crop() }
-            ToolButton { label: "调整尺寸…"; active: bridge.image_width > 0; onClicked: openResizeDialog() }
+        }
 
-            Rectangle { width: 1; height: 20; color: "#3c4043" }
+        IconButton {
+            id: settingsBtn
+            anchors.right: layersBtn.left
+            anchors.rightMargin: 2
+            anchors.verticalCenter: parent.verticalCenter
+            glyph: "⚙"
+            tip: "设置…"
+            visible: true
+            onClicked: settingsOverlay.visible = true
+        }
 
-            ToolButton { label: "提取图层"; active: root.selExists; onClicked: commitExtract() }
-            ToolButton { label: "删除选区像素"; active: root.selExists; onClicked: deleteSelectionPixels() }
-            ToolButton {
-                label: "图层"
-                active: true
-                selected: root.panelVisible
-                onClicked: root.panelVisible = !root.panelVisible
+        IconButton {
+            id: layersBtn
+            anchors.right: menuBtn.left
+            anchors.rightMargin: 2
+            anchors.verticalCenter: parent.verticalCenter
+            glyph: "☰"
+            tip: "图层面板"
+            selected: root.panelVisible
+            visible: true
+            onClicked: root.panelVisible = !root.panelVisible
+        }
+
+        IconButton {
+            id: menuBtn
+            anchors.right: winRow.left
+            anchors.rightMargin: 6
+            anchors.verticalCenter: parent.verticalCenter
+            glyph: "⋯"
+            tip: "更多操作"
+            visible: true
+            onClicked: overflowMenu.visible = !overflowMenu.visible
+        }
+
+        Row {
+            id: winRow
+            anchors.right: parent.right
+            anchors.rightMargin: 4
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 2
+
+            IconButton {
+                glyph: "─"
+                tip: "最小化"
+                onClicked: { const w = Window.window; if (w) w.showMinimized() }
             }
+            IconButton {
+                glyph: "▢"
+                tip: "最大化 / 还原"
+                onClicked: {
+                    const w = Window.window
+                    if (!w) return
+                    if (w.visibility === Window.Maximized) w.showNormal()
+                    else w.showMaximized()
+                }
+            }
+            IconButton {
+                glyph: "✕"
+                tip: "关闭"
+                onClicked: { const w = Window.window; if (w) w.close() }
+            }
+        }
+    }
 
-            Rectangle { width: 1; height: 20; color: "#3c4043" }
+    // Traditional text menu behind "…": every command, keyboard-hint labels.
+    Rectangle {
+        id: overflowMenu
+        visible: false
+        z: 210
+        width: 232
+        height: menuCol.height + 10
+        color: "#2a2d31"
+        border.color: "#3c4043"
+        radius: 6
+        x: toolbar.width - width - 10
+        y: toolbar.height + 2
 
-            ToolButton { label: "-"; onClicked: bridge.zoom_out() }
-            ToolButton { label: "+"; onClicked: bridge.zoom_in() }
-            ToolButton { label: "适应窗口"; active: !bridge.fit_mode; onClicked: bridge.zoom_fit() }
-            ToolButton { label: "100%"; active: bridge.zoom_percent !== 100; onClicked: bridge.zoom_actual() }
+        Column {
+            id: menuCol
+            anchors.top: parent.top
+            anchors.topMargin: 5
+            anchors.horizontalCenter: parent.horizontalCenter
+            spacing: 0
 
-            Rectangle { width: 1; height: 20; color: "#3c4043" }
+            Repeater {
+                model: toolbar.menuActions
 
-            ToolButton { label: "另存副本"; onClicked: bridge.save_edited() }
-            ToolButton { label: "另存为…"; onClicked: saveDialog.open() }
+                delegate: MenuRow {
+                    required property var modelData
+                    required property int index
+                    // Reactive like the bar icons above.
+                    label: modelData.l
+                    separator: modelData.sep === true
+                    active: modelData.sep === true
+                            || toolbar.menuActions[index].ok === true
+                    onActivated: {
+                        overflowMenu.visible = false
+                        modelData.run()
+                    }
+                }
+            }
+        }
+    }
+
+    // Click-away catcher for the overflow menu.
+    MouseArea {
+        z: 205
+        anchors.fill: parent
+        visible: overflowMenu.visible
+        enabled: overflowMenu.visible
+        onPressed: (mouse) => {
+            overflowMenu.visible = false
+            mouse.accepted = true
         }
     }
 
@@ -461,17 +849,50 @@ Window {
         anchors.right: parent.right
         clip: true
         boundsBehavior: Flickable.StopAtBounds
+        // Panning happens ONLY via wheel/touchpad and middle-drag (panMa);
+        // left-drag belongs to selection/layer gestures.
+        interactive: false
         // PAD display px of slack around the image so layers pushed partially
         // off-canvas stay visible and clickable (canvasSurface matches).
         readonly property int pad: 64
         contentWidth: Math.max(width, previewImage.width + 2 * pad)
         contentHeight: Math.max(height, previewImage.height + 2 * pad)
 
-        onWidthChanged: bridge.set_viewport(width, height)
-        onHeightChanged: bridge.set_viewport(width, height)
+        // In fit mode the content includes the 64px work-area pad on every
+        // side, so it is slightly larger than the viewport — without recentring
+        // the image would sit 64px down (blank top, cut bottom). Center the
+        // image in the viewport whenever fit sizing changes.
+        function centerContent() {
+            if (!bridge.fit_mode)
+                return
+            contentX = Math.max(0, (contentWidth - width) / 2)
+            contentY = Math.max(0, (contentHeight - height) / 2)
+        }
+        onContentWidthChanged: centerContent()
+        onContentHeightChanged: centerContent()
+        onWidthChanged: {
+            centerContent()
+            bridge.set_viewport(width, height)
+        }
+        onHeightChanged: {
+            centerContent()
+            bridge.set_viewport(width, height)
+        }
+        Connections {
+            target: bridge
+            function onFitModeChanged() { view.centerContent() }
+        }
+
+        // Clamp-and-shift the visible region by (dx, dy) viewport px.
+        function panBy(dx, dy) {
+            const maxX = Math.max(0, contentWidth - width)
+            const maxY = Math.max(0, contentHeight - height)
+            contentX = Math.min(maxX, Math.max(0, contentX + dx))
+            contentY = Math.min(maxY, Math.max(0, contentY + dy))
+        }
 
         // PS-style checkerboard behind the image: transparent pixels show
-        // the classic gray/white grid.
+        // the grid configured in the settings panel.
         Canvas {
             id: checkerboard
             visible: bridge.preview_url.length > 0
@@ -479,15 +900,19 @@ Window {
             y: previewImage.y
             width: previewImage.width
             height: previewImage.height
+            readonly property color cLight: bridge.checkerLight
+            readonly property color cDark: bridge.checkerDark
+            onCLightChanged: requestPaint()
+            onCDarkChanged: requestPaint()
             onWidthChanged: requestPaint()
             onHeightChanged: requestPaint()
             onPaint: {
                 var ctx = getContext("2d")
                 ctx.clearRect(0, 0, width, height)
                 const cell = 8
-                ctx.fillStyle = "#cccccc"
+                ctx.fillStyle = cDark
                 ctx.fillRect(0, 0, width, height)
-                ctx.fillStyle = "#ffffff"
+                ctx.fillStyle = cLight
                 for (var gy = 0; gy < height; gy += cell) {
                     for (var gx = 0; gx < width; gx += cell) {
                         if (((gx / cell) | 0) % 2 === ((gy / cell) | 0) % 2)
@@ -518,6 +943,29 @@ Window {
                         Qt.quit();
                 }
             }
+        }
+
+        // Resolution badges on the image's top-left / bottom-right corners
+        // (outlined text so it stays readable on any background).
+        Text {
+            visible: bridge.image_width > 0
+            x: previewImage.x + 6
+            y: previewImage.y + 6
+            text: bridge.image_width + " × " + bridge.image_height
+            color: "#f2f4f7"
+            font.pixelSize: 11
+            style: Text.Outline
+            styleColor: "#b3000000"
+        }
+        Text {
+            visible: bridge.image_width > 0
+            x: previewImage.x + previewImage.width - width - 6
+            y: previewImage.y + previewImage.height - height - 6
+            text: bridge.image_width + " × " + bridge.image_height
+            color: "#f2f4f7"
+            font.pixelSize: 11
+            style: Text.Outline
+            styleColor: "#b3000000"
         }
 
         // ---- Persistent-selection interaction stack ----------------------
@@ -553,6 +1001,8 @@ Window {
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: {
+                    if (panMa.pressed)
+                        return Qt.ClosedHandCursor
                     if (!root.selExists && bridge.image_width > 0) {
                         const hit = topLayerAt(selDragMouse.mouseX, selDragMouse.mouseY)
                         if (hit !== null && !isLocked(hit))
@@ -568,6 +1018,9 @@ Window {
                 // Layer pick-and-move gesture (no selection active).
                 property bool pickDrag: false
                 property bool pickMoved: false
+                // Last deltas sent to the bridge (skip redundant renders).
+                property int lastDx: 0
+                property int lastDy: 0
 
                 onPressed: (mouse) => {
                     const hit = root.selExists ? null : topLayerAt(mouse.x, mouse.y)
@@ -597,10 +1050,16 @@ Window {
                         if (!pickMoved
                             && Math.abs(curX - startX) + Math.abs(curY - startY) > 3) {
                             pickMoved = true
+                            lastDx = 0
+                            lastDy = 0
                             bridge.drag_translate_begin()
+                            // Start ONCE and keep repeating: restarting the
+                            // timer on every mouse-move event would reset the
+                            // countdown faster than it can expire (mouse
+                            // events arrive at ~125Hz), so fast drags never
+                            // rendered live.
+                            liveTimer.start()
                         }
-                        if (pickMoved)
-                            liveTimer.restart()
                         return
                     }
                     if (!dragging)
@@ -644,28 +1103,44 @@ Window {
             Timer {
                 id: liveTimer
                 interval: 33
+                repeat: true
                 onTriggered: {
                     if (!selDragMouse.pickMoved)
                         return
                     const scale = toImageScale()
-                    bridge.drag_translate_update(
-                        Math.round((selDragMouse.curX - selDragMouse.startX) * scale),
-                        Math.round((selDragMouse.curY - selDragMouse.startY) * scale))
+                    const dx = Math.round((selDragMouse.curX - selDragMouse.startX) * scale)
+                    const dy = Math.round((selDragMouse.curY - selDragMouse.startY) * scale)
+                    if (dx === selDragMouse.lastDx && dy === selDragMouse.lastDy)
+                        return
+                    selDragMouse.lastDx = dx
+                    selDragMouse.lastDy = dy
+                    bridge.drag_translate_update(dx, dy)
                 }
             }
 
             // Live scale preview throttle for the selected layer's handles.
+            // repeat:true + start-once: restarting per mouse-move event would
+            // starve the timer during fast drags (same as liveTimer).
             Timer {
                 id: scaleTimer
                 interval: 60
+                repeat: true
+                property int lastW: -1
+                property int lastH: -1
+                property int lastX: 0
+                property int lastY: 0
                 onTriggered: {
                     if (root.scaleW <= 0)
                         return
                     const s = toDispScale()
-                    bridge.scale_layer_update(
-                        Math.max(1, Math.round(root.scaleW / s)),
-                        Math.max(1, Math.round(root.scaleH / s)),
-                        Math.round(root.scaleX / s), Math.round(root.scaleY / s))
+                    const w = Math.max(1, Math.round(root.scaleW / s))
+                    const h = Math.max(1, Math.round(root.scaleH / s))
+                    const x = Math.round(root.scaleX / s)
+                    const y = Math.round(root.scaleY / s)
+                    if (w === lastW && h === lastH && x === lastX && y === lastY)
+                        return
+                    lastW = w; lastH = h; lastX = x; lastY = y
+                    bridge.scale_layer_update(w, h, x, y)
                 }
             }
         }
@@ -780,22 +1255,70 @@ Window {
             font.pixelSize: 11
         }
 
-        WheelHandler {
-            enabled: !root.modeActive
-            onWheel: (event) => {
-                if (event.angleDelta.y > 0)
-                    bridge.zoom_in();
-                else if (event.angleDelta.y < 0)
-                    bridge.zoom_out();
-            }
-        }
-
         Text {
             anchors.centerIn: parent
             visible: bridge.preview_url.length === 0
             text: "把图片拖到这里，或在命令行传入文件路径"
             color: "#6b7076"
             font.pixelSize: 14
+        }
+    }
+
+    // Viewport-fixed pan/zoom input (sits above the Flickable so it never
+    // scrolls with content). Wheel/touchpad = pan, Ctrl+wheel = zoom,
+    // Shift+wheel = horizontal pan. Middle-drag pans. Left-button events are
+    // NOT accepted here and pass through to the canvas gesture stack, so a
+    // normal click-drag can never pan the view.
+    MouseArea {
+        id: panMa
+        anchors.top: toolbar.bottom
+        anchors.bottom: statusBar.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        acceptedButtons: Qt.MiddleButton
+        // No cursorShape here ON PURPOSE: a MouseArea with a cursor set wins
+        // over EVERY lower item (the window picks the topmost item that has
+        // any cursor shape, regardless of acceptedButtons), which would turn
+        // the whole viewport into the pan hand and mask the canvas cross /
+        // layer move / handle-resize cursors. The pan feedback cursor comes
+        // from selDragMouse instead (ClosedHand while this area is pressed).
+        property real lastX: 0
+        property real lastY: 0
+        onPressed: (mouse) => {
+            lastX = mouse.x
+            lastY = mouse.y
+        }
+        onPositionChanged: (mouse) => {
+            if (!pressed)
+                return
+            view.panBy(lastX - mouse.x, lastY - mouse.y)
+            lastX = mouse.x
+            lastY = mouse.y
+        }
+        onWheel: (event) => {
+            if (root.modeActive) {
+                event.accepted = false
+                return
+            }
+            if ((event.modifiers & Qt.ControlModifier) !== 0) {
+                if (event.angleDelta.y > 0)
+                    bridge.zoom_in()
+                else if (event.angleDelta.y < 0)
+                    bridge.zoom_out()
+                event.accepted = true
+                return
+            }
+            if (event.pixelDelta.x !== 0 || event.pixelDelta.y !== 0) {
+                // Touchpad pan: content follows the fingers.
+                view.panBy(event.pixelDelta.x, event.pixelDelta.y)
+            } else if ((event.modifiers & Qt.ShiftModifier) !== 0) {
+                view.panBy(-event.angleDelta.y * 0.4, 0)
+            } else if (event.angleDelta.x !== 0) {
+                view.panBy(event.angleDelta.x * 0.4, 0)
+            } else {
+                view.panBy(0, -event.angleDelta.y * 0.4)
+            }
+            event.accepted = true
         }
     }
 
@@ -827,9 +1350,21 @@ Window {
         }
 
         Text {
+            id: fileInfo
             anchors.verticalCenter: parent.verticalCenter
             anchors.left: parent.left
             anchors.leftMargin: 10
+            visible: bridge.fileName.length > 0
+            text: bridge.fileName + "   ·   " + bridge.image_width + "×" + bridge.image_height
+                  + (bridge.fileSizeStr.length > 0 ? "   ·   " + bridge.fileSizeStr : "")
+            color: "#9aa3b2"
+            font.pixelSize: 12
+        }
+
+        Text {
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.left: fileInfo.visible ? fileInfo.right : parent.left
+            anchors.leftMargin: fileInfo.visible ? 12 : 10
             anchors.right: (root.modeActive || root.selExists) ? modeHint.left : zoomLabel.left
             anchors.rightMargin: 10
             elide: Text.ElideMiddle
@@ -988,10 +1523,13 @@ Window {
                                 // Display position p ↔ doc index docLen-1-p.
                                 bridge.reorder_layer(docLen - 1 - fromPos,
                                                      docLen - 1 - toPos)
-                            } else if (!reordering && layerRow.row && !layerRow.isBase) {
-                                // Selecting a layer takes over the canvas:
-                                // drop any active selection so the layer's
-                                // handles and drag become usable at once.
+                            } else if (!reordering && layerRow.row && !layerRow.isBase
+                                       && layerRow.row.l !== true) {
+                                // Locked layers reject selection; unlock via
+                                // the row's lock icon first. Selecting a
+                                // layer takes over the canvas: drop any
+                                // active selection so the layer's handles
+                                // and drag become usable at once.
                                 root.selW = 0
                                 root.selH = 0
                                 bridge.select_layer(layerRow.row.i)
@@ -1019,7 +1557,8 @@ Window {
                             width: 18
                             height: 18
                             property bool on: layerRow.vis
-                            readonly property bool disabled: layerRow.isBase && layerRow.row && layerRow.row.v !== true
+                            readonly property bool disabled: layerRow.isBase
+                                && layerRow.row && layerRow.row.bd === true
                             onOnChanged: requestPaint()
                             onDisabledChanged: requestPaint()
                             onPaint: {
@@ -1050,10 +1589,18 @@ Window {
                         MouseArea {
                             anchors.fill: parent
                             anchors.margins: -4
-                            enabled: !(layerRow.isBase && layerRow.row && layerRow.row.v !== true)
+                            // Base: hidden via the dedicated undoable toggle
+                            // (set_layer_visible_at only indexes real layers;
+                            // deleted base rows have no eye at all).
+                            enabled: !(layerRow.isBase && layerRow.row
+                                       && layerRow.row.bd === true)
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: if (layerRow.row)
-                                bridge.set_layer_visible_at(layerRow.row.i, !layerRow.row.v)
+                            onClicked: if (layerRow.row) {
+                                if (layerRow.isBase)
+                                    bridge.toggle_base_visible()
+                                else
+                                    bridge.set_layer_visible_at(layerRow.row.i, !layerRow.row.v)
+                            }
                         }
                     }
 
@@ -1069,7 +1616,7 @@ Window {
                                    ? (layerRow.row.l === true ? "（背景）" : "（已解锁，Delete 删除）")
                                    : "")
                                 + (layerRow.row.o !== undefined && layerRow.row.o < 100 ? "  " + layerRow.row.o + "%" : "")
-                                + (isSel ? "  (选中)" : "")
+                                // Selection is shown by row highlight only.
                               : ""
                         color: isSel ? "#ffffff" : "#c9cdd2"
                         font.pixelSize: 12
@@ -1268,6 +1815,13 @@ Window {
         visible: false
         z: 100
         property bool keepRatio: false
+        // Clear text-field focus on close, otherwise the hidden TextInput
+        // keeps consuming Ctrl+Z / Ctrl+Y as text undo and the document
+        // undo/redo shortcuts appear dead (bug: dead after resize dialog).
+        onVisibleChanged: if (!visible) {
+            resizeW.focus = false
+            resizeH.focus = false
+        }
 
         MouseArea {
             anchors.fill: parent
@@ -1480,7 +2034,11 @@ Window {
         }
         root.scaleX = x; root.scaleY = y
         root.scaleW = Math.max(1, w); root.scaleH = Math.max(1, h)
-        scaleTimer.restart()
+        if (!scaleTimer.running) {
+            scaleTimer.lastW = -1; scaleTimer.lastH = -1
+            scaleTimer.lastX = 0; scaleTimer.lastY = 0
+            scaleTimer.start()
+        }
     }
 
     function commitLayerScale() {
@@ -1540,7 +2098,9 @@ Window {
             return
         }
         const base = findBase()
-        if (base !== null && base.v === true && !isLocked(base)
+        // bd !== true: the base still exists (not "deleted"); visibility is
+        // irrelevant for the delete flow.
+        if (base !== null && base.bd !== true && !isLocked(base)
             && bridge.layer_count > 0)
             bridge.delete_base_layer()
     }
@@ -1656,6 +2216,7 @@ Window {
     function onEscape() {
         if (root.renamingIndex >= 0) { root.renamingIndex = -1; return }
         if (confirmOverlay.visible) { confirmCancel(); return }
+        if (settingsOverlay.visible) { settingsOverlay.visible = false; return }
         if (root.scaleW > 0) { cancelLayerScale(); return }
         if (selDragMouse.dragging) { selDragMouse.dragging = false; return }
         if (root.pasteFloating) {
@@ -1732,10 +2293,11 @@ Window {
         return null
     }
 
-    // Topmost visible non-base layer whose content box contains the
+    // Topmost visible UNLOCKED non-base layer whose content box contains the
     // canvasSurface-space point (mx, my); null when the point is empty
     // canvas. layerList is display-ordered (index 0 = top), so the first
-    // hit wins. Hidden layers and the base row are not pickable.
+    // hit wins. Hidden and locked layers are not pickable (locked layers
+    // must be unlocked via the panel's lock icon first).
     function topLayerAt(mx, my) {
         const s = toDispScale()
         if (s <= 0)
@@ -1744,7 +2306,7 @@ Window {
         const iy = (my - view.pad) / s
         for (var k = 0; k < root.layerList.length; k++) {
             const l = root.layerList[k]
-            if (l.base === true || l.v !== true)
+            if (l.base === true || l.v !== true || l.l === true)
                 continue
             if (l.w > 0 && l.h > 0
                 && ix >= l.x && ix <= l.x + l.w && iy >= l.y && iy <= l.y + l.h)
@@ -1761,47 +2323,111 @@ Window {
 
         MouseArea { anchors.fill: parent }
 
+        // Native-dialog-style window: title bar with close button, body with
+        // warning icon + message, footer with right-aligned actions.
         Rectangle {
-            width: 360
-            height: 168
+            width: 420
+            height: 190
             anchors.centerIn: parent
-            radius: 6
-            color: "#2b2e33"
-            border.color: "#3c4043"
+            radius: 8
+            color: "#25272b"
+            border.color: "#4a4e54"
+            clip: true
 
-            Column {
-                anchors.centerIn: parent
-                spacing: 14
-                width: parent.width - 32
+            // Title bar
+            Item {
+                id: confirmTitle
+                width: parent.width
+                height: 38
 
                 Text {
-                    width: parent.width
-                    horizontalAlignment: Text.AlignHCenter
-                    text: "当前文档有未保存的修改"
+                    anchors.left: parent.left
+                    anchors.leftMargin: 14
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "未保存的更改"
                     color: "#e9eaec"
-                    font.pixelSize: 14
+                    font.pixelSize: 13
                     font.bold: true
                 }
 
+                IconButton {
+                    anchors.right: parent.right
+                    anchors.rightMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    glyph: "✕"
+                    tip: "关闭"
+                    onClicked: confirmCancel()
+                }
+
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    height: 1
+                    color: "#3c4043"
+                }
+            }
+
+            // Body: warning glyph + message
+            Item {
+                anchors.top: confirmTitle.bottom
+                anchors.bottom: confirmFooter.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+
                 Text {
-                    width: parent.width
-                    horizontalAlignment: Text.AlignHCenter
+                    id: warnGlyph
+                    anchors.left: parent.left
+                    anchors.leftMargin: 18
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "⚠"
+                    color: "#e8b339"
+                    font.pixelSize: 26
+                }
+
+                Text {
+                    anchors.left: warnGlyph.right
+                    anchors.leftMargin: 14
+                    anchors.right: parent.right
+                    anchors.rightMargin: 18
+                    anchors.verticalCenter: parent.verticalCenter
                     text: root.confirmMode === "open"
-                          ? "打开新文件将放弃这些修改，是否继续？"
-                          : "关闭窗口将放弃这些修改，是否继续？"
-                    color: "#b8bcc0"
-                    font.pixelSize: 12
+                          ? "打开新文件将放弃当前图片的未保存修改。"
+                          : root.confirmMode === "nav"
+                          ? "切换到其他图片将放弃当前图片的未保存修改。"
+                          : "关闭窗口将放弃当前图片的未保存修改。"
+                    color: "#c9cdd2"
+                    font.pixelSize: 13
                     wrapMode: Text.WordWrap
+                }
+            }
+
+            // Footer: right-aligned action buttons
+            Item {
+                id: confirmFooter
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                height: 58
+
+                Rectangle {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    height: 1
+                    color: "#3c4043"
                 }
 
                 Row {
-                    anchors.horizontalCenter: parent.horizontalCenter
+                    anchors.right: parent.right
+                    anchors.rightMargin: 14
+                    anchors.verticalCenter: parent.verticalCenter
                     spacing: 8
 
                     ToolButton {
-                        label: root.confirmMode === "open" ? "放弃并打开" : "放弃并关闭"
+                        label: "取消"
                         active: true
-                        onClicked: confirmProceed()
+                        onClicked: confirmCancel()
                     }
                     ToolButton {
                         label: "保存并关闭"
@@ -1809,9 +2435,249 @@ Window {
                         onClicked: confirmSaveAndClose()
                     }
                     ToolButton {
-                        label: "取消"
+                        label: root.confirmMode === "open" ? "放弃并打开"
+                             : root.confirmMode === "nav" ? "放弃并切换"
+                             : "放弃并关闭"
                         active: true
-                        onClicked: confirmCancel()
+                        selected: true
+                        onClicked: confirmProceed()
+                    }
+                }
+            }
+        }
+    }
+
+    // Settings panel: transparency checkerboard colors, "open file" behavior,
+    // and default-viewer registration. Every change persists immediately
+    // (%APPDATA%/ImageEdit/settings.ini via the Bridge).
+    Rectangle {
+        id: settingsOverlay
+        anchors.fill: parent
+        visible: false
+        z: 200
+        color: "#88000000"
+        onVisibleChanged: if (!visible) {
+            hexLight.focus = false
+            hexDark.focus = false
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked: settingsOverlay.visible = false
+        }
+
+        Rectangle {
+            width: 420
+            height: settingsCol.height + 32
+            anchors.centerIn: parent
+            radius: 6
+            color: "#2b2e33"
+            border.color: "#3c4043"
+
+            Column {
+                id: settingsCol
+                anchors.centerIn: parent
+                spacing: 12
+                width: parent.width - 36
+
+                Text {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    text: "设置"
+                    color: "#e9eaec"
+                    font.pixelSize: 14
+                    font.bold: true
+                }
+
+                Rectangle { width: parent.width; height: 1; color: "#3c4043" }
+
+                // ---- 1. checkerboard colors ----
+                Text {
+                    text: "透明背景（棋盘格）颜色"
+                    color: "#b8bcc0"
+                    font.pixelSize: 12
+                }
+                Row {
+                    spacing: 10
+
+                    Canvas {
+                        id: checkerPreview
+                        width: 76
+                        height: 26
+                        anchors.verticalCenter: parent.verticalCenter
+                        readonly property color cLight: bridge.checkerLight
+                        readonly property color cDark: bridge.checkerDark
+                        onCLightChanged: requestPaint()
+                        onCDarkChanged: requestPaint()
+                        onPaint: {
+                            var ctx = getContext("2d")
+                            const cell = 8
+                            ctx.fillStyle = cDark
+                            ctx.fillRect(0, 0, width, height)
+                            ctx.fillStyle = cLight
+                            for (var gy = 0; gy < height; gy += cell)
+                                for (var gx = 0; gx < width; gx += cell)
+                                    if (((gx / cell) | 0) % 2 === ((gy / cell) | 0) % 2)
+                                        ctx.fillRect(gx, gy, cell, cell)
+                        }
+                    }
+
+                    Column {
+                        spacing: 4
+                        Text { text: "亮格"; color: "#8f96a3"; font.pixelSize: 11 }
+                        Item {
+                            width: 72
+                            height: 24
+                            Rectangle { anchors.fill: parent; color: "#1b1c1e"; border.color: "#3c4043"; radius: 3 }
+                            TextInput {
+                                id: hexLight
+                                anchors.fill: parent
+                                anchors.margins: 4
+                                text: bridge.checkerLight
+                                font.pixelSize: 12
+                                color: "#e9eaec"
+                                verticalAlignment: TextInput.AlignVCenter
+                                onEditingFinished: {
+                                    if (/^#[0-9A-Fa-f]{6}$/.test(text))
+                                        bridge.update_checker_light(text)
+                                    else
+                                        text = bridge.checkerLight
+                                }
+                            }
+                        }
+                    }
+
+                    Column {
+                        spacing: 4
+                        Text { text: "暗格"; color: "#8f96a3"; font.pixelSize: 11 }
+                        Item {
+                            width: 72
+                            height: 24
+                            Rectangle { anchors.fill: parent; color: "#1b1c1e"; border.color: "#3c4043"; radius: 3 }
+                            TextInput {
+                                id: hexDark
+                                anchors.fill: parent
+                                anchors.margins: 4
+                                text: bridge.checkerDark
+                                font.pixelSize: 12
+                                color: "#e9eaec"
+                                verticalAlignment: TextInput.AlignVCenter
+                                onEditingFinished: {
+                                    if (/^#[0-9A-Fa-f]{6}$/.test(text))
+                                        bridge.update_checker_dark(text)
+                                    else
+                                        text = bridge.checkerDark
+                                }
+                            }
+                        }
+                    }
+                }
+                Row {
+                    spacing: 6
+                    ToolButton {
+                        label: "经典"
+                        onClicked: {
+                            bridge.update_checker_light("#ffffff")
+                            bridge.update_checker_dark("#cccccc")
+                            hexLight.text = "#ffffff"
+                            hexDark.text = "#cccccc"
+                        }
+                    }
+                    ToolButton {
+                        label: "暗色"
+                        onClicked: {
+                            bridge.update_checker_light("#3c4043")
+                            bridge.update_checker_dark("#202225")
+                            hexLight.text = "#3c4043"
+                            hexDark.text = "#202225"
+                        }
+                    }
+                    ToolButton {
+                        label: "纯白"
+                        onClicked: {
+                            bridge.update_checker_light("#ffffff")
+                            bridge.update_checker_dark("#f2f2f2")
+                            hexLight.text = "#ffffff"
+                            hexDark.text = "#f2f2f2"
+                        }
+                    }
+                    ToolButton {
+                        label: "炭黑"
+                        onClicked: {
+                            bridge.update_checker_light("#2a2d31")
+                            bridge.update_checker_dark("#141517")
+                            hexLight.text = "#2a2d31"
+                            hexDark.text = "#141517"
+                        }
+                    }
+                }
+
+                Rectangle { width: parent.width; height: 1; color: "#3c4043" }
+
+                // ---- 2. open behavior ----
+                Text {
+                    text: "打开文件时"
+                    color: "#b8bcc0"
+                    font.pixelSize: 12
+                }
+                Repeater {
+                    model: [
+                        { label: "在当前窗口显示（替换现有图片）", value: false },
+                        { label: "在单独的新窗口显示", value: true }
+                    ]
+                    delegate: MouseArea {
+                        id: radioRow
+                        required property var modelData
+                        width: 16 + 8 + lbl.implicitWidth
+                        height: Math.max(16, lbl.implicitHeight)
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: bridge.update_open_in_new_window(modelData.value)
+
+                        Item {
+                            width: 16
+                            height: 16
+                            anchors.verticalCenter: parent.verticalCenter
+                            Rectangle {
+                                anchors.fill: parent
+                                radius: 8
+                                color: "transparent"
+                                border.color: bridge.openInNewWindow === radioRow.modelData.value ? "#6aa9ff" : "#5a6069"
+                                border.width: 2
+                            }
+                            Rectangle {
+                                anchors.centerIn: parent
+                                width: 8
+                                height: 8
+                                radius: 4
+                                color: "#6aa9ff"
+                                visible: bridge.openInNewWindow === radioRow.modelData.value
+                            }
+                        }
+                        Text {
+                            id: lbl
+                            x: 24
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: radioRow.modelData.label
+                            color: "#d5d8dd"
+                            font.pixelSize: 12
+                        }
+                    }
+                }
+
+                Rectangle { width: parent.width; height: 1; color: "#3c4043" }
+
+                // ---- 3. default viewer ----
+                Text {
+                    text: "默认图片查看器"
+                    color: "#b8bcc0"
+                    font.pixelSize: 12
+                }
+                Row {
+                    spacing: 10
+                    ToolButton { label: "注册并打开系统设置…"; onClicked: bridge.register_as_viewer() }
+                    Text {
+                        text: "写入「打开方式」列表后打开\n系统设置，请在其中选择 ImageEdit"
+                        color: "#8f96a3"
+                        font.pixelSize: 11
                     }
                 }
             }
@@ -1836,13 +2702,42 @@ Window {
 
     // Unsaved-changes guard: opening a file or closing the window goes through
     // here, so an edited document is never silently replaced.
+    // Open a file, honoring the settings-panel choice: reuse the current
+    // window or spawn a new document window for it.
+    function openFile(url) {
+        if (bridge.openInNewWindow)
+            openNewWindow(url)
+        else
+            bridge.open_file(url)
+    }
+
     function confirmThenOpen(url) {
         if (bridge.dirty) {
             root.pendingOpenUrl = url
             root.confirmMode = "open"
             confirmOverlay.visible = true
         } else {
-            bridge.open_file(url)
+            openFile(url)
+        }
+    }
+
+    // Left/Right arrow browsing through images in the same folder. Blocked
+    // while a selection/layer gesture owns the keyboard; an edited document
+    // asks for confirmation first.
+    function canNavigate() {
+        return bridge.image_width > 0 && !root.selExists
+            && bridge.selected_layer < 0 && !root.pasteFloating
+            && !root.modeActive && !confirmOverlay.visible
+            && !settingsOverlay.visible
+    }
+
+    function navigateRel(dir) {
+        if (bridge.dirty) {
+            root.pendingNavDir = dir
+            root.confirmMode = "nav"
+            confirmOverlay.visible = true
+        } else {
+            bridge.navigate(dir)
         }
     }
 
@@ -1862,17 +2757,21 @@ Window {
             root.pendingOpenUrl = null
             confirmOverlay.visible = false
             if (url)
-                bridge.open_file(url)
+                openFile(url)
+        } else if (root.confirmMode === "nav") {
+            const dir = root.pendingNavDir
+            root.pendingNavDir = 0
+            confirmOverlay.visible = false
+            bridge.navigate(dir)
         } else if (root.confirmMode === "close") {
             confirmOverlay.visible = false
             root.forceClose = true
-            if (root.primary) {
-                Qt.quit()
-            } else {
-                const w = Window.window
-                if (w)
-                    w.close()
-            }
+            // Close ONLY this window; the app quits automatically once the
+            // last window goes away (Qt quitOnLastWindowClosed). Qt.quit()
+            // here would kill every other open document window too.
+            const w = Window.window
+            if (w)
+                w.close()
         }
         root.confirmMode = ""
     }
@@ -1885,8 +2784,24 @@ Window {
 
     function confirmCancel() {
         root.pendingOpenUrl = null
+        root.pendingNavDir = 0
         root.confirmMode = ""
         confirmOverlay.visible = false
+    }
+
+    // Probe timer: --probe-settings opens the settings panel automatically
+    // (UI layout debugging / screenshots without user interaction).
+    Timer {
+        id: settingsProbeTimer
+        interval: 600
+        onTriggered: settingsOverlay.visible = true
+    }
+
+    // Probe timer: --probe-menu opens the "…" overflow menu automatically.
+    Timer {
+        id: menuProbeTimer
+        interval: 600
+        onTriggered: overflowMenu.visible = true
     }
 
     Component.onCompleted: {
@@ -1895,6 +2810,14 @@ Window {
             bridge.start();
             if (root.probeDialog)
                 dialogProbeTimer.start();
+            if (root.probeSettings)
+                settingsProbeTimer.start();
+            if (root.probeMenu)
+                menuProbeTimer.start();
+        } else if (root.fileUrl.toString().length > 0) {
+            // Document window spawned for a specific file ("open in separate
+            // window" setting, drag-out, etc.).
+            bridge.open_file(root.fileUrl)
         }
     }
 }

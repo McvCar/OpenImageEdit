@@ -66,6 +66,11 @@ pub mod qobject {
         #[qproperty(i32, selected_layer)]
         #[qproperty(QString, layers_json)]
         #[qproperty(bool, dirty)]
+        #[qproperty(QString, file_name, cxx_name = "fileName")]
+        #[qproperty(QString, file_size_str, cxx_name = "fileSizeStr")]
+        #[qproperty(QString, checker_light, cxx_name = "checkerLight")]
+        #[qproperty(QString, checker_dark, cxx_name = "checkerDark")]
+        #[qproperty(bool, open_in_new_window, cxx_name = "openInNewWindow")]
         #[namespace = "imageedit"]
         type Bridge = super::BridgeRust;
 
@@ -80,6 +85,26 @@ pub mod qobject {
 
         #[qinvokable]
         fn open_file(self: Pin<&mut Self>, url: &QUrl);
+
+        // ---- 图片浏览 / 设置 ----
+
+        /// Open the previous (-1) or next (+1) image in the same folder.
+        #[qinvokable]
+        fn navigate(self: Pin<&mut Self>, dir: i32);
+
+        /// Register the app in the Windows "Open with" list and open the
+        /// system default-apps settings page (the user picks the default).
+        #[qinvokable]
+        fn register_as_viewer(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn update_checker_light(self: Pin<&mut Self>, value: &QString);
+
+        #[qinvokable]
+        fn update_checker_dark(self: Pin<&mut Self>, value: &QString);
+
+        #[qinvokable]
+        fn update_open_in_new_window(self: Pin<&mut Self>, value: bool);
 
         #[qinvokable]
         fn set_viewport(self: Pin<&mut Self>, width: i32, height: i32);
@@ -169,6 +194,7 @@ pub mod qobject {
 
         #[qinvokable]
         fn delete_base_layer(self: Pin<&mut Self>);
+        fn toggle_base_visible(self: Pin<&mut Self>);
 
         #[qinvokable]
         fn translate_selected(self: Pin<&mut Self>, dx: i32, dy: i32);
@@ -235,7 +261,82 @@ pub mod qobject {
     }
 }
 
-#[derive(Default)]
+/// User preferences persisted across runs (plain key=value file under
+/// %APPDATA%/ImageEdit so no extra dependency is needed).
+struct AppConfig {
+    checker_light: String,
+    checker_dark: String,
+    open_in_new_window: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            checker_light: "#ffffff".to_string(),
+            checker_dark: "#cccccc".to_string(),
+            open_in_new_window: false,
+        }
+    }
+}
+
+impl AppConfig {
+    fn path() -> Option<PathBuf> {
+        std::env::var_os("APPDATA")
+            .map(|root| PathBuf::from(root).join("ImageEdit").join("settings.ini"))
+    }
+
+    fn load() -> Self {
+        let mut cfg = Self::default();
+        if let Some(path) = Self::path() {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                for line in text.lines() {
+                    let (key, value) = match line.split_once('=') {
+                        Some((k, v)) => (k.trim(), v.trim()),
+                        None => continue,
+                    };
+                    match key {
+                        "checker_light" if !value.is_empty() => {
+                            cfg.checker_light = value.to_string()
+                        }
+                        "checker_dark" if !value.is_empty() => cfg.checker_dark = value.to_string(),
+                        "open_in_new_window" => cfg.open_in_new_window = value == "true",
+                        _ => {}
+                    }
+                }
+            }
+        }
+        cfg
+    }
+
+    fn save(&self) {
+        if let Some(path) = Self::path() {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let text = format!(
+                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\n",
+                self.checker_light, self.checker_dark, self.open_in_new_window
+            );
+            let _ = std::fs::write(path, text);
+        }
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 pub struct BridgeRust {
     status: QString,
     preview_url: QString,
@@ -256,6 +357,13 @@ pub struct BridgeRust {
     selected_layer: i32,
     layers_json: QString,
     dirty: bool,
+    /// Loaded file's display name and human-readable size for the status bar.
+    file_name: QString,
+    file_size_str: QString,
+    /// User preferences (checkerboard colors, open-in-new-window behavior).
+    checker_light: QString,
+    checker_dark: QString,
+    open_in_new_window: bool,
     paste_counter: RefCell<u32>,
     /// Opacity of the selected layer before the current live slider drag, so
     /// the committed history op can record the true pre-drag value.
@@ -269,6 +377,44 @@ pub struct BridgeRust {
     scale_start: RefCell<Option<(RgbaImage, (i32, i32))>>,
     session: RefCell<Option<Session>>,
     viewport: RefCell<Size>,
+}
+
+impl Default for BridgeRust {
+    fn default() -> Self {
+        let cfg = AppConfig::load();
+        Self {
+            status: QString::default(),
+            preview_url: QString::default(),
+            image_width: 0,
+            image_height: 0,
+            display_width: 0,
+            display_height: 0,
+            zoom_percent: 100,
+            fit_mode: true,
+            can_undo: false,
+            can_redo: false,
+            decode_ms: 0,
+            shown_ms: 0,
+            auto_quit: false,
+            load_failed: false,
+            default_save_url: QString::default(),
+            layer_count: 0,
+            selected_layer: -1,
+            layers_json: QString::default(),
+            dirty: false,
+            file_name: QString::default(),
+            file_size_str: QString::default(),
+            checker_light: QString::from(cfg.checker_light.as_str()),
+            checker_dark: QString::from(cfg.checker_dark.as_str()),
+            open_in_new_window: cfg.open_in_new_window,
+            paste_counter: RefCell::new(0),
+            opacity_live: RefCell::new(None),
+            drag_start_offset: RefCell::new(None),
+            scale_start: RefCell::new(None),
+            session: RefCell::new(None),
+            viewport: RefCell::new(Size::new(0, 0)),
+        }
+    }
 }
 
 /// Process-global clipboard (per-window `RefCell` fields cannot share state
@@ -479,12 +625,16 @@ impl Session {
         }
         // The base image is listed last (display order = top first) as a
         // locked-by-default row: not reorderable, not deletable while locked
-        // (see §4.8 of the UX plan). v reports base_deleted so the row can
-        // grey out after a delete.
+        // (see §4.8 of the UX plan). v reports visibility (deleted/hidden),
+        // bd reports base_deleted so the panel can distinguish "hidden" from
+        // "deleted" (Delete key flow) for the base row.
         parts.push(format!(
-            "{{\"i\":-1,\"n\":\"背景\",\"v\":{},\"o\":100,\"l\":{},\"x\":0,\"y\":0,\"w\":{},\"h\":{},\"base\":true}}",
-            !base_deleted, base_locked,
-            self.doc.canvas.width, self.doc.canvas.height
+            "{{\"i\":-1,\"n\":\"背景\",\"v\":{},\"bd\":{},\"o\":100,\"l\":{},\"x\":0,\"y\":0,\"w\":{},\"h\":{},\"base\":true}}",
+            !base_deleted && !self.doc.base_hidden,
+            base_deleted,
+            base_locked,
+            self.doc.canvas.width,
+            self.doc.canvas.height
         ));
         format!("[{}]", parts.join(","))
     }
@@ -552,6 +702,8 @@ impl qobject::Bridge {
                 "layer-up" => self.as_mut().move_selected_up(),
                 "layer-down" => self.as_mut().move_selected_down(),
                 "paste" => self.as_mut().paste_clipboard(),
+                "next" => self.as_mut().navigate(1),
+                "prev" => self.as_mut().navigate(-1),
                 "copy" => self.as_mut().copy_selected_layer(),
                 "cut" => self.as_mut().cut_selected_layer(),
                 other if other.starts_with("opacity:") => {
@@ -736,6 +888,212 @@ println!(
         self.as_mut().load_path(&path);
     }
 
+    /// Open the previous/next image file in the loaded file's folder. The
+    /// dirty check happens in QML (confirm overlay) before calling this.
+    pub fn navigate(mut self: Pin<&mut Self>, dir: i32) {
+        let current = self
+            .session
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.source.clone());
+        let Some(current) = current else {
+            self.as_mut()
+                .set_status(QString::from("尚未打开文件，无法切换"));
+            return;
+        };
+        let Some(parent) = current.parent().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        let is_image = |p: &Path| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| {
+                    matches!(
+                        e.to_ascii_lowercase().as_str(),
+                        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tif" | "tiff"
+                    )
+                })
+                .unwrap_or(false)
+        };
+        let mut siblings: Vec<PathBuf> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&parent) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && is_image(&path) {
+                    siblings.push(path);
+                }
+            }
+        }
+        siblings.sort_by_key(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default()
+        });
+        if siblings.len() < 2 {
+            self.as_mut()
+                .set_status(QString::from("当前目录没有其他图片"));
+            return;
+        }
+        let cur_key = current
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let idx = siblings
+            .iter()
+            .position(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().to_lowercase())
+                    .unwrap_or_default()
+                    == cur_key
+            })
+            .unwrap_or(0);
+        let len = siblings.len() as i32;
+        let next = (idx as i32 + dir).rem_euclid(len) as usize;
+        self.as_mut().load_path(&siblings[next]);
+    }
+
+    /// Register a ProgId + "Open with" entries under HKCU (no admin needed),
+    /// then open the Windows default-apps settings page so the user can pick
+    /// ImageEdit as the default viewer. Windows does not allow setting the
+    /// default programmatically (UserChoice is hash-protected by design).
+    pub fn register_as_viewer(mut self: Pin<&mut Self>) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+            let exe = match std::env::current_exe() {
+                Ok(path) => path.to_string_lossy().to_string(),
+                Err(_) => {
+                    self.as_mut()
+                        .set_status(QString::from("无法定位程序路径"));
+                    return;
+                }
+            };
+            let run_reg = |args: Vec<String>| -> bool {
+                std::process::Command::new("reg")
+                    .args(&args)
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .output()
+                    .map(|out| out.status.success())
+                    .unwrap_or(false)
+            };
+
+            let mut all_ok = true;
+            all_ok &= run_reg(vec![
+                "add".into(),
+                r"HKCU\Software\Classes\ImageEdit.Document".into(),
+                "/ve".into(),
+                "/d".into(),
+                "ImageEdit 图片".into(),
+                "/f".into(),
+            ]);
+            all_ok &= run_reg(vec![
+                "add".into(),
+                r"HKCU\Software\Classes\ImageEdit.Document\shell\open\command".into(),
+                "/ve".into(),
+                "/d".into(),
+                format!("\"{exe}\" \"%1\""),
+                "/f".into(),
+            ]);
+            for ext in [
+                ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff",
+            ] {
+                all_ok &= run_reg(vec![
+                    "add".into(),
+                    format!(r"HKCU\Software\Classes\{ext}\OpenWithProgids"),
+                    "/v".into(),
+                    "ImageEdit.Document".into(),
+                    "/t".into(),
+                    "REG_SZ".into(),
+                    "/d".into(),
+                    "".into(),
+                    "/f".into(),
+                ]);
+            }
+            if !all_ok {
+                self.as_mut()
+                    .set_status(QString::from("注册失败：请尝试以管理员身份运行"));
+                return;
+            }
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "start", "", "ms-settings:defaultapps"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+            self.as_mut().set_status(QString::from(
+                "已加入系统「打开方式」列表：请在打开的系统设置中将 ImageEdit 设为默认应用",
+            ));
+        }
+        #[cfg(not(windows))]
+        {
+            self.as_mut()
+                .set_status(QString::from("此功能仅支持 Windows"));
+        }
+    }
+
+    fn persist_config(&self) {
+        AppConfig {
+            checker_light: self.checker_light().to_string(),
+            checker_dark: self.checker_dark().to_string(),
+            open_in_new_window: *self.open_in_new_window(),
+        }
+        .save();
+    }
+
+    pub fn update_checker_light(mut self: Pin<&mut Self>, value: &QString) {
+        if *self.checker_light() == *value {
+            return;
+        }
+        self.as_mut().set_checker_light(value.clone());
+        self.persist_config();
+    }
+
+    pub fn update_checker_dark(mut self: Pin<&mut Self>, value: &QString) {
+        if *self.checker_dark() == *value {
+            return;
+        }
+        self.as_mut().set_checker_dark(value.clone());
+        self.persist_config();
+    }
+
+    pub fn update_open_in_new_window(mut self: Pin<&mut Self>, value: bool) {
+        if *self.open_in_new_window() == value {
+            return;
+        }
+        self.as_mut().set_open_in_new_window(value);
+        self.persist_config();
+    }
+
+    /// Refresh the status-bar file info from the session's source path.
+    fn update_file_info(mut self: Pin<&mut Self>) {
+        let info = self
+            .session
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.source.clone())
+            .map(|path| {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.to_string_lossy().to_string());
+                let size = std::fs::metadata(&path)
+                    .map(|m| human_size(m.len()))
+                    .unwrap_or_default();
+                (name, size)
+            });
+        match info {
+            Some((name, size)) => {
+                self.as_mut().set_file_name(QString::from(name.as_str()));
+                self.as_mut()
+                    .set_file_size_str(QString::from(size.as_str()));
+            }
+            None => {
+                self.as_mut().set_file_name(QString::from(""));
+                self.as_mut().set_file_size_str(QString::from(""));
+            }
+        }
+    }
+
     pub fn set_viewport(mut self: Pin<&mut Self>, width: i32, height: i32) {
         let size = Size::new(width.max(0) as u32, height.max(0) as u32);
         if *self.viewport.borrow() == size {
@@ -864,6 +1222,7 @@ println!(
                 s.dirty = false;
             }
             self.as_mut().set_dirty(false);
+            self.as_mut().update_file_info();
         }
         self.as_mut().report_save(result);
     }
@@ -883,8 +1242,10 @@ println!(
         if result.is_ok() {
             if let Some(s) = self.session.borrow_mut().as_mut() {
                 s.dirty = false;
+                s.source = Some(path.clone());
             }
             self.as_mut().set_dirty(false);
+            self.as_mut().update_file_info();
         }
         self.as_mut().report_save(result);
     }
@@ -1835,6 +2196,33 @@ session
         self.as_mut().refresh_layers_only();
     }
 
+    /// Eye toggle on the base row: hide/show the background (undoable).
+    pub fn toggle_base_visible(mut self: Pin<&mut Self>) {
+        let result: Result<bool, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => {
+                    let make_visible = session.doc.base_hidden;
+                    match session.doc.set_base_visible(make_visible) {
+                        Ok(()) => {
+                            session.dirty = true;
+                            Ok(make_visible)
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(_) => {
+                // Visibility flips don't change the canvas size: no refit.
+                self.as_mut().refresh_preview();
+            }
+            Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
+        }
+    }
+
     pub fn delete_base_layer(mut self: Pin<&mut Self>) {
         let viewport = *self.viewport.borrow();
         let result: Result<bool, String> = {
@@ -2031,6 +2419,7 @@ session
                 self.as_mut().set_load_failed(false);
                 self.as_mut().set_decode_ms(ms);
                 *self.session.borrow_mut() = Some(session);
+                self.as_mut().update_file_info();
                 self.as_mut().refresh_preview();
             }
             Err(err) => {
@@ -2040,6 +2429,7 @@ session
                 self.as_mut().set_status(QString::from(status.as_str()));
                 self.as_mut().set_preview_url(QString::from(""));
                 self.as_mut().set_load_failed(true);
+                self.as_mut().update_file_info();
             }
         }
     }

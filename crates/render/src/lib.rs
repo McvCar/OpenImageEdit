@@ -103,8 +103,11 @@ pub fn composite_for_preview(doc: &Document, target: Size) -> RgbaImage {
     let sx = target.width as f64 / doc.canvas.width as f64;
     let sy = target.height as f64 / doc.canvas.height as f64;
 
-    let base_view = crop_region(&doc.base, doc.view);
-    let mut out = resize_to(&base_view, target);
+    let mut out = if doc.base_hidden {
+        RgbaImage::new(target.width, target.height)
+    } else {
+        resize_to(&crop_region(&doc.base, doc.view), target)
+    };
 
     for layer in &doc.layers {
         if !layer.visible || layer.opacity <= 0.0 {
@@ -116,31 +119,43 @@ pub fn composite_for_preview(doc: &Document, target: Size) -> RgbaImage {
         let ox = (layer.offset.0 as f64 * sx).round() as i32;
         let oy = (layer.offset.1 as f64 * sy).round() as i32;
 
+        // Row-slice fast path: whole rows are handed out as byte slices so
+        // the per-tick cost stays low even in debug builds.
+        let x0 = ox.max(0) as u32;
+        let x1 = (ox + nw as i32).min(target.width as i32).max(0) as u32;
+        if x0 >= x1 {
+            continue;
+        }
+        let src_stride = nw as usize * 4;
+        let src_buf = scaled.into_raw();
+        let out_stride = target.width as usize * 4;
+        let mut out_buf = out.into_raw();
         for ty in 0..target.height {
-            let ly = ty as i32 - oy;
-            if ly < 0 || ly >= nh as i32 {
+            let ly = ty as i64 - oy as i64;
+            if ly < 0 || ly >= nh as i64 {
                 continue;
             }
-            for tx in 0..target.width {
-                let lx = tx as i32 - ox;
-                if lx < 0 || lx >= nw as i32 {
+            let srow = &src_buf[ly as usize * src_stride..(ly as usize + 1) * src_stride];
+            let orow =
+                &mut out_buf[ty as usize * out_stride..(ty as usize + 1) * out_stride];
+            for tx in x0..x1 {
+                let lx = tx as i64 - ox as i64;
+                let so = lx as usize * 4;
+                let sa = srow[so + 3] as f32 / 255.0 * layer.opacity;
+                if sa <= 0.0 {
                     continue;
                 }
-                let src = scaled.get_pixel(lx as u32, ly as u32).0;
-                let a = (src[3] as f32 / 255.0) * layer.opacity;
-                if a <= 0.0 {
-                    continue;
-                }
-                let inv = 1.0 - a;
-                let o = out.get_pixel(tx, ty).0;
-                let mut n = o;
+                let oo = tx as usize * 4;
+                let inv = 1.0 - sa;
                 for c in 0..3 {
-                    n[c] = (src[c] as f32 * a + o[c] as f32 * inv).round() as u8;
+                    orow[oo + c] =
+                        (srow[so + c] as f32 * sa + orow[oo + c] as f32 * inv).round() as u8;
                 }
-                n[3] = ((a + o[3] as f32 / 255.0 * inv) * 255.0).round() as u8;
-                out.put_pixel(tx, ty, image::Rgba(n));
+                orow[oo + 3] = ((sa + orow[oo + 3] as f32 / 255.0 * inv) * 255.0).round() as u8;
             }
         }
+        out = RgbaImage::from_raw(target.width, target.height, out_buf)
+            .expect("preview buffer size preserved");
     }
     out
 }

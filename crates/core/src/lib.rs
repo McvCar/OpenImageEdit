@@ -203,6 +203,9 @@ pub struct Document {
     /// True while the base layer has been "deleted" (fully transparent
     /// canvas). Tracked so the panel can grey out the base row.
     pub base_deleted: bool,
+    /// True while the base layer is hidden by the user (eye toggle in the
+    /// panel). Non-destructive and undoable.
+    pub base_hidden: bool,
     /// Auto-naming counter: new layers (extract/paste) are named by their
     /// creation order ("1", "2", ...). Not part of snapshots on purpose, so
     /// names keep increasing across undo/redo.
@@ -313,6 +316,8 @@ pub struct DocumentSnapshot {
     pub layers: Vec<Layer>,
     /// True while the base has been "deleted" (fully transparent canvas).
     pub base_deleted: bool,
+    /// Base hidden by the user (eye toggle).
+    pub base_hidden: bool,
 }
 
 impl Document {
@@ -323,6 +328,7 @@ impl Document {
             view: self.view,
             layers: self.layers.clone(),
             base_deleted: self.base_deleted,
+            base_hidden: self.base_hidden,
         }
     }
 
@@ -333,6 +339,7 @@ impl Document {
         self.view = snapshot.view;
         self.layers = snapshot.layers;
         self.base_deleted = snapshot.base_deleted;
+        self.base_hidden = snapshot.base_hidden;
     }
 }
 
@@ -365,6 +372,9 @@ pub enum EditOp {
     /// "Delete" the base layer: the canvas becomes fully transparent while
     /// layers stay untouched. Undo restores the previous base pixels.
     DeleteBase { from: DocumentSnapshot },
+    /// Hide/show the base layer (eye toggle in the panel). Cheap flag flip,
+    /// no pixels involved; snapshot-free undo via from/to.
+    SetBaseVisible { from: bool, to: bool },
 }
 
 impl EditOp {
@@ -461,6 +471,10 @@ impl EditOp {
                 apply_delete_base(doc);
                 Ok(())
             }
+            EditOp::SetBaseVisible { to, .. } => {
+                doc.base_hidden = *to;
+                Ok(())
+            }
         }
     }
 
@@ -542,6 +556,10 @@ impl EditOp {
             }
             EditOp::DeleteBase { from } => {
                 doc.restore(from.clone());
+                Ok(())
+            }
+            EditOp::SetBaseVisible { from, .. } => {
+                doc.base_hidden = *from;
                 Ok(())
             }
         }
@@ -650,6 +668,7 @@ impl Document {
             view: Rect::new(0, 0, canvas.width, canvas.height),
             layers: Vec::new(),
             base_deleted: false,
+            base_hidden: false,
             next_layer_seq: 0,
             history: History::new(256),
         }
@@ -837,6 +856,17 @@ impl Document {
         self.execute(EditOp::DeleteBase { from })
     }
 
+    /// Hide/show the base layer. No-op (no history entry) when the state
+    /// already matches.
+    pub fn set_base_visible(&mut self, visible: bool) -> Result<(), EditError> {
+        let from = self.base_hidden;
+        let to = !visible;
+        if from == to {
+            return Ok(());
+        }
+        self.execute(EditOp::SetBaseVisible { from, to })
+    }
+
     pub fn undo(&mut self) -> Result<(), EditError> {
         let op = self.history.undo.pop().ok_or(EditError::NothingToUndo)?;
         op.revert(self)?;
@@ -919,7 +949,10 @@ impl Document {
         }
         let bx = (self.view.x + x) as u32;
         let by = (self.view.y + y) as u32;
-        let mut out = if bx < self.base.width() && by < self.base.height() {
+        let mut out = if !self.base_hidden
+            && bx < self.base.width()
+            && by < self.base.height()
+        {
             self.base.get_pixel(bx, by).0
         } else {
             [0, 0, 0, 0]
@@ -1161,6 +1194,29 @@ mod tests {
         // Rejected calls must not touch the history stack.
         assert_eq!(doc.history.undo.len(), undo_depth);
         assert_eq!(doc.layers[index].image.width(), 4);
+    }
+
+    #[test]
+    fn set_base_visible_roundtrips_and_affects_composite() {
+        let mut doc = Document::from_image(checker(8, 8));
+        doc.set_base_visible(false).unwrap();
+        assert!(doc.base_hidden);
+        // Hidden base composites as fully transparent.
+        assert_eq!(doc.composite_pixel(0, 0).0, [0, 0, 0, 0]);
+
+        doc.undo().unwrap();
+        assert!(!doc.base_hidden);
+        assert_eq!(doc.composite_pixel(0, 0).0[3], 255);
+        doc.redo().unwrap();
+        assert!(doc.base_hidden);
+
+        // Setting the same state again must not push a history entry.
+        let depth = doc.history.undo.len();
+        doc.set_base_visible(false).unwrap();
+        assert_eq!(doc.history.undo.len(), depth);
+        doc.set_base_visible(true).unwrap();
+        assert_eq!(doc.history.undo.len(), depth + 1);
+        assert!(!doc.base_hidden);
     }
 
     #[test]
