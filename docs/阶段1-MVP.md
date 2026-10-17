@@ -16,10 +16,10 @@
 | 旋转 / 翻转 | ✅ | 左/右转 90°、水平/垂直翻转，含图层坐标迁移 |
 | 撤销 / 重做 | ✅ | `Ctrl+Z`/`Ctrl+Y`，基于 `editcore::History`，含变换后的画布尺寸还原 |
 | 导出 / 另存 | ✅ | `Ctrl+S` 另存副本（`<名>-edited.<ext>`）、`Ctrl+Shift+S` 另存为 |
-| 多窗口 | ⚠️ 部分 | 目前为「单进程单窗口」，多窗口 = 多次启动（尚未做同进程多窗口） |
-| 裁剪 (Crop) | ✅ | 工具栏「裁剪」进入拖框模式（交叉光标），松手按选区裁剪；「重置裁剪」还原底图；含 23 项 core 测试 |
+| 多窗口 | ✅ | 同进程多文档（每窗口独立 `Bridge`）；`Ctrl+N`/工具栏「新窗口」开新窗；打开/关闭前有「未保存改动」确认浮层（放弃/保存并关闭/取消） |
+| 裁剪 (Crop) | ✅ | 工具栏「裁剪」进入拖框模式（交叉光标），松手后进入**手柄精修**（8 向缩放手柄 + 中心拖移 + 像素吸附），「应用裁剪 (Enter) / 取消 (Esc)」浮层确认；「重置裁剪」还原底图；含 23 项 core 测试 |
 | 调整尺寸 (Resize) | ✅ | 「调整尺寸…」对话框：宽/高输入 + 保持比例 + 回车提交，Lanczos3 重采样；撤销栈可回滚 |
-| 选区图层（框选/提取/移动/图层面板） | ✅ | 「框选」拖框 →「提取图层」生成图层；右侧图层面板（显示序=顶层在前）可 选择/显隐/上移/下移/删除；方向键 ±1、Shift+方向键 ±10 微调；跨图复制粘贴未做 |
+| 选区图层（框选/提取/移动/图层面板） | ✅ | 「框选」拖框 →「提取图层」生成图层；右侧图层面板（显示序=顶层在前）可 选择/显隐/上移/下移/删除/**不透明度滑条/双击重命名**；方向键 ±1、Shift+方向键 ±10 微调；**移动拖拽 70ms 实时预览**；**跨图复制粘贴 `Ctrl+C/X/V`**；**非破坏「删除选区像素」`Delete`** |
 | 基础快捷键 | ✅ | 见 §3 |
 
 ## 2. 本次交付物
@@ -62,6 +62,27 @@
 
 设计决策：不做破坏性「删除选区像素」（core 无此 op），只做「提取到图层」；图层 Vec 末尾 = 顶层，面板反向显示；「上移」= Vec index +1。移动图层不做逐帧重渲染（松手一次性提交），避免拖拽卡顿。
 
+### 2.4 选区增强 + 裁剪手柄 + 多窗口（2026-10-17 第二轮迭代）
+
+| 文件 | 变更 |
+| --- | --- |
+| `crates/core/src/lib.rs` | 新增 `EditOp::EraseBasePixels { from: DocumentSnapshot, selection }`（apply 将底图选区像素置 `[0,0,0,0]`，revert 用快照还原）+ `erase_base_pixels()` 辅助 + `Document::erase_selection()`（空/出界选区报 `EmptySelection`）；新增 4 项测试（含 crop view 坐标映射组合用例），core 共 **27 项测试** |
+| `crates/ui/src/bridge.rs` | 进程级剪贴板 `clipboard: RefCell<Option<Layer>>`（跨文档/跨窗口）；invokable：`copy/cut/erase_selection_pixels`、`copy/cut_selected_layer`、`paste_clipboard`（clamp 进画布 + 重复粘贴 +12px 扇出）、`set_selected_opacity(op, commit)`（live 值不入历史，commit 前回滚保证历史起点真实）、`rename_selected_layer`、`drag_translate_begin/update/end`（update 临时改 offset 不入历史，end 一次性入栈）；`layers_json` 增 `o`（不透明度 %）/`x/y/w/h`（bounds）；qproperty `dirty` 全修改点维护；`SESSION_SEQ` 原子会话 id 让多窗口预览临时文件名唯一；`run_script` 新增 `paste/copy/cut/copy:x,y,w/h/cut:x,y,w,h/erase:x,y,w,h/opacity:F/rename:NAME` |
+| `crates/ui/qml/main.qml` | 重构为多窗口架构：shell `Window` + 内联组件 `EditorContent`（每实例独立 `Bridge`）+ `DocWindow` + 工厂；`EdgeHandles` 内联组件（8 手柄 Repeater + 中心拖移，`resizeFn`/`moveFn` 回调注入）同时服务裁剪框与选区框；`snapDisplay()` 吸附显示坐标到图像像素边界；图层不透明度滑条（`Binding when:!dragging` 回同步）+ 双击重命名 `TextInput`；`Ctrl+C/X/V`/`Delete`/`Ctrl+N`/`Enter`（应用裁剪）快捷键；dirty 确认浮层（`confirmThenOpen`/`requestClose`/`confirmOverlay`） |
+| `scripts/env.ps1` | 构建前清理 workaround：删除 `target\*\build\imageedit-ui-*\out\qmlcachegen` 与 `plugin.qmltypes`（见 §5 第 17 条，360 实时防护拦截 qmlcachegen 的 QSaveFile 覆盖写） |
+
+### 2.5 交互重构：对齐 Preview + 图层面板重构（2026-10-17 第三轮迭代）
+
+按 `docs/交互改进方案-选区裁剪粘贴.md` 实施（决策点均取推荐项 A）。核心范式从「模式开关」改为「**常驻选区 + 即时对象操作**」：
+
+| 文件 | 变更 |
+| --- | --- |
+| `crates/core/src/lib.rs` | 新增 `EditOp::ScaleLayer`（Lanczos3 缩放图层 + 快照回滚）+ `Document::scale_layer()` + `next_layer_name()`（新图层按产生顺序命名 1/2/3…，不入快照）；确认 `move_layer(from,to)` 为单步撤销 op；core 共 **30 项测试** |
+| `crates/ui/src/bridge.rs` | `scale_selected_layer(w,h,keep_ratio)`、`reorder_layer(from,to)`、`set_layer_visible_at(i,v)` invokable；`layers_json` 追加主图层条目（`"base":true`，置底锁定）；粘贴自动按序号命名 |
+| `crates/ui/qml/main.qml` | 废弃 crop/selection/move 三互斥模式 → **常驻选区**（拖框即建、拖内部移动、点外清除）+ `pasteFloating` 粘贴落位态（Enter/点外落定，Esc 整体回滚）；`DashedRect` 虚线框组件 + `EdgeHandles` 蓝点手柄（10px 圆点 hover 12px + 方向光标）；选中图层虚线框 + 拖手柄缩放（角点等比、Shift 自由、松手提交）；`Ctrl+A` 全画布选区、`Ctrl+K` 裁剪、`Ctrl+L/0/9`、`Ctrl+Shift+Z`、`Ctrl+W/Q`、Backspace 对齐 Preview；图层面板：主图层「背景」行置底锁定、拖拽行排序（插入指示线）、行首眼睛图标开关显隐、移除底部上移/下移/显隐/删除按钮、`Delete` 键删除选中图层 |
+
+验证：`cargo test --workspace` 全过（30+8+7）；selftest 链路 extract→paste→scale-selected→undo/redo 与 copy→paste×2→cut→undo/redo 全部正确（exit=0）。多窗口 UI 与拖拽交互的目视验证仍需人工完成。
+
 ## 3. 交互清单
 
 | 操作 | 快捷键 |
@@ -76,10 +97,15 @@
 | 裁剪模式 | 工具栏「裁剪」进入；拖框选择后松手应用；`Esc` 取消（裁剪模式下 `Esc` 不退出全屏） |
 | 重置裁剪 | 工具栏「重置裁剪」，非破坏还原到底图全尺寸 |
 | 调整尺寸 | 工具栏「调整尺寸…」→ 对话框输入宽/高（可选保持比例）→ 确定 / 回车 |
-| 框选 | 工具栏「框选」→ 拖框松手产生选区（高亮）；点「提取图层」生成图层；`Esc` 取消选区 |
+| 框选 | 工具栏「框选」→ 拖框松手产生选区（高亮 + 8 向手柄精修）；点「提取图层」生成图层；`Esc` 取消选区 |
 | 提取图层 | 工具栏「提取图层」（有选区时可用），选区像素提为非破坏图层并选中 |
-| 移动图层 | 工具栏「移动图层」（有选中图层时可用）→ 拖动画面移动；**方向键 ±1px、Shift+方向键 ±10px** 微调；`Esc` 退出 |
-| 图层面板 | 工具栏「图层」开合：行点击选中该行图层；底部 上移/下移/显隐/删除 作用于选中图层；显示序自顶向下（首行=顶层） |
+| 复制 / 剪切 / 粘贴 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V`：有选区时作用于选区像素，否则作用于选中图层；进程级剪贴板，**可跨窗口粘贴**；重复粘贴每次 +12px 扇出避免重叠 |
+| 删除选区像素 | `Delete`：底图选区内像素置透明（非破坏，撤销可还原），图层不受影响 |
+| 移动图层 | 工具栏「移动图层」（有选中图层时可用）→ 拖动画面移动（**70ms 节流实时预览，松手一次入撤销栈**）；**方向键 ±1px、Shift+方向键 ±10px** 微调；`Esc` 退出 |
+| 图层面板 | 工具栏「图层」开合：行点击选中该行图层；**行内不透明度滑条**（拖动实时生效，松手入撤销栈）；**双击行内名称重命名**（回车提交）；底部 上移/下移/显隐/删除 作用于选中图层；显示序自顶向下（首行=顶层） |
+| 裁剪手柄 | 裁剪拖框松手后进入精修态：8 向手柄缩放、框内拖移、吸附图像像素边界；浮层「应用裁剪 (Enter) / 取消 (Esc)」 |
+| 新窗口 | `Ctrl+N` 或工具栏「新窗口」：同进程开新文档窗口（独立 Bridge，CLI 参数仅归主窗口） |
+| 未保存确认 | 编辑后打开新文件或关闭窗口时弹出浮层：放弃并打开/关闭、保存并关闭、取消 |
 
 状态栏显示：画布尺寸、缩放百分比、（预览降采样时）预览尺寸；工具栏按钮按可用性自动置灰（`can_undo`/`can_redo`/`fit_mode`）。
 
@@ -146,13 +172,17 @@
 14. **match 臂是表达式体**：`match guard.as_mut() { Some(s) => { ... } None => ... }` 的臂里不能用裸 `return` 或 `?`（会报类型错/E0308）。需要在臂内用 `if/else` 表达式或嵌套 `match` 把值算出来，`return`/`?` 放到外层函数体。
 15. **QML 图层数据必须走 qproperty 而非 invokable**：`Repeater` 的 delegate 若用 `bridge.layer_visible(i)`（invokable，非响应式）取值不会随状态刷新。改为暴露 `layers_json`（qproperty，JSON 数组），QML `readsonly property var layerList: JSON.parse(bridge.layers_json)` + `Repeater{model: layerList}`——qproperty 变化即重算 model、重建 delegate，天然响应。
 16. **跑 imageedit.exe 必须先 `. .\scripts\env.ps1`**（把 Qt `bin` 加进 PATH）。忘记加载时进程无输出直接崩 `0xC0000135`（0xC0000005/135 视缺 DLL 组合），极易误判为代码 bug；构建（`cargo build`）同样依赖此 PATH。
+17. **360 实时防护拦截 qmlcachegen 的 QSaveFile 覆盖写**：qmlcachegen 生成 loader/QML 缓存时用 QSaveFile 原子替换输出；**输出文件已存在时必被拒（「拒绝访问」）**，新建总是成功。症状是 `cargo build` 报 `Error generating loader stub / compiling qml file: <乱码>` 且 `cargo clean` 后第一次构建总能成功。乱码是 GBK 控制台显示 UTF-8/GBK 混合字节所致，用 Python/shim 捕获原始字节才能看到真实错误。workaround：`env.ps1` 构建前删除 `target\*\build\imageedit-ui-*\out\qmlcachegen`（强制走 create-new 路径）；**根治方案是把项目目录加入 360 信任区**。
+18. **QML 内联组件（inline component）禁止循环引用**：`EditorContent` 里定义 `Component { DocWindow {} }` 工厂、而 `DocWindow` 又内含 `EditorContent` 时，加载报 `Inline components form a cycle!`。解法：把工厂和 `openNewWindow()` 上移到 shell 根对象，`EditorContent` 改发 `signal requestNewWindow()`，`DocWindow` 用 `property var newWindowFn` 由工厂注入回调——类型引用变成单向 `shell → DocWindow → EditorContent`。
+19. **内联组件内部的 id 对外不可见**：`EditorContent { Bridge { id: bridge } }` 的 `bridge` 在组件外不可访问，`content.bridge.xxx` 是 undefined（且静默失败只报 TypeError）。解法：`readonly property alias b: bridge` 暴露成属性；组件内声明的 `function` 则可以从外部直接调用（`content.afterFrame()` 合法）。另外 Repeater + JS 数组 model 的 delegate 里，`model` 可能解析到 Repeater 的 model 属性（数组）而非行对象，`model.n` 为 undefined → 「Unable to assign [undefined] to QString」；用 `typeof modelData !== "undefined"` 优先取 `modelData` 并对字段做防御性判空。
+20. **Qt 6.8 中 `Qt.quit()` 会给可见窗口派发 close 事件**：dirty 守卫在 `onClosing` 里 `close.accepted = false` 会**阻断程序化退出**，Qt 稍后重试（间隔不定，实测 1.5s–13.5s+），自测可能撞上 20s 看门狗（exit 3）。解法：调用 `Qt.quit()` 前置 `quitting = true`，`requestClose` 见到该标志直接放行。
 
 ## 6. 已知限制
 
 1. **预览通道仍是「Rust 编码 PNG → 临时文件 → Qt 读回」**（阶段 0 技术债 #1）。预览长边上限 4096px，因此 50MP 图在缩放 >50% 时看到的是降采样结果，不是全分辨率像素。
 2. **大图解码无降采样优先**：50MP JPEG 全量解码约 600ms，占 large 冷启动的一半以上。
-3. **多窗口未实现**：同进程只能打开一个文档；打开新文件会替换当前文档（未加「未保存改动」确认）。
-4. **选区图层 UI**：框选提取、图层面板（选择/显隐/上下移/删除）、移动/方向键微调已实现；**剩**：跨图复制粘贴、非破坏性「删除选区像素」（core 侧无此 op）、移动图层拖拽的实时预览（当前松手一次性提交）、图层不透明度/重命名。
+3. **多窗口已实现，但次级窗口无法加载 CLI 输入**：CLI 参数（`--script=` 等）只归主窗口；次级窗口通过 `Ctrl+N` 新开后用 `Ctrl+O`/拖放装图。多窗口的 UI 交互（新建/拖放/确认浮层）依赖人工点击验证，脚本自测只覆盖主窗口链路。
+4. **选区图层 UI**：框选提取、图层面板（选择/显隐/上下移/删除/不透明度/重命名）、移动/方向键微调、跨图复制粘贴、非破坏「删除选区像素」、拖拽实时预览均已实现；剩：图层面板拖拽排序、图层缩略图。
 5. **编辑器未提供「另存会覆盖原文件」的路径**：`save_as` 由用户在选择框里决定，覆盖原文件时无二次确认。
 6. **`Image` 同步加载**：变换操作是「同步重渲染 + 同步重载预览」，大图连点旋转会有可见卡顿（主线程阻塞）。
 7. **可视化验证缺失**：目前全部依赖像素采样与打点，未做截图目视确认（阶段 0 技术债 #7 仍未关闭）。
@@ -162,7 +192,7 @@
 
 1. **预览通道直传**：`QQuickImageProvider` 或 `QQmlImageProviderBase` 交付纹理，去掉临时 PNG 与二次解码（预期大图缩放交互明显变顺、冷启动再降几十毫秒）。
 2. **大图降采样优先解码**：接入 libjpeg-turbo scaled decode（`jpeg_decompress` 的 scale_num/scale_denom）与渐进显示——这是 large 突破 ≤1000ms 目标的唯一路径。
-3. **裁剪手柄精修**：当前拖框裁剪已可用；可加选区缩放手柄、9 点锚点、像素吸附与「取消已选」浮层（复用 §2.2 的 `crop_to`）。
-4. **选区图层增强**：框选/提取/图层面板/移动/方向键微调已交付（§2.3）；剩 **跨图复制粘贴**（`crates/core` 的跨文档剪贴板模型已就绪，缺 UI 与快捷键 `Ctrl+C/X/V`）、非破坏「删除选区像素」、图层不透明度/重命名、移动图层拖拽实时预览。
+3. ~~裁剪手柄精修~~ ✅ 已交付（§2.4：8 向手柄、9 点锚点、像素吸附、应用/取消浮层）。
+4. ~~选区图层增强~~ ✅ 已交付（§2.4：跨图复制粘贴 `Ctrl+C/X/V`、非破坏「删除选区像素」`Delete`、图层不透明度/重命名、拖拽实时预览）。
 5. **主线程解耦**：解码/渲染搬进工作线程（`queued` 信号回主线程），消除大图操作卡顿。
 6. **打包脚本纳入回归**：`scripts/package.ps1` 已含自检，建议连同 `imageedit-bench ui` 门槛检查一起接入 CI。

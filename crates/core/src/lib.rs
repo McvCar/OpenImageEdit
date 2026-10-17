@@ -196,6 +196,10 @@ pub struct Document {
     /// this rect (no pixel copy), so crop is O(1) and reversible.
     pub view: Rect,
     pub layers: Vec<Layer>,
+    /// Auto-naming counter: new layers (extract/paste) are named by their
+    /// creation order ("1", "2", ...). Not part of snapshots on purpose, so
+    /// names keep increasing across undo/redo.
+    next_layer_seq: u32,
     history: History,
 }
 
@@ -331,6 +335,14 @@ pub enum EditOp {
     SetOpacity { index: usize, from: f32, to: f32 },
     TranslateLayer { index: usize, from: (i32, i32), to: (i32, i32) },
     RenameLayer { index: usize, from: String, to: String },
+    /// Non-destructive "delete selection pixels": the base pixels under the
+    /// selection are made fully transparent while layers stay untouched. The
+    /// pre-op snapshot makes undo exact (same pattern as `ResizeDocument`).
+    EraseBasePixels { from: DocumentSnapshot, selection: Selection },
+    /// Scale a layer's image to `to` (Lanczos3). The offset (top-left corner)
+    /// is kept, so only the content size changes. The pre-op snapshot makes
+    /// undo exact (same pattern as `ResizeDocument`).
+    ScaleLayer { index: usize, from: DocumentSnapshot, to: Size },
 }
 
 impl EditOp {
@@ -400,6 +412,26 @@ impl EditOp {
                     .get_mut(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
                 layer.name = to.clone();
+                Ok(())
+            }
+            EditOp::EraseBasePixels { selection, .. } => {
+                erase_base_pixels(doc, selection);
+                Ok(())
+            }
+            EditOp::ScaleLayer { index, to, .. } => {
+                let layer = doc
+                    .layers
+                    .get_mut(*index)
+                    .ok_or(EditError::LayerIndex(*index))?;
+                if to.width < 1 || to.height < 1 {
+                    return Err(EditError::InvalidCanvasSize);
+                }
+                layer.image = image::imageops::resize(
+                    &layer.image,
+                    to.width,
+                    to.height,
+                    image::imageops::FilterType::Lanczos3,
+                );
                 Ok(())
             }
         }
@@ -473,6 +505,14 @@ impl EditOp {
                 layer.name = from.clone();
                 Ok(())
             }
+            EditOp::EraseBasePixels { from, .. } => {
+                doc.restore(from.clone());
+                Ok(())
+            }
+            EditOp::ScaleLayer { from, .. } => {
+                doc.restore(from.clone());
+                Ok(())
+            }
         }
     }
 }
@@ -505,6 +545,33 @@ impl History {
 fn apply_view(doc: &mut Document, view: Rect) {
     doc.view = view;
     doc.canvas = Size::new(view.width, view.height);
+}
+
+/// Make every base pixel under `selection` fully transparent. Selection
+/// coordinates are canvas coordinates and map into `base` through `view`.
+fn erase_base_pixels(doc: &mut Document, selection: &Selection) {
+    let canvas_rect = Rect::new(0, 0, doc.canvas.width, doc.canvas.height);
+    let Some(clipped) = selection.bounds().intersect(canvas_rect) else {
+        return;
+    };
+    for y in 0..clipped.height {
+        for x in 0..clipped.width {
+            let cx = clipped.x + x as i32;
+            let cy = clipped.y + y as i32;
+            if !selection.contains(cx as f32 + 0.5, cy as f32 + 0.5) {
+                continue;
+            }
+            let bx = doc.view.x + cx;
+            let by = doc.view.y + cy;
+            if bx < 0 || by < 0 {
+                continue;
+            }
+            let (bx, by) = (bx as u32, by as u32);
+            if bx < doc.base.width() && by < doc.base.height() {
+                *doc.base.get_pixel_mut(bx, by) = image::Rgba([0, 0, 0, 0]);
+            }
+        }
+    }
 }
 
 fn apply_resize(doc: &mut Document, to: Size) {
@@ -546,6 +613,7 @@ impl Document {
             base: image,
             view: Rect::new(0, 0, canvas.width, canvas.height),
             layers: Vec::new(),
+            next_layer_seq: 0,
             history: History::new(256),
         }
     }
@@ -676,6 +744,20 @@ impl Document {
         })
     }
 
+    /// Scale a layer's image to exactly `to` (Lanczos3). The layer offset
+    /// (top-left corner) is unchanged; only the content is resampled. Undo
+    /// restores the full previous state via snapshot.
+    pub fn scale_layer(&mut self, index: usize, to: Size) -> Result<(), EditError> {
+        if to.width < 1 || to.height < 1 {
+            return Err(EditError::InvalidCanvasSize);
+        }
+        if index >= self.layers.len() {
+            return Err(EditError::LayerIndex(index));
+        }
+        let from = self.snapshot();
+        self.execute(EditOp::ScaleLayer { index, from, to })
+    }
+
     pub fn undo(&mut self) -> Result<(), EditError> {
         let op = self.history.undo.pop().ok_or(EditError::NothingToUndo)?;
         op.revert(self)?;
@@ -719,11 +801,37 @@ impl Document {
         Ok(layer)
     }
 
+    /// Next auto name for a created layer ("1", "2", ...), by creation order.
+    pub fn next_layer_name(&mut self) -> String {
+        self.next_layer_seq += 1;
+        self.next_layer_seq.to_string()
+    }
+
     pub fn extract_selection(&mut self, selection: &Selection) -> Result<usize, EditError> {
-        let layer = self.selection_layer(selection)?;
+        let mut layer = self.selection_layer(selection)?;
+        layer.name = self.next_layer_name();
         let index = self.layers.len();
         self.execute(EditOp::AddLayer { layer, index })?;
         Ok(index)
+    }
+
+    /// Non-destructive "delete selection pixels": base pixels under the
+    /// selection become transparent; layers are untouched; undo restores the
+    /// exact previous state via snapshot.
+    pub fn erase_selection(&mut self, selection: &Selection) -> Result<(), EditError> {
+        let canvas_rect = Rect::new(0, 0, self.canvas.width, self.canvas.height);
+        let clipped = selection
+            .bounds()
+            .intersect(canvas_rect)
+            .ok_or(EditError::EmptySelection)?;
+        if clipped.is_empty() {
+            return Err(EditError::EmptySelection);
+        }
+        let from = self.snapshot();
+        self.execute(EditOp::EraseBasePixels {
+            from,
+            selection: selection.clone(),
+        })
     }
 
     pub fn composite_pixel(&self, x: i32, y: i32) -> image::Rgba<u8> {
@@ -869,6 +977,129 @@ mod tests {
         assert_eq!(dst.layers[pasted].offset, (4, 6));
         assert_eq!(dst.layers[pasted].image.width(), 8);
         assert_eq!(dst.composite_pixel(4, 6).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn erase_selection_makes_base_pixels_transparent_and_keeps_layers() {
+        let mut doc = Document::from_image(checker(32, 16));
+        let index = doc
+            .extract_selection(&Selection::Rect(Rect::new(20, 2, 8, 8)))
+            .unwrap();
+
+        doc.erase_selection(&Selection::Rect(Rect::new(4, 4, 8, 8)))
+            .unwrap();
+        // Erased base area is transparent (no layer above it there).
+        assert_eq!(doc.composite_pixel(4, 4).0, [0, 0, 0, 0]);
+        assert_eq!(doc.composite_pixel(11, 11).0, [0, 0, 0, 0]);
+        // Outside the selection the base is untouched.
+        assert_eq!(doc.composite_pixel(0, 0).0[3], 255);
+        // The layer extracted before erasing is untouched.
+        assert_eq!(doc.layers[index].image.get_pixel(0, 0).0[3], 255);
+        assert_eq!(doc.composite_pixel(20, 2).0[3], 255);
+    }
+
+    #[test]
+    fn erase_selection_clips_to_canvas_and_roundtrips_undo_redo() {
+        let mut doc = Document::from_image(checker(16, 16));
+        let original = doc.flatten();
+
+        // Selection partially outside the canvas: only the inside part erases.
+        doc.erase_selection(&Selection::Rect(Rect::new(12, 12, 20, 20)))
+            .unwrap();
+        assert_eq!(doc.composite_pixel(12, 12).0, [0, 0, 0, 0]);
+        assert_eq!(doc.composite_pixel(15, 15).0, [0, 0, 0, 0]);
+        assert_eq!(doc.composite_pixel(11, 11).0[3], 255);
+
+        doc.undo().unwrap();
+        assert_eq!(doc.flatten(), original);
+        doc.redo().unwrap();
+        assert_eq!(doc.composite_pixel(12, 12).0, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn erase_selection_rejects_empty_and_outside_selections() {
+        let mut doc = Document::from_image(checker(16, 16));
+        assert_eq!(
+            doc.erase_selection(&Selection::Rect(Rect::new(0, 0, 0, 0))),
+            Err(EditError::EmptySelection)
+        );
+        assert_eq!(
+            doc.erase_selection(&Selection::Rect(Rect::new(40, 40, 4, 4))),
+            Err(EditError::EmptySelection)
+        );
+        assert_eq!(doc.can_undo(), false);
+    }
+
+    #[test]
+    fn erase_selection_composes_with_crop_view_mapping() {
+        // Erase must map canvas coords through `view` after a crop.
+        let mut doc = Document::from_image(ramp(32, 32));
+        doc.crop(Rect::new(8, 8, 16, 16)).unwrap();
+        doc.erase_selection(&Selection::Rect(Rect::new(0, 0, 4, 4)))
+            .unwrap();
+        assert_eq!(doc.composite_pixel(0, 0).0, [0, 0, 0, 0]);
+        // base pixel at (8,8) is what canvas (0,0) maps to.
+        assert_eq!(doc.base.get_pixel(8, 8).0, [0, 0, 0, 0]);
+        assert_eq!(doc.composite_pixel(4, 4).0, [12, 12, 0, 255]);
+    }
+
+    #[test]
+    fn scale_layer_resamples_content_and_keeps_offset() {
+        let mut doc = Document::from_image(checker(32, 32));
+        let index = doc
+            .add_layer(Layer::new("clip", checker(8, 4)))
+            .unwrap();
+        doc.translate_layer(index, 5, 3).unwrap();
+
+        doc.scale_layer(index, Size::new(16, 8)).unwrap();
+        let layer = &doc.layers[index];
+        assert_eq!(layer.image.width(), 16);
+        assert_eq!(layer.image.height(), 8);
+        // Offset (top-left anchor) is untouched by scaling.
+        assert_eq!(layer.offset, (5, 3));
+
+        doc.undo().unwrap();
+        assert_eq!(doc.layers[index].image.width(), 8);
+        assert_eq!(doc.layers[index].image.height(), 4);
+        assert_eq!(doc.layers[index].offset, (5, 3));
+        doc.redo().unwrap();
+        assert_eq!(doc.layers[index].image.width(), 16);
+    }
+
+    #[test]
+    fn scale_layer_rejects_bad_size_and_index() {
+        let mut doc = Document::from_image(checker(16, 16));
+        let index = doc.add_layer(Layer::new("clip", checker(4, 4))).unwrap();
+        let undo_depth = doc.history.undo.len();
+        assert_eq!(
+            doc.scale_layer(index, Size::new(0, 4)),
+            Err(EditError::InvalidCanvasSize)
+        );
+        assert_eq!(
+            doc.scale_layer(9, Size::new(4, 4)),
+            Err(EditError::LayerIndex(9))
+        );
+        // Rejected calls must not touch the history stack.
+        assert_eq!(doc.history.undo.len(), undo_depth);
+        assert_eq!(doc.layers[index].image.width(), 4);
+    }
+
+    #[test]
+    fn move_layer_is_single_reorder_op() {
+        // Drag-reorder in the panel relies on move_layer(from, to) being one
+        // undoable step that lands the layer exactly at `to`.
+        let mut doc = Document::from_image(checker(16, 16));
+        doc.add_layer(Layer::new("a", checker(2, 2))).unwrap();
+        doc.add_layer(Layer::new("b", checker(2, 2))).unwrap();
+        doc.add_layer(Layer::new("c", checker(2, 2))).unwrap();
+
+        doc.move_layer(2, 0).unwrap();
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["c", "a", "b"]);
+
+        doc.undo().unwrap();
+        let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
     }
 
     #[test]

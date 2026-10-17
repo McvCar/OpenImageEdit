@@ -2,13 +2,18 @@ use core::pin::Pin;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use cxx_qt_lib::{QString, QUrl};
 use decode::{decode_path, encode, format_from_path, DecodeOptions, Format};
-use editcore::{Document, Rect, Selection, Size, Transform};
+use editcore::{Document, Layer, Rect, Selection, Size, Transform};
 
 pub static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+/// Session ids make preview temp filenames unique per document, which is
+/// required once multiple windows (documents) live in the same process.
+static SESSION_SEQ: AtomicU32 = AtomicU32::new(0);
 
 pub fn mark_process_start() {
     let _ = PROCESS_START.set(Instant::now());
@@ -59,6 +64,7 @@ pub mod qobject {
         #[qproperty(i32, layer_count)]
         #[qproperty(i32, selected_layer)]
         #[qproperty(QString, layers_json)]
+        #[qproperty(bool, dirty)]
         #[namespace = "imageedit"]
         type Bridge = super::BridgeRust;
 
@@ -140,6 +146,9 @@ pub mod qobject {
         fn toggle_selected_visible(self: Pin<&mut Self>);
 
         #[qinvokable]
+        fn set_layer_visible_at(self: Pin<&mut Self>, index: i32, visible: bool);
+
+        #[qinvokable]
         fn delete_selected_layer(self: Pin<&mut Self>);
 
         #[qinvokable]
@@ -149,7 +158,52 @@ pub mod qobject {
         fn move_selected_down(self: Pin<&mut Self>);
 
         #[qinvokable]
+        fn reorder_layer(self: Pin<&mut Self>, from: i32, to: i32);
+
+        #[qinvokable]
         fn translate_selected(self: Pin<&mut Self>, dx: i32, dy: i32);
+
+        // ---- 剪贴板（跨文档） ----
+
+        #[qinvokable]
+        fn copy_selection_pixels(self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32);
+
+        #[qinvokable]
+        fn cut_selection_pixels(self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32);
+
+        #[qinvokable]
+        fn erase_selection_pixels(self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32);
+
+        #[qinvokable]
+        fn copy_selected_layer(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn cut_selected_layer(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn paste_clipboard(self: Pin<&mut Self>);
+
+        // ---- 图层属性 ----
+
+        #[qinvokable]
+        fn set_selected_opacity(self: Pin<&mut Self>, opacity: f32, commit: bool);
+
+        #[qinvokable]
+        fn rename_selected_layer(self: Pin<&mut Self>, name: &QString);
+
+        #[qinvokable]
+        fn scale_selected_layer(self: Pin<&mut Self>, width: i32, height: i32, keep_ratio: bool);
+
+        // ---- 移动图层拖拽实时预览 ----
+
+        #[qinvokable]
+        fn drag_translate_begin(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn drag_translate_update(self: Pin<&mut Self>, dx: i32, dy: i32);
+
+        #[qinvokable]
+        fn drag_translate_end(self: Pin<&mut Self>, commit: bool);
     }
 }
 
@@ -173,16 +227,30 @@ pub struct BridgeRust {
     layer_count: i32,
     selected_layer: i32,
     layers_json: QString,
+    dirty: bool,
+    /// Process-level clipboard holding a full `Layer`, so pixels survive
+    /// opening a different document (cross-image copy/paste).
+    clipboard: RefCell<Option<Layer>>,
+    paste_counter: RefCell<u32>,
+    /// Opacity of the selected layer before the current live slider drag, so
+    /// the committed history op can record the true pre-drag value.
+    opacity_live: RefCell<Option<f32>>,
+    /// Offset of the selected layer when a drag started; `None` while not
+    /// dragging. `drag_translate_update` mutates the offset without touching
+    /// history, `drag_translate_end` commits a single history op.
+    drag_start_offset: RefCell<Option<(i32, i32)>>,
     session: RefCell<Option<Session>>,
     viewport: RefCell<Size>,
 }
 
 struct Session {
+    id: u32,
     doc: Document,
     source: Option<PathBuf>,
     zoom: f64,
     fit: bool,
     render_count: u32,
+    dirty: bool,
 }
 
 struct Rendered {
@@ -204,6 +272,7 @@ enum Refresh {
         save_url: String,
         layer_count: i32,
         layers_json: String,
+        dirty: bool,
     },
     Err(String),
 }
@@ -261,11 +330,13 @@ impl Session {
         let ms = t0.elapsed().as_millis().min(i32::MAX as u128) as i32;
         Ok((
             Self {
+                id: SESSION_SEQ.fetch_add(1, Ordering::Relaxed),
                 doc,
                 source: Some(path.to_path_buf()),
                 zoom,
                 fit: true,
                 render_count: 0,
+                dirty: false,
             },
             ms,
         ))
@@ -297,10 +368,12 @@ impl Session {
         let image = render::composite_for_preview(&self.doc, target);
         let png = encode(&image, Format::Png, 90).map_err(|e| e.to_string())?;
         self.render_count = self.render_count.wrapping_add(1);
-        // Alternate between two files so the URL keeps changing (forces Qt to
-        // re-read) while the number of temp files stays bounded.
+        // Two rotating filenames per session: the URL keeps changing (forces
+        // Qt to re-read) while temp files stay bounded. The session id keeps
+        // concurrent windows from overwriting each other's preview.
         let path = std::env::temp_dir().join(format!(
-            "imageedit-preview-{}.png",
+            "imageedit-preview-{}-{}.png",
+            self.id,
             self.render_count % 2
         ));
         std::fs::write(&path, png).map_err(|e| e.to_string())?;
@@ -346,11 +419,25 @@ impl Session {
         let mut parts: Vec<String> = Vec::new();
         for (i, layer) in self.doc.layers.iter().enumerate().rev() {
             let name = layer.name.replace('\\', "\\\\").replace('"', "\\\"");
+            let bounds = layer.bounds();
+            // o: opacity in percent (0-100); x/y/w/h: bounds in image pixels
+            // (the QML side uses them for the live layer outline while dragging).
             parts.push(format!(
-                "{{\"i\":{},\"n\":\"{name}\",\"v\":{}}}",
-                i, layer.visible
+                "{{\"i\":{i},\"n\":\"{name}\",\"v\":{},\"o\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+                layer.visible,
+                (layer.opacity * 100.0).round() as i32,
+                bounds.x,
+                bounds.y,
+                bounds.width,
+                bounds.height
             ));
         }
+        // The base image is listed last (display order = top first) as a
+        // locked row: not reorderable, not deletable (see §4.8 of the UX plan).
+        parts.push(format!(
+            "{{\"i\":-1,\"n\":\"背景\",\"v\":true,\"o\":100,\"x\":0,\"y\":0,\"w\":{},\"h\":{},\"base\":true}}",
+            self.doc.canvas.width, self.doc.canvas.height
+        ));
         format!("[{}]", parts.join(","))
     }
 
@@ -368,6 +455,7 @@ impl Session {
                 save_url: file_url(&self.default_save_path().0),
                 layer_count: self.doc.layers.len() as i32,
                 layers_json: self.layers_json(),
+                dirty: self.dirty,
             },
             Err(err) => Refresh::Err(err),
         }
@@ -415,76 +503,146 @@ impl qobject::Bridge {
                 "delete-selected" => self.as_mut().delete_selected_layer(),
                 "layer-up" => self.as_mut().move_selected_up(),
                 "layer-down" => self.as_mut().move_selected_down(),
-                other if other.starts_with("extract:") => {
-                    let nums: Vec<i32> = other
-                        .strip_prefix("extract:")
-                        .unwrap_or("")
-                        .split(',')
-                        .map(str::trim)
-                        .filter_map(|s| s.parse().ok())
-                        .collect();
-                    if nums.len() == 4 {
+                "paste" => self.as_mut().paste_clipboard(),
+                "copy" => self.as_mut().copy_selected_layer(),
+                "cut" => self.as_mut().cut_selected_layer(),
+                other if other.starts_with("opacity:") => {
+                    match other
+                        .strip_prefix("opacity:")
+                        .and_then(|s| s.trim().parse::<f32>().ok())
+                    {
+                        Some(v) => self.as_mut().set_selected_opacity(v, true),
+                        None => println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        ),
+                    }
+                }
+                other if other.starts_with("rename:") => {
+                    let name = other.strip_prefix("rename:").unwrap_or("").trim();
+                    if !name.is_empty() {
                         self.as_mut()
-                            .extract_selection(nums[0], nums[1], nums[2], nums[3])
+                            .rename_selected_layer(&QString::from(name.to_string()))
                     } else {
                         println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}")
                     }
                 }
-                other if other.starts_with("select-layer:") => {
-                    let n: Option<i32> = other
-                        .strip_prefix("select-layer:")
-                        .and_then(|s| s.trim().parse().ok());
-                    if let Some(n) = n {
-                        self.as_mut().select_layer(n)
-                    } else {
-                        println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}")
-                    }
-                }
-                other if other.starts_with("translate-selected:") => {
+                other if other.starts_with("scale-selected:") => {
                     let nums: Vec<i32> = other
-                        .strip_prefix("translate-selected:")
+                        .strip_prefix("scale-selected:")
                         .unwrap_or("")
                         .split(',')
                         .map(str::trim)
                         .filter_map(|s| s.parse().ok())
                         .collect();
                     if nums.len() == 2 {
-                        self.as_mut().translate_selected(nums[0], nums[1])
+                        self.as_mut()
+                            .scale_selected_layer(nums[0], nums[1], false)
                     } else {
                         println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}")
                     }
                 }
-                other => match other.strip_prefix("crop:") {
+                other => match other
+                    .strip_prefix("copy:")
+                    .or_else(|| other.strip_prefix("cut:"))
+                    .or_else(|| other.strip_prefix("erase:"))
+                {
                     Some(spec) => {
                         let nums: Vec<i32> = spec
                             .split(',')
                             .map(str::trim)
                             .filter_map(|s| s.parse().ok())
                             .collect();
-                        if nums.len() == 4 {
-                            self.as_mut().crop_to(nums[0], nums[1], nums[2], nums[3])
+                        if nums.len() != 4 {
+                            println!(
+                                "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                            );
+                        } else if other.starts_with("copy:") {
+                            self.as_mut()
+                                .copy_selection_pixels(nums[0], nums[1], nums[2], nums[3]);
+                        } else if other.starts_with("cut:") {
+                            self.as_mut()
+                                .cut_selection_pixels(nums[0], nums[1], nums[2], nums[3]);
                         } else {
-                            println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}")
+                            self.as_mut()
+                                .erase_selection_pixels(nums[0], nums[1], nums[2], nums[3]);
                         }
                     }
-                    _ => match other.strip_prefix("resize:") {
+                    None => match other.strip_prefix("extract:") {
                         Some(spec) => {
                             let nums: Vec<i32> = spec
                                 .split(',')
                                 .map(str::trim)
                                 .filter_map(|s| s.parse().ok())
                                 .collect();
-                            if nums.len() == 2 {
-                                self.as_mut().resize_to(nums[0], nums[1])
+                            if nums.len() == 4 {
+                                self.as_mut()
+                                    .extract_selection(nums[0], nums[1], nums[2], nums[3])
                             } else {
                                 println!(
                                     "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
                                 )
                             }
                         }
-                        None => println!(
-                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
-                        ),
+                        None => match other.strip_prefix("select-layer:") {
+                            Some(spec) => match spec.trim().parse::<i32>() {
+                                Ok(n) => self.as_mut().select_layer(n),
+                                Err(_) => println!(
+                                    "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                                ),
+                            },
+                            None => match other.strip_prefix("translate-selected:") {
+                                Some(spec) => {
+                                    let nums: Vec<i32> = spec
+                                        .split(',')
+                                        .map(str::trim)
+                                        .filter_map(|s| s.parse().ok())
+                                        .collect();
+                                    if nums.len() == 2 {
+                                        self.as_mut().translate_selected(nums[0], nums[1])
+                                    } else {
+                                        println!(
+                                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                                        )
+                                    }
+                                }
+                                None => match other.strip_prefix("crop:") {
+                                    Some(spec) => {
+                                        let nums: Vec<i32> = spec
+                                            .split(',')
+                                            .map(str::trim)
+                                            .filter_map(|s| s.parse().ok())
+                                            .collect();
+                                        if nums.len() == 4 {
+                                            self.as_mut()
+                                                .crop_to(nums[0], nums[1], nums[2], nums[3])
+                                        } else {
+                                            println!(
+                                                "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                                            )
+                                        }
+                                    }
+                                    _ => match other.strip_prefix("resize:") {
+                                        Some(spec) => {
+                                            let nums: Vec<i32> = spec
+                                                .split(',')
+                                                .map(str::trim)
+                                                .filter_map(|s| s.parse().ok())
+                                                .collect();
+                                            if nums.len() == 2 {
+                                                self.as_mut().resize_to(nums[0], nums[1])
+                                            } else {
+                                                println!(
+                                                    "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                                                )
+                                            }
+                                        }
+                                        None => println!(
+                                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                                        ),
+                                    },
+                                },
+                            },
+                        },
                     },
                 },
             }
@@ -609,6 +767,7 @@ println!(
                 Some(session) => match session.doc.undo() {
                     Ok(()) => {
                         session.refit_if_needed(viewport);
+                        session.dirty = true;
                         Ok(true)
                     }
                     Err(err) => Err(err.to_string()),
@@ -631,6 +790,7 @@ println!(
                 Some(session) => match session.doc.redo() {
                     Ok(()) => {
                         session.refit_if_needed(viewport);
+                        session.dirty = true;
                         Ok(true)
                     }
                     Err(err) => Err(err.to_string()),
@@ -651,6 +811,12 @@ println!(
             .as_ref()
             .map(Session::save)
             .unwrap_or_else(|| Err("nothing to save".to_string()));
+        if result.is_ok() {
+            if let Some(s) = self.session.borrow_mut().as_mut() {
+                s.dirty = false;
+            }
+            self.as_mut().set_dirty(false);
+        }
         self.as_mut().report_save(result);
     }
 
@@ -666,6 +832,12 @@ println!(
                 }
             }
         };
+        if result.is_ok() {
+            if let Some(s) = self.session.borrow_mut().as_mut() {
+                s.dirty = false;
+            }
+            self.as_mut().set_dirty(false);
+        }
         self.as_mut().report_save(result);
     }
 
@@ -704,6 +876,7 @@ println!(
                     let mut guard = self.session.borrow_mut();
                     if let Some(s) = guard.as_mut() {
                         s.refit_if_needed(viewport);
+                        s.dirty = true;
                     }
                 }
                 self.as_mut().refresh_preview();
@@ -752,6 +925,7 @@ session
                     let mut guard = self.session.borrow_mut();
                     if let Some(s) = guard.as_mut() {
                         s.refit_if_needed(viewport);
+                        s.dirty = true;
                     }
                 }
                 self.as_mut().refresh_preview();
@@ -792,6 +966,13 @@ session
         };
         match result {
             Ok(true) => {
+                {
+                    let mut guard = self.session.borrow_mut();
+                    if let Some(s) = guard.as_mut() {
+                        s.refit_if_needed(viewport);
+                        s.dirty = true;
+                    }
+                }
                 self.as_mut().refresh_preview();
                 self.as_mut()
                     .set_status(QString::from("crop reset"));
@@ -847,6 +1028,7 @@ session
                     let mut guard = self.session.borrow_mut();
                     if let Some(s) = guard.as_mut() {
                         s.refit_if_needed(viewport);
+                        s.dirty = true;
                     }
                 }
                 self.as_mut().refresh_preview();
@@ -913,6 +1095,48 @@ session
                     let mut guard = self.session.borrow_mut();
                     if let Some(s) = guard.as_mut() {
                         s.refit_if_needed(viewport);
+                        s.dirty = true;
+                    }
+                }
+                self.as_mut().refresh_preview();
+            }
+            Ok(false) => {}
+            Err(message) => self
+                .as_mut()
+                .set_status(QString::from(message.as_str())),
+        }
+    }
+
+    /// Eye icon in the layers panel: toggle one layer's visibility by index.
+    pub fn set_layer_visible_at(mut self: Pin<&mut Self>, index: i32, visible: bool) {
+        if index < 0 {
+            return;
+        }
+        let viewport = *self.viewport.borrow();
+        let result: Result<bool, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => {
+                    if index as usize >= session.doc.layers.len() {
+                        Err("layer index out of range".into())
+                    } else {
+                        session
+                            .doc
+                            .set_layer_visible(index as usize, visible)
+                            .map(|()| true)
+                            .map_err(|e| e.to_string())
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(true) => {
+                {
+                    let mut guard = self.session.borrow_mut();
+                    if let Some(s) = guard.as_mut() {
+                        s.refit_if_needed(viewport);
+                        s.dirty = true;
                     }
                 }
                 self.as_mut().refresh_preview();
@@ -953,6 +1177,7 @@ session
                     let mut guard = self.session.borrow_mut();
                     if let Some(s) = guard.as_mut() {
                         s.refit_if_needed(viewport);
+                        s.dirty = true;
                     }
                 }
                 self.as_mut().refresh_preview();
@@ -977,11 +1202,13 @@ session
                     if ix + 1 >= session.doc.layers.len() {
                         Ok(false)
                     } else {
-                        session
-                            .doc
-                            .move_layer(ix, ix + 1)
-                            .map(|()| true)
-                            .map_err(|e| e.to_string())
+                        match session.doc.move_layer(ix, ix + 1) {
+                            Ok(()) => {
+                                session.dirty = true;
+                                Ok(true)
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
                     }
                 }
             }
@@ -1005,17 +1232,52 @@ session
                     if ix == 0 {
                         Ok(false)
                     } else {
-                        session
-                            .doc
-                            .move_layer(ix, ix - 1)
-                            .map(|()| true)
-                            .map_err(|e| e.to_string())
+                        match session.doc.move_layer(ix, ix - 1) {
+                            Ok(()) => {
+                                session.dirty = true;
+                                Ok(true)
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
                     }
                 }
             }
         };
         if result.as_ref().ok().copied() == Some(true) {
             self.as_mut().set_selected_layer((ix - 1) as i32);
+        }
+        self.apply_layer_edit(viewport, result);
+    }
+
+    /// Drag-reorder in the layers panel: one undoable step via core
+    /// `move_layer(from, to)`; the selection follows the moved layer.
+    pub fn reorder_layer(mut self: Pin<&mut Self>, from: i32, to: i32) {
+        if from < 0 || to < 0 || from == to {
+            return;
+        }
+        let viewport = *self.viewport.borrow();
+        let result: Result<bool, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => {
+                    let len = session.doc.layers.len() as i32;
+                    if from >= len || to >= len {
+                        Err("layer index out of range".into())
+                    } else {
+                        match session.doc.move_layer(from as usize, to as usize) {
+                            Ok(()) => {
+                                session.dirty = true;
+                                Ok(true)
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                }
+            }
+        };
+        if result.as_ref().ok().copied() == Some(true) {
+            self.as_mut().set_selected_layer(to);
         }
         self.apply_layer_edit(viewport, result);
     }
@@ -1032,11 +1294,439 @@ session
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
                 None => Err("no document".into()),
+                Some(session) => match session.doc.translate_layer(ix, dx, dy) {
+                    Ok(()) => {
+                        session.dirty = true;
+                        Ok(true)
+                    }
+                    Err(e) => Err(e.to_string()),
+                },
+            }
+        };
+        self.apply_layer_edit(viewport, result);
+    }
+
+    // ---- 剪贴板（跨文档复制粘贴） ----
+
+    pub fn copy_selection_pixels(mut self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32) {
+        let Some(rect) = self.clamp_selection(x, y, w, h) else {
+            return;
+        };
+        let result: Result<Layer, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
                 Some(session) => session
                     .doc
-                    .translate_layer(ix, dx, dy)
-                    .map(|()| true)
+                    .selection_layer(&Selection::Rect(rect))
                     .map_err(|e| e.to_string()),
+            }
+        };
+        match result {
+            Ok(layer) => {
+                let text = format!(
+                    "已复制 {}×{}（Ctrl+V 粘贴，可跨文档）",
+                    layer.image.width(),
+                    layer.image.height()
+                );
+                *self.clipboard.borrow_mut() = Some(layer);
+                *self.paste_counter.borrow_mut() = 0;
+                self.as_mut().set_status(QString::from(text.as_str()));
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"copied\",\"rect\":\"{},{},{},{}\"}}",
+                    rect.x, rect.y, rect.width, rect.height
+                );
+            }
+            Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
+        }
+    }
+
+    pub fn cut_selection_pixels(mut self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32) {
+        let Some(rect) = self.clamp_selection(x, y, w, h) else {
+            return;
+        };
+        let viewport = *self.viewport.borrow();
+        let result: Result<Layer, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => {
+                    match session.doc.selection_layer(&Selection::Rect(rect)) {
+                        Err(e) => Err(e.to_string()),
+                        Ok(layer) => {
+                            match session.doc.erase_selection(&Selection::Rect(rect)) {
+                                Err(e) => Err(e.to_string()),
+                                Ok(()) => {
+                                    session.refit_if_needed(viewport);
+                                    session.dirty = true;
+                                    Ok(layer)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(layer) => {
+                let text = format!(
+                    "已剪切 {}×{}（Ctrl+V 粘贴，可跨文档）",
+                    layer.image.width(),
+                    layer.image.height()
+                );
+                *self.clipboard.borrow_mut() = Some(layer);
+                *self.paste_counter.borrow_mut() = 0;
+                self.as_mut().set_status(QString::from(text.as_str()));
+                self.as_mut().refresh_preview();
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"cut\",\"rect\":\"{},{},{},{}\"}}",
+                    rect.x, rect.y, rect.width, rect.height
+                );
+            }
+            Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
+        }
+    }
+
+    pub fn erase_selection_pixels(mut self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32) {
+        let Some(rect) = self.clamp_selection(x, y, w, h) else {
+            return;
+        };
+        let viewport = *self.viewport.borrow();
+        let result: Result<bool, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Ok(false),
+                Some(session) => {
+                    match session.doc.erase_selection(&Selection::Rect(rect)) {
+                        Ok(()) => {
+                            session.refit_if_needed(viewport);
+                            session.dirty = true;
+                            Ok(true)
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(true) => {
+                self.as_mut().refresh_preview();
+                self.as_mut().set_status(QString::from("已删除选区像素（非破坏，可撤销）"));
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"erased\",\"rect\":\"{},{},{},{}\"}}",
+                    rect.x, rect.y, rect.width, rect.height
+                );
+            }
+            Ok(false) => {}
+            Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
+        }
+    }
+
+    pub fn copy_selected_layer(mut self: Pin<&mut Self>) {
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            self.as_mut().set_status(QString::from("没有选中的图层"));
+            return;
+        };
+        let layer = {
+            let guard = self.session.borrow();
+            match guard.as_ref() {
+                Some(session) => session.doc.layers[ix].clone(),
+                None => return,
+            }
+        };
+        let text = format!("已复制图层「{}」（Ctrl+V 粘贴，可跨文档）", layer.name);
+        *self.clipboard.borrow_mut() = Some(layer);
+        *self.paste_counter.borrow_mut() = 0;
+        self.as_mut().set_status(QString::from(text.as_str()));
+        println!("{{\"phase\":\"ui\",\"event\":\"copied-layer\",\"index\":{ix}}}");
+    }
+
+    pub fn cut_selected_layer(mut self: Pin<&mut Self>) {
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            self.as_mut().set_status(QString::from("没有选中的图层"));
+            return;
+        };
+        let layer = {
+            let guard = self.session.borrow();
+            match guard.as_ref() {
+                Some(session) => session.doc.layers[ix].clone(),
+                None => return,
+            }
+        };
+        *self.clipboard.borrow_mut() = Some(layer);
+        *self.paste_counter.borrow_mut() = 0;
+        println!("{{\"phase\":\"ui\",\"event\":\"cut-layer\",\"index\":{ix}}}");
+        self.as_mut().delete_selected_layer();
+    }
+
+    pub fn paste_clipboard(mut self: Pin<&mut Self>) {
+        let clipboard = self.clipboard.borrow().clone();
+        let Some(clip) = clipboard else {
+            self.as_mut().set_status(QString::from("剪贴板为空"));
+            return;
+        };
+        let viewport = *self.viewport.borrow();
+        const PASTE_SHIFT: i32 = 12;
+        let result: Result<usize, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => {
+                    let canvas = session.doc.canvas;
+                    let count = *self.paste_counter.borrow() as i32;
+                    let mut layer = clip.clone();
+                    // Auto-name by creation order ("1", "2", ...).
+                    layer.name = session.doc.next_layer_name();
+                    // Keep the pasted layer at its copied position, clamped so
+                    // part of it stays on the canvas; repeated pastes fan out.
+                    layer.offset.0 = (clip.offset.0 + PASTE_SHIFT * count).clamp(
+                        -(layer.image.width() as i32 - 1),
+                        canvas.width as i32 - 1,
+                    );
+                    layer.offset.1 = (clip.offset.1 + PASTE_SHIFT * count).clamp(
+                        -(layer.image.height() as i32 - 1),
+                        canvas.height as i32 - 1,
+                    );
+                    match session.doc.add_layer(layer) {
+                        Ok(index) => {
+                            session.dirty = true;
+                            *self.paste_counter.borrow_mut() = count as u32 + 1;
+                            Ok(index)
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(index) => {
+                self.as_mut().set_selected_layer(index as i32);
+                {
+                    let mut guard = self.session.borrow_mut();
+                    if let Some(s) = guard.as_mut() {
+                        s.refit_if_needed(viewport);
+                    }
+                }
+                self.as_mut().refresh_preview();
+                println!("{{\"phase\":\"ui\",\"event\":\"pasted\",\"index\":{index}}}");
+            }
+            Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
+        }
+    }
+
+    // ---- 图层属性 ----
+
+    pub fn set_selected_opacity(self: Pin<&mut Self>, opacity: f32, commit: bool) {
+        let viewport = *self.viewport.borrow();
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            return;
+        };
+        let op = opacity.clamp(0.0, 1.0);
+        let result: Result<bool, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => {
+                    if commit {
+                        // Rewind any live (history-free) change first so the
+                        // history op records the true pre-drag opacity.
+                        let start = self.opacity_live.borrow_mut().take();
+                        if let Some(start) = start {
+                            if let Some(layer) = session.doc.layers.get_mut(ix) {
+                                layer.opacity = start;
+                            }
+                        }
+                        match session.doc.set_layer_opacity(ix, op) {
+                            Ok(()) => {
+                                session.dirty = true;
+                                Ok(true)
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    } else {
+                        if self.opacity_live.borrow().is_none() {
+                            let cur = session.doc.layers.get(ix).map(|l| l.opacity);
+                            *self.opacity_live.borrow_mut() = cur;
+                        }
+                        if let Some(layer) = session.doc.layers.get_mut(ix) {
+                            layer.opacity = op;
+                        }
+                        Ok(true)
+                    }
+                }
+            }
+        };
+        self.apply_layer_edit(viewport, result);
+    }
+
+    pub fn rename_selected_layer(self: Pin<&mut Self>, name: &QString) {
+        let new_name = name.to_string();
+        if new_name.trim().is_empty() {
+            return;
+        }
+        let viewport = *self.viewport.borrow();
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            return;
+        };
+        let result: Result<bool, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => match session.doc.rename_layer(ix, new_name.as_str()) {
+                    Ok(()) => {
+                        session.dirty = true;
+                        Ok(true)
+                    }
+                    Err(e) => Err(e.to_string()),
+                },
+            }
+        };
+        self.apply_layer_edit(viewport, result);
+    }
+
+    /// Scale the selected layer to `width × height` (Lanczos3 via core
+    /// `scale_layer`). keep_ratio: if either dimension is <= 0, derive it from
+    /// the other using the layer's current aspect.
+    pub fn scale_selected_layer(
+        mut self: Pin<&mut Self>,
+        width: i32,
+        height: i32,
+        keep_ratio: bool,
+    ) {
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            return;
+        };
+        let result: Result<bool, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => {
+                    let layer = &session.doc.layers[ix];
+                    let (ow, oh) = (layer.image.width() as i32, layer.image.height() as i32);
+                    let (mut tw, mut th) = (width, height);
+                    if keep_ratio && (tw <= 0 || th <= 0) {
+                        // Derive the missing side from the current aspect.
+                        if tw <= 0 && th > 0 {
+                            tw = ((th as f64) * (ow as f64 / oh as f64)).round() as i32;
+                        } else if th <= 0 && tw > 0 {
+                            th = ((tw as f64) * (oh as f64 / ow as f64)).round() as i32;
+                        }
+                    }
+                    if tw < 1 || th < 1 {
+                        Err("缩放尺寸至少为 1×1".into())
+                    } else if tw == ow && th == oh {
+                        Ok(false)
+                    } else {
+                        match session.doc.scale_layer(ix, Size::new(tw as u32, th as u32)) {
+                            Ok(()) => {
+                                session.dirty = true;
+                                Ok(true)
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(true) => {
+                self.as_mut().refresh_preview();
+                self.as_mut().set_dirty(true);
+                println!("{{\"phase\":\"ui\",\"event\":\"layer-scaled\",\"index\":{ix}}}");
+            }
+            Ok(false) => {}
+            Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
+        }
+    }
+
+    // ---- 移动图层拖拽实时预览 ----
+
+    pub fn drag_translate_begin(self: Pin<&mut Self>) {
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            return;
+        };
+        let guard = self.session.borrow();
+        if let Some(session) = guard.as_ref() {
+            if let Some(layer) = session.doc.layers.get(ix) {
+                *self.drag_start_offset.borrow_mut() = Some(layer.offset);
+            }
+        }
+    }
+
+    pub fn drag_translate_update(self: Pin<&mut Self>, dx: i32, dy: i32) {
+        let Some(start) = *self.drag_start_offset.borrow() else {
+            return;
+        };
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            return;
+        };
+        {
+            let guard = self.session.borrow();
+            match guard.as_ref() {
+                Some(session) => {
+                    // Skip render when the offset did not actually change.
+                    if session.doc.layers.get(ix).map(|l| l.offset)
+                        == Some((start.0 + dx, start.1 + dy))
+                    {
+                        return;
+                    }
+                }
+                None => return,
+            }
+        }
+        {
+            let mut guard = self.session.borrow_mut();
+            if let Some(session) = guard.as_mut() {
+                if let Some(layer) = session.doc.layers.get_mut(ix) {
+                    // Live preview only: no history entry until commit.
+                    layer.offset = (start.0 + dx, start.1 + dy);
+                }
+            }
+        }
+        self.refresh_preview();
+    }
+
+    pub fn drag_translate_end(self: Pin<&mut Self>, commit: bool) {
+        let viewport = *self.viewport.borrow();
+        let Some(start) = self.drag_start_offset.borrow_mut().take() else {
+            return;
+        };
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            return;
+        };
+        let result: Result<bool, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => {
+                    let cur = session
+                        .doc
+                        .layers
+                        .get(ix)
+                        .map(|l| l.offset)
+                        .unwrap_or(start);
+                    if !commit || cur == start {
+                        // Roll back the live (history-free) offset.
+                        if let Some(layer) = session.doc.layers.get_mut(ix) {
+                            layer.offset = start;
+                        }
+                        Ok(true)
+                    } else {
+                        // Reset to the drag start, then translate once so the
+                        // history op records from=start to=cur.
+                        session.doc.layers[ix].offset = start;
+                        match session
+                            .doc
+                            .translate_layer(ix, cur.0 - start.0, cur.1 - start.1)
+                        {
+                            Ok(()) => {
+                                session.dirty = true;
+                                Ok(true)
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                }
             }
         };
         self.apply_layer_edit(viewport, result);
@@ -1113,6 +1803,7 @@ session
                             session.doc.canvas.width, session.doc.canvas.height
                         );
                         session.refit_if_needed(viewport);
+                        session.dirty = true;
                         Ok(true)
                     }
                     Err(err) => Err(err.to_string()),
@@ -1147,6 +1838,7 @@ session
                 save_url,
                 layer_count,
                 layers_json,
+                dirty,
             } => {
                 let status = if preview == display {
                     format!("{}x{}", canvas.width, canvas.height)
@@ -1169,6 +1861,7 @@ session
                 self.as_mut().set_can_undo(can_undo);
                 self.as_mut().set_can_redo(can_redo);
                 self.as_mut().set_layer_count(layer_count);
+                self.as_mut().set_dirty(dirty);
                 self.as_mut()
                     .set_layers_json(QString::from(layers_json.as_str()));
                 if *self.selected_layer() < 0 || *self.selected_layer() >= layer_count {

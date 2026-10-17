@@ -4,28 +4,7 @@ import QtQuick.Dialogs
 import com.imageedit
 
 Window {
-    id: root
-
-    property bool firstFrameSeen: false
-    property bool imageRendered: false
-    property bool imageFrameSeen: false
-    readonly property int toolbarHeight: 40
-    readonly property int statusHeight: 26
-
-    property bool fullscreen: false
-    property bool cropMode: false
-    property bool selectionMode: false
-    property bool moveMode: false
-    property bool panelVisible: false
-    readonly property bool modeActive: cropMode || selectionMode || moveMode
-    property real selX: 0
-    property real selY: 0
-    property real selW: 0
-    property real selH: 0
-    readonly property bool selExists: selW >= 3 && selH >= 3
-    readonly property var layerList: parseLayers(bridge.layers_json)
-    readonly property var selLayer: findSelLayer()
-    readonly property bool probeDialog: Qt.application.arguments.indexOf("--probe-dialog") !== -1
+    id: shell
 
     width: 1100
     height: 760
@@ -33,18 +12,33 @@ Window {
     minimumHeight: 320
     visible: Qt.application.arguments.indexOf("--hidden") === -1
     color: "#1b1c1e"
-    visibility: root.fullscreen ? Window.FullScreen : Window.Windowed
-    title: bridge.image_width > 0
-           ? "ImageEdit — " + bridge.image_width + "×" + bridge.image_height
+    visibility: content.fullscreen ? Window.FullScreen : Window.Windowed
+    title: content.b.image_width > 0
+           ? "ImageEdit — " + content.b.image_width + "×" + content.b.image_height
            : "ImageEdit"
 
-    Bridge {
-        id: bridge
+    onAfterRendering: content.afterFrame()
+    onVisibleChanged: content.b.mark("window-visible")
+    onClosing: (close) => content.requestClose(close)
 
-        onLoadFailedChanged: if (bridge.loadFailed && bridge.auto_quit)
-            Qt.quit()
-        onImage_widthChanged: if (!cropMouse.dragging)
-            root.cropMode = false
+    EditorContent {
+        id: content
+        anchors.fill: parent
+        primary: true
+        onRequestNewWindow: openNewWindow()
+    }
+
+    property int windowCascade: 0
+
+    function openNewWindow() {
+        const offset = shell.windowCascade * 32
+        shell.windowCascade = (shell.windowCascade + 1) % 8
+        docWindowFactory.createObject(null, { x: 80 + offset, y: 60 + offset, newWindowFn: openNewWindow })
+    }
+
+    Component {
+        id: docWindowFactory
+        DocWindow {}
     }
 
     component ToolButton: Rectangle {
@@ -80,6 +74,226 @@ Window {
         }
     }
 
+    // Dashed rectangle outline (selection / layer boxes). rx/ry/rw/rh are in
+    // this item's coordinates; parent is sized to the preview area.
+    component DashedRect: Canvas {
+        id: dashed
+        property real rx: 0
+        property real ry: 0
+        property real rw: 0
+        property real rh: 0
+        property color dashColor: "#5b9dff"
+        onRxChanged: requestPaint()
+        onRyChanged: requestPaint()
+        onRwChanged: requestPaint()
+        onRhChanged: requestPaint()
+        onDashColorChanged: requestPaint()
+        onPaint: {
+            var ctx = getContext("2d")
+            ctx.clearRect(0, 0, width, height)
+            if (rw < 1 || rh < 1)
+                return
+            ctx.strokeStyle = String(dashColor)
+            ctx.lineWidth = 1.5
+            ctx.setLineDash([5, 4])
+            ctx.strokeRect(rx + 0.75, ry + 0.75, rw - 1.5, rh - 1.5)
+        }
+    }
+
+    // 8 resize handles (4 corners + 4 edge midpoints) for the crop / selection
+    // boxes. Geometry callbacks live in the enclosing scope and are injected
+    // at the instantiation site; all coordinates snap to image pixels.
+    component EdgeHandles: Item {
+        id: handles
+
+        property real bx: 0
+        property real by: 0
+        property real bw: 0
+        property real bh: 0
+        property real pxScale: 1
+        property var resizeFn: null
+        property var moveFn: null
+        property bool moveEnabled: true
+        // True while any handle (or the center pad) is being dragged.
+        property bool engaged: false
+
+        Repeater {
+            model: ["nw", "n", "ne", "e", "se", "s", "sw", "w"]
+
+            delegate: Rectangle {
+                readonly property string role: modelData
+                readonly property bool corner: role.length === 2
+                // Blue-dot handle (selected state marker), white-ringed; the
+                // hit area extends past the visible dot for easy grabbing.
+                width: hma.containsMouse || hma.pressed ? 12 : 10
+                height: width
+                radius: width / 2
+                color: hma.pressed ? "#7fc3ff" : "#5b9dff"
+                border.color: "#ffffff"
+                border.width: 1.5
+                z: 2
+
+                x: handles.bx
+                   + (role.indexOf("e") >= 0 ? handles.bw
+                      : (role === "n" || role === "s" ? handles.bw / 2 : 0))
+                   - width / 2
+                y: handles.by
+                   + (role.indexOf("s") >= 0 ? handles.bh
+                      : (role === "w" || role === "e" ? handles.bh / 2 : 0))
+                   - height / 2
+
+                MouseArea {
+                    id: hma
+                    anchors.fill: parent
+                    anchors.margins: -4
+                    hoverEnabled: true
+                    cursorShape: role === "n" || role === "s" ? Qt.SizeVerCursor
+                               : role === "e" || role === "w" ? Qt.SizeHorCursor
+                               : (role === "nw" || role === "se") ? Qt.SizeFDiagCursor
+                               : Qt.SizeBDiagCursor
+                    property rect startRect
+                    property real px: 0
+                    property real py: 0
+
+                    onPressed: (mouse) => {
+                        px = mouse.x
+                        py = mouse.y
+                        startRect = Qt.rect(handles.bx, handles.by, handles.bw, handles.bh)
+                        handles.engaged = true
+                    }
+                    onPositionChanged: (mouse) => {
+                        if (pressed && handles.resizeFn)
+                            handles.resizeFn(startRect, role, mouse.x - px, mouse.y - py,
+                                             (mouse.modifiers & Qt.ShiftModifier) !== 0)
+                    }
+                    onReleased: handles.engaged = false
+                }
+            }
+        }
+
+        MouseArea {
+            id: centerMa
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.SizeAllCursor
+            enabled: handles.moveEnabled && handles.moveFn !== null
+                     && handles.bw > 0 && handles.bh > 0
+                     && centerMa.mouseX > handles.bx && centerMa.mouseX < handles.bx + handles.bw
+                     && centerMa.mouseY > handles.by && centerMa.mouseY < handles.by + handles.bh
+            property rect startRect
+            property real px: 0
+            property real py: 0
+
+            onPressed: (mouse) => {
+                px = mouse.x
+                py = mouse.y
+                startRect = Qt.rect(handles.bx, handles.by, handles.bw, handles.bh)
+                handles.engaged = true
+            }
+            onPositionChanged: (mouse) => {
+                if (pressed && handles.moveFn)
+                    handles.moveFn(startRect, mouse.x - px, mouse.y - py)
+            }
+            onReleased: handles.engaged = false
+        }
+    }
+
+    // A secondary document window: same editor content, its own Bridge
+    // instance, no CLI handling (that stays with the primary window).
+    // newWindowFn is injected by the shell factory so the inline component
+    // never needs to reference the shell (which would create a cycle).
+    component DocWindow: Window {
+        id: docWin
+
+        property var newWindowFn: null
+
+        width: 1100
+        height: 760
+        minimumWidth: 480
+        minimumHeight: 320
+        color: "#1b1c1e"
+        visible: true
+        visibility: content.fullscreen ? Window.FullScreen : Window.Windowed
+        title: content.b.image_width > 0
+               ? "ImageEdit — " + content.b.image_width + "×" + content.b.image_height
+               : "ImageEdit"
+
+        onAfterRendering: content.afterFrame()
+        onVisibleChanged: content.b.mark("window-visible")
+        onClosing: (close) => content.requestClose(close)
+
+        EditorContent {
+            id: content
+            anchors.fill: parent
+            onRequestNewWindow: if (docWin.newWindowFn) docWin.newWindowFn()
+        }
+    }
+
+    component EditorContent: Item {
+        id: root
+
+        property bool primary: false
+        property bool forceClose: false
+        // Set right before Qt.quit() (selftest flow): in Qt 6.8 quitting
+        // delivers close events to visible windows, and the dirty-guard in
+        // requestClose() must not reject an intentional programmatic quit.
+        property bool quitting: false
+        property var pendingOpenUrl: null
+        property string confirmMode: ""
+        signal requestNewWindow()
+        property bool firstFrameSeen: false
+        property bool imageRendered: false
+        property bool imageFrameSeen: false
+        readonly property int toolbarHeight: 40
+        readonly property int statusHeight: 26
+
+        property bool fullscreen: false
+        // Persistent-selection interaction model (no crop/selection/move mode
+        // toggles): one selection lives on the canvas, crop is applied to it,
+        // a freshly pasted layer enters a "floating" place-it state.
+        property bool panelVisible: false
+        property bool pasteFloating: false
+        // How many undoable ops were committed since the paste that started the
+        // floating state (the paste itself + any drag/scale commits), so Esc
+        // can roll the whole paste back.
+        property int floatingOps: 0
+        property real selX: 0
+        property real selY: 0
+        property real selW: 0
+        property real selH: 0
+        readonly property bool selExists: selW >= 3 && selH >= 3
+        // Transient "rubber band in use" state; hides the handle dots and
+        // disables the wheel zoom while dragging a new selection.
+        readonly property bool selRubberBanding: selDragMouse.dragging
+        readonly property bool modeActive: selRubberBanding || pasteFloating
+        // Scale target for the selected layer (display coords); empty when idle.
+        property real scaleX: 0
+        property real scaleY: 0
+        property real scaleW: 0
+        property real scaleH: 0
+        property int renamingIndex: -1
+        readonly property var layerList: parseLayers(bridge.layers_json)
+        readonly property var selLayer: findSelLayer()
+        readonly property var selLayerBox: findLayerBox()
+        readonly property bool probeDialog: Qt.application.arguments.indexOf("--probe-dialog") !== -1
+        // Ids inside an inline component are invisible from outside, so the
+        // shell / DocWindow wrappers reach the Bridge through this alias.
+        readonly property alias b: bridge
+
+        Bridge {
+            id: bridge
+
+            onLoadFailedChanged: if (bridge.loadFailed && bridge.auto_quit)
+                Qt.quit()
+            onImage_widthChanged: {
+                // New canvas: drop any pending selection / scale preview.
+                root.selW = 0
+                root.selH = 0
+                root.scaleW = 0
+                root.scaleH = 0
+            }
+        }
+
     FileDialog {
         id: openDialog
         title: "打开图片"
@@ -87,7 +301,7 @@ Window {
             "图片文件 (*.jpg *.jpeg *.png *.gif *.bmp *.tif *.tiff *.webp)",
             "所有文件 (*)"
         ]
-        onAccepted: bridge.open_file(selectedFile)
+        onAccepted: confirmThenOpen(selectedFile)
         onVisibleChanged: if (visible) {
             bridge.mark("dialog-opened");
             if (bridge.auto_quit)
@@ -117,9 +331,13 @@ Window {
     }
 
     Shortcut { sequences: [StandardKey.Open]; onActivated: openDialog.open() }
+    Shortcut { sequences: [StandardKey.New]; onActivated: root.requestNewWindow() }
     Shortcut { sequences: [StandardKey.SaveAs]; onActivated: saveDialog.open() }
     Shortcut { sequence: "F11"; onActivated: root.fullscreen = !root.fullscreen }
     Shortcut { sequence: "Escape"; onActivated: onEscape() }
+    Shortcut { sequences: ["Return", "Enter"]
+               enabled: root.pasteFloating || root.selExists
+               onActivated: onEnter() }
 
     Shortcut { sequence: "Left";  enabled: bridge.selected_layer >= 0; onActivated: nudgeLayer(-1, 0) }
     Shortcut { sequence: "Right"; enabled: bridge.selected_layer >= 0; onActivated: nudgeLayer(1, 0) }
@@ -132,13 +350,29 @@ Window {
 
     Shortcut { sequences: [StandardKey.ZoomIn, "Ctrl+="]; onActivated: bridge.zoom_in() }
     Shortcut { sequences: [StandardKey.ZoomOut]; onActivated: bridge.zoom_out() }
-    Shortcut { sequence: "Ctrl+0"; onActivated: bridge.zoom_fit() }
-    Shortcut { sequence: "Ctrl+1"; onActivated: bridge.zoom_actual() }
+    // Preview-aligned: ⌘0 actual size, ⌘9 zoom-to-fit (old keys kept as aliases).
+    Shortcut { sequences: ["Ctrl+0", "Ctrl+1"]; onActivated: bridge.zoom_actual() }
+    Shortcut { sequences: ["Ctrl+9"]; onActivated: bridge.zoom_fit() }
     Shortcut { sequences: [StandardKey.Undo]; onActivated: bridge.undo() }
-    Shortcut { sequences: [StandardKey.Redo]; onActivated: bridge.redo() }
+    // Preview ⇧⌘Z; Ctrl+Y stays as a Windows-friendly alias.
+    Shortcut { sequences: ["Ctrl+Shift+Z", StandardKey.Redo]; onActivated: bridge.redo() }
     Shortcut { sequences: [StandardKey.Save]; onActivated: bridge.save_edited() }
-    Shortcut { sequence: "Ctrl+R"; onActivated: bridge.rotate_cw() }
+    Shortcut { sequences: [StandardKey.Copy]; onActivated: doCopy() }
+    Shortcut { sequences: [StandardKey.Cut]; onActivated: doCut() }
+    Shortcut { sequences: [StandardKey.Paste]; onActivated: doPaste() }
+    Shortcut { sequence: "Ctrl+K"; enabled: root.selExists; onActivated: applyCrop() }
+    Shortcut { sequence: "Ctrl+L"; onActivated: bridge.rotate_ccw() }
     Shortcut { sequence: "Ctrl+Shift+R"; onActivated: bridge.rotate_ccw() }
+    Shortcut { sequences: ["Delete", "Backspace"]
+               enabled: root.selExists || bridge.selected_layer >= 0
+               onActivated: onDeleteKey() }
+    Shortcut { sequence: "Ctrl+A"
+               enabled: bridge.image_width > 0 && root.renamingIndex < 0
+               onActivated: selectAllCanvas() }
+    // ⌘W / ⌘Q: close window / quit, both through the dirty-confirm guard.
+    Shortcut { sequence: "Ctrl+W"; onActivated: requestQuit() }
+    Shortcut { sequence: "Ctrl+Q"; onActivated: requestQuit() }
+    Shortcut { sequence: "Ctrl+R"; onActivated: bridge.rotate_cw() }
 
     Rectangle {
         id: toolbar
@@ -155,6 +389,7 @@ Window {
             spacing: 6
 
             ToolButton { label: "打开"; onClicked: openDialog.open() }
+            ToolButton { label: "新窗口"; onClicked: root.requestNewWindow() }
 
             Rectangle { width: 1; height: 20; color: "#3c4043" }
 
@@ -172,28 +407,16 @@ Window {
 
             ToolButton {
                 label: "裁剪"
-                active: bridge.image_width > 0
-                selected: root.cropMode
-                onClicked: toggleMode("crop")
+                active: root.selExists
+                onClicked: applyCrop()
             }
             ToolButton { label: "重置裁剪"; active: bridge.image_width > 0; onClicked: bridge.reset_crop() }
             ToolButton { label: "调整尺寸…"; active: bridge.image_width > 0; onClicked: openResizeDialog() }
 
             Rectangle { width: 1; height: 20; color: "#3c4043" }
 
-            ToolButton {
-                label: "框选"
-                active: bridge.image_width > 0
-                selected: root.selectionMode
-                onClicked: toggleMode("selection")
-            }
             ToolButton { label: "提取图层"; active: root.selExists; onClicked: commitExtract() }
-            ToolButton {
-                label: "移动图层"
-                active: bridge.selected_layer >= 0
-                selected: root.moveMode
-                onClicked: toggleMode("move")
-            }
+            ToolButton { label: "删除选区像素"; active: root.selExists; onClicked: deleteSelectionPixels() }
             ToolButton {
                 label: "图层"
                 active: bridge.layer_count > 0
@@ -253,19 +476,25 @@ Window {
             }
         }
 
+        // ---- Persistent-selection interaction stack ----------------------
+        // Hit priority: selected layer content drag (no active selection) →
+        // selection move (center of the selection) → new selection rubber
+        // band. Crop is applied to the live selection (Enter / Ctrl+K).
+
         Item {
-            id: cropSurface
-            visible: root.cropMode && bridge.image_width > 0
+            id: canvasSurface
+            visible: bridge.image_width > 0
             z: 5
             x: previewImage.x
             y: previewImage.y
             width: previewImage.width
             height: previewImage.height
 
+            // Bottom layer: draw a new selection (rubber band). Pressing on
+            // empty canvas also settles a floating paste.
             MouseArea {
-                id: cropMouse
+                id: selDragMouse
                 anchors.fill: parent
-                enabled: cropSurface.visible
                 cursorShape: Qt.CrossCursor
                 property real startX: 0
                 property real startY: 0
@@ -279,124 +508,39 @@ Window {
                     curX = mouse.x
                     curY = mouse.y
                     dragging = true
+                    root.selW = 0
+                    root.selH = 0
+                    settlePaste()
                 }
                 onPositionChanged: (mouse) => {
-                    if (dragging) {
-                        curX = mouse.x
-                        curY = mouse.y
-                    }
-                }
-                onReleased: {
-                    dragging = false
-                    if (root.cropMode)
-                        finishCrop()
-                }
-            }
-
-            Rectangle {
-                id: cropRect
-                visible: cropMouse.dragging
-                color: "#224f8ef7"
-                border.color: "#5b9dff"
-                border.width: 1
-                x: Math.min(cropMouse.startX, cropMouse.curX)
-                y: Math.min(cropMouse.startY, cropMouse.curY)
-                width: Math.abs(cropMouse.curX - cropMouse.startX)
-                height: Math.abs(cropMouse.curY - cropMouse.startY)
-            }
-        }
-
-        Item {
-            id: selectionSurface
-            visible: root.selectionMode && bridge.image_width > 0
-            z: 6
-            x: previewImage.x
-            y: previewImage.y
-            width: previewImage.width
-            height: previewImage.height
-
-            MouseArea {
-                id: selectionMouse
-                anchors.fill: parent
-                enabled: selectionSurface.visible
-                cursorShape: Qt.CrossCursor
-                property real startX: 0
-                property real startY: 0
-                property real curX: 0
-                property real curY: 0
-                property bool dragging: false
-
-                onPressed: (mouse) => {
-                    startX = mouse.x
-                    startY = mouse.y
+                    if (!dragging)
+                        return
                     curX = mouse.x
                     curY = mouse.y
-                    dragging = true
-                }
-                onPositionChanged: (mouse) => {
-                    if (dragging) {
-                        curX = mouse.x
-                        curY = mouse.y
-                    }
-                }
-                onReleased: {
-                    dragging = false
                     const x = Math.min(startX, curX)
                     const y = Math.min(startY, curY)
-                    const w = Math.abs(curX - startX)
-                    const h = Math.abs(curY - startY)
-                    if (w < 3 || h < 3) {
+                    root.selX = snapDisplay(x)
+                    root.selY = snapDisplay(y)
+                    root.selW = Math.max(snapDisplay(Math.abs(curX - startX)), toDispScale())
+                    root.selH = Math.max(snapDisplay(Math.abs(curY - startY)), toDispScale())
+                }
+                onReleased: {
+                    dragging = false
+                    if (root.selW < 3 || root.selH < 3) {
+                        // Click on empty canvas: clear the selection.
                         root.selW = 0
                         root.selH = 0
-                    } else {
-                        root.selX = x
-                        root.selY = y
-                        root.selW = w
-                        root.selH = h
                     }
-                    root.selectionMode = false
                 }
             }
-        }
 
-        Rectangle {
-            id: selRectViz
-            visible: root.selExists && !root.selectionMode
-            z: 7
-            x: previewImage.x + root.selX
-            y: previewImage.y + root.selY
-            width: root.selW
-            height: root.selH
-            color: "transparent"
-            border.color: "#5b9dff"
-            border.width: 2
-        }
-
-        Item {
-            id: moveSurface
-            visible: root.moveMode && bridge.selected_layer >= 0
-            z: 6
-            x: previewImage.x
-            y: previewImage.y
-            width: previewImage.width
-            height: previewImage.height
-
-            Rectangle {
-                id: moveRect
-                visible: moveMouse.dragging
-                color: "#5b9dff33"
-                border.color: "#5b9dff"
-                border.width: 1
-                x: Math.min(moveMouse.startX, moveMouse.curX)
-                y: Math.min(moveMouse.startY, moveMouse.curY)
-                width: Math.abs(moveMouse.curX - moveMouse.startX)
-                height: Math.abs(moveMouse.curY - moveMouse.startY)
-            }
-
+            // Top layer: drag the selected layer's content to move it. Only
+            // reachable while no selection is active (selection owns the
+            // canvas while it exists).
             MouseArea {
-                id: moveMouse
+                id: layerDragMouse
                 anchors.fill: parent
-                enabled: moveSurface.visible
+                enabled: bridge.selected_layer >= 0 && root.selLayer !== null && !root.selExists
                 cursorShape: Qt.SizeAllCursor
                 property real startX: 0
                 property real startY: 0
@@ -405,28 +549,161 @@ Window {
                 property bool dragging: false
 
                 onPressed: (mouse) => {
+                    const b = root.selLayerBox
+                    const s = toDispScale()
+                    const inside = b !== null
+                        && mouse.x >= b.x * s && mouse.x <= (b.x + b.w) * s
+                        && mouse.y >= b.y * s && mouse.y <= (b.y + b.h) * s
+                    if (!inside) {
+                        mouse.accepted = false
+                        return
+                    }
                     startX = mouse.x
                     startY = mouse.y
                     curX = mouse.x
                     curY = mouse.y
                     dragging = true
+                    bridge.drag_translate_begin()
                 }
                 onPositionChanged: (mouse) => {
                     if (dragging) {
                         curX = mouse.x
                         curY = mouse.y
+                        liveTimer.restart()
                     }
                 }
                 onReleased: {
-                    dragging = false
-                    const dx = curX - startX
-                    const dy = curY - startY
-                    if (Math.abs(dx) < 1 && Math.abs(dy) < 1)
+                    if (!dragging)
                         return
+                    dragging = false
+                    liveTimer.stop()
                     const scale = toImageScale()
-                    bridge.translate_selected(Math.round(dx * scale), Math.round(dy * scale))
+                    bridge.drag_translate_update(
+                        Math.round((curX - startX) * scale),
+                        Math.round((curY - startY) * scale))
+                    bridge.drag_translate_end(true)
+                    if (root.pasteFloating)
+                        root.floatingOps += 1
                 }
             }
+
+            Timer {
+                id: liveTimer
+                interval: 70
+                onTriggered: {
+                    if (!layerDragMouse.dragging)
+                        return
+                    const scale = toImageScale()
+                    bridge.drag_translate_update(
+                        Math.round((layerDragMouse.curX - layerDragMouse.startX) * scale),
+                        Math.round((layerDragMouse.curY - layerDragMouse.startY) * scale))
+                }
+            }
+        }
+
+        // Selection outline: dashed frame + W×H pixel readout + blue dots.
+        DashedRect {
+            id: selRectViz
+            visible: root.selExists
+            z: 7
+            x: previewImage.x
+            y: previewImage.y
+            width: previewImage.width
+            height: previewImage.height
+            rx: root.selX
+            ry: root.selY
+            rw: root.selW
+            rh: root.selH
+            dashColor: "#5b9dff"
+        }
+
+        Text {
+            visible: root.selExists
+            z: 8
+            x: previewImage.x + root.selX
+            y: Math.min(previewImage.y + previewImage.height - 16,
+                        previewImage.y + root.selY + root.selH + 4)
+            text: Math.round(root.selW / toDispScale()) + " × "
+                  + Math.round(root.selH / toDispScale())
+                  + (root.pasteFloating ? "" : "　Enter 应用裁剪 · Esc 取消")
+            color: "#7fc3ff"
+            font.pixelSize: 11
+        }
+
+        EdgeHandles {
+            id: selHandles
+            visible: root.selExists && !root.selRubberBanding && bridge.image_width > 0
+            z: 8
+            x: previewImage.x
+            y: previewImage.y
+            width: previewImage.width
+            height: previewImage.height
+            bx: root.selX
+            by: root.selY
+            bw: root.selW
+            bh: root.selH
+            pxScale: toDispScale()
+            resizeFn: function(startRect, role, dx, dy, free) {
+                resizeBoxFrom(startRect, role, dx, dy)
+            }
+            moveFn: function(startRect, dx, dy) {
+                moveSelFrom(startRect, dx, dy)
+            }
+        }
+
+        // Selected layer outline (dashed) + blue-dot handles for scaling.
+        DashedRect {
+            id: layerBoxViz
+            visible: root.selLayer !== null && root.scaleW === 0
+            z: 6
+            x: previewImage.x
+            y: previewImage.y
+            width: previewImage.width
+            height: previewImage.height
+            rx: root.selLayerBox !== null ? root.selLayerBox.x * toDispScale() : 0
+            ry: root.selLayerBox !== null ? root.selLayerBox.y * toDispScale() : 0
+            rw: root.selLayerBox !== null ? root.selLayerBox.w * toDispScale() : 0
+            rh: root.selLayerBox !== null ? root.selLayerBox.h * toDispScale() : 0
+            dashColor: "#5b9dff99"
+        }
+
+        EdgeHandles {
+            id: layerHandles
+            visible: root.selLayer !== null && !root.selExists && bridge.image_width > 0
+            z: 8
+            x: previewImage.x
+            y: previewImage.y
+            width: previewImage.width
+            height: previewImage.height
+            bx: root.scaleW > 0 ? root.scaleX
+                                : (root.selLayerBox !== null ? root.selLayerBox.x * toDispScale() : 0)
+            by: root.scaleW > 0 ? root.scaleY
+                                : (root.selLayerBox !== null ? root.selLayerBox.y * toDispScale() : 0)
+            bw: root.scaleW > 0 ? root.scaleW
+                                : (root.selLayerBox !== null ? root.selLayerBox.w * toDispScale() : 0)
+            bh: root.scaleW > 0 ? root.scaleH
+                                : (root.selLayerBox !== null ? root.selLayerBox.h * toDispScale() : 0)
+            moveEnabled: false
+            pxScale: toDispScale()
+            resizeFn: function(startRect, role, dx, dy, free) {
+                resizeLayerFrom(startRect, role, dx, dy, free)
+            }
+            onEngagedChanged: {
+                if (!layerHandles.engaged && root.scaleW > 0)
+                    commitLayerScale()
+            }
+        }
+
+        Text {
+            visible: root.scaleW > 0
+            z: 8
+            x: previewImage.x + root.scaleX
+            y: Math.min(previewImage.y + previewImage.height - 16,
+                        previewImage.y + root.scaleY + root.scaleH + 4)
+            text: Math.round(root.scaleW / toDispScale()) + " × "
+                  + Math.round(root.scaleH / toDispScale()) + "　松手应用缩放 · Esc 取消"
+            color: "#7fc3ff"
+            font.pixelSize: 11
         }
 
         WheelHandler {
@@ -462,13 +739,13 @@ Window {
             anchors.right: zoomLabel.left
             anchors.rightMargin: 10
             visible: root.modeActive || root.selExists
-            text: root.cropMode
-                    ? "拖框选择裁剪区域（Esc 取消）"
-                    : root.selectionMode
-                    ? "拖框选择区域，松手后点「提取图层」（Esc 取消）"
-                    : root.moveMode
-                    ? "拖动画面移动选中图层，方向键微调（Esc 退出）"
-                    : "已选区：点「提取图层」生成图层，Esc 取消"
+            text: root.pasteFloating
+                  ? "粘贴内容可拖动定位：Enter / 点击外部落定，Esc 撤销粘贴"
+                  : root.selRubberBanding
+                  ? "松手完成选区，随后可拖手柄精修、拖内部移动"
+                  : root.scaleW > 0
+                  ? "拖角/边调整图层大小（角点等比，Shift 自由）；松手应用，Esc 取消"
+                  : "已选区：拖手柄缩放 / 拖内部移动；Enter 或 Ctrl+K 应用裁剪，Esc 取消"
             color: "#9fb6d8"
             font.pixelSize: 12
         }
@@ -502,7 +779,7 @@ Window {
         anchors.fill: parent
         onDropped: (drop) => {
             if (drop.hasUrls && drop.urls.length > 0)
-                bridge.open_file(drop.urls[0]);
+                confirmThenOpen(drop.urls[0]);
         }
     }
 
@@ -571,44 +848,184 @@ Window {
                     id: layerRepeater
                     model: root.layerList
 
-                    delegate: Rectangle {
-                        width: layerRepeaterColumn.width
-                        height: 34
-                        radius: 4
-                        readonly property bool isSel: model !== undefined && model.i === bridge.selected_layer
-                        readonly property bool vis: model !== undefined && model.v === true
-                        color: isSel ? "#3d5a80" : "#33373c"
+                delegate: Rectangle {
+                    id: layerRow
+                    width: layerRepeaterColumn.width
+                    height: 34
+                    radius: 4
+                    // Repeater + JS-array models expose the row either as the
+                    // `model` context object or as `modelData` depending on the
+                    // model wrapper; resolve once, defensively.
+                    readonly property var row: {
+                        if (typeof modelData !== "undefined" && modelData !== null && modelData.n !== undefined)
+                            return modelData
+                        if (model !== undefined && model !== null && model.n !== undefined)
+                            return model
+                        return null
+                    }
+                    readonly property bool isBase: row !== null && row.base === true
+                    readonly property bool isSel: row !== null && row.i === bridge.selected_layer
+                    readonly property bool vis: row !== null && row.v === true
+                    readonly property int disp: index
+                    color: isSel ? "#3d5a80"
+                         : (rowMa.containsMouse && !isBase ? "#3a3e44" : "#33373c")
+
+                    // Press = select; press + drag = reorder (insertion line
+                    // shows the drop slot); double-click = rename. The base
+                    // row is display-only.
+                    MouseArea {
+                        id: rowMa
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        enabled: layerRow.row !== null
+                        cursorShape: layerRow.isBase ? Qt.ArrowCursor : Qt.PointingHandCursor
+                        property bool reordering: false
+                        property int fromPos: -1
+                        property int toPos: -1
+                        property real pressY: 0
+
+                        onPressed: (mouse) => {
+                            pressY = mouse.y
+                            reordering = false
+                        }
+                        onPositionChanged: (mouse) => {
+                            if (!pressed || layerRow.isBase)
+                                return
+                            if (!reordering && Math.abs(mouse.y - pressY) > 6) {
+                                reordering = true
+                                fromPos = layerRow.disp
+                            }
+                            if (!reordering)
+                                return
+                            const pitch = 38  // row 34 + spacing 4
+                            const docLen = root.layerList.length - 1  // exclude base row
+                            const colY = layerRow.mapToItem(layerRepeaterColumn, 0, mouse.y).y
+                            let t = Math.floor(colY / pitch + 0.5)
+                            t = Math.max(0, Math.min(t, docLen - 1))
+                            toPos = t
+                            dropIndicator.y = t * pitch - 2
+                            dropIndicator.visible = t !== fromPos
+                        }
+                        onReleased: {
+                            if (reordering && toPos >= 0 && toPos !== fromPos) {
+                                const docLen = root.layerList.length - 1
+                                // Display position p ↔ doc index docLen-1-p.
+                                bridge.reorder_layer(docLen - 1 - fromPos,
+                                                     docLen - 1 - toPos)
+                            } else if (!reordering && layerRow.row && !layerRow.isBase) {
+                                bridge.select_layer(layerRow.row.i)
+                            }
+                            reordering = false
+                            toPos = -1
+                            dropIndicator.visible = false
+                        }
+                        onDoubleClicked: if (layerRow.row && !layerRow.isBase) {
+                            root.renamingIndex = layerRow.row.i
+                            renameInput.focus = true
+                            renameInput.selectAll()
+                        }
+                    }
+
+                    // Eye icon: click toggles this layer's visibility.
+                    Item {
+                        x: 5
+                        width: 22
+                        height: parent.height
+
+                        Canvas {
+                            id: eyeIcon
+                            anchors.centerIn: parent
+                            width: 18
+                            height: 18
+                            property bool on: layerRow.vis
+                            readonly property bool disabled: layerRow.isBase
+                            onOnChanged: requestPaint()
+                            onDisabledChanged: requestPaint()
+                            onPaint: {
+                                var ctx = getContext("2d")
+                                ctx.clearRect(0, 0, width, height)
+                                ctx.lineWidth = 1.4
+                                ctx.strokeStyle = disabled ? "#4a4e54"
+                                                    : (on ? "#7fc3ff" : "#5a5f66")
+                                ctx.beginPath()
+                                ctx.moveTo(2, 9)
+                                ctx.quadraticCurveTo(9, 2.5, 16, 9)
+                                ctx.quadraticCurveTo(9, 15.5, 2, 9)
+                                ctx.stroke()
+                                if (on) {
+                                    ctx.beginPath()
+                                    ctx.arc(9, 9, 2.6, 0, Math.PI * 2)
+                                    ctx.fillStyle = ctx.strokeStyle
+                                    ctx.fill()
+                                } else {
+                                    ctx.beginPath()
+                                    ctx.moveTo(4.5, 14)
+                                    ctx.lineTo(13.5, 4)
+                                    ctx.stroke()
+                                }
+                            }
+                        }
 
                         MouseArea {
                             anchors.fill: parent
-                            hoverEnabled: true
+                            anchors.margins: -4
+                            enabled: !layerRow.isBase
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: if (model !== undefined) bridge.select_layer(model.i)
-                        }
-
-                        Text {
-                            x: 8
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: vis ? "●" : "○"
-                            color: vis ? "#7fc3ff" : "#5a5f66"
-                            font.pixelSize: 12
-                        }
-
-                        Text {
-                            x: 28
-                            width: parent.width - 28
-                            anchors.verticalCenter: parent.verticalCenter
-                            elide: Text.ElideRight
-                            text: model !== undefined ? model.n + (isSel ? "  (选中)" : "") : ""
-                            color: isSel ? "#ffffff" : "#c9cdd2"
-                            font.pixelSize: 12
+                            onClicked: if (layerRow.row)
+                                bridge.set_layer_visible_at(layerRow.row.i, !layerRow.row.v)
                         }
                     }
+
+                    Text {
+                        x: 30
+                        width: parent.width - 38
+                        anchors.verticalCenter: parent.verticalCenter
+                        elide: Text.ElideRight
+                        visible: !renameInput.visible
+                        text: layerRow.row
+                              ? layerRow.row.n
+                                + (layerRow.isBase ? "（锁定）" : "")
+                                + (layerRow.row.o !== undefined && layerRow.row.o < 100 ? "  " + layerRow.row.o + "%" : "")
+                                + (isSel ? "  (选中)" : "")
+                              : ""
+                        color: isSel ? "#ffffff" : "#c9cdd2"
+                        font.pixelSize: 12
+                    }
+
+                    TextInput {
+                        id: renameInput
+                        x: 30
+                        width: parent.width - 38
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: root.renamingIndex !== -1 && root.renamingIndex === (layerRow.row ? layerRow.row.i : -1)
+                        text: layerRow.row ? layerRow.row.n : ""
+                        color: "#ffffff"
+                        font.pixelSize: 12
+                        focus: visible
+                        onAccepted: {
+                            if (text.trim().length > 0)
+                                bridge.rename_selected_layer(text)
+                            root.renamingIndex = -1
+                        }
+                        onActiveFocusChanged: if (!activeFocus && visible)
+                            root.renamingIndex = -1
+                    }
+                }
                 }
             }
+                // Drop-position line shown while dragging a row to reorder.
+                Rectangle {
+                    id: dropIndicator
+                    visible: false
+                    width: parent.width
+                    height: 2
+                    color: "#5b9dff"
+                    radius: 1
+                    z: 10
+                }
         }
 
-        Row {
+        Column {
             id: panelFooter
             anchors.bottom: parent.bottom
             anchors.left: parent.left
@@ -619,26 +1036,96 @@ Window {
             spacing: 6
             visible: bridge.selected_layer >= 0
 
-            ToolButton {
-                label: "上移"
-                active: true
-                onClicked: bridge.move_selected_up()
+            Row {
+                id: opacityRow
+                width: parent.width
+                spacing: 6
+
+                Text {
+                    text: "不透明度"
+                    color: "#b8bcc0"
+                    font.pixelSize: 11
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+
+                Item {
+                    id: opacitySlider
+                    width: parent.width - 104
+                    height: 20
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    property real value: 1.0
+                    property bool dragging: false
+
+                    function setValue(x) {
+                        value = Math.min(1.0, Math.max(0.0, x / width))
+                        bridge.set_selected_opacity(value, false)
+                    }
+
+                    Binding {
+                        target: opacitySlider
+                        property: "value"
+                        value: root.selLayer ? root.selLayer.o / 100.0 : 1.0
+                        when: !opacitySlider.dragging
+                    }
+
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width
+                        height: 4
+                        radius: 2
+                        color: "#3c4043"
+                    }
+
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: opacitySlider.value * opacitySlider.width
+                        height: 4
+                        radius: 2
+                        color: "#5b9dff"
+                    }
+
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        x: opacitySlider.value * (opacitySlider.width - 12)
+                        width: 12
+                        height: 12
+                        radius: 6
+                        color: opMa.containsMouse || opacitySlider.dragging ? "#7fc3ff" : "#e9eaec"
+                    }
+
+                    MouseArea {
+                        id: opMa
+                        anchors.fill: parent
+                        anchors.margins: -6
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onPressed: (mouse) => {
+                            opacitySlider.dragging = true
+                            opacitySlider.setValue(mouse.x + 6)
+                        }
+                        onPositionChanged: (mouse) => {
+                            if (opacitySlider.dragging)
+                                opacitySlider.setValue(mouse.x + 6)
+                        }
+                        onReleased: {
+                            opacitySlider.dragging = false
+                            bridge.set_selected_opacity(opacitySlider.value, true)
+                        }
+                    }
+                }
+
+                Text {
+                    width: 40
+                    text: Math.round(opacitySlider.value * 100) + "%"
+                    color: "#b8bcc0"
+                    font.pixelSize: 11
+                    anchors.verticalCenter: parent.verticalCenter
+                    horizontalAlignment: Text.AlignRight
+                }
             }
-            ToolButton {
-                label: "下移"
-                active: true
-                onClicked: bridge.move_selected_down()
-            }
-            ToolButton {
-                label: root.selLayer && !root.selLayer.v ? "显示" : "隐藏"
-                active: bridge.selected_layer >= 0
-                onClicked: bridge.toggle_selected_visible()
-            }
-            ToolButton {
-                label: "删除"
-                active: true
-                onClicked: bridge.delete_selected_layer()
-            }
+            // Reorder = drag rows; delete = Delete/Backspace on the selected
+            // row; visibility = the eye icon (per §4.8 of the UX plan).
         }
     }
 
@@ -771,17 +1258,211 @@ Window {
         return previewImage.width > 0 ? bridge.image_width / previewImage.width : 1
     }
 
-    function finishCrop() {
-        const sx = Math.min(cropMouse.startX, cropMouse.curX)
-        const sy = Math.min(cropMouse.startY, cropMouse.curY)
-        const sw = Math.abs(cropMouse.curX - cropMouse.startX)
-        const sh = Math.abs(cropMouse.curY - cropMouse.startY)
-        root.cropMode = false
-        if (sw < 3 || sh < 3)
+    function toDispScale() {
+        return bridge.image_width > 0 && previewImage.width > 0
+               ? previewImage.width / bridge.image_width : 0
+    }
+
+    // Snap a display coordinate to the nearest image-pixel boundary so every
+    // crop / selection edge maps to an exact integer image coordinate.
+    function snapDisplay(v) {
+        const s = toDispScale()
+        return s > 0 ? Math.round(v / s) * s : v
+    }
+
+    function boxSet(x, y, w, h) {
+        root.selX = x; root.selY = y; root.selW = w; root.selH = h
+    }
+
+    function resizeBoxFrom(startRect, role, dx, dy) {
+        const s = Math.max(toDispScale(), 0.001)
+        let x = startRect.x, y = startRect.y, w = startRect.width, h = startRect.height
+        if (role.indexOf("w") >= 0) {
+            let nx = snapDisplay(startRect.x + dx)
+            nx = Math.max(0, Math.min(nx, startRect.x + startRect.width - s))
+            w = startRect.x + startRect.width - nx
+            x = nx
+        }
+        if (role.indexOf("e") >= 0) {
+            w = Math.min(Math.max(s, snapDisplay(startRect.width + dx)),
+                         previewImage.width - x)
+        }
+        if (role.indexOf("n") >= 0) {
+            let ny = snapDisplay(startRect.y + dy)
+            ny = Math.max(0, Math.min(ny, startRect.y + startRect.height - s))
+            h = startRect.y + startRect.height - ny
+            y = ny
+        }
+        if (role.indexOf("s") >= 0) {
+            h = Math.min(Math.max(s, snapDisplay(startRect.height + dy)),
+                         previewImage.height - y)
+        }
+        boxSet(x, y, w, h)
+    }
+
+    function moveSelFrom(startRect, dx, dy) {
+        let x = snapDisplay(startRect.x + dx)
+        let y = snapDisplay(startRect.y + dy)
+        x = Math.max(0, Math.min(x, previewImage.width - startRect.width))
+        y = Math.max(0, Math.min(y, previewImage.height - startRect.height))
+        boxSet(x, y, startRect.width, startRect.height)
+    }
+
+    // Live scale-target box for the selected layer; committed on release.
+    function resizeLayerFrom(startRect, role, dx, dy, free) {
+        const s = Math.max(toDispScale(), 0.001)
+        let x = startRect.x, y = startRect.y, w = startRect.width, h = startRect.height
+        if (role.indexOf("w") >= 0) {
+            let nx = snapDisplay(startRect.x + dx)
+            nx = Math.max(0, Math.min(nx, startRect.x + startRect.width - s))
+            w = startRect.x + startRect.width - nx
+            x = nx
+        }
+        if (role.indexOf("e") >= 0) {
+            w = Math.min(Math.max(s, snapDisplay(startRect.width + dx)),
+                         previewImage.width - x)
+        }
+        if (role.indexOf("n") >= 0) {
+            let ny = snapDisplay(startRect.y + dy)
+            ny = Math.max(0, Math.min(ny, startRect.y + startRect.height - s))
+            h = startRect.y + startRect.height - ny
+            y = ny
+        }
+        if (role.indexOf("s") >= 0) {
+            h = Math.min(Math.max(s, snapDisplay(startRect.height + dy)),
+                         previewImage.height - y)
+        }
+        if (role.length === 2 && !free) {
+            // Corner handles keep the layer's aspect ratio by default
+            // (D5-A); hold Shift for a free resize.
+            const ar = startRect.width / Math.max(1, startRect.height)
+            if (w / Math.max(1, h) > ar)
+                w = h * ar
+            else
+                h = w / ar
+            if (role.indexOf("w") >= 0)
+                x = startRect.x + startRect.width - w
+            if (role.indexOf("n") >= 0)
+                y = startRect.y + startRect.height - h
+        }
+        root.scaleX = x; root.scaleY = y
+        root.scaleW = Math.max(1, w); root.scaleH = Math.max(1, h)
+    }
+
+    function commitLayerScale() {
+        const s = toDispScale()
+        if (root.scaleW >= 1 && root.scaleH >= 1 && s > 0) {
+            bridge.scale_selected_layer(
+                Math.max(1, Math.round(root.scaleW / s)),
+                Math.max(1, Math.round(root.scaleH / s)), false)
+        }
+        root.scaleX = 0; root.scaleY = 0; root.scaleW = 0; root.scaleH = 0
+    }
+
+    function cancelLayerScale() {
+        root.scaleX = 0; root.scaleY = 0; root.scaleW = 0; root.scaleH = 0
+    }
+
+    function applyCrop() {
+        if (!root.selExists)
             return
-        const scale = toImageScale()
-        bridge.crop_to(Math.floor(sx * scale), Math.floor(sy * scale),
-                       Math.round(sw * scale), Math.round(sh * scale))
+        const s = toDispScale()
+        bridge.crop_to(Math.round(root.selX / s), Math.round(root.selY / s),
+                       Math.max(1, Math.round(root.selW / s)),
+                       Math.max(1, Math.round(root.selH / s)))
+        root.selW = 0
+        root.selH = 0
+        cancelLayerScale()
+    }
+
+    function deleteSelectionPixels() {
+        if (!root.selExists)
+            return
+        const s = toDispScale()
+        bridge.erase_selection_pixels(
+            Math.floor(root.selX / s), Math.floor(root.selY / s),
+            Math.round(root.selW / s), Math.round(root.selH / s))
+        root.selW = 0
+        root.selH = 0
+    }
+
+    // Delete / Backspace: with a selection → erase selection pixels;
+    // otherwise delete the selected (non-base) layer.
+    function onDeleteKey() {
+        if (root.selExists) {
+            deleteSelectionPixels()
+            return
+        }
+        if (bridge.selected_layer >= 0 && !(root.selLayer && root.selLayer.base))
+            bridge.delete_selected_layer()
+    }
+
+    // Ctrl+A: selection covering the whole canvas (Preview ⌘A).
+    function selectAllCanvas() {
+        if (previewImage.width < 1 || previewImage.height < 1)
+            return
+        root.selX = 0
+        root.selY = 0
+        root.selW = previewImage.width
+        root.selH = previewImage.height
+        settlePaste()
+    }
+
+    // Ctrl+W / Ctrl+Q: close the window through the dirty-confirm guard.
+    function requestQuit() {
+        if (bridge.dirty && !root.forceClose) {
+            root.confirmMode = "close"
+            confirmOverlay.visible = true
+            return
+        }
+        const w = Window.window
+        if (w)
+            w.close()
+    }
+
+    // Ctrl+C: prefer the pending selection rect; fall back to the selected
+    // layer. The clipboard is process-level, so pixels survive opening a
+    // different document (cross-image paste).
+    function doCopy() {
+        if (root.selExists) {
+            const s = toDispScale()
+            bridge.copy_selection_pixels(
+                Math.floor(root.selX / s), Math.floor(root.selY / s),
+                Math.round(root.selW / s), Math.round(root.selH / s))
+        } else if (bridge.selected_layer >= 0) {
+            bridge.copy_selected_layer()
+        }
+    }
+
+    function doCut() {
+        if (root.selExists) {
+            const s = toDispScale()
+            bridge.cut_selection_pixels(
+                Math.floor(root.selX / s), Math.floor(root.selY / s),
+                Math.round(root.selW / s), Math.round(root.selH / s))
+            root.selW = 0
+            root.selH = 0
+        } else if (bridge.selected_layer >= 0) {
+            bridge.cut_selected_layer()
+        }
+    }
+
+    // Paste enters the floating "place it" state: the pasted layer is auto-
+    // selected, dragging it repositions live, Enter / clicking outside
+    // settles, Esc rolls the whole paste back (D3-A).
+    function doPaste() {
+        if (root.pasteFloating)
+            settlePaste()
+        root.selW = 0
+        root.selH = 0
+        bridge.paste_clipboard()
+        root.pasteFloating = true
+        root.floatingOps = 1
+    }
+
+    function settlePaste() {
+        root.pasteFloating = false
+        root.floatingOps = 0
     }
 
     function linkedHeight() {
@@ -825,25 +1506,29 @@ Window {
     }
 
     function onEscape() {
-        if (root.moveMode) { root.moveMode = false; return }
-        if (root.selectionMode) { root.selectionMode = false; return }
+        if (root.renamingIndex >= 0) { root.renamingIndex = -1; return }
+        if (confirmOverlay.visible) { confirmCancel(); return }
+        if (root.scaleW > 0) { cancelLayerScale(); return }
+        if (selDragMouse.dragging) { selDragMouse.dragging = false; return }
+        if (root.pasteFloating) {
+            // D3-A: roll back everything committed since the paste.
+            for (var i = 0; i < root.floatingOps; i++)
+                bridge.undo()
+            settlePaste()
+            return
+        }
         if (root.selExists) { root.selW = 0; root.selH = 0; return }
         if (root.panelVisible) { root.panelVisible = false; return }
-        if (root.cropMode) { root.cropMode = false; return }
         root.fullscreen = false
     }
 
-    function toggleMode(m) {
-        const wasActive = m === "crop" ? root.cropMode
-                        : (m === "selection" ? root.selectionMode : root.moveMode)
-        root.cropMode = false
-        root.selectionMode = false
-        root.moveMode = false
-        if (!wasActive) {
-            if (m === "crop") root.cropMode = true
-            else if (m === "selection") root.selectionMode = true
-            else root.moveMode = true
+    function onEnter() {
+        if (root.pasteFloating) {
+            settlePaste()
+            return
         }
+        if (root.selExists)
+            applyCrop()
     }
 
     function commitExtract() {
@@ -880,9 +1565,79 @@ Window {
         return null
     }
 
-    onVisibleChanged: bridge.mark("window-visible")
+    function findLayerBox() {
+        for (var i = 0; i < layerList.length; i++)
+            if (layerList[i].i === bridge.selected_layer)
+                return layerList[i]
+        return null
+    }
 
-    onAfterRendering: {
+    Item {
+        id: confirmOverlay
+        anchors.fill: parent
+        visible: false
+        z: 200
+
+        MouseArea { anchors.fill: parent }
+
+        Rectangle {
+            width: 360
+            height: 168
+            anchors.centerIn: parent
+            radius: 6
+            color: "#2b2e33"
+            border.color: "#3c4043"
+
+            Column {
+                anchors.centerIn: parent
+                spacing: 14
+                width: parent.width - 32
+
+                Text {
+                    width: parent.width
+                    horizontalAlignment: Text.AlignHCenter
+                    text: "当前文档有未保存的修改"
+                    color: "#e9eaec"
+                    font.pixelSize: 14
+                    font.bold: true
+                }
+
+                Text {
+                    width: parent.width
+                    horizontalAlignment: Text.AlignHCenter
+                    text: root.confirmMode === "open"
+                          ? "打开新文件将放弃这些修改，是否继续？"
+                          : "关闭窗口将放弃这些修改，是否继续？"
+                    color: "#b8bcc0"
+                    font.pixelSize: 12
+                    wrapMode: Text.WordWrap
+                }
+
+                Row {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    spacing: 8
+
+                    ToolButton {
+                        label: root.confirmMode === "open" ? "放弃并打开" : "放弃并关闭"
+                        active: true
+                        onClicked: confirmProceed()
+                    }
+                    ToolButton {
+                        label: "保存并关闭"
+                        active: root.confirmMode === "close"
+                        onClicked: confirmSaveAndClose()
+                    }
+                    ToolButton {
+                        label: "取消"
+                        active: true
+                        onClicked: confirmCancel()
+                    }
+                }
+            }
+        }
+    }
+
+    function afterFrame() {
         if (!firstFrameSeen) {
             firstFrameSeen = true;
             bridge.mark("first-frame");
@@ -890,15 +1645,76 @@ Window {
         if (imageRendered && !imageFrameSeen) {
             imageFrameSeen = true;
             bridge.mark("image-frame");
-            if (bridge.auto_quit && !root.probeDialog)
+            if (bridge.auto_quit && !root.probeDialog) {
+                bridge.mark("quit-requested");
+                root.quitting = true
                 Qt.quit();
+            }
         }
+    }
+
+    // Unsaved-changes guard: opening a file or closing the window goes through
+    // here, so an edited document is never silently replaced.
+    function confirmThenOpen(url) {
+        if (bridge.dirty) {
+            root.pendingOpenUrl = url
+            root.confirmMode = "open"
+            confirmOverlay.visible = true
+        } else {
+            bridge.open_file(url)
+        }
+    }
+
+    function requestClose(close) {
+        if (root.quitting)
+            return
+        if (bridge.dirty && !root.forceClose) {
+            close.accepted = false
+            root.confirmMode = "close"
+            confirmOverlay.visible = true
+        }
+    }
+
+    function confirmProceed() {
+        if (root.confirmMode === "open") {
+            const url = root.pendingOpenUrl
+            root.pendingOpenUrl = null
+            confirmOverlay.visible = false
+            if (url)
+                bridge.open_file(url)
+        } else if (root.confirmMode === "close") {
+            confirmOverlay.visible = false
+            root.forceClose = true
+            if (root.primary) {
+                Qt.quit()
+            } else {
+                const w = Window.window
+                if (w)
+                    w.close()
+            }
+        }
+        root.confirmMode = ""
+    }
+
+    function confirmSaveAndClose() {
+        bridge.save_edited()
+        root.confirmMode = "close"
+        confirmProceed()
+    }
+
+    function confirmCancel() {
+        root.pendingOpenUrl = null
+        root.confirmMode = ""
+        confirmOverlay.visible = false
     }
 
     Component.onCompleted: {
         bridge.mark("qml-completed");
-        bridge.start();
-        if (root.probeDialog)
-            dialogProbeTimer.start();
+        if (root.primary) {
+            bridge.start();
+            if (root.probeDialog)
+                dialogProbeTimer.start();
+        }
     }
+}
 }

@@ -113,7 +113,7 @@ if (-not $SkipVerify) {
     $ErrorActionPreference = 'Continue'
     try {
         if (Test-Path -LiteralPath $sample) {
-            $log = & (Join-Path $distDir 'imageedit.exe') $sample '--script=crop:100,100,800,600;extract:100,100,300,200;resize:400,300;undo;redo' '--selftest' *>&1 | Out-String
+            $log = & (Join-Path $distDir 'imageedit.exe') $sample '--script=crop:100,100,800,600;extract:100,100,300,200;resize:400,300;copy:20,20,100,100;paste;scale-selected:150,80;undo;redo' '--selftest' *>&1 | Out-String
             if ($LASTEXITCODE -ne 0) { throw "packaged run failed with exit $LASTEXITCODE`n$log" }
             if ($log -notmatch 'script-done') { throw "packaged run produced no script-done`n$log" }
             Write-Host "verify: edit pipeline ok"
