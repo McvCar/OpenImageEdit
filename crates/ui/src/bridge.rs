@@ -151,6 +151,12 @@ pub mod qobject {
         #[qinvokable]
         fn resize_to(self: Pin<&mut Self>, width: i32, height: i32);
 
+        /// Change only the canvas resolution: the image is NOT resampled;
+        /// content keeps its pixel size and is re-anchored to the center of
+        /// the new canvas (clipped when shrinking, padded when growing).
+        #[qinvokable]
+        fn resize_canvas(self: Pin<&mut Self>, width: i32, height: i32);
+
         #[qinvokable]
         fn reset_crop(self: Pin<&mut Self>);
 
@@ -193,7 +199,10 @@ pub mod qobject {
         fn set_base_locked(self: Pin<&mut Self>, locked: bool);
 
         #[qinvokable]
+        #[qinvokable]
         fn delete_base_layer(self: Pin<&mut Self>);
+
+        #[qinvokable]
         fn toggle_base_visible(self: Pin<&mut Self>);
 
         #[qinvokable]
@@ -1320,6 +1329,52 @@ session
                         .map(move |_| {
                             println!(
                                 "{{\"phase\":\"ui\",\"event\":\"resized\",\"from\":\"{}x{}\",\"to\":\"{}x{}\"}}",
+                                old.width, old.height, size.width, size.height
+                            );
+                            true
+                        })
+                        .map_err(|e| e.to_string())
+                }
+            }
+        };
+        match result {
+            Ok(true) => {
+                {
+                    let mut guard = self.session.borrow_mut();
+                    if let Some(s) = guard.as_mut() {
+                        s.refit_if_needed(viewport);
+                        s.dirty = true;
+                    }
+                }
+                self.as_mut().refresh_preview();
+            }
+            Ok(false) => {}
+            Err(message) => self
+                .as_mut()
+                .set_status(QString::from(message.as_str())),
+        }
+    }
+
+    pub fn resize_canvas(mut self: Pin<&mut Self>, width: i32, height: i32) {
+        if width < 1 || height < 1 {
+            self.as_mut()
+                .set_status(QString::from("resize-error: size must be >= 1"));
+            return;
+        }
+        let viewport = *self.viewport.borrow();
+        let result = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Ok(false),
+                Some(session) => {
+                    let size = Size::new(width as u32, height as u32);
+                    let old = session.doc.canvas;
+                    session
+                        .doc
+                        .resize_canvas(size)
+                        .map(move |_| {
+                            println!(
+                                "{{\"phase\":\"ui\",\"event\":\"canvas-resized\",\"from\":\"{}x{}\",\"to\":\"{}x{}\"}}",
                                 old.width, old.height, size.width, size.height
                             );
                             true

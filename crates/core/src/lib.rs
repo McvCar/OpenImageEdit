@@ -375,6 +375,11 @@ pub enum EditOp {
     /// Hide/show the base layer (eye toggle in the panel). Cheap flag flip,
     /// no pixels involved; snapshot-free undo via from/to.
     SetBaseVisible { from: bool, to: bool },
+    /// Change the canvas resolution WITHOUT resampling any pixels: content
+    /// keeps its size and is re-anchored to the center of the new canvas
+    /// (clipped when shrinking, transparent padding when growing). The
+    /// pre-op snapshot makes undo exact (same pattern as `ResizeDocument`).
+    CanvasResize { from: DocumentSnapshot, to: Size },
 }
 
 impl EditOp {
@@ -475,6 +480,10 @@ impl EditOp {
                 doc.base_hidden = *to;
                 Ok(())
             }
+            EditOp::CanvasResize { to, .. } => {
+                apply_canvas_resize(doc, *to);
+                Ok(())
+            }
         }
     }
 
@@ -562,6 +571,10 @@ impl EditOp {
                 doc.base_hidden = *from;
                 Ok(())
             }
+            EditOp::CanvasResize { from, .. } => {
+                doc.restore(from.clone());
+                Ok(())
+            }
         }
     }
 }
@@ -625,6 +638,50 @@ fn erase_base_pixels(doc: &mut Document, selection: &Selection) {    let canvas_
                 *doc.base.get_pixel_mut(bx, by) = image::Rgba([0, 0, 0, 0]);
             }
         }
+    }
+}
+
+/// Canvas-only resize (no resampling): the old base pixels are copied to the
+/// center of the new canvas (center anchor, cropped when shrinking), and every
+/// layer is shifted by the same delta so the whole composition stays centered.
+/// Layer pixels are NEVER resampled.
+fn apply_canvas_resize(doc: &mut Document, to: Size) {
+    let mut old = doc.base.clone();
+    let dx = (to.width as i64 - old.width() as i64) / 2;
+    let dy = (to.height as i64 - old.height() as i64) / 2;
+
+    // Copy the overlapping region of the old base into the new canvas.
+    // Source rect (old coords) and destination rect (new coords) are the same
+    // content translated by (dx, dy), clipped to both images.
+    let sx0 = (-dx).max(0);
+    let sy0 = (-dy).max(0);
+    let tx0 = dx.max(0);
+    let ty0 = dy.max(0);
+    let w = (old.width() as i64 - sx0).min(to.width as i64 - tx0).max(0) as u32;
+    let h = (old.height() as i64 - sy0).min(to.height as i64 - ty0).max(0) as u32;
+
+    let mut new_base = image::RgbaImage::new(to.width, to.height);
+    if w > 0 && h > 0 {
+        let part = image::imageops::crop(
+            &mut old,
+            sx0 as u32,
+            sy0 as u32,
+            w,
+            h,
+        );
+        image::imageops::overlay(
+            &mut new_base,
+            &part.to_image(),
+            tx0 as i64,
+            ty0 as i64,
+        );
+    }
+    doc.base = new_base;
+    doc.view = Rect::new(0, 0, to.width, to.height);
+    doc.canvas = to;
+    for layer in &mut doc.layers {
+        layer.offset.0 += dx as i32;
+        layer.offset.1 += dy as i32;
     }
 }
 
@@ -729,6 +786,16 @@ impl Document {
         }
         let from = self.snapshot();
         self.execute(EditOp::ResizeDocument { from, to })
+    }
+
+    /// Change only the canvas resolution: no pixel is resampled. Content is
+    /// re-anchored to the center of the new canvas (see `apply_canvas_resize`).
+    pub fn resize_canvas(&mut self, to: Size) -> Result<(), EditError> {
+        if to.width < 1 || to.height < 1 {
+            return Err(EditError::InvalidCanvasSize);
+        }
+        let from = self.snapshot();
+        self.execute(EditOp::CanvasResize { from, to })
     }
 
     pub fn add_layer(&mut self, layer: Layer) -> Result<usize, EditError> {
@@ -1535,6 +1602,63 @@ mod tests {
         assert_eq!(l.offset, (5, 3));
         assert_eq!(l.image.dimensions(), (2, 2));
         assert_eq!(doc.composite_pixel(5, 3).0, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn canvas_resize_centers_content_without_resampling() {
+        let mut doc = Document::from_image(ramp(8, 8));
+        let original = doc.flatten();
+
+        doc.resize_canvas(Size::new(12, 12)).unwrap();
+        assert_eq!(doc.canvas, Size::new(12, 12));
+        assert_eq!(doc.view, Rect::new(0, 0, 12, 12));
+        assert_eq!(doc.base.dimensions(), (12, 12));
+        // Old content is re-anchored to the center (offset +2/+2) and every
+        // pixel is copied verbatim (no resampling).
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(
+                    doc.composite_pixel(x + 2, y + 2).0,
+                    original.get_pixel(x as u32, y as u32).0
+                );
+            }
+        }
+        // Corners are transparent padding.
+        assert_eq!(doc.composite_pixel(0, 0).0[3], 0);
+        assert_eq!(doc.composite_pixel(11, 11).0[3], 0);
+    }
+
+    #[test]
+    fn canvas_resize_shrink_clips_to_center_and_undoes() {
+        let mut doc = Document::from_image(ramp(8, 8));
+        let mut layer = Layer::new(
+            "dot",
+            RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 255, 255])),
+        );
+        layer.offset = (0, 0);
+        doc.add_layer(layer).unwrap();
+        let original = doc.flatten();
+        let original_layers = doc.layers.clone();
+
+        doc.resize_canvas(Size::new(4, 4)).unwrap();
+        assert_eq!(doc.canvas, Size::new(4, 4));
+        // Composition re-anchored to the center: old (x+2, y+2) → new (x, y).
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(
+                    doc.composite_pixel(x, y).0,
+                    original.get_pixel((x + 2) as u32, (y + 2) as u32).0
+                );
+            }
+        }
+        // Layer shifted by (-2, -2); its pixels are untouched (still 2x2).
+        assert_eq!(doc.layers[0].offset, (-2, -2));
+        assert_eq!(doc.layers[0].image.dimensions(), (2, 2));
+
+        doc.undo().unwrap();
+        assert_eq!(doc.canvas, Size::new(8, 8));
+        assert_eq!(doc.layers, original_layers);
+        assert_eq!(doc.flatten(), original);
     }
 
     #[test]

@@ -83,6 +83,60 @@ Window {
         }
     }
 
+    // Checkbox row with a real checkbox visual: filled blue square + check
+    // mark when on, empty dark square when off, hover highlight on both.
+    component CheckRow: Item {
+        id: ck
+
+        property string label
+        property bool checked: false
+        property bool active: true
+        signal toggled()
+
+        width: 14 + 8 + ckLabel.implicitWidth
+        height: 18
+
+        Rectangle {
+            id: box
+            x: 0
+            anchors.verticalCenter: parent.verticalCenter
+            width: 14
+            height: 14
+            radius: 3
+            color: ck.checked ? "#3d5a80" : (ckHover.containsMouse && ck.active ? "#33373c" : "#1b1c1e")
+            border.color: ck.checked ? "#6aa9ff"
+                          : (ckHover.containsMouse && ck.active ? "#8f96a3" : "#5a6069")
+            border.width: ck.checked ? 2 : 1
+            opacity: ck.active ? 1.0 : 0.35
+
+            Text {
+                anchors.centerIn: parent
+                visible: ck.checked
+                text: "✓"
+                color: "#e9eaec"
+                font.pixelSize: 11
+                font.bold: true
+            }
+        }
+        Text {
+            id: ckLabel
+            x: 22
+            anchors.verticalCenter: parent.verticalCenter
+            text: ck.label
+            color: ck.checked ? "#e9eaec" : "#b8bcc0"
+            font.pixelSize: 12
+            opacity: ck.active ? 1.0 : 0.35
+        }
+        MouseArea {
+            id: ckHover
+            anchors.fill: parent
+            hoverEnabled: true
+            enabled: ck.active
+            cursorShape: Qt.PointingHandCursor
+            onClicked: ck.toggled()
+        }
+    }
+
     // Title-bar icon button (no QtQuick.Controls dependency: the tooltip is
     // hand-rolled). `separator` renders a slim divider instead of a button.
     component IconButton: Rectangle {
@@ -452,6 +506,7 @@ Window {
         readonly property bool probeDialog: Qt.application.arguments.indexOf("--probe-dialog") !== -1
         readonly property bool probeSettings: Qt.application.arguments.indexOf("--probe-settings") !== -1
         readonly property bool probeMenu: Qt.application.arguments.indexOf("--probe-menu") !== -1
+        readonly property bool probeResize: Qt.application.arguments.indexOf("--probe-resize") !== -1
         // Ids inside an inline component are invisible from outside, so the
         // shell / DocWindow wrappers reach the Bridge through this alias.
         readonly property alias b: bridge
@@ -512,6 +567,8 @@ Window {
     Shortcut { sequence: "F11"; onActivated: root.fullscreen = !root.fullscreen }
     Shortcut { sequence: "Escape"; onActivated: onEscape() }
     // Browse images in the loaded file's folder (guard: no active gesture).
+    // Dialogs block navigation so arrow keys never swap the file behind a
+    // open settings/resize panel.
     Shortcut { sequence: "Left"; enabled: canNavigate(); onActivated: navigateRel(-1) }
     Shortcut { sequence: "Right"; enabled: canNavigate(); onActivated: navigateRel(1) }
     Shortcut { sequences: ["Return", "Enter"]
@@ -943,29 +1000,6 @@ Window {
                         Qt.quit();
                 }
             }
-        }
-
-        // Resolution badges on the image's top-left / bottom-right corners
-        // (outlined text so it stays readable on any background).
-        Text {
-            visible: bridge.image_width > 0
-            x: previewImage.x + 6
-            y: previewImage.y + 6
-            text: bridge.image_width + " × " + bridge.image_height
-            color: "#f2f4f7"
-            font.pixelSize: 11
-            style: Text.Outline
-            styleColor: "#b3000000"
-        }
-        Text {
-            visible: bridge.image_width > 0
-            x: previewImage.x + previewImage.width - width - 6
-            y: previewImage.y + previewImage.height - height - 6
-            text: bridge.image_width + " × " + bridge.image_height
-            color: "#f2f4f7"
-            font.pixelSize: 11
-            style: Text.Outline
-            styleColor: "#b3000000"
         }
 
         // ---- Persistent-selection interaction stack ----------------------
@@ -1815,6 +1849,9 @@ Window {
         visible: false
         z: 100
         property bool keepRatio: false
+        // Canvas-only mode: change the canvas resolution WITHOUT resampling
+        // the image (content is re-anchored to the new center).
+        property bool canvasOnly: false
         // Clear text-field focus on close, otherwise the hidden TextInput
         // keeps consuming Ctrl+Z / Ctrl+Y as text undo and the document
         // undo/redo shortcuts appear dead (bug: dead after resize dialog).
@@ -1823,36 +1860,55 @@ Window {
             resizeH.focus = false
         }
 
+        // Blocks clicks on the dimmed background; the dialog closes via the
+        // ✕ / 取消 buttons or Esc only (click-away closing felt accidental).
         MouseArea {
             anchors.fill: parent
-            onClicked: resizeOverlay.visible = false
         }
 
         Rectangle {
             id: resizeDialog
-            width: 320
-            height: 210
+            width: 360
+            height: resizeCol.height + 28
             x: (parent.width - width) / 2
             y: (parent.height - height) / 2
-            radius: 6
+            radius: 8
             color: "#2b2e33"
             border.color: "#3c4043"
 
             Column {
-                anchors.centerIn: parent
+                id: resizeCol
+                anchors.top: parent.top
+                anchors.topMargin: 14
+                anchors.left: parent.left
+                anchors.leftMargin: 14
+                anchors.right: parent.right
+                anchors.rightMargin: 14
                 spacing: 12
 
-                Text {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    text: "调整尺寸"
-                    color: "#e9eaec"
-                    font.pixelSize: 14
-                    font.bold: true
+                // Title bar: title + close button.
+                Row {
+                    width: parent.width
+                    spacing: 8
+                    Text {
+                        id: resizeTitle
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "调整尺寸"
+                        color: "#e9eaec"
+                        font.pixelSize: 14
+                        font.bold: true
+                    }
+                    Item { width: parent.width - resizeTitle.implicitWidth - 30 - 16; height: 1 }
+                    IconButton {
+                        glyph: "✕"
+                        tip: "关闭"
+                        onClicked: resizeOverlay.visible = false
+                    }
                 }
+                Rectangle { width: parent.width; height: 1; color: "#3c4043" }
 
                 Row {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    spacing: 6
+                    spacing: 8
 
                     Text {
                         text: "宽"
@@ -1862,24 +1918,32 @@ Window {
                     }
 
                     Item {
-                        width: 80
+                        width: 76
                         height: 26
                         anchors.verticalCenter: parent.verticalCenter
 
                         Rectangle {
                             anchors.fill: parent
                             color: "#1b1c1e"
-                            border.color: "#3c4043"
+                            border.color: resizeW.activeFocus ? "#6aa9ff" : "#3c4043"
+                            border.width: resizeW.activeFocus ? 2 : 1
                             radius: 3
                         }
 
                         TextInput {
                             id: resizeW
                             anchors.fill: parent
+                            anchors.margins: 5
                             text: ""
                             font.pixelSize: 13
                             color: "#e9eaec"
-                            onTextChanged: if (resizeOverlay.keepRatio)
+                            verticalAlignment: TextInput.AlignVCenter
+                            validator: IntValidator { bottom: 1; top: 99999 }
+                            selectByMouse: true
+                            onActiveFocusChanged: if (activeFocus) selectAll()
+                            onTextChanged: if (resizeOverlay.keepRatio
+                                               && !resizeOverlay.canvasOnly
+                                               && activeFocus)
                                 resizeH.text = linkedHeight()
                             onAccepted: commitResize()
                         }
@@ -1893,49 +1957,94 @@ Window {
                     }
 
                     Item {
-                        width: 80
+                        width: 76
                         height: 26
                         anchors.verticalCenter: parent.verticalCenter
 
                         Rectangle {
                             anchors.fill: parent
                             color: "#1b1c1e"
-                            border.color: "#3c4043"
+                            border.color: resizeH.activeFocus ? "#6aa9ff" : "#3c4043"
+                            border.width: resizeH.activeFocus ? 2 : 1
                             radius: 3
                         }
 
                         TextInput {
                             id: resizeH
                             anchors.fill: parent
+                            anchors.margins: 5
                             text: ""
                             font.pixelSize: 13
                             color: "#e9eaec"
-                            onTextChanged: if (resizeOverlay.keepRatio)
+                            verticalAlignment: TextInput.AlignVCenter
+                            validator: IntValidator { bottom: 1; top: 99999 }
+                            selectByMouse: true
+                            onActiveFocusChanged: if (activeFocus) selectAll()
+                            onTextChanged: if (resizeOverlay.keepRatio
+                                               && !resizeOverlay.canvasOnly
+                                               && activeFocus)
                                 resizeW.text = linkedWidth()
                             onAccepted: commitResize()
                         }
                     }
 
-                    ToolButton {
-                        label: "保持比例" + (resizeOverlay.keepRatio ? " [x]" : "")
-                        active: true
+                    Text {
+                        text: "px"
+                        color: "#6b7076"
+                        font.pixelSize: 11
                         anchors.verticalCenter: parent.verticalCenter
-                        onClicked: resizeOverlay.keepRatio = !resizeOverlay.keepRatio
                     }
                 }
 
-                Row {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    spacing: 12
-                    ToolButton { label: "确定"; active: true; onClicked: commitResize() }
-                    ToolButton { label: "取消"; active: true; onClicked: resizeOverlay.visible = false }
+                CheckRow {
+                    id: ratioCheck
+                    label: "保持宽高比"
+                    checked: resizeOverlay.keepRatio
+                    active: !resizeOverlay.canvasOnly
+                    onToggled: resizeOverlay.keepRatio = !resizeOverlay.keepRatio
+                }
+
+                CheckRow {
+                    id: canvasCheck
+                    label: "只调整画布大小（图片不缩放，内容居中）"
+                    checked: resizeOverlay.canvasOnly
+                    onToggled: {
+                        resizeOverlay.canvasOnly = !resizeOverlay.canvasOnly
+                        if (resizeOverlay.canvasOnly)
+                            resizeOverlay.keepRatio = false
+                    }
                 }
 
                 Text {
-                    anchors.horizontalCenter: parent.horizontalCenter
+                    text: resizeOverlay.canvasOnly
+                          ? "画布变为目标分辨率，图片按原样居中放置"
+                          : "图片内容缩放到目标分辨率（Lanczos）"
+                    color: "#8f96a3"
+                    font.pixelSize: 11
+                }
+
+                Text {
                     text: "当前：" + bridge.image_width + " × " + bridge.image_height
                     color: "#6b7076"
                     font.pixelSize: 11
+                }
+
+                Row {
+                    width: parent.width
+                    spacing: 8
+
+                    Item { width: parent.width - 60 - 60 - 16; height: 1 }
+                    ToolButton {
+                        label: "取消"
+                        active: true
+                        onClicked: resizeOverlay.visible = false
+                    }
+                    ToolButton {
+                        label: resizeOverlay.canvasOnly ? "应用画布" : "确定"
+                        active: true
+                        selected: true
+                        onClicked: commitResize()
+                    }
                 }
             }
         }
@@ -2195,13 +2304,14 @@ Window {
         resizeW.text = String(bridge.image_width)
         resizeH.text = String(bridge.image_height)
         resizeOverlay.keepRatio = false
+        resizeOverlay.canvasOnly = false
         resizeOverlay.visible = true
     }
 
     function commitResize() {
         let w = parseInt(resizeW.text)
         let h = parseInt(resizeH.text)
-        if (resizeOverlay.keepRatio) {
+        if (resizeOverlay.keepRatio && !resizeOverlay.canvasOnly) {
             if (isNaN(h))
                 h = parseInt(linkedHeight())
             if (isNaN(w))
@@ -2209,13 +2319,17 @@ Window {
         }
         if (isNaN(w) || w < 1 || isNaN(h) || h < 1)
             return
-        bridge.resize_to(w, h)
+        if (resizeOverlay.canvasOnly)
+            bridge.resize_canvas(w, h)
+        else
+            bridge.resize_to(w, h)
         resizeOverlay.visible = false
     }
 
     function onEscape() {
         if (root.renamingIndex >= 0) { root.renamingIndex = -1; return }
         if (confirmOverlay.visible) { confirmCancel(); return }
+        if (resizeOverlay.visible) { resizeOverlay.visible = false; return }
         if (settingsOverlay.visible) { settingsOverlay.visible = false; return }
         if (root.scaleW > 0) { cancelLayerScale(); return }
         if (selDragMouse.dragging) { selDragMouse.dragging = false; return }
@@ -2461,31 +2575,48 @@ Window {
             hexDark.focus = false
         }
 
+        // Blocks clicks on the dimmed background; the panel closes via the
+        // ✕ button or Esc only (click-away closing felt accidental).
         MouseArea {
             anchors.fill: parent
-            onClicked: settingsOverlay.visible = false
         }
 
         Rectangle {
             width: 420
-            height: settingsCol.height + 32
+            height: settingsCol.height + 28
             anchors.centerIn: parent
-            radius: 6
+            radius: 8
             color: "#2b2e33"
             border.color: "#3c4043"
 
             Column {
                 id: settingsCol
-                anchors.centerIn: parent
+                anchors.top: parent.top
+                anchors.topMargin: 14
+                anchors.left: parent.left
+                anchors.leftMargin: 14
+                anchors.right: parent.right
+                anchors.rightMargin: 14
                 spacing: 12
-                width: parent.width - 36
 
-                Text {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    text: "设置"
-                    color: "#e9eaec"
-                    font.pixelSize: 14
-                    font.bold: true
+                // Title bar: title + close button.
+                Row {
+                    width: parent.width
+                    spacing: 8
+                    Text {
+                        id: setTitle
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "设置"
+                        color: "#e9eaec"
+                        font.pixelSize: 14
+                        font.bold: true
+                    }
+                    Item { width: parent.width - setTitle.implicitWidth - 30 - 16; height: 1 }
+                    IconButton {
+                        glyph: "✕"
+                        tip: "关闭"
+                        onClicked: settingsOverlay.visible = false
+                    }
                 }
 
                 Rectangle { width: parent.width; height: 1; color: "#3c4043" }
@@ -2728,7 +2859,7 @@ Window {
         return bridge.image_width > 0 && !root.selExists
             && bridge.selected_layer < 0 && !root.pasteFloating
             && !root.modeActive && !confirmOverlay.visible
-            && !settingsOverlay.visible
+            && !settingsOverlay.visible && !resizeOverlay.visible
     }
 
     function navigateRel(dir) {
@@ -2804,6 +2935,13 @@ Window {
         onTriggered: overflowMenu.visible = true
     }
 
+    // Probe timer: --probe-resize opens the resize dialog automatically.
+    Timer {
+        id: resizeProbeTimer
+        interval: 900
+        onTriggered: openResizeDialog()
+    }
+
     Component.onCompleted: {
         bridge.mark("qml-completed");
         if (root.primary) {
@@ -2814,6 +2952,8 @@ Window {
                 settingsProbeTimer.start();
             if (root.probeMenu)
                 menuProbeTimer.start();
+            if (root.probeResize)
+                resizeProbeTimer.start();
         } else if (root.fileUrl.toString().length > 0) {
             // Document window spawned for a specific file ("open in separate
             // window" setting, drag-out, etc.).
