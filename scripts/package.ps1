@@ -14,8 +14,12 @@ $benchDir = Join-Path $repoRoot 'bench-data'
 $sample = Join-Path $benchDir 'small-1600x1200.jpg'
 
 if (-not $SkipBuild) {
-    & cargo build --release --workspace
-    if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+    $oldEA = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $buildOut = & cargo build --release --workspace 2>&1 | Out-String
+    $buildExit = $LASTEXITCODE
+    $ErrorActionPreference = $oldEA
+    if ($buildExit -ne 0) { throw "cargo build failed`n$buildOut" }
 }
 
 if (Test-Path -LiteralPath $distDir) { Remove-Item -LiteralPath $distDir -Recurse -Force }
@@ -24,11 +28,15 @@ New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 Copy-Item (Join-Path $repoRoot 'target\release\imageedit.exe') $distDir
 Copy-Item (Join-Path $repoRoot 'target\release\imageedit-bench.exe') $distDir
 
-& (Join-Path $env:IMAGEEDIT_QT_BIN 'windeployqt.exe') --release --no-translations `
+$oldEA = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+$depOut = & (Join-Path $env:IMAGEEDIT_QT_BIN 'windeployqt.exe') --release --no-translations `
     --no-system-d3d-compiler --compiler-runtime `
-    --qmldir (Join-Path $repoRoot 'crates\ui\qml') (Join-Path $distDir 'imageedit.exe') |
-    Out-Null
-if ($LASTEXITCODE -ne 0) { throw "windeployqt failed" }
+    --qmldir (Join-Path $repoRoot 'crates\ui\qml') (Join-Path $distDir 'imageedit.exe') 2>&1 |
+    Out-String
+$depExit = $LASTEXITCODE
+$ErrorActionPreference = $oldEA
+if ($depExit -ne 0) { throw "windeployqt failed`n$depOut" }
 
 # QML modules and DLLs that this app never imports. QtQuick.Dialogs.quickimpl
 # only needs QtQuick + QtQuick.Templates + QtQuick.Layouts, so the whole

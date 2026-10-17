@@ -119,6 +119,7 @@
 5. **打包自检必须自动化**：`--probe-dialog` 在启动 500ms 后自动打开文件对话框并把 `dialog-opened` 打点到 stdout，`--selftest --probe-dialog` 可无人值守验证「对话框插件 + QML 模块 + DLL 依赖」完整（本次裁剪失败正是靠它定位到缺少 `Qt6QuickControls2Impl.dll`）。
 6. **PowerShell 会毁掉 UTF-8 源文件**：用 `Get-Content -Raw` + `-replace` + `Set-Content` 改含中文/符号的 `.qml` 会把非 ASCII 字符替换成 `?`（并吞掉引号），导致 qmlcachegen 报 `Expected token ','`。**改文件必须用专用编辑工具，不要走 PowerShell 文本往返**。
 7. **PowerShell 管道截断会杀掉原生进程**：`windeployqt ... | Select-Object -First 5` 会因管道提前关闭而中断 `windeployqt`，产物只剩 `Qt6Core.dll`（当时 9.7MB）。要么全量重定向到文件，要么 `| Out-Null`。
+   **补充（2026-10-17）**：脚本顶部 `$ErrorActionPreference='Stop'` 时，`cargo`/`windeployqt` 的 stderr 输出（进度/warning）会以 `NativeCommandError` 中断脚本——仅靠 `2>&1 | Out-String` 不够，必须临时 `$ErrorActionPreference='Continue'` 包一层再捕获。
 8. **bench 必须校验输入文件存在**：否则 UI 子进程进入「解码失败 → 永不渲染 → 看门狗超时」路径，计时器会把超时当成首帧耗时上报（本次曾产出 2197ms/10609ms 的伪数据）。
 9. **缺失文件应快速失败**：`loadFailed` 属性 + QML `Qt.quit()` 让自测路径在 0.5s 内退出，而不是干等 10s 看门狗。
 10. **MSVC 必须带 `/utf-8`**：`qmlcachegen` 把含中文的 `main.qml` 生成 `.cpp`（UTF-8 字节），`cl.exe` 不带 `/utf-8` 按 GBK 解析会把字符串字面量中的多字节字符切断，报 `C2001 常量中有换行符`。在 `scripts/env.ps1` 设 `CFLAGS/CXXFLAGS=/utf-8` 解决。
