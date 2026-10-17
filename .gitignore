@@ -1,0 +1,9 @@
+/target
+/.tools
+/build
+/.qt
+/dist
+/bench-data
+aqtinstall.log
+*.user
+.qmlls.ini
