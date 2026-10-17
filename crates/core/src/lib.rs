@@ -192,6 +192,9 @@ pub struct Document {
     pub source: Option<std::path::PathBuf>,
     pub canvas: Size,
     pub base: RgbaImage,
+    /// Visible region of `base`, in `base` coordinates. Cropping only shrinks
+    /// this rect (no pixel copy), so crop is O(1) and reversible.
+    pub view: Rect,
     pub layers: Vec<Layer>,
     history: History,
 }
@@ -202,6 +205,8 @@ pub enum EditError {
     LayerIndex(usize),
     #[error("selection is empty")]
     EmptySelection,
+    #[error("crop rect is empty or outside the image")]
+    EmptyCrop,
     #[error("nothing to undo")]
     NothingToUndo,
     #[error("nothing to redo")]
@@ -243,6 +248,20 @@ impl Transform {
     }
 }
 
+fn transform_rect(rect: Rect, transform: Transform, canvas: Size) -> Rect {
+    let (cw, ch) = (canvas.width as i32, canvas.height as i32);
+    let (lw, lh) = (rect.width as i32, rect.height as i32);
+    let (ox, oy) = (rect.x, rect.y);
+    let (x, y, width, height) = match transform {
+        Transform::Rotate90Cw => (ch - (oy + lh), ox, lh, lw),
+        Transform::Rotate90Ccw => (oy, cw - (ox + lw), lh, lw),
+        Transform::Rotate180 => (cw - (ox + lw), ch - (oy + lh), lw, lh),
+        Transform::FlipHorizontal => (cw - (ox + lw), oy, lw, lh),
+        Transform::FlipVertical => (ox, ch - (oy + lh), lw, lh),
+    };
+    Rect::new(x, y, width.max(0) as u32, height.max(0) as u32)
+}
+
 fn transform_document(doc: &mut Document, transform: Transform) {
     let canvas = doc.canvas;
     for layer in &mut doc.layers {
@@ -259,6 +278,10 @@ fn transform_document(doc: &mut Document, transform: Transform) {
             Transform::FlipVertical => (ox, ch - (oy + lh)),
         };
     }
+    // `view` lives in base coordinates, so it maps against the base dimensions
+    // (layers use canvas dimensions, since their offsets are canvas-relative).
+    let base_before = Size::new(doc.base.width(), doc.base.height());
+    doc.view = transform_rect(doc.view, transform, base_before);
     doc.base = transform.apply_to_image(&doc.base);
     if transform.swaps_axes() {
         doc.canvas = Size::new(canvas.height, canvas.width);
@@ -268,6 +291,7 @@ fn transform_document(doc: &mut Document, transform: Transform) {
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditOp {
     TransformDocument { transform: Transform },
+    CropDocument { from: Rect, to: Rect },
     AddLayer { layer: Layer, index: usize },
     RemoveLayer { layer: Layer, index: usize },
     MoveLayer { from: usize, to: usize },
@@ -282,6 +306,10 @@ impl EditOp {
         match self {
             EditOp::TransformDocument { transform } => {
                 transform_document(doc, *transform);
+                Ok(())
+            }
+            EditOp::CropDocument { to, .. } => {
+                apply_view(doc, *to);
                 Ok(())
             }
             EditOp::AddLayer { layer, index } => {
@@ -345,6 +373,10 @@ impl EditOp {
         match self {
             EditOp::TransformDocument { transform } => {
                 transform_document(doc, transform.inverted());
+                Ok(())
+            }
+            EditOp::CropDocument { from, .. } => {
+                apply_view(doc, *from);
                 Ok(())
             }
             EditOp::AddLayer { index, .. } => {
@@ -430,6 +462,11 @@ impl History {
     }
 }
 
+fn apply_view(doc: &mut Document, view: Rect) {
+    doc.view = view;
+    doc.canvas = Size::new(view.width, view.height);
+}
+
 impl Document {
     pub fn from_image(image: RgbaImage) -> Self {
         let canvas = Size::new(image.width(), image.height());
@@ -437,6 +474,7 @@ impl Document {
             source: None,
             canvas,
             base: image,
+            view: Rect::new(0, 0, canvas.width, canvas.height),
             layers: Vec::new(),
             history: History::new(256),
         }
@@ -446,6 +484,41 @@ impl Document {
         op.apply(self)?;
         self.history.push(op);
         Ok(())
+    }
+
+    /// Crop to `rect`, given in canvas coordinates. The rect is clamped to the
+    /// current canvas; a rect that falls outside it is rejected. Use
+    /// [`Document::reset_crop`] to reveal the full base image again.
+    pub fn crop(&mut self, rect: Rect) -> Result<(), EditError> {
+        let canvas_rect = Rect::new(0, 0, self.canvas.width, self.canvas.height);
+        let clamped = rect.intersect(canvas_rect).ok_or(EditError::EmptyCrop)?;
+        if clamped.is_empty() {
+            return Err(EditError::EmptyCrop);
+        }
+        self.execute(EditOp::CropDocument {
+            from: self.view,
+            to: Rect::new(
+                self.view.x + clamped.x,
+                self.view.y + clamped.y,
+                clamped.width,
+                clamped.height,
+            ),
+        })
+    }
+
+    /// Undo every crop, showing the full base image again.
+    pub fn reset_crop(&mut self) -> Result<(), EditError> {
+        if self.view.x == 0
+            && self.view.y == 0
+            && self.view.width == self.base.width()
+            && self.view.height == self.base.height()
+        {
+            return Ok(());
+        }
+        self.execute(EditOp::CropDocument {
+            from: self.view,
+            to: Rect::new(0, 0, self.base.width(), self.base.height()),
+        })
     }
 
     pub fn apply_transform(&mut self, transform: Transform) -> Result<(), EditError> {
@@ -575,7 +648,13 @@ impl Document {
         if x < 0 || y < 0 || x >= self.canvas.width as i32 || y >= self.canvas.height as i32 {
             return image::Rgba([0, 0, 0, 0]);
         }
-        let mut out = self.base.get_pixel(x as u32, y as u32).0;
+        let bx = (self.view.x + x) as u32;
+        let by = (self.view.y + y) as u32;
+        let mut out = if bx < self.base.width() && by < self.base.height() {
+            self.base.get_pixel(bx, by).0
+        } else {
+            [0, 0, 0, 0]
+        };
         for layer in &self.layers {
             if !layer.visible || layer.opacity <= 0.0 {
                 continue;
@@ -804,6 +883,108 @@ mod tests {
         let mut image = RgbaImage::from_pixel(width, height, image::Rgba([0, 0, 0, 255]));
         image.put_pixel(0, 0, image::Rgba([255, 255, 255, 255]));
         image
+    }
+
+    fn ramp(width: u32, height: u32) -> RgbaImage {
+        RgbaImage::from_fn(width, height, |x, y| {
+            image::Rgba([x as u8, y as u8, 0, 255])
+        })
+    }
+
+    #[test]
+    fn crop_shrinks_canvas_and_shifts_visible_region() {
+        let mut doc = Document::from_image(ramp(64, 48));
+        doc.crop(Rect::new(10, 6, 20, 12)).unwrap();
+
+        assert_eq!(doc.canvas, Size::new(20, 12));
+        assert_eq!(doc.view, Rect::new(10, 6, 20, 12));
+        assert_eq!(doc.base.width(), 64);
+        assert_eq!(doc.composite_pixel(0, 0).0, [10, 6, 0, 255]);
+        assert_eq!(doc.composite_pixel(19, 11).0, [29, 17, 0, 255]);
+    }
+
+    #[test]
+    fn crop_undo_and_redo_restore_canvas_and_pixels() {
+        let mut doc = Document::from_image(ramp(64, 48));
+        let original = doc.flatten();
+
+        doc.crop(Rect::new(10, 6, 20, 12)).unwrap();
+        doc.undo().unwrap();
+        assert_eq!(doc.canvas, Size::new(64, 48));
+        assert_eq!(doc.flatten(), original);
+
+        doc.redo().unwrap();
+        assert_eq!(doc.canvas, Size::new(20, 12));
+        assert_eq!(doc.composite_pixel(0, 0).0, [10, 6, 0, 255]);
+    }
+
+    #[test]
+    fn crop_composes_and_clamps_to_the_image() {
+        let mut doc = Document::from_image(ramp(64, 48));
+        doc.crop(Rect::new(10, 6, 20, 12)).unwrap();
+        doc.crop(Rect::new(2, 2, 100, 100)).unwrap();
+
+        assert_eq!(doc.canvas, Size::new(18, 10));
+        assert_eq!(doc.view, Rect::new(12, 8, 18, 10));
+        assert_eq!(doc.composite_pixel(0, 0).0, [12, 8, 0, 255]);
+
+        let mut doc = Document::from_image(ramp(16, 16));
+        assert_eq!(doc.crop(Rect::new(20, 20, 4, 4)), Err(EditError::EmptyCrop));
+        assert_eq!(doc.crop(Rect::new(0, 0, 0, 4)), Err(EditError::EmptyCrop));
+    }
+
+    #[test]
+    fn reset_crop_shows_the_full_image_again() {
+        let mut doc = Document::from_image(ramp(64, 48));
+        doc.crop(Rect::new(10, 6, 20, 12)).unwrap();
+        doc.reset_crop().unwrap();
+
+        assert_eq!(doc.canvas, Size::new(64, 48));
+        assert_eq!(doc.composite_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert_eq!(doc.composite_pixel(63, 47).0, [63, 47, 0, 255]);
+        doc.undo().unwrap();
+        assert_eq!(doc.canvas, Size::new(20, 12));
+    }
+
+    #[test]
+    fn crop_moves_layers_relative_to_the_new_origin() {
+        let mut doc = Document::from_image(RgbaImage::from_pixel(
+            40,
+            30,
+            image::Rgba([0, 0, 0, 255]),
+        ));
+        let mut layer = Layer::new(
+            "dot",
+            RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255])),
+        );
+        layer.offset = (2, 3);
+        doc.add_layer(layer).unwrap();
+
+        doc.crop(Rect::new(5, 5, 20, 20)).unwrap();
+        assert_eq!(doc.canvas, Size::new(20, 20));
+        // 图层坐标未改动，但视口左上角移到了 (5,5)，所以它落在画布外左侧/上方。
+        assert_eq!(doc.layers[0].offset, (2, 3));
+        assert_eq!(doc.composite_pixel(0, 0).0, [0, 0, 0, 255]);
+
+        doc.reset_crop().unwrap();
+        assert_eq!(doc.composite_pixel(2, 3).0, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn crop_then_rotate_keeps_the_view_on_the_same_content() {
+        let mut doc = Document::from_image(ramp(64, 48));
+        doc.crop(Rect::new(10, 6, 20, 12)).unwrap();
+        doc.apply_transform(Transform::Rotate90Cw).unwrap();
+
+        assert_eq!(doc.canvas, Size::new(12, 20));
+        assert_eq!(doc.view, Rect::new(48 - 6 - 12, 10, 12, 20));
+        // 裁剪区左上角的内容在旋转后落到右上角。
+        assert_eq!(doc.composite_pixel(11, 0).0, [10, 6, 0, 255]);
+        assert_eq!(doc.composite_pixel(0, 19).0, [29, 17, 0, 255]);
+
+        doc.apply_transform(Transform::Rotate90Ccw).unwrap();
+        assert_eq!(doc.canvas, Size::new(20, 12));
+        assert_eq!(doc.composite_pixel(0, 0).0, [10, 6, 0, 255]);
     }
 
     #[test]

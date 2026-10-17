@@ -85,12 +85,13 @@ pub fn render_for_viewport(doc: &Document, viewport: Viewport) -> RgbaImage {
 }
 
 /// Fast path for preview generation: when no layer contributes pixels the base
-/// image is resized directly, avoiding a full-resolution flatten.
+/// image is resized directly (through the crop view), avoiding a full-resolution
+/// flatten.
 pub fn composite_for_preview(doc: &Document, target: Size) -> RgbaImage {
     if doc.layers.iter().any(|layer| layer.visible) {
         resize_to(&doc.flatten(), target)
     } else {
-        resize_to(&doc.base, target)
+        resize_to(&crop_region(&doc.base, doc.view), target)
     }
 }
 
@@ -140,6 +141,24 @@ mod tests {
         let preview = composite_for_preview(&doc, Size::new(40, 20));
         assert_eq!(preview.dimensions(), (40, 20));
         assert_eq!(preview.get_pixel(0, 0).0, [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn preview_fast_path_honors_the_crop_view() {
+        let mut doc = Document::from_image(solid(100, 50, [10, 20, 30, 255]));
+        let mut hidden = Layer::new("hidden", solid(100, 50, [200, 0, 0, 255]));
+        hidden.visible = false;
+        doc.add_layer(hidden).unwrap();
+
+        doc.crop(Rect::new(40, 10, 30, 20)).unwrap();
+        let preview = composite_for_preview(&doc, Size::new(30, 20));
+        assert_eq!(preview.dimensions(), (30, 20));
+
+        // 还原裁剪后回到全尺寸底图。
+        doc.reset_crop().unwrap();
+        let restored = composite_for_preview(&doc, Size::new(100, 50));
+        assert_eq!(restored.dimensions(), (100, 50));
+        assert_eq!(restored.get_pixel(0, 0).0, [10, 20, 30, 255]);
     }
 
     #[test]
