@@ -292,11 +292,16 @@ Window {
         property real rw: 0
         property real rh: 0
         property color dashColor: "#5b9dff"
+        // "Marching ants" phase: bumped periodically while visible, the
+        // dash pattern slides backwards along the (clockwise) rect path,
+        // which reads as a counterclockwise rotation.
+        property real dashPhase: 0
         onRxChanged: requestPaint()
         onRyChanged: requestPaint()
         onRwChanged: requestPaint()
         onRhChanged: requestPaint()
         onDashColorChanged: requestPaint()
+        onDashPhaseChanged: requestPaint()
         onPaint: {
             var ctx = getContext("2d")
             ctx.clearRect(0, 0, width, height)
@@ -305,7 +310,14 @@ Window {
             ctx.strokeStyle = String(dashColor)
             ctx.lineWidth = 1.5
             ctx.setLineDash([5, 4])
+            ctx.lineDashOffset = dashPhase
             ctx.strokeRect(rx + 0.75, ry + 0.75, rw - 1.5, rh - 1.5)
+        }
+        Timer {
+            interval: 90
+            repeat: true
+            running: dashed.visible && dashed.rw > 0 && dashed.rh > 0
+            onTriggered: dashed.dashPhase = (dashed.dashPhase + 1) % 9
         }
     }
 
@@ -391,17 +403,25 @@ Window {
         MouseArea {
             id: centerMa
             anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: Qt.SizeAllCursor
+            hoverEnabled: false
             enabled: handles.moveEnabled && handles.moveFn !== null
                      && handles.bw > 0 && handles.bh > 0
-                     && centerMa.mouseX > handles.bx && centerMa.mouseX < handles.bx + handles.bw
-                     && centerMa.mouseY > handles.by && centerMa.mouseY < handles.by + handles.bh
             property rect startRect
             property real px: 0
             property real py: 0
 
+            // Only grab presses that land INSIDE the box; a press on empty
+            // canvas is rejected so it falls through to the rubber-band area
+            // below. NOTE: gating `enabled` on hover coordinates (the old
+            // approach) deadlocks — a disabled MouseArea stops receiving
+            // hover, so its mouseX/mouseY freeze and `enabled` can never
+            // become true again.
             onPressed: (mouse) => {
+                if (mouse.x <= handles.bx || mouse.x >= handles.bx + handles.bw
+                        || mouse.y <= handles.by || mouse.y >= handles.by + handles.bh) {
+                    mouse.accepted = false
+                    return
+                }
                 px = mouse.x
                 py = mouse.y
                 startRect = Qt.rect(handles.bx, handles.by, handles.bw, handles.bh)
@@ -412,6 +432,53 @@ Window {
                     handles.moveFn(startRect, mouse.x - px, mouse.y - py)
             }
             onReleased: handles.engaged = false
+        }
+
+        // Four edge strips: the whole dashed border is grabbable, not only
+        // the dots. Each strip straddles the box edge (half in, half out),
+        // shows the matching resize cursor on hover and feeds resizeFn with
+        // the same role strings the dot handles use. z:1 keeps them above
+        // the center move pad (z:0) but below the dot handles (z:2), so
+        // corners keep their diagonal cursors.
+        Repeater {
+            model: [
+                { role: "n", shape: Qt.SizeVerCursor },
+                { role: "s", shape: Qt.SizeVerCursor },
+                { role: "w", shape: Qt.SizeHorCursor },
+                { role: "e", shape: Qt.SizeHorCursor }
+            ]
+
+            delegate: MouseArea {
+                required property var modelData
+                readonly property string role: modelData.role
+                hoverEnabled: true
+                cursorShape: modelData.shape
+                enabled: handles.resizeFn !== null && handles.bw > 0 && handles.bh > 0
+                z: 1
+                x: role === "e" ? handles.bx + handles.bw - 4
+                                : handles.bx - 4
+                y: role === "s" ? handles.by + handles.bh - 4
+                                : handles.by - 4
+                width: role === "w" || role === "e" ? 8 : handles.bw + 8
+                height: role === "n" || role === "s" ? 8 : handles.bh + 8
+
+                property rect startRect
+                property real px: 0
+                property real py: 0
+
+                onPressed: (mouse) => {
+                    px = mouse.x
+                    py = mouse.y
+                    startRect = Qt.rect(handles.bx, handles.by, handles.bw, handles.bh)
+                    handles.engaged = true
+                }
+                onPositionChanged: (mouse) => {
+                    if (pressed && handles.resizeFn)
+                        handles.resizeFn(startRect, role, mouse.x - px, mouse.y - py,
+                                         (mouse.modifiers & Qt.ShiftModifier) !== 0)
+                }
+                onReleased: handles.engaged = false
+            }
         }
     }
 
@@ -744,9 +811,7 @@ Window {
             anchors.verticalCenter: parent.verticalCenter
             width: Math.min(implicitWidth, 220)
             elide: Text.ElideRight
-            text: bridge.image_width > 0
-                  ? "ImageEdit — " + bridge.image_width + "×" + bridge.image_height
-                  : "ImageEdit"
+            text: "ImageEdit"
             color: "#c9cdd2"
             font.pixelSize: 12
             onImplicitWidthChanged: toolbar.updateCapacity()
@@ -1037,8 +1102,30 @@ Window {
                 cursorShape: {
                     if (panMa.pressed)
                         return Qt.ClosedHandCursor
+                    // Single source of truth for canvas cursors. Overlay
+                    // MouseAreas (dots/edge strips) DO receive presses but
+                    // their cursorShape never wins the cursor arbitration —
+                    // this bottom area's shape is the one that actually
+                    // applies, so everything is computed here from coords.
+                    const pad = view.pad
+                    const x = selDragMouse.mouseX - pad
+                    const y = selDragMouse.mouseY - pad
+                    if (root.selExists) {
+                        const c = boxCursor(x, y, root.selX, root.selY,
+                                            root.selW, root.selH)
+                        if (c >= 0)
+                            return c
+                    }
+                    if (layerHandles.visible) {
+                        const c = boxCursor(x, y, layerHandles.bx,
+                                            layerHandles.by,
+                                            layerHandles.bw, layerHandles.bh)
+                        if (c >= 0)
+                            return c
+                    }
                     if (!root.selExists && bridge.image_width > 0) {
-                        const hit = topLayerAt(selDragMouse.mouseX, selDragMouse.mouseY)
+                        const hit = topLayerAt(selDragMouse.mouseX,
+                                               selDragMouse.mouseY)
                         if (hit !== null && !isLocked(hit))
                             return Qt.SizeAllCursor
                     }
@@ -1100,12 +1187,18 @@ Window {
                         return
                     curX = mouse.x
                     curY = mouse.y
-                    const x = Math.min(startX, curX) - view.pad
-                    const y = Math.min(startY, curY) - view.pad
-                    root.selX = snapDisplay(x)
-                    root.selY = snapDisplay(y)
-                    root.selW = Math.max(snapDisplay(Math.abs(curX - startX)), toDispScale())
-                    root.selH = Math.max(snapDisplay(Math.abs(curY - startY)), toDispScale())
+                    // Clamp the rubber band to the canvas: a selection can
+                    // never exceed the image bounds. Mouse coords are in
+                    // canvasSurface space; the image spans [pad, pad+size].
+                    const pad = view.pad
+                    const x1 = Math.max(pad, Math.min(startX, curX))
+                    const y1 = Math.max(pad, Math.min(startY, curY))
+                    const x2 = Math.min(pad + previewImage.width, Math.max(startX, curX))
+                    const y2 = Math.min(pad + previewImage.height, Math.max(startY, curY))
+                    root.selX = snapDisplay(x1 - pad)
+                    root.selY = snapDisplay(y1 - pad)
+                    root.selW = Math.max(snapDisplay(x2 - x1), toDispScale())
+                    root.selH = Math.max(snapDisplay(y2 - y1), toDispScale())
                 }
                 onReleased: {
                     if (pickDrag) {
@@ -1192,20 +1285,36 @@ Window {
             ry: root.selY
             rw: root.selW
             rh: root.selH
-            dashColor: "#5b9dff"
+            dashColor: "#000000"
         }
 
-        Text {
+        // Selection size badge: W×H only, in a small gray rounded chip so it
+        // stays readable over any image content.
+        Rectangle {
+            id: selBadge
             visible: root.selExists
             z: 8
-            x: previewImage.x + root.selX
-            y: Math.min(previewImage.y + previewImage.height - 16,
-                        previewImage.y + root.selY + root.selH + 4)
-            text: Math.round(root.selW / toDispScale()) + " × "
-                  + Math.round(root.selH / toDispScale())
-                  + (root.pasteFloating ? "" : "　Enter 应用裁剪 · Esc 取消")
-            color: "#7fc3ff"
-            font.pixelSize: 11
+            x: previewImage.x
+               + Math.max(0, Math.min(root.selX,
+                   previewImage.width - selBadge.width))
+            y: previewImage.y
+               + Math.min(previewImage.height - selBadge.height,
+                          root.selY + root.selH + 4)
+            width: selBadgeLabel.implicitWidth + 12
+            height: selBadgeLabel.implicitHeight + 6
+            radius: 3
+            color: "#43474d"
+            border.color: "#6b7076"
+            border.width: 1
+
+            Text {
+                id: selBadgeLabel
+                anchors.centerIn: parent
+                text: Math.round(root.selW / toDispScale()) + " × "
+                      + Math.round(root.selH / toDispScale())
+                color: "#d5d8dd"
+                font.pixelSize: 11
+            }
         }
 
         EdgeHandles {
@@ -1389,7 +1498,7 @@ Window {
             anchors.left: parent.left
             anchors.leftMargin: 10
             visible: bridge.fileName.length > 0
-            text: bridge.fileName + "   ·   " + bridge.image_width + "×" + bridge.image_height
+            text: bridge.fileName
                   + (bridge.fileSizeStr.length > 0 ? "   ·   " + bridge.fileSizeStr : "")
             color: "#9aa3b2"
             font.pixelSize: 12
@@ -1413,7 +1522,7 @@ Window {
             anchors.right: parent.right
             anchors.rightMargin: 10
             text: bridge.image_width > 0
-                  ? bridge.image_width + " × " + bridge.image_height + "   " + bridge.zoom_percent + "%"
+                  ? bridge.zoom_percent + "%"
                   : ""
             color: "#b8bcc0"
             font.pixelSize: 12
@@ -2066,6 +2175,30 @@ Window {
         return s > 0 ? Math.round(v / s) * s : v
     }
 
+    // Cursor for hovering a box's border / interior (display px).
+    // Returns the matching Qt cursor, or -1 when the point is outside the
+    // grab zone. Border tolerance: corners beat edges, edges beat interior.
+    function boxCursor(x, y, bx, by, bw, bh) {
+        const tol = 7
+        if (x < bx - tol || x > bx + bw + tol
+                || y < by - tol || y > by + bh + tol)
+            return -1
+        const nearL = Math.abs(x - bx) <= tol
+        const nearR = Math.abs(x - (bx + bw)) <= tol
+        const nearT = Math.abs(y - by) <= tol
+        const nearB = Math.abs(y - (by + bh)) <= tol
+        if ((nearL || nearR) && (nearT || nearB))
+            return (nearL === nearT) ? Qt.SizeFDiagCursor
+                                     : Qt.SizeBDiagCursor
+        if (nearL || nearR)
+            return Qt.SizeHorCursor
+        if (nearT || nearB)
+            return Qt.SizeVerCursor
+        if (x > bx && x < bx + bw && y > by && y < by + bh)
+            return Qt.SizeAllCursor
+        return -1
+    }
+
     function boxSet(x, y, w, h) {
         root.selX = x; root.selY = y; root.selW = w; root.selH = h
     }
@@ -2303,7 +2436,7 @@ Window {
     function openResizeDialog() {
         resizeW.text = String(bridge.image_width)
         resizeH.text = String(bridge.image_height)
-        resizeOverlay.keepRatio = false
+        resizeOverlay.keepRatio = true
         resizeOverlay.canvasOnly = false
         resizeOverlay.visible = true
     }

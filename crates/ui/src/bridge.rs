@@ -2539,13 +2539,14 @@ session
                 layers_json,
                 dirty,
             } => {
+                // The status bar's left side already shows the file name and
+                // size; a second resolution readout here was redundant, so
+                // only keep the preview-degraded hint when it matters.
                 let status = if preview == display {
-                    format!("{}x{}", canvas.width, canvas.height)
+                    String::new()
                 } else {
                     format!(
-                        "{}x{}  {}  (预览 {}x{})",
-                        canvas.width,
-                        canvas.height,
+                        "{}  (预览 {}x{})",
                         if fit { "适应窗口" } else { "缩放" },
                         preview.width,
                         preview.height
