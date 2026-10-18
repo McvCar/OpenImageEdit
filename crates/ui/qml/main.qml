@@ -912,6 +912,37 @@ Window {
             }
         }
 
+        // ---- 单实例：接收另一个进程交过来的图片 -------------------------
+        // 资源管理器里双击图片会新起一个进程；main() 发现已有实例时把路径通过
+        // 本地回环 socket 交给它并退出，于是所有文档窗口都在同一个进程里（图层
+        // 剪贴板自然共享）。这里由主窗口轮询取出路径，按「在单独的新窗口显示」
+        // 设置决定开新窗口还是就地替换（有未保存修改时走确认对话框）。
+        Timer {
+            id: externalOpenTimer
+            interval: 250
+            repeat: true
+            running: root.primary && !root.quitting
+            onTriggered: {
+                const url = bridge.take_external_open()
+                if (url.length === 0)
+                    return
+                if (bridge.openInNewWindow)
+                    root.requestNewWindow(url)
+                else
+                    confirmThenOpen(url)
+                root.raiseWindow()
+            }
+        }
+
+        function raiseWindow() {
+            const w = Window.window
+            if (!w)
+                return
+            if (w.visibility === Window.Minimized)
+                w.showNormal()
+            w.requestActivate()
+        }
+
     FileDialog {
         id: openDialog
         title: "打开图片"

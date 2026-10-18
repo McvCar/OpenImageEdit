@@ -447,6 +447,14 @@ pub mod qobject {
         #[qinvokable]
         fn paste_clipboard(self: Pin<&mut Self>) -> bool;
 
+        /// Pop a file handed over by another process ("" when none). QML polls
+        /// this from the primary window and opens it either in a new window or
+        /// in place, following the "在单独的新窗口显示" setting. This is what
+        /// makes an Explorer double-click reuse the running instance instead of
+        /// starting a second process (and a second, empty layer clipboard).
+        #[qinvokable]
+        fn take_external_open(self: Pin<&mut Self>) -> QString;
+
         // ---- 图层属性 ----
 
         #[qinvokable]
@@ -3119,6 +3127,20 @@ session
                 false
             }
         }
+    }
+
+    /// Pop a file handed to us by another process (single-instance hand-off).
+    /// Returns a `file:///…` URL, or "" when nothing is waiting.
+    pub fn take_external_open(self: Pin<&mut Self>) -> QString {
+        let Some(path) = crate::instance::take_pending() else {
+            return QString::default();
+        };
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"external-open-consumed\",\"file\":\"{}\"}}",
+            path.to_string_lossy().replace('\\', "/")
+        );
+        let url = file_url(&path);
+        QString::from(url.as_str())
     }
 
     // ---- 图层属性 ----

@@ -4,6 +4,7 @@
 #![cfg_attr(all(windows, not(feature = "console")), windows_subsystem = "windows")]
 
 pub mod bridge;
+pub mod instance;
 
 use std::time::Duration;
 
@@ -19,11 +20,31 @@ fn elapsed_ms() -> i64 {
 fn main() {
     bridge::mark_process_start();
 
-    let selftest = std::env::args().any(|a| a == "--selftest");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let selftest = args.iter().any(|a| a == "--selftest");
     println!(
         "{{\"phase\":\"ui\",\"event\":\"main-enter\",\"ms\":{}}}",
         elapsed_ms()
     );
+
+    // Single instance: a plain `imageedit.exe <image>` run (what Explorer's
+    // double-click produces) hands the path to the running instance and exits,
+    // so every document window shares one process — and therefore one layer
+    // clipboard. Runs with any `--` flag (probes, scripts, selftest) opt out
+    // completely, so automation can run beside the user's session.
+    let automation = args.iter().any(|a| a.starts_with("--"));
+    if !automation {
+        if let Some(path) = args.iter().find(|a| !a.starts_with("--")) {
+            if instance::try_handoff(std::path::Path::new(path)) {
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"handoff-ok\",\"file\":\"{}\"}}",
+                    path.replace('\\', "/")
+                );
+                return;
+            }
+        }
+        instance::acquire();
+    }
 
     if selftest {
         std::thread::spawn(|| {
