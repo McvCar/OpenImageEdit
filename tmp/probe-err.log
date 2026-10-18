@@ -1,0 +1,1 @@
+qrc:/qt/qml/com/imageedit/qml/main.qml:1741:9: QML Connections: Detected function "onFitModeChanged" in Connections element. This is probably intended to be a signal handler but no signal of the target matches the name.

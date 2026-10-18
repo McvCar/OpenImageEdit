@@ -79,6 +79,21 @@ pub struct TextLayout {
 /// are applied at the buffer level (1 px emboldening / ~12° shear), so no
 /// separate face files are needed.
 pub fn layout_text(text: &str, font_id: &str, font_size: f32, bold: bool, italic: bool) -> TextLayout {
+    layout_text_ex(text, font_id, font_size, bold, italic, false, 0)
+}
+
+/// Full layout with text-mark extras: `underline` draws a bar under every
+/// line; `align` is 0 left / 1 center / 2 right (per-line, relative to the
+/// widest line).
+pub fn layout_text_ex(
+    text: &str,
+    font_id: &str,
+    font_size: f32,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    align: u8,
+) -> TextLayout {
     let empty = TextLayout { width: 1, height: 1, coverage: vec![0] };
     let font = match load_font(font_id) {
         Some(f) => f,
@@ -90,19 +105,31 @@ pub fn layout_text(text: &str, font_id: &str, font_size: f32, bold: bool, italic
 
     // Pass 1: measure (per-line advance sum; ignores kerning, fine for marks).
     let lines: Vec<&str> = text.split('\n').collect();
+    let mut line_ws: Vec<f32> = Vec::with_capacity(lines.len());
     let mut max_w = 0.0f32;
     for line in &lines {
         let mut w = 0.0f32;
         for ch in line.chars() {
             w += scaled.h_advance(font.glyph_id(ch));
         }
+        line_ws.push(w);
         max_w = max_w.max(w);
     }
-    // Padding for faux-bold extension and italic shear.
+    // Padding for faux-bold extension and italic shear; extra bottom room so
+    // the underline bar never clips.
     let shear = if italic { 0.22 } else { 0.0 };
     let pad = (line_h * shear).ceil() + if bold { 1.0 } else { 0.0 };
     let width = (max_w + pad).ceil().max(1.0) as u32;
-    let height = (line_h * lines.len() as f32).ceil().max(1.0) as u32;
+    let height = (line_h * lines.len() as f32 + if underline { 6.0 } else { 0.0 })
+        .ceil()
+        .max(1.0) as u32;
+    let align_off = |line_w: f32| -> f32 {
+        match align {
+            1 => (max_w - line_w) * 0.5,
+            2 => max_w - line_w,
+            _ => 0.0,
+        }
+    };
 
     // Pass 2: rasterize into the buffer. Shear shifts x right for higher
     // rows (top leans right like real italics); bold ORs a 1 px neighbor.
@@ -115,8 +142,9 @@ pub fn layout_text(text: &str, font_id: &str, font_size: f32, bold: bool, italic
         cov[idx] = cov[idx].max((a * 255.0).round() as u8);
     };
     let mut pen_y = scaled.ascent();
-    for line in &lines {
-        let mut pen_x = 0.0f32;
+    for (li, line) in lines.iter().enumerate() {
+        let x0 = align_off(line_ws[li]);
+        let mut pen_x = x0;
         for ch in line.chars() {
             let gid = font.glyph_id(ch);
             let glyph = gid.with_scale_and_position(font_size, ab_glyph::point(pen_x, pen_y));
@@ -143,6 +171,19 @@ pub fn layout_text(text: &str, font_id: &str, font_size: f32, bold: bool, italic
                 });
             }
             pen_x += scaled.h_advance(gid);
+        }
+        if underline {
+            // Bar under this line only, from its aligned left edge to the
+            // line's own advance width.
+            let t = (font_size * 0.08).round().clamp(2.0, 8.0) as i32;
+            let uy = (pen_y + 2.0).round() as i32;
+            let ux0 = x0.round() as i32;
+            let ux1 = (x0 + line_ws[li]).round() as i32;
+            for y in uy..uy + t {
+                for x in ux0..ux1 {
+                    put(&mut cov, x, y, 1.0);
+                }
+            }
         }
         pen_y += line_h;
     }
@@ -196,5 +237,28 @@ mod tests {
         let it = layout_text("W", "msyh", 40.0, false, true);
         assert!(b.width >= a.width);
         assert!(it.width > a.width, "shear must add width");
+    }
+
+    #[test]
+    fn underline_and_align_change_layout() {
+        let a = layout_text_ex("Hi\nThere", "msyh", 32.0, false, false, false, 0);
+        let u = layout_text_ex("Hi\nThere", "msyh", 32.0, false, false, true, 0);
+        assert!(u.height > a.height, "underline adds bottom room");
+        assert!(u.coverage.iter().any(|&c| c > 0));
+        let r = layout_text_ex("Hi\nThere", "msyh", 32.0, false, false, false, 2);
+        assert_eq!(r.width, a.width, "align must not change buffer size");
+        // Right-aligning shifts the narrower top line ("Hi") rightwards.
+        let min_x_top = |l: &TextLayout| {
+            (0..l.width)
+                .find(|&x| {
+                    (0..(l.height / 2) as usize)
+                        .any(|y| l.coverage[y * l.width as usize + x as usize] > 0)
+                })
+                .unwrap_or(0)
+        };
+        assert!(
+            min_x_top(&r) > min_x_top(&a),
+            "right align shifts the short line right"
+        );
     }
 }

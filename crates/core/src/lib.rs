@@ -173,7 +173,8 @@ pub enum MarkKind {
     Ellipse,
     Arrow,
     Brush,
-    /// Mosaic brush: pixelates the image under the stroke path.
+    /// Mosaic: pixelates the image under the stroke path, or the whole rect
+    /// when `points` is empty (drag-selection mode).
     Mosaic,
     /// Text run anchored at the rect's top-left corner.
     Text,
@@ -204,6 +205,9 @@ pub struct Mark {
     pub font_size: f32,
     pub bold: bool,
     pub italic: bool,
+    /// Text only: underline every line; alignment 0 left / 1 center / 2 right.
+    pub underline: bool,
+    pub align: u8,
     /// Hidden marks stay in the document (and the panel list) but are not
     /// rasterized onto the canvas.
     pub visible: bool,
@@ -227,6 +231,8 @@ impl Mark {
             font_size: 28.0,
             bold: false,
             italic: false,
+            underline: false,
+            align: 0,
             visible: true,
         }
     }
@@ -502,48 +508,64 @@ fn draw_mark(img: &mut RgbaImage, mark: &Mark, sx: f32, sy: f32) {
             }
         }
         MarkKind::Mosaic => {
-            if mark.points.is_empty() {
-                return;
-            }
             // Block size scales with the preview like every other mark.
             let cell = (mark.cell.max(2) as f32 * (sx + sy) * 0.5).max(2.0);
-            let r = sw / 2.0;
-            // Stamp along the path like the brush, but snap to a cell grid:
-            // unique cells are averaged BEFORE any painting so overlapping
-            // stamps never average already-pixelated output.
+            // Snap cells to a grid: unique cells are averaged BEFORE any
+            // painting so overlapping stamps never average already-pixelated
+            // output.
             let mut cells: Vec<(i64, i64)> = Vec::new();
-            let push_stamp = |cells: &mut Vec<(i64, i64)>, cx: f32, cy: f32| {
-                let gx0 = ((cx - r) / cell).floor() as i64;
-                let gx1 = ((cx + r) / cell).floor() as i64;
-                let gy0 = ((cy - r) / cell).floor() as i64;
-                let gy1 = ((cy + r) / cell).floor() as i64;
-                for gy in gy0..=gy1 {
-                    for gx in gx0..=gx1 {
-                        // Cell center within the brush radius?
-                        let ccx = (gx as f32 + 0.5) * cell;
-                        let ccy = (gy as f32 + 0.5) * cell;
-                        if (ccx - cx).powi(2) + (ccy - cy).powi(2) <= r * r
-                            && !cells.contains(&(gx, gy))
-                        {
+            if mark.points.is_empty() {
+                // Region mode: pixelate the whole rect (drag-selection).
+                let (rx0, ry0, rx1, ry1) = mark.rect;
+                let (x0, y0) = (rx0.min(rx1) * sx, ry0.min(ry1) * sy);
+                let (x1, y1) = (rx1.max(rx0) * sx, ry1.max(ry0) * sy);
+                if x1 - x0 >= 1.0 && y1 - y0 >= 1.0 {
+                    let gx0 = (x0 / cell).floor() as i64;
+                    let gx1 = ((x1 / cell).ceil() as i64).max(gx0 + 1);
+                    let gy0 = (y0 / cell).floor() as i64;
+                    let gy1 = ((y1 / cell).ceil() as i64).max(gy0 + 1);
+                    for gy in gy0..gy1 {
+                        for gx in gx0..gx1 {
                             cells.push((gx, gy));
                         }
                     }
                 }
-            };
-            if mark.points.len() == 1 {
-                let p = sp(mark.points[0]);
-                push_stamp(&mut cells, p.0, p.1);
-            }
-            for w in mark.points.windows(2) {
-                let a = sp(w[0]);
-                let b = sp(w[1]);
-                let dx = b.0 - a.0;
-                let dy = b.1 - a.1;
-                let len = (dx * dx + dy * dy).sqrt();
-                let steps = (len / (cell * 0.4).max(0.5)).ceil().max(1.0) as i32;
-                for i in 0..=steps {
-                    let t = i as f32 / steps as f32;
-                    push_stamp(&mut cells, a.0 + dx * t, a.1 + dy * t);
+            } else {
+                let r = sw / 2.0;
+                // Stamp along the path like the brush.
+                let push_stamp = |cells: &mut Vec<(i64, i64)>, cx: f32, cy: f32| {
+                    let gx0 = ((cx - r) / cell).floor() as i64;
+                    let gx1 = ((cx + r) / cell).floor() as i64;
+                    let gy0 = ((cy - r) / cell).floor() as i64;
+                    let gy1 = ((cy + r) / cell).floor() as i64;
+                    for gy in gy0..=gy1 {
+                        for gx in gx0..=gx1 {
+                            // Cell center within the brush radius?
+                            let ccx = (gx as f32 + 0.5) * cell;
+                            let ccy = (gy as f32 + 0.5) * cell;
+                            if (ccx - cx).powi(2) + (ccy - cy).powi(2) <= r * r
+                                && !cells.contains(&(gx, gy))
+                            {
+                                cells.push((gx, gy));
+                            }
+                        }
+                    }
+                };
+                if mark.points.len() == 1 {
+                    let p = sp(mark.points[0]);
+                    push_stamp(&mut cells, p.0, p.1);
+                }
+                for w in mark.points.windows(2) {
+                    let a = sp(w[0]);
+                    let b = sp(w[1]);
+                    let dx = b.0 - a.0;
+                    let dy = b.1 - a.1;
+                    let len = (dx * dx + dy * dy).sqrt();
+                    let steps = (len / (cell * 0.4).max(0.5)).ceil().max(1.0) as i32;
+                    for i in 0..=steps {
+                        let t = i as f32 / steps as f32;
+                        push_stamp(&mut cells, a.0 + dx * t, a.1 + dy * t);
+                    }
                 }
             }
             // Pass 1: average the underlying (already-composited) pixels.
@@ -590,12 +612,14 @@ fn draw_mark(img: &mut RgbaImage, mark: &Mark, sx: f32, sy: f32) {
             if mark.text.is_empty() {
                 return;
             }
-            let layout = crate::font::layout_text(
+            let layout = crate::font::layout_text_ex(
                 &mark.text,
                 &mark.font,
                 mark.font_size,
                 mark.bold,
                 mark.italic,
+                mark.underline,
+                mark.align,
             );
             if layout.width == 0 || layout.height == 0 {
                 return;
@@ -2573,6 +2597,42 @@ mod tests {
         // Outside the mosaic band: untouched.
         assert_eq!(flat.get_pixel(5, 5).0, [0, 0, 0, 255]);
         assert_eq!(flat.get_pixel(20, 20).0, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn mosaic_region_mode_pixelates_whole_rect() {
+        // Empty points = region mode: the entire rect is pixelated, not a
+        // stamp path. A 2px checkerboard averages to ~127 in every 4px cell.
+        let mut base = blank(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                let v = if ((x / 2 + y / 2) % 2) == 0 { 255u8 } else { 0u8 };
+                base.put_pixel(x, y, image::Rgba([v, v, v, 255]));
+            }
+        }
+        let mut doc = Document::from_image(base);
+        doc.add_mark({
+            let mut m = Mark::new(MarkKind::Mosaic);
+            m.rect = (8.0, 8.0, 24.0, 24.0);
+            m.points = Vec::new();
+            m.cell = 4;
+            m
+        })
+        .unwrap();
+        let flat = doc.flatten();
+        // Every pixel inside the rect is a flat cell average (~127), i.e.
+        // the hard checkerboard texture is gone.
+        for y in 8..24 {
+            for x in 8..24 {
+                let p = flat.get_pixel(x, y).0;
+                assert_eq!(p[0], p[1]);
+                assert_eq!(p[1], p[2]);
+                assert!(p[0] > 100 && p[0] < 155, "cell average at ({x},{y}): {p:?}");
+            }
+        }
+        // Outside the rect: untouched (raw checkerboard extremes remain).
+        assert_eq!(flat.get_pixel(4, 4).0, [255, 255, 255, 255]);
+        assert_eq!(flat.get_pixel(30, 32).0, [0, 0, 0, 255]);
     }
 
     #[test]

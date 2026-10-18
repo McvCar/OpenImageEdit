@@ -257,6 +257,18 @@ pub mod qobject {
         #[qinvokable]
         fn add_mosaic_mark(self: Pin<&mut Self>, points: &QString, stroke: i32, cell: i32);
 
+        /// Add a Mosaic region mark: the whole rect is pixelated. (x, y) is
+        /// one corner, (x1, y1) the opposite one, in image coords.
+        #[qinvokable]
+        fn add_mosaic_rect(
+            self: Pin<&mut Self>,
+            x0: f64,
+            y0: f64,
+            x1: f64,
+            y1: f64,
+            cell: i32,
+        );
+
         /// Add a Text mark anchored at (x, y) top-left; the natural text
         /// size is measured with the named font and stored as the mark rect.
         #[qinvokable]
@@ -272,8 +284,8 @@ pub mod qobject {
             color: &QString,
         );
 
-        /// Restyle the selected Text mark (family / size / faux styles),
-        /// undoable.
+        /// Restyle the selected Text mark (family / size / faux styles /
+        /// underline / alignment), undoable.
         #[qinvokable]
         fn update_text_style(
             self: Pin<&mut Self>,
@@ -281,7 +293,19 @@ pub mod qobject {
             font_size: i32,
             bold: bool,
             italic: bool,
+            underline: bool,
+            align: i32,
         );
+
+        /// Hide (or restore, -1) a mark in the preview while its text is
+        /// edited inline in QML. Plain preview state, not undoable.
+        #[qinvokable]
+        fn set_editing_mark(self: Pin<&mut Self>, index: i32);
+
+        /// Replace the selected Text mark's content, re-measuring the rect,
+        /// undoable.
+        #[qinvokable]
+        fn update_text_content(self: Pin<&mut Self>, text: &QString);
 
         /// Restyle the selected Mosaic mark's block size ("strength"),
         /// undoable.
@@ -585,6 +609,9 @@ struct Session {
     /// Save quality snapshot from AppConfig at session creation (updated
     /// live by `update_save_quality`).
     save_quality: u8,
+    /// Mark index hidden from the PREVIEW only while its text is being
+    /// edited inline in QML (the TextInput overlays the real mark). -1 = none.
+    preview_hidden_mark: i32,
 }
 
 struct Rendered {
@@ -674,6 +701,7 @@ impl Session {
                 dirty: false,
                 base_locked: true,
                 save_quality,
+                preview_hidden_mark: -1,
             },
             ms,
         ))
@@ -702,7 +730,21 @@ impl Session {
         if target.pixels() == 0 {
             return Err("empty canvas".into());
         }
-        let image = render::composite_for_preview(&self.doc, target);
+        // Inline text editing: the mark being edited is hidden from the
+        // preview only (restored right after the composite; never undoable).
+        let hidden_idx = self.preview_hidden_mark;
+        let image = if hidden_idx >= 0
+            && (hidden_idx as usize) < self.doc.marks.len()
+        {
+            let idx = hidden_idx as usize;
+            let saved = self.doc.marks[idx].visible;
+            self.doc.marks[idx].visible = false;
+            let img = render::composite_for_preview(&self.doc, target);
+            self.doc.marks[idx].visible = saved;
+            img
+        } else {
+            render::composite_for_preview(&self.doc, target)
+        };
         // BMP on purpose: uncompressed means both the encode here and Qt's
         // decode are near memcpy speed. PNG compression dominated each live
         // drag tick (tens of ms); BMP keeps the preview path real-time. The
@@ -832,12 +874,14 @@ impl Session {
                 let extra = match m.kind {
                     MarkKind::Mosaic => format!(",\"cell\":{}", m.cell),
                     MarkKind::Text => format!(
-                        ",\"t\":\"{}\",\"fn\":\"{}\",\"fs\":{},\"b\":{},\"it\":{}",
+                        ",\"t\":\"{}\",\"fn\":\"{}\",\"fs\":{},\"b\":{},\"it\":{},\"u\":{},\"al\":{}",
                         escape(&m.text),
                         escape(&m.font),
                         m.font_size,
                         m.bold as u8,
-                        m.italic as u8
+                        m.italic as u8,
+                        m.underline as u8,
+                        m.align
                     ),
                     _ => String::new(),
                 };
@@ -1004,11 +1048,7 @@ impl qobject::Bridge {
                         300.0, 150.0, &QString::from("示例文本 Abc 123"), &QString::from("msyh"),
                         36, true, false, &QString::from("#378add"),
                     );
-                    self.as_mut().add_mosaic_mark(
-                        &QString::from("500,400 560,440 620,430"),
-                        18,
-                        20,
-                    );
+                    self.as_mut().add_mosaic_rect(480.0, 380.0, 660.0, 470.0, 20);
                     println!(
                         "{{\"phase\":\"ui\",\"event\":\"marks\",\"count\":{}}}",
                         {
@@ -3173,6 +3213,41 @@ session
         self.select_newest_mark();
     }
 
+    pub fn add_mosaic_rect(
+        self: Pin<&mut Self>,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        cell: i32,
+    ) {
+        let (x0, x1) = (x0.min(x1), x0.max(x1));
+        let (y0, y1) = (y0.min(y1), y0.max(y1));
+        if x1 - x0 < 1.0 || y1 - y0 < 1.0 {
+            return;
+        }
+        let mark = {
+            let mut m = Mark::new(MarkKind::Mosaic);
+            m.rect = (x0 as f32, y0 as f32, x1 as f32, y1 as f32);
+            m.points = Vec::new(); // empty points = region mode in core
+            m.cell = cell.clamp(2, 255) as u8;
+            m
+        };
+        {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => return,
+                Some(session) => {
+                    if session.doc.add_mark(mark).is_err() {
+                        return;
+                    }
+                    session.dirty = true;
+                }
+            }
+        }
+        self.select_newest_mark();
+    }
+
     pub fn add_text_mark(
         self: Pin<&mut Self>,
         x: f64,
@@ -3250,6 +3325,8 @@ session
         font_size: i32,
         bold: bool,
         italic: bool,
+        underline: bool,
+        align: i32,
     ) {
         let index = *self.selected_mark();
         if index < 0 {
@@ -3271,6 +3348,8 @@ session
             to.font_size = (font_size as f32).clamp(4.0, 512.0);
             to.bold = bold;
             to.italic = italic;
+            to.underline = underline;
+            to.align = align.clamp(0, 2) as u8;
             // Re-measure the rect so handles keep wrapping the new text.
             let (tw, th) =
                 editcore::measure_text(&to.text, &to.font, to.font_size, to.bold, to.italic);
@@ -3284,6 +3363,60 @@ session
             ()
         };
         let _ = grabbed;
+        self.as_mut().refresh_preview();
+    }
+
+    pub fn set_editing_mark(mut self: Pin<&mut Self>, index: i32) {
+        {
+            let mut guard = self.session.borrow_mut();
+            if let Some(session) = guard.as_mut() {
+                let idx = if index >= 0
+                    && (index as usize) < session.doc.marks.len()
+                {
+                    index
+                } else {
+                    -1
+                };
+                if session.preview_hidden_mark != idx {
+                    session.preview_hidden_mark = idx;
+                }
+            }
+        }
+        self.as_mut().refresh_preview();
+    }
+
+    pub fn update_text_content(mut self: Pin<&mut Self>, text: &QString) {
+        let text = text.to_string();
+        if text.trim().is_empty() {
+            return;
+        }
+        let index = *self.selected_mark();
+        if index < 0 {
+            return;
+        }
+        let mut guard = self.session.borrow_mut();
+        let Some(session) = guard.as_mut() else {
+            return;
+        };
+        let Some(mark) = session.doc.marks.get(index as usize).cloned() else {
+            return;
+        };
+        if mark.kind != MarkKind::Text || mark.text == text {
+            return;
+        }
+        let mut to = mark.clone();
+        to.text = text;
+        // Re-measure the rect so handles keep wrapping the new text.
+        let (tw, th) =
+            editcore::measure_text(&to.text, &to.font, to.font_size, to.bold, to.italic);
+        to.rect = (mark.rect.0, mark.rect.1, mark.rect.0 + tw, mark.rect.1 + th);
+        session.dirty = true;
+        let _ = session.doc.execute(editcore::EditOp::UpdateMark {
+            index: index as usize,
+            from: mark,
+            to,
+        });
+        drop(guard);
         self.as_mut().refresh_preview();
     }
 
