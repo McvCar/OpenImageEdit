@@ -35,14 +35,34 @@ Window {
     }
 
     property int windowCascade: 0
+    // Strong references to every live secondary document window. createObject
+    // with a null parent transfers ownership to the JS engine, so without
+    // this array the GC may collect a visible window — it would just close
+    // itself after a while (the "new window randomly disappears" bug).
+    property var docWindows: []
 
     function openNewWindow(fileUrl) {
         const offset = shell.windowCascade * 32
         shell.windowCascade = (shell.windowCascade + 1) % 8
-        docWindowFactory.createObject(null, {
+        const win = docWindowFactory.createObject(null, {
             x: 80 + offset, y: 60 + offset,
             newWindowFn: openNewWindow,
             fileUrl: fileUrl !== undefined ? fileUrl : ""
+        })
+        if (!win)
+            return
+        shell.docWindows.push(win)
+        // DocWindow's own onClosing runs first (connected at creation), so
+        // `accepted` already reflects the dirty-guard decision here: only
+        // forget + destroy a window the user was really allowed to close.
+        win.closing.connect(function (closeEvent) {
+            if (!closeEvent.accepted)
+                return
+            const i = shell.docWindows.indexOf(win)
+            if (i >= 0)
+                shell.docWindows.splice(i, 1)
+            // Deferred delete: safe during close-event processing.
+            win.destroy()
         })
     }
 
@@ -1013,7 +1033,7 @@ Window {
     // Redo: explicit keys — StandardKey.Redo maps inconsistently across
     // platforms/layouts, plain strings fire reliably (Ctrl+Y and ⇧Ctrl+Z).
     Shortcut { sequences: ["Ctrl+Shift+Z", "Ctrl+Y"]; onActivated: bridge.redo() }
-    Shortcut { sequences: [StandardKey.Save]; onActivated: bridge.save_edited() }
+    Shortcut { sequences: [StandardKey.Save]; onActivated: root.saveOrSaveAs() }
     Shortcut { sequences: [StandardKey.Copy]; onActivated: doCopy() }
     Shortcut { sequences: [StandardKey.Cut]; onActivated: doCut() }
     Shortcut { sequences: [StandardKey.Paste]; onActivated: doPaste() }
@@ -1113,7 +1133,7 @@ Window {
             { l: "适应窗口 (Ctrl+9)", ok: bridge.image_width > 0, run: function () { bridge.zoom_fit() } },
             { l: "100% 实际大小 (Ctrl+0)", ok: bridge.image_width > 0, run: function () { bridge.zoom_actual() } },
             { l: "", ok: true, sep: true },
-            { l: "另存副本 (Ctrl+S)", ok: bridge.image_width > 0, run: function () { bridge.save_edited() } },
+            { l: "保存 (Ctrl+S)", ok: bridge.image_width > 0, run: function () { root.saveOrSaveAs() } },
             { l: "另存为… (Ctrl+Shift+S)", ok: true, run: function () { saveDialog.open() } },
             { l: "", ok: true, sep: true },
             { l: "设置…", ok: true, run: function () { settingsOverlay.visible = true } },
@@ -6643,11 +6663,29 @@ Window {
         root.confirmMode = ""
     }
 
+    // Ctrl+S: overwrite the file the image was loaded from. A document with
+    // no source file (pasted image, new window) has nothing to overwrite, so
+    // fall back to the Save-As dialog.
+    function saveOrSaveAs() {
+        if (bridge.file_name.length > 0)
+            bridge.save_edited()
+        else
+            saveDialog.open()
+    }
+
     // Default (highlighted) action of the unsaved-changes dialog: save the
     // edited image, then continue whatever the user originally asked for
     // (open another file / navigate / close the window).
     function confirmSaveProceed() {
         const mode = root.confirmMode
+        // No source file: saving needs a destination first; let the user
+        // pick one instead of discarding the edits silently.
+        if (bridge.file_name.length === 0) {
+            confirmOverlay.visible = false
+            root.confirmMode = ""
+            saveDialog.open()
+            return
+        }
         bridge.save_edited()
         confirmOverlay.visible = false
         root.confirmMode = ""

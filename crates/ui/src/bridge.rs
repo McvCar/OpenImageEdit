@@ -517,7 +517,7 @@ impl Default for AppConfig {
         Self {
             checker_light: "#ffffff".to_string(),
             checker_dark: "#cccccc".to_string(),
-            open_in_new_window: false,
+            open_in_new_window: true,
             save_quality: 92,
             ruler_bottom_up: false,
         }
@@ -1039,10 +1039,15 @@ impl Session {
         }
     }
 
+    /// Ctrl+S semantics: overwrite the file the document was loaded from,
+    /// keeping its original format. Without a source (e.g. a pasted image)
+    /// there is nothing to overwrite — QML routes those to the Save-As
+    /// dialog instead.
     fn save(&self) -> Result<PathBuf, String> {
-        let (path, format) = self.default_save_path();
-        self.write_to(&path, format)?;
-        Ok(path)
+        let src = self.source.clone().ok_or_else(|| "没有可保存的文件".to_string())?;
+        let format = format_from_path(&src).unwrap_or(Format::Png);
+        self.write_to(&src, format)?;
+        Ok(src)
     }
 
     fn write_to(&self, path: &Path, format: Format) -> Result<(), String> {
