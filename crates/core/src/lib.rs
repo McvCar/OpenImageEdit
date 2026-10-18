@@ -1575,39 +1575,6 @@ impl Document {
         self.execute(EditOp::ScaleLayer { index, from, to, offset })
     }
 
-    /// History-free live preview of [`Document::scale_layer`], using a fast
-    /// (Triangle) filter so handle drags render in real time. The committing
-    /// call re-does the work with Lanczos3 and full undo support.
-    pub fn scale_layer_live(
-        &mut self,
-        index: usize,
-        src: &image::RgbaImage,
-        to: Size,
-        offset: (i32, i32),
-    ) -> Result<(), EditError> {
-        if to.width < 1 || to.height < 1 {
-            return Err(EditError::InvalidCanvasSize);
-        }
-        let layer = self
-            .layers
-            .get_mut(index)
-            .ok_or(EditError::LayerIndex(index))?;
-        // Resample from the drag-start snapshot, NOT from the current layer:
-        // progressive resampling of the already-rescaled bitmap degraded
-        // quality tick by tick during long drags.
-        layer.image = image::imageops::resize(
-            src,
-            to.width,
-            to.height,
-            image::imageops::FilterType::Triangle,
-        );
-        layer.offset = offset;
-        // Pixels changed without going through execute(): bump the epoch so
-        // preview caches never serve a stale bitmap during live-scale drags.
-        self.edit_epoch = self.edit_epoch.wrapping_add(1);
-        Ok(())
-    }
-
     /// "Delete" the base layer: the canvas becomes fully transparent while
     /// layers stay untouched. Requires at least one layer to remain.
     pub fn delete_base(&mut self) -> Result<(), EditError> {
@@ -1976,31 +1943,6 @@ mod tests {
         // Rejected calls must not touch the history stack.
         assert_eq!(doc.history.undo.len(), undo_depth);
         assert_eq!(doc.layers[index].image.width(), 4);
-    }
-
-    // Live scaling resamples from the snapshot each tick: two successive
-    // live calls with the same snapshot must produce the same bitmap as one
-    // call (no progressive quality loss across ticks).
-    #[test]
-    fn scale_layer_live_resamples_from_snapshot_not_current() {
-        let mut doc = Document::from_image(checker(32, 32));
-        let index = doc.add_layer(Layer::new("clip", checker(16, 16))).unwrap();
-        let snapshot = doc.layers[index].image.clone();
-
-        doc.scale_layer_live(index, &snapshot, Size::new(8, 8), (1, 1))
-            .unwrap();
-        doc.scale_layer_live(index, &snapshot, Size::new(8, 8), (2, 2))
-            .unwrap();
-
-        let expected = image::imageops::resize(
-            &snapshot,
-            8,
-            8,
-            image::imageops::FilterType::Triangle,
-        );
-        assert_eq!(doc.layers[index].image.dimensions(), (8, 8));
-        assert_eq!(doc.layers[index].image.as_raw(), expected.as_raw());
-        assert_eq!(doc.layers[index].offset, (2, 2));
     }
 
     #[test]

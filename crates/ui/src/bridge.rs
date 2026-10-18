@@ -534,9 +534,6 @@ pub struct BridgeRust {
     /// dragging. `drag_translate_update` mutates the offset without touching
     /// history, `drag_translate_end` commits a single history op.
     drag_start_offset: RefCell<Option<(i32, i32)>>,
-    /// Image + offset of the selected layer when a handle-driven scale
-    /// started; live updates resample without history, end commits one op.
-    scale_start: RefCell<Option<(RgbaImage, (i32, i32))>>,
     /// The selected mark and its pre-drag geometry; live updates map
     /// geometry without history, end commits one UpdateMark op.
     mark_drag: RefCell<Option<(usize, Mark)>>,
@@ -579,7 +576,6 @@ impl Default for BridgeRust {
             paste_counter: RefCell::new(0),
             opacity_live: RefCell::new(None),
             drag_start_offset: RefCell::new(None),
-            scale_start: RefCell::new(None),
             mark_drag: RefCell::new(None),
             session: RefCell::new(None),
             viewport: RefCell::new(Size::new(0, 0)),
@@ -612,9 +608,22 @@ struct Session {
     /// Mark index hidden from the PREVIEW only while its text is being
     /// edited inline in QML (the TextInput overlays the real mark). -1 = none.
     preview_hidden_mark: i32,
+    /// In-flight handle-driven layer resize. The document bitmap is NOT
+    /// touched during the gesture: the preview stretches `snapshot` to
+    /// `to`/`offset` via `PreviewComposer::composite_live_scale`, and
+    /// `scale_layer_end` applies the real (undoable) resize exactly once.
+    live_scale: Option<LiveScaleState>,
     /// Cached preview-scaled base/layers; invalidated by doc.edit_epoch so
     /// live drag ticks skip the per-layer resample.
     composer: render::PreviewComposer,
+}
+
+/// Session-side state for a live layer resize gesture.
+struct LiveScaleState {
+    index: usize,
+    snapshot: RgbaImage,
+    to: Size,
+    offset: (i32, i32),
 }
 
 struct Rendered {
@@ -705,6 +714,7 @@ impl Session {
                 base_locked: true,
                 save_quality,
                 preview_hidden_mark: -1,
+                live_scale: None,
                 composer: render::PreviewComposer::new(),
             },
             ms,
@@ -736,6 +746,8 @@ impl Session {
         }
         // Inline text editing: the mark being edited is hidden from the
         // preview only (restored right after the composite; never undoable).
+        // An in-flight layer resize routes the composite through the
+        // live-scale path (snapshot stretch, document untouched).
         let hidden_idx = self.preview_hidden_mark;
         let image = if hidden_idx >= 0
             && (hidden_idx as usize) < self.doc.marks.len()
@@ -743,11 +755,31 @@ impl Session {
             let idx = hidden_idx as usize;
             let saved = self.doc.marks[idx].visible;
             self.doc.marks[idx].visible = false;
-            let img = self.composer.composite(&self.doc, target);
+            let img = match self.live_scale.as_ref() {
+                Some(ls) => self.composer.composite_live_scale(
+                    &self.doc,
+                    target,
+                    ls.index,
+                    &ls.snapshot,
+                    ls.to,
+                    ls.offset,
+                ),
+                None => self.composer.composite(&self.doc, target),
+            };
             self.doc.marks[idx].visible = saved;
             img
         } else {
-            self.composer.composite(&self.doc, target)
+            match self.live_scale.as_ref() {
+                Some(ls) => self.composer.composite_live_scale(
+                    &self.doc,
+                    target,
+                    ls.index,
+                    &ls.snapshot,
+                    ls.to,
+                    ls.offset,
+                ),
+                None => self.composer.composite(&self.doc, target),
+            }
         };
         // BMP on purpose: uncompressed means both the encode here and Qt's
         // decode are near memcpy speed. PNG compression dominated each live
@@ -2625,6 +2657,13 @@ session
     }
 
     // ---- 图层缩放拖拽实时预览 ----
+    //
+    // The gesture keeps the document bitmap untouched: `begin` snapshots the
+    // layer, `update` only records the requested size/offset (the preview
+    // stretches the snapshot via composite_live_scale), and `end` applies the
+    // real, undoable resize exactly once. This keeps every drag tick at
+    // O(the dragged layer's preview pixels) instead of a full-resolution
+    // resample + full preview recompose.
 
     pub fn scale_layer_begin(self: Pin<&mut Self>) {
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
@@ -2633,18 +2672,20 @@ session
         if self.layer_locked(ix) {
             return;
         }
-        let guard = self.session.borrow();
-        if let Some(session) = guard.as_ref() {
+        let mut guard = self.session.borrow_mut();
+        if let Some(session) = guard.as_mut() {
             if let Some(layer) = session.doc.layers.get(ix) {
-                *self.scale_start.borrow_mut() = Some((layer.image.clone(), layer.offset));
+                session.live_scale = Some(LiveScaleState {
+                    index: ix,
+                    snapshot: layer.image.clone(),
+                    to: Size::new(layer.image.width(), layer.image.height()),
+                    offset: layer.offset,
+                });
             }
         }
     }
 
     pub fn scale_layer_update(self: Pin<&mut Self>, w: i32, h: i32, ox: i32, oy: i32) {
-        let Some(_) = *self.scale_start.borrow() else {
-            return;
-        };
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
             return;
         };
@@ -2652,63 +2693,50 @@ session
             return;
         }
         {
-            let src = self.scale_start.borrow();
-            let Some((src_image, _)) = src.as_ref() else {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
                 return;
             };
-            let mut guard = self.session.borrow_mut();
-            if let Some(session) = guard.as_mut() {
-                // Live preview: fast (Triangle) resample from the drag-start
-                // snapshot each tick (never from the already-rescaled layer —
-                // progressive resampling degraded quality and made each tick
-                // oscillate in cost), no history entry.
-                let _ = session.doc.scale_layer_live(
-                    ix,
-                    src_image,
-                    Size::new(w as u32, h as u32),
-                    (ox, oy),
-                );
+            match &mut session.live_scale {
+                Some(ls) if ls.index == ix => {
+                    ls.to = Size::new(w as u32, h as u32);
+                    ls.offset = (ox, oy);
+                }
+                _ => return,
             }
         }
         self.refresh_preview();
     }
 
     pub fn scale_layer_end(mut self: Pin<&mut Self>, commit: bool, w: i32, h: i32, ox: i32, oy: i32) {
-        let Some((image, offset)) = self.scale_start.borrow_mut().take() else {
-            return;
-        };
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
             return;
         };
-        let result: Result<bool, String> = {
+        let mut outcome: Result<bool, String> = Ok(false);
+        {
             let mut guard = self.session.borrow_mut();
-            match guard.as_mut() {
-                None => Err("no document".into()),
-                Some(session) => {
-                    // Roll the live preview back to the pre-drag state, then
-                    // re-apply once so the history op records the true start.
-                    if let Some(layer) = session.doc.layers.get_mut(ix) {
-                        layer.image = image;
-                        layer.offset = offset;
-                    }
-                    if !commit {
-                        Ok(false)
-                    } else {
-                        match session
-                            .doc
-                            .scale_layer(ix, Size::new(w.max(1) as u32, h.max(1) as u32), (ox, oy))
-                        {
+            if let Some(session) = guard.as_mut() {
+                // Drop the live state first: the document bitmap was never
+                // modified during the gesture, so a cancel needs no rollback.
+                match session.live_scale.take() {
+                    Some(ls) if ls.index == ix && commit => {
+                        match session.doc.scale_layer(
+                            ix,
+                            Size::new(w.max(1) as u32, h.max(1) as u32),
+                            (ox, oy),
+                        ) {
                             Ok(()) => {
                                 session.dirty = true;
-                                Ok(true)
+                                outcome = Ok(true);
                             }
-                            Err(e) => Err(e.to_string()),
+                            Err(e) => outcome = Err(e.to_string()),
                         }
                     }
+                    _ => {}
                 }
             }
-        };
-        match result {
+        }
+        match outcome {
             Ok(true) => {
                 self.as_mut().refresh_preview();
                 self.as_mut().set_dirty(true);

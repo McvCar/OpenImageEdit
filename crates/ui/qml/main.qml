@@ -1,4 +1,4 @@
-import QtQuick
+﻿import QtQuick
 import QtQuick.Window
 import QtQuick.Dialogs
 import com.imageedit
@@ -3402,7 +3402,7 @@ Window {
                 Text {
                     id: markSectionHdr
                     width: layerRepeaterColumn.width
-                    text: "标记（" + root.markList.length + "）· 左键选中，按 Delete 删除"
+                    text: "标记（" + root.markList.length + "）"
                     color: "#e9eaec"
                     font.pixelSize: 12
                     font.bold: true
