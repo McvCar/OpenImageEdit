@@ -2517,8 +2517,19 @@ Window {
                         const ecy = (y0 + y1) / 2
                         const erx = Math.max(0.5, Math.abs(x1 - x0) / 2 - shrink)
                         const ery = Math.max(0.5, Math.abs(y1 - y0) / 2 - shrink)
+                        // ★Qt 的 Context2D.ellipse(x, y, w, h, ...) 把 (x,y)
+                        // 当外接矩形左上角、(w,h) 当宽高，而非 HTML 标准的
+                        // 圆心+半径——传圆心+半径会画进右下四分之一子矩形
+                        //（"拖动时小椭圆跑偏、放手后变大"的真正根因，REDBBOX
+                        // 实测 [ecx..ecx+erx, ecy..ecy+ery]）。改用单位圆 +
+                        // 坐标缩放构造：路径点在缩放变换生效时记录，恢复变换
+                        // 后再描边，线宽保持均匀，且不依赖任何 ellipse 语义。
+                        ctx.save()
+                        ctx.translate(ecx, ecy)
+                        ctx.scale(erx, ery)
                         ctx.beginPath()
-                        ctx.ellipse(ecx, ecy, erx, ery, 0, 0, Math.PI * 2)
+                        ctx.arc(0, 0, 1, 0, Math.PI * 2)
+                        ctx.restore()
                         if (root.markFill)
                             ctx.fill()
                         ctx.stroke()
