@@ -1,4 +1,4 @@
-﻿import QtQuick
+import QtQuick
 import QtQuick.Window
 import QtQuick.Dialogs
 import com.imageedit
@@ -497,12 +497,180 @@ Window {
         }
     }
 
+    // One "调整颜色" slider row: label + bipolar/unipolar track + readout +
+    // per-row reset, mirroring the macOS Preview panel. `minVal`/`maxVal`
+    // drive both the knob math and the readout sign.
+    component AdjustRow: Item {
+        id: arow
+
+        property string label: ""
+        property string glyph: ""
+        property string key: ""
+        property real value: 0
+        property real minVal: -1
+        property real maxVal: 1
+        // 0..1 position of the knob; while dragging the local override wins so
+        // the knob never fights the throttled round-trip through Rust.
+        property bool dragging: false
+        property real dragNorm: 0
+        readonly property real norm: {
+            const span = arow.maxVal - arow.minVal
+            return span > 0 ? Math.max(0, Math.min(1, (arow.value - arow.minVal) / span)) : 0
+        }
+        readonly property real knobPos: arow.dragging ? arow.dragNorm : arow.norm
+        // Bipolar readouts show a signed percentage, unipolar a plain one.
+        readonly property string readout: {
+            const v = arow.dragging
+                ? arow.minVal + arow.dragNorm * (arow.maxVal - arow.minVal)
+                : arow.value
+            if (arow.minVal < 0)
+                return (v > 0 ? "+" : "") + Math.round(v * 100)
+            return Math.round(v * 100)
+        }
+        readonly property bool neutral: Math.abs(arow.value) < 0.005
+
+        signal moved(real value)
+        signal resetRequested()
+
+        width: parent.width
+        height: 22
+
+        Text {
+            id: arowIcon
+            x: 2
+            width: 14
+            anchors.verticalCenter: parent.verticalCenter
+            text: arow.glyph
+            color: "#9aa3b2"
+            font.pixelSize: 11
+            horizontalAlignment: Text.AlignHCenter
+        }
+        Text {
+            id: arowLabel
+            x: 20
+            width: 52
+            anchors.verticalCenter: parent.verticalCenter
+            text: arow.label
+            color: "#c9ccd1"
+            font.pixelSize: 11
+            elide: Text.ElideRight
+        }
+
+        Item {
+            id: arowTrack
+            anchors.left: arowLabel.right
+            anchors.leftMargin: 4
+            anchors.right: arowValue.left
+            anchors.rightMargin: 6
+            anchors.verticalCenter: parent.verticalCenter
+            height: 18
+
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: parent.width
+                height: 3
+                radius: 2
+                color: "#3c4043"
+            }
+
+            // Filled part: from the neutral point (bipolar) or the left end.
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                x: arow.minVal < 0
+                   ? arowTrack.width * Math.min(0.5, arow.knobPos)
+                   : 0
+                width: arow.minVal < 0
+                       ? Math.abs(arow.knobPos - 0.5) * arowTrack.width
+                       : arow.knobPos * arowTrack.width
+                height: 3
+                radius: 2
+                color: "#5b9dff"
+            }
+
+            // Neutral tick for bipolar rows.
+            Rectangle {
+                visible: arow.minVal < 0
+                anchors.verticalCenter: parent.verticalCenter
+                x: arowTrack.width * 0.5 - 0.5
+                width: 1
+                height: 9
+                color: "#5a6069"
+            }
+
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                x: Math.max(0, Math.min(arowTrack.width - 10,
+                                       arow.knobPos * arowTrack.width - 5))
+                width: 10
+                height: 10
+                radius: 5
+                color: arowMa.containsMouse || arow.dragging ? "#7fc3ff" : "#e9eaec"
+            }
+
+            MouseArea {
+                id: arowMa
+                anchors.fill: parent
+                anchors.margins: -6
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+
+                function applyAt(x) {
+                    const t = Math.max(0, Math.min(1, (x + 6) / arowTrack.width))
+                    arow.dragging = true
+                    arow.dragNorm = t
+                    arow.moved(arow.minVal + t * (arow.maxVal - arow.minVal))
+                }
+                onPressed: (mouse) => applyAt(mouse.x)
+                onPositionChanged: (mouse) => { if (pressed) applyAt(mouse.x) }
+                onReleased: arow.dragging = false
+                onCanceled: arow.dragging = false
+                onDoubleClicked: arow.resetRequested()
+            }
+        }
+
+        Text {
+            id: arowValue
+            anchors.right: arowReset.left
+            anchors.rightMargin: 5
+            anchors.verticalCenter: parent.verticalCenter
+            width: 30
+            text: arow.readout
+            color: arow.neutral ? "#7c828b" : "#e9eaec"
+            font.pixelSize: 10
+            horizontalAlignment: Text.AlignRight
+        }
+
+        // Per-row reset (the circular arrow at the right of every row).
+        Rectangle {
+            id: arowReset
+            anchors.right: parent.right
+            anchors.rightMargin: 2
+            anchors.verticalCenter: parent.verticalCenter
+            width: 16
+            height: 16
+            radius: 8
+            color: arowResetMa.containsMouse && !arow.neutral ? "#3d5a80" : "transparent"
+            Text {
+                anchors.centerIn: parent
+                text: "↺"
+                color: arow.neutral ? "#5a6069" : "#b8bcc0"
+                font.pixelSize: 11
+            }
+            MouseArea {
+                id: arowResetMa
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: arow.resetRequested()
+            }
+        }
+    }
+
     // A secondary document window: same editor content, its own Bridge
     // instance, no CLI handling (that stays with the primary window).
     // newWindowFn is injected by the shell factory so the inline component
     // never needs to reference the shell (which would create a cycle).
-    component DocWindow: Window {
-        id: docWin
+    component DocWindow: Window {        id: docWin
 
         property var newWindowFn: null
 
@@ -621,6 +789,18 @@ Window {
         property bool markUnderline: false
         property int markAlign: 0 // 0 left / 1 center / 2 right
         readonly property var markList: parseMarks(bridge.marks_json)
+        // ---- 调整颜色（macOS 预览风格）----
+        // Mirrored parameters (slider positions) and the throttled live push.
+        readonly property var adjustVals: parseAdjust(bridge.adjustValues)
+        property string adjustKey: ""
+        property real adjustValue: 0
+        property bool adjustDirty: false
+        // Levels (histogram handles) pending values, throttled like sliders.
+        property real pendingBlack: 0
+        property real pendingGamma: 1
+        property real pendingWhite: 1
+        property bool levelsDirty: false
+        readonly property bool probeAdjust: Qt.application.arguments.indexOf("--probe-adjust") !== -1
         // Whether the currently selected mark is a text mark (drives the
         // Aa style button and the font panel).
         readonly property bool selMarkIsText: {
@@ -724,6 +904,9 @@ Window {
     Shortcut { sequences: [StandardKey.Cut]; onActivated: doCut() }
     Shortcut { sequences: [StandardKey.Paste]; onActivated: doPaste() }
     Shortcut { sequence: "Ctrl+K"; enabled: root.selExists; onActivated: applyCrop() }
+    // 调整颜色面板（macOS 预览的调色入口）。
+    Shortcut { sequence: "Ctrl+E"; enabled: bridge.image_width > 0
+               onActivated: root.toggleAdjustPanel() }
     Shortcut { sequence: "Ctrl+L"; onActivated: bridge.rotate_ccw() }
     Shortcut { sequence: "Ctrl+Shift+R"; onActivated: bridge.rotate_cw() }
     Shortcut { sequences: ["Delete", "Backspace"]
@@ -804,6 +987,8 @@ Window {
             { l: "删除选区像素 (Delete)", ok: root.selExists, run: function () { deleteSelectionPixels() } },
             { l: "图层面板", ok: true, run: function () { root.panelVisible = !root.panelVisible } },
             { l: "标记工具栏", ok: true, run: function () { markBarBtn.clicked() } },
+            { l: "调整颜色… (Ctrl+E)", ok: bridge.image_width > 0,
+              run: function () { root.toggleAdjustPanel() } },
             { l: "", ok: true, sep: true },
             { l: "放大 (Ctrl++)", ok: true, run: function () { bridge.zoom_in() } },
             { l: "缩小 (Ctrl+-)", ok: true, run: function () { bridge.zoom_out() } },
@@ -1187,6 +1372,19 @@ Window {
                     border.color: root.markFill ? "#e9eaec" : "#5a5e64"
                     border.width: 1
                 }
+            }
+
+            Rectangle { width: 9; height: 18; color: "transparent"
+                Rectangle { anchors.centerIn: parent; width: 1; height: 18; color: "#3c4043" } }
+
+            // 调整颜色（macOS 预览风格）：打开实时调色面板；再点一次 = 应用。
+            IconButton {
+                id: adjustBtn
+                glyph: "◑"
+                tip: "调整颜色（曝光 / 对比度 / 色阶 …）"
+                active: bridge.image_width > 0
+                selected: bridge.adjustOpen
+                onClicked: root.toggleAdjustPanel()
             }
         }
 
@@ -3683,6 +3881,331 @@ Window {
         }
     }
 
+    // ---- 调整颜色面板（macOS 预览「调整颜色」，见截图）------------------
+    // 实时预览只改参数；关闭面板（✕ / 再点工具栏按钮）才把参数烘焙成一次
+    // 可撤销操作，Esc 放弃（文档像素从未被改动）。
+    Item {
+        id: adjustPanel
+        visible: bridge.adjustOpen
+        width: 300
+        height: Math.min(adjustCol.implicitHeight + 24,
+                         Math.max(260, root.height - toolbar.height - 72))
+        x: layerPanel.visible ? Math.max(8, layerPanel.x - width - 8)
+                              : root.width - width - 12
+        y: toolbar.height + 10
+        z: 75
+
+        Rectangle {
+            anchors.fill: parent
+            radius: 8
+            color: "#2b2e33"
+            border.color: "#3c4043"
+            border.width: 1
+        }
+
+        Flickable {
+            id: adjustFlick
+            anchors.fill: parent
+            anchors.margins: 12
+            contentWidth: width
+            contentHeight: adjustCol.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            interactive: contentHeight > height
+
+            Column {
+                id: adjustCol
+                width: adjustFlick.width
+                spacing: 7
+
+                // ---- 标题栏：标题 + 作用对象 + 应用并关闭 ----
+                Item {
+                    width: parent.width
+                    height: 26
+
+                    Text {
+                        id: adjustTitle
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "调整颜色"
+                        color: "#e9eaec"
+                        font.pixelSize: 13
+                        font.bold: true
+                    }
+                    Text {
+                        anchors.left: adjustTitle.right
+                        anchors.leftMargin: 8
+                        anchors.right: adjustClose.left
+                        anchors.rightMargin: 6
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: bridge.adjustTargetName.length > 0
+                              ? "作用：" + bridge.adjustTargetName : ""
+                        color: "#8f96a3"
+                        font.pixelSize: 10
+                        elide: Text.ElideRight
+                    }
+                    IconButton {
+                        id: adjustClose
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        glyph: "✕"
+                        tip: "应用并关闭（Esc 放弃）"
+                        onClicked: root.commitAdjust()
+                    }
+                }
+
+                // ---- 直方图 + 色阶三手柄 ----
+                Item {
+                    width: parent.width
+                    height: 112
+
+                    Canvas {
+                        id: adjustHistCanvas
+                        anchors.top: parent.top
+                        width: parent.width
+                        height: 74
+                        renderStrategy: Canvas.Immediate
+                        renderTarget: Canvas.Image
+                        property var hist: parseHistogram(bridge.adjustHistogram)
+                        onHistChanged: requestPaint()
+
+                        onPaint: {
+                            const ctx = getContext("2d")
+                            const w = width
+                            const h = height
+                            ctx.clearRect(0, 0, w, h)
+                            ctx.fillStyle = "#1b1c1e"
+                            ctx.fillRect(0, 0, w, h)
+
+                            const hist = adjustHistCanvas.hist
+                            const n = (hist && hist.n) ? hist.n : 64
+                            let peak = 1
+                            if (hist) {
+                                for (let i = 0; i < n; i++)
+                                    peak = Math.max(peak, hist.r[i], hist.g[i], hist.b[i])
+                            }
+                            const lg = Math.log(1 + peak)
+
+                            // 色阶手柄之外的裁剪区（暗一点，提示会被裁掉）
+                            const bl = root.adjustVals.bl
+                            const wh = root.adjustVals.wh
+                            ctx.fillStyle = "rgba(0,0,0,0.45)"
+                            ctx.fillRect(0, 0, bl * w, h)
+                            ctx.fillRect(wh * w, 0, Math.max(0, w - wh * w), h)
+
+                            if (hist) {
+                                const channel = function (bins, color) {
+                                    ctx.beginPath()
+                                    ctx.moveTo(0, h)
+                                    for (let i = 0; i < n; i++) {
+                                        const x = (i + 0.5) * w / n
+                                        const y = h - (Math.log(1 + bins[i]) / lg) * (h - 3)
+                                        ctx.lineTo(x, y)
+                                    }
+                                    ctx.lineTo(w, h)
+                                    ctx.closePath()
+                                    ctx.fillStyle = color
+                                    ctx.fill()
+                                }
+                                // 叠加混色，接近预览面板的 RGB 直方图
+                                ctx.globalCompositeOperation = "lighter"
+                                channel(hist.r, "rgba(255,88,88,0.60)")
+                                channel(hist.g, "rgba(88,255,140,0.50)")
+                                channel(hist.b, "rgba(88,140,255,0.60)")
+                                ctx.globalCompositeOperation = "source-over"
+                            }
+
+                            ctx.strokeStyle = "#3c4043"
+                            ctx.lineWidth = 1
+                            ctx.strokeRect(0.5, 0.5, w - 1, h - 1)
+                        }
+                    }
+
+                    // 三个手柄：黑场 / Gamma / 白场。
+                    Item {
+                        id: adjustHandles
+                        anchors.top: adjustHistCanvas.bottom
+                        width: parent.width
+                        height: 20
+
+                        function setHandle(kind, x) {
+                            const t = Math.max(0, Math.min(1, x / width))
+                            const v = root.adjustVals
+                            if (kind === "black")
+                                root.setLevels(t, v.ga, v.wh)
+                            else if (kind === "white")
+                                root.setLevels(v.bl, v.ga, t)
+                            else
+                                root.setLevels(v.bl, Math.max(0.05, Math.min(20,
+                                               Math.log(Math.max(0.02, Math.min(0.98, t)))
+                                               / Math.log(0.5))), v.wh)
+                        }
+
+                        Repeater {
+                            model: [{ kind: "black", glyph: "▲" },
+                                    { kind: "mid", glyph: "▲" },
+                                    { kind: "white", glyph: "▲" }]
+
+                            delegate: Item {
+                                required property var modelData
+                                readonly property real pos: {
+                                    const v = root.adjustVals
+                                    if (modelData.kind === "black")
+                                        return v.bl
+                                    if (modelData.kind === "white")
+                                        return v.wh
+                                    return v.bl + (v.wh - v.bl) * v.mh
+                                }
+                                x: Math.max(0, Math.min(adjustHandles.width - 12,
+                                                       pos * adjustHandles.width - 6))
+                                width: 12
+                                height: 22
+
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "▲"
+                                    color: handleMa.containsMouse || handleMa.pressed
+                                           ? "#7fc3ff" : "#e9eaec"
+                                    font.pixelSize: 11
+                                }
+
+                                MouseArea {
+                                    id: handleMa
+                                    anchors.fill: parent
+                                    anchors.margins: -4
+                                    hoverEnabled: true
+                                    cursorShape: Qt.SizeHorCursor
+                                    onPressed: (mouse) => adjustHandles.setHandle(
+                                                      modelData.kind,
+                                                      (mapToItem(adjustHandles, mouse.x, 0).x))
+                                    onPositionChanged: (mouse) => {
+                                        if (pressed)
+                                            adjustHandles.setHandle(
+                                                modelData.kind,
+                                                mapToItem(adjustHandles, mouse.x, 0).x)
+                                    }
+                                }
+                            }
+                        }
+
+                        // 色阶读数放在手柄行下方单独一行（见下方 Text），
+                        // 避免与白场手柄重叠。
+                    }
+
+                    // 色阶读数（手柄单独一行，避免与白场手柄重叠）。
+                    Text {
+                        anchors.top: adjustHandles.bottom
+                        anchors.left: parent.left
+                        text: "黑场 " + Math.round(root.adjustVals.bl * 255)
+                              + "    中间 " + root.adjustVals.ga.toFixed(2)
+                              + "    白场 " + Math.round(root.adjustVals.wh * 255)
+                        color: "#7c828b"
+                        font.pixelSize: 9
+                    }
+                }
+
+                // ---- 自动色阶 ----
+                Item {
+                    width: parent.width
+                    height: 26
+                    ToolButton {
+                        anchors.centerIn: parent
+                        label: "自动色阶"
+                        active: bridge.image_width > 0
+                        onClicked: bridge.adjust_auto_levels()
+                    }
+                }
+
+                Rectangle { width: parent.width; height: 1; color: "#3c4043" }
+
+                // ---- 组 1：光量 ----
+                AdjustRow {
+                    glyph: "☼"; label: "曝光"; key: "exposure"; value: root.adjustVals.e
+                    onMoved: (v) => root.setAdjust("exposure", v)
+                    onResetRequested: root.applyAdjustNow("exposure", 0)
+                }
+                AdjustRow {
+                    glyph: "◑"; label: "对比度"; key: "contrast"; value: root.adjustVals.c
+                    onMoved: (v) => root.setAdjust("contrast", v)
+                    onResetRequested: root.applyAdjustNow("contrast", 0)
+                }
+                AdjustRow {
+                    glyph: "◉"; label: "高光"; key: "highlights"; value: root.adjustVals.hi
+                    onMoved: (v) => root.setAdjust("highlights", v)
+                    onResetRequested: root.applyAdjustNow("highlights", 0)
+                }
+                AdjustRow {
+                    glyph: "◍"; label: "阴影"; key: "shadows"; value: root.adjustVals.sh
+                    onMoved: (v) => root.setAdjust("shadows", v)
+                    onResetRequested: root.applyAdjustNow("shadows", 0)
+                }
+
+                Rectangle { width: parent.width; height: 1; color: "#3c4043" }
+
+                // ---- 组 2：颜色 ----
+                AdjustRow {
+                    glyph: "◈"; label: "饱和度"; key: "saturation"; value: root.adjustVals.sa
+                    onMoved: (v) => root.setAdjust("saturation", v)
+                    onResetRequested: root.applyAdjustNow("saturation", 0)
+                }
+                AdjustRow {
+                    glyph: "❄"; label: "色温"; key: "temperature"; value: root.adjustVals.te
+                    onMoved: (v) => root.setAdjust("temperature", v)
+                    onResetRequested: root.applyAdjustNow("temperature", 0)
+                }
+                AdjustRow {
+                    glyph: "◐"; label: "色调"; key: "tint"; value: root.adjustVals.ti
+                    onMoved: (v) => root.setAdjust("tint", v)
+                    onResetRequested: root.applyAdjustNow("tint", 0)
+                }
+                AdjustRow {
+                    glyph: "▤"; label: "棕褐色"; key: "sepia"; value: root.adjustVals.se
+                    minVal: 0; maxVal: 1
+                    onMoved: (v) => root.setAdjust("sepia", v)
+                    onResetRequested: root.applyAdjustNow("sepia", 0)
+                }
+
+                Rectangle { width: parent.width; height: 1; color: "#3c4043" }
+
+                // ---- 组 3：清晰度 ----
+                AdjustRow {
+                    glyph: "◆"; label: "清晰度"; key: "sharpness"; value: root.adjustVals.sp
+                    minVal: 0; maxVal: 1
+                    onMoved: (v) => root.setAdjust("sharpness", v)
+                    onResetRequested: root.applyAdjustNow("sharpness", 0)
+                }
+
+                // ---- 全部还原 ----
+                Item {
+                    width: parent.width
+                    height: 28
+                    ToolButton {
+                        anchors.centerIn: parent
+                        label: "全部还原"
+                        active: bridge.adjustOpen
+                        onClicked: {
+                            root.adjustDirty = false
+                            root.levelsDirty = false
+                            bridge.adjust_reset()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 调整颜色的节流下发：用 repeat 计时器（不是 restart）——快速拖动时
+    // 鼠标事件会不断重置 restart 型计时器，预览就永远不更新（见 MEMORY）。
+    Timer {
+        id: adjustFlushTimer
+        interval: 33
+        repeat: true
+        running: bridge.adjustOpen && (root.adjustDirty || root.levelsDirty)
+        onTriggered: {
+            root.flushAdjust()
+            root.flushLevels()
+        }
+    }
+
     Item {
         id: resizeOverlay
         anchors.fill: parent
@@ -4336,6 +4859,8 @@ Window {
 
     function onEscape() {
         if (textPopup.visible) { textPopup.close(false); return }
+        // 调色面板：Esc = 放弃（像素从未被改动）。
+        if (bridge.adjustOpen) { root.cancelAdjust(); return }
         if (widthPopover.visible || colorPopover.visible
             || mosaicPopover.visible || fontPopover.visible) {
             widthPopover.visible = false
@@ -4449,6 +4974,95 @@ Window {
 
     function findMark(index) {
         return root.markList.find(mk => mk.i === index) || null
+    }
+
+    // ---- 调整颜色：参数镜像 / 节流下发 ----
+    function parseAdjust(s) {
+        const empty = { e: 0, c: 0, hi: 0, sh: 0, sa: 0, te: 0, ti: 0,
+                        se: 0, sp: 0, bl: 0, ga: 1, wh: 1, mh: 0.5 }
+        if (!s)
+            return empty
+        try {
+            const v = JSON.parse(s)
+            for (const k in empty)
+                if (v[k] === undefined)
+                    v[k] = empty[k]
+            return v
+        } catch (e) {
+            return empty
+        }
+    }
+
+    // Live slider updates are throttled: a 33ms repeat timer (NOT restart())
+    // flushes the latest pending value, so a fast drag cannot starve it
+    // (see MEMORY: restart()-based throttling never fires on fast input).
+    function setAdjust(key, value) {
+        root.adjustKey = key
+        root.adjustValue = value
+        root.adjustDirty = true
+    }
+
+    function flushAdjust() {
+        if (!root.adjustDirty)
+            return
+        root.adjustDirty = false
+        if (bridge.adjustOpen)
+            bridge.adjust_set(root.adjustKey, root.adjustValue)
+    }
+
+    // Immediate variant for discrete actions (per-row reset, buttons).
+    function applyAdjustNow(key, value) {
+        root.adjustKey = key
+        root.adjustValue = value
+        root.adjustDirty = false
+        if (bridge.adjustOpen)
+            bridge.adjust_set(key, value)
+    }
+
+    function setLevels(black, gamma, white) {
+        root.pendingBlack = black
+        root.pendingGamma = gamma
+        root.pendingWhite = white
+        root.levelsDirty = true
+    }
+
+    function flushLevels() {
+        if (!root.levelsDirty)
+            return
+        root.levelsDirty = false
+        if (bridge.adjustOpen)
+            bridge.adjust_set_levels(root.pendingBlack, root.pendingGamma,
+                                     root.pendingWhite)
+    }
+
+    function parseHistogram(s) {
+        if (!s)
+            return null
+        try {
+            const v = JSON.parse(s)
+            return (v && v.r && v.g && v.b) ? v : null
+        } catch (e) {
+            return null
+        }
+    }
+
+    function commitAdjust() {
+        flushAdjust()
+        if (bridge.adjustOpen)
+            bridge.adjust_commit()
+    }
+
+    function cancelAdjust() {
+        root.adjustDirty = false
+        if (bridge.adjustOpen)
+            bridge.adjust_cancel()
+    }
+
+    function toggleAdjustPanel() {
+        if (bridge.adjustOpen)
+            commitAdjust()
+        else if (bridge.image_width > 0)
+            bridge.adjust_begin()
     }
 
     // Selected-mark display bounds [x, y, w, h] relative to the preview
@@ -5094,6 +5708,7 @@ Window {
             && bridge.selected_layer < 0 && !root.pasteFloating
             && !root.modeActive && !confirmOverlay.visible
             && !settingsOverlay.visible && !resizeOverlay.visible
+            && !bridge.adjustOpen
     }
 
     function navigateRel(dir) {
@@ -5273,6 +5888,18 @@ Window {
         }
     }
 
+    // Probe timer: --probe-adjust opens the 调整颜色 panel (live preview of the
+    // parameters supplied via --script=adjust:...).
+    Timer {
+        id: adjustProbeTimer
+        interval: 700
+        onTriggered: {
+            root.markBarVisible = true
+            if (!bridge.adjustOpen && bridge.image_width > 0)
+                bridge.adjust_begin()
+        }
+    }
+
     Component.onCompleted: {
         bridge.mark("qml-completed");
         if (root.primary) {
@@ -5299,6 +5926,8 @@ Window {
                 ellipseDragProbeTimer.start();
             if (Qt.application.arguments.indexOf("--probe-markbar") !== -1)
                 markBarProbeTimer.start();
+            if (root.probeAdjust)
+                adjustProbeTimer.start();
         } else if (root.fileUrl.toString().length > 0) {
             // Document window spawned for a specific file ("open in separate
             // window" setting, drag-out, etc.).

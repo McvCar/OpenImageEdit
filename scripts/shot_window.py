@@ -11,6 +11,13 @@ PW_RENDERFULLCONTENT = 0x2
 
 
 def find_main_window(pid):
+    """Largest visible top-level window of `pid`.
+
+    The process may own helper windows too (Qt's screen-change observer, and —
+    when stdout is redirected — a "PseudoConsoleWindow" at 0x0 that comes first
+    in the enumeration). Picking the largest one reliably lands on the real
+    editor window.
+    """
     result = []
 
     @ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
@@ -18,11 +25,18 @@ def find_main_window(pid):
         wpid = wt.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
         if wpid.value == pid and user32.IsWindowVisible(hwnd):
-            result.append(hwnd)
+            rect = wt.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            area = (rect.right - rect.left) * (rect.bottom - rect.top)
+            if area > 0:
+                result.append((area, hwnd))
         return True
 
     user32.EnumWindows(cb, 0)
-    return result[0] if result else None
+    if not result:
+        return None
+    result.sort(reverse=True)
+    return result[0][1]
 
 
 def main():

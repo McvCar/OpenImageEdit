@@ -7,7 +7,10 @@ use std::time::Instant;
 
 use cxx_qt_lib::{QString, QUrl};
 use decode::{decode_path, encode, format_from_path, DecodeOptions, Format};
-use editcore::{Document, Layer, Mark, MarkKind, Rect, Selection, Size, Transform};
+use editcore::{
+    adjust_json, Adjust, AdjustTarget, Document, Histogram, Layer, Mark, MarkKind, Rect, Selection,
+    Size, Transform,
+};
 use image::RgbaImage;
 
 pub static PROCESS_START: OnceLock<Instant> = OnceLock::new();
@@ -74,6 +77,11 @@ pub mod qobject {
         #[qproperty(bool, open_in_new_window, cxx_name = "openInNewWindow")]
         #[qproperty(i32, save_quality, cxx_name = "saveQuality")]
         #[qproperty(QString, source_path, cxx_name = "sourcePath")]
+        // ---- 调整颜色 (color adjustment) panel ----
+        #[qproperty(bool, adjust_open, cxx_name = "adjustOpen")]
+        #[qproperty(QString, adjust_target_name, cxx_name = "adjustTargetName")]
+        #[qproperty(QString, adjust_values, cxx_name = "adjustValues")]
+        #[qproperty(QString, adjust_histogram, cxx_name = "adjustHistogram")]
         #[namespace = "imageedit"]
         type Bridge = super::BridgeRust;
 
@@ -342,6 +350,39 @@ pub mod qobject {
             fill_color: &QString,
         );
 
+        // ---- 调整颜色（macOS 预览风格） ----
+        /// Open the color-adjust panel and capture its scope: the selected
+        /// layer, else the base photo. Parameters start neutral.
+        #[qinvokable]
+        fn adjust_begin(self: Pin<&mut Self>);
+
+        /// Live parameter update (history-free; document pixels untouched).
+        /// `name` is one of exposure/contrast/highlights/shadows/saturation/
+        /// temperature/tint/sepia/sharpness/black/gamma/white.
+        #[qinvokable]
+        fn adjust_set(self: Pin<&mut Self>, name: &QString, value: f64);
+
+        /// Levels: `black` / `gamma` / `white` (0..1, > 0, 0..1).
+        #[qinvokable]
+        fn adjust_set_levels(self: Pin<&mut Self>, black: f64, gamma: f64, white: f64);
+
+        /// Auto levels from the scope's own histogram (percentile clip).
+        #[qinvokable]
+        fn adjust_auto_levels(self: Pin<&mut Self>);
+
+        /// Back to neutral (pixels were never modified; keeps the panel open).
+        #[qinvokable]
+        fn adjust_reset(self: Pin<&mut Self>);
+
+        /// Bake the parameters into the scope's pixels as ONE undoable op and
+        /// close the panel (the macOS-friendly "close applies" flow).
+        #[qinvokable]
+        fn adjust_commit(self: Pin<&mut Self>);
+
+        /// Close the panel discarding the parameters.
+        #[qinvokable]
+        fn adjust_cancel(self: Pin<&mut Self>);
+
         // ---- 剪贴板（跨文档） ----
 
         #[qinvokable]
@@ -526,6 +567,14 @@ pub struct BridgeRust {
     /// Full path of the loaded file ("" when no file), for the clickable
     /// status-bar path button.
     source_path: QString,
+    /// "调整颜色" panel state published to QML.
+    adjust_open: bool,
+    /// Scope label shown in the panel title ("背景" / layer name).
+    adjust_target_name: QString,
+    /// JSON of the live parameters (slider positions + level handles).
+    adjust_values: QString,
+    /// JSON of the 64-bin RGB histogram of the current preview.
+    adjust_histogram: QString,
     paste_counter: RefCell<u32>,
     /// Opacity of the selected layer before the current live slider drag, so
     /// the committed history op can record the true pre-drag value.
@@ -573,6 +622,10 @@ impl Default for BridgeRust {
             open_in_new_window: cfg.open_in_new_window,
             save_quality: cfg.save_quality as i32,
             source_path: QString::default(),
+            adjust_open: false,
+            adjust_target_name: QString::default(),
+            adjust_values: QString::default(),
+            adjust_histogram: QString::default(),
             paste_counter: RefCell::new(0),
             opacity_live: RefCell::new(None),
             drag_start_offset: RefCell::new(None),
@@ -616,6 +669,16 @@ struct Session {
     /// Cached preview-scaled base/layers; invalidated by doc.edit_epoch so
     /// live drag ticks skip the per-layer resample.
     composer: render::PreviewComposer,
+    /// Open "调整颜色" panel: the scope captured when it opened plus the live
+    /// parameters. Document pixels are NOT touched until `adjust_commit`.
+    adjust: Option<AdjustLive>,
+}
+
+/// Live "调整颜色" state (history-free until the panel commits).
+#[derive(Debug, Clone, Copy)]
+struct AdjustLive {
+    target: AdjustTarget,
+    params: Adjust,
 }
 
 /// Session-side state for a live layer resize gesture.
@@ -630,6 +693,8 @@ struct Rendered {
     url: String,
     display: Size,
     preview: Size,
+    /// JSON of the preview histogram (only while the adjust panel is open).
+    histogram: Option<String>,
 }
 
 enum Refresh {
@@ -647,6 +712,10 @@ enum Refresh {
         layers_json: String,
         marks_json: String,
         dirty: bool,
+        adjust_open: bool,
+        adjust_target_name: String,
+        adjust_values: String,
+        adjust_histogram: String,
     },
     Err(String),
 }
@@ -716,6 +785,7 @@ impl Session {
                 preview_hidden_mark: -1,
                 live_scale: None,
                 composer: render::PreviewComposer::new(),
+                adjust: None,
             },
             ms,
         ))
@@ -747,7 +817,12 @@ impl Session {
         // Inline text editing: the mark being edited is hidden from the
         // preview only (restored right after the composite; never undoable).
         // An in-flight layer resize routes the composite through the
-        // live-scale path (snapshot stretch, document untouched).
+        // live-scale path (snapshot stretch, document untouched). The open
+        // "调整颜色" panel applies its live parameters to the scope's
+        // preview-resolution bitmap only.
+        let adjust = self
+            .adjust
+            .map(|state| (state.target, state.params));
         let hidden_idx = self.preview_hidden_mark;
         let image = if hidden_idx >= 0
             && (hidden_idx as usize) < self.doc.marks.len()
@@ -755,31 +830,11 @@ impl Session {
             let idx = hidden_idx as usize;
             let saved = self.doc.marks[idx].visible;
             self.doc.marks[idx].visible = false;
-            let img = match self.live_scale.as_ref() {
-                Some(ls) => self.composer.composite_live_scale(
-                    &self.doc,
-                    target,
-                    ls.index,
-                    &ls.snapshot,
-                    ls.to,
-                    ls.offset,
-                ),
-                None => self.composer.composite(&self.doc, target),
-            };
+            let img = self.composite_for_preview(target, adjust);
             self.doc.marks[idx].visible = saved;
             img
         } else {
-            match self.live_scale.as_ref() {
-                Some(ls) => self.composer.composite_live_scale(
-                    &self.doc,
-                    target,
-                    ls.index,
-                    &ls.snapshot,
-                    ls.to,
-                    ls.offset,
-                ),
-                None => self.composer.composite(&self.doc, target),
-            }
+            self.composite_for_preview(target, adjust)
         };
         // BMP on purpose: uncompressed means both the encode here and Qt's
         // decode are near memcpy speed. PNG compression dominated each live
@@ -794,11 +849,66 @@ impl Session {
             self.render_count % 2
         ));
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        // The panel graph reflects the adjusted preview (like Preview), so it
+        // is computed from the composited pixels and only while it is open.
+        let histogram = if self.adjust.is_some() {
+            Some(Histogram::of(&image).to_json())
+        } else {
+            None
+        };
         Ok(Rendered {
             url: file_url(&path),
             display,
             preview: Size::new(image.width(), image.height()),
+            histogram,
         })
+    }
+
+    /// Composite one preview frame, honoring an in-flight live resize and the
+    /// optional color adjustment.
+    fn composite_for_preview(
+        &mut self,
+        target: Size,
+        adjust: Option<(AdjustTarget, Adjust)>,
+    ) -> RgbaImage {
+        match self.live_scale.as_ref() {
+            Some(ls) => self.composer.composite_live_scale_adjusted(
+                &self.doc,
+                target,
+                ls.index,
+                &ls.snapshot,
+                ls.to,
+                ls.offset,
+                adjust,
+            ),
+            None => self.composer.composite_adjusted(&self.doc, target, adjust),
+        }
+    }
+
+    /// Scope label for the panel title.
+    fn adjust_target_name(&self, target: AdjustTarget) -> String {
+        match target {
+            AdjustTarget::Base => "背景".to_string(),
+            AdjustTarget::Layer(index) => self
+                .doc
+                .layers
+                .get(index)
+                .map(|layer| layer.name.clone())
+                .unwrap_or_else(|| format!("图层 {}", index + 1)),
+        }
+    }
+
+    /// Scope captured when the panel opens: the selected layer, else the base
+    /// photo. Once the base has been "unlocked" into a regular layer the base
+    /// bitmap is only transparent padding, so fall back to the bottom layer.
+    fn adjust_scope(&self, selected_layer: i32) -> AdjustTarget {
+        if selected_layer >= 0 && (selected_layer as usize) < self.doc.layers.len() {
+            return AdjustTarget::Layer(selected_layer as usize);
+        }
+        if self.doc.base_converted && !self.doc.layers.is_empty() {
+            return AdjustTarget::Layer(0);
+        }
+        AdjustTarget::Base
     }
 
     fn default_save_path(&self) -> (PathBuf, Format) {
@@ -940,21 +1050,34 @@ impl Session {
 
     fn refresh(&mut self) -> Refresh {
         match self.render() {
-            Ok(rendered) => Refresh::Ok {
-                url: rendered.url,
-                canvas: self.doc.canvas,
-                display: rendered.display,
-                preview: rendered.preview,
-                zoom_percent: (self.zoom * 100.0).round() as i32,
-                fit: self.fit,
-                can_undo: self.doc.can_undo(),
-                can_redo: self.doc.can_redo(),
-                save_url: file_url(&self.default_save_path().0),
-                layer_count: self.doc.layers.len() as i32,
-                layers_json: self.layers_json(),
-                marks_json: self.marks_json(),
-                dirty: self.dirty,
-            },
+            Ok(rendered) => {
+                let adjust = self.adjust;
+                let adjust_target_name = match adjust {
+                    Some(state) => self.adjust_target_name(state.target),
+                    None => String::new(),
+                };
+                Refresh::Ok {
+                    url: rendered.url,
+                    canvas: self.doc.canvas,
+                    display: rendered.display,
+                    preview: rendered.preview,
+                    zoom_percent: (self.zoom * 100.0).round() as i32,
+                    fit: self.fit,
+                    can_undo: self.doc.can_undo(),
+                    can_redo: self.doc.can_redo(),
+                    save_url: file_url(&self.default_save_path().0),
+                    layer_count: self.doc.layers.len() as i32,
+                    layers_json: self.layers_json(),
+                    marks_json: self.marks_json(),
+                    dirty: self.dirty,
+                    adjust_open: adjust.is_some(),
+                    adjust_target_name,
+                    adjust_values: adjust_json(
+                        &adjust.map(|state| state.params).unwrap_or_default(),
+                    ),
+                    adjust_histogram: rendered.histogram.unwrap_or_default(),
+                }
+            }
             Err(err) => Refresh::Err(err),
         }
     }
@@ -1098,6 +1221,46 @@ impl qobject::Bridge {
                 }
                 // Dump the flattened (marks composited) canvas to a PNG for
                 // headless verification of mark rendering.
+                // ---- 调整颜色 headless hooks ----
+                // `adjust:exposure=40,saturation=-30` — percentages (gamma is
+                // a raw ratio). Opens the panel implicitly.
+                "adjust-begin" => self.as_mut().adjust_begin(),
+                // Auto levels needs an open panel (it edits the live params).
+                "adjust-auto" => {
+                    if !*self.adjust_open() {
+                        self.as_mut().adjust_begin();
+                    }
+                    self.as_mut().adjust_auto_levels();
+                }
+                "adjust-reset" => self.as_mut().adjust_reset(),
+                "adjust-commit" => self.as_mut().adjust_commit(),
+                "adjust-cancel" => self.as_mut().adjust_cancel(),
+                other if other.starts_with("adjust:") => {
+                    if !*self.adjust_open() {
+                        self.as_mut().adjust_begin();
+                    }
+                    let spec = other.strip_prefix("adjust:").unwrap_or("");
+                    for pair in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                        let Some((name, value)) = pair.split_once('=') else {
+                            continue;
+                        };
+                        let Ok(raw) = value.trim().parse::<f64>() else {
+                            continue;
+                        };
+                        // gamma is a ratio; everything else is a percentage.
+                        let value = if name.trim() == "gamma" {
+                            raw
+                        } else {
+                            raw / 100.0
+                        };
+                        self.as_mut()
+                            .adjust_set(&QString::from(name.trim().to_string()), value);
+                    }
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"adjust-set\",\"values\":{}}}",
+                        self.adjust_values(),
+                    );
+                }
                 "dump-flat" => {
                     let guard = self.session.borrow();
                     if let Some(session) = guard.as_ref() {
@@ -1110,8 +1273,7 @@ impl qobject::Bridge {
                             });
                     }
                 }
-                "marks-undo" => {
-                    self.as_mut().undo();
+                "marks-undo" => {                    self.as_mut().undo();
                     self.as_mut().undo();
                     self.as_mut().undo();
                     self.as_mut().undo();
@@ -2312,6 +2474,197 @@ session
             }
         };
         self.apply_layer_edit(viewport, result);
+    }
+
+    // ---- 调整颜色（macOS 预览风格） ----
+
+    /// Open the panel and capture its scope. Parameters start neutral, so
+    /// opening the panel never changes the document.
+    pub fn adjust_begin(mut self: Pin<&mut Self>) {
+        if *self.adjust_open() {
+            return;
+        }
+        if self
+            .session
+            .borrow()
+            .as_ref()
+            .map(|session| session.doc.canvas.pixels() == 0)
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let selected = *self.selected_layer();
+        {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            // Scope: the selected layer, else the base photo. Locked at open
+            // time so changing the selection mid-adjust cannot retarget it.
+            let target = session.adjust_scope(selected);
+            session.adjust = Some(AdjustLive {
+                target,
+                params: Adjust::identity(),
+            });
+        }
+        println!("{{\"phase\":\"ui\",\"event\":\"adjust-open\"}}");
+        self.as_mut().refresh_preview();
+    }
+
+    /// Live parameter update: history-free, document pixels untouched.
+    pub fn adjust_set(mut self: Pin<&mut Self>, name: &QString, value: f64) {
+        let name = name.to_string();
+        {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            let Some(state) = session.adjust.as_mut() else {
+                return;
+            };
+            let v = value as f32;
+            let bipolar = v.clamp(-1.0, 1.0);
+            let unipolar = v.clamp(0.0, 1.0);
+            match name.as_str() {
+                "exposure" | "e" => state.params.exposure = bipolar,
+                "contrast" | "c" => state.params.contrast = bipolar,
+                "highlights" | "hi" => state.params.highlights = bipolar,
+                "shadows" | "sh" => state.params.shadows = bipolar,
+                "saturation" | "sa" => state.params.saturation = bipolar,
+                "temperature" | "te" => state.params.temperature = bipolar,
+                "tint" | "ti" => state.params.tint = bipolar,
+                "sepia" | "se" => state.params.sepia = unipolar,
+                "sharpness" | "sp" => state.params.sharpness = unipolar,
+                "black" | "bl" => state.params.black = unipolar,
+                "white" | "wh" => state.params.white = unipolar,
+                "gamma" | "ga" => state.params.gamma = (v as f32).clamp(0.05, 20.0),
+                _ => {
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"adjust-unknown\",\"name\":\"{name}\"}}"
+                    );
+                    return;
+                }
+            }
+            state.params.sanitize();
+        }
+        self.as_mut().refresh_preview();
+    }
+
+    pub fn adjust_set_levels(mut self: Pin<&mut Self>, black: f64, gamma: f64, white: f64) {
+        {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            let Some(state) = session.adjust.as_mut() else {
+                return;
+            };
+            state.params.black = (black as f32).clamp(0.0, 0.95);
+            state.params.white = (white as f32).clamp(0.0, 1.0);
+            state.params.gamma = (gamma as f32).clamp(0.05, 20.0);
+            state.params.sanitize();
+        }
+        self.as_mut().refresh_preview();
+    }
+
+    /// Auto levels from the scope's own histogram (percentile clip), like
+    /// the "自动色阶" button in the screenshot.
+    pub fn adjust_auto_levels(mut self: Pin<&mut Self>) {
+        let mut levels = None;
+        {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            let Some(state) = session.adjust.as_mut() else {
+                return;
+            };
+            if let Some(hist) = session.doc.scope_histogram(state.target) {
+                let (black, white) = hist.auto_levels();
+                state.params.black = black;
+                state.params.white = white;
+                state.params.gamma = 1.0;
+                state.params.sanitize();
+                levels = Some((black, white));
+            }
+        }
+        if let Some((black, white)) = levels {
+            println!(
+                "{{\"phase\":\"ui\",\"event\":\"adjust-auto\",\"black\":{black:.3},\"white\":{white:.3}}}"
+            );
+        }
+        self.as_mut().refresh_preview();
+    }
+
+    pub fn adjust_reset(mut self: Pin<&mut Self>) {
+        {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            let Some(state) = session.adjust.as_mut() else {
+                return;
+            };
+            state.params = Adjust::identity();
+        }
+        self.as_mut().refresh_preview();
+    }
+
+    /// Bake the parameters into the scope's pixels as one undoable op and
+    /// close the panel (macOS Preview's "closing applies" flow).
+    pub fn adjust_commit(mut self: Pin<&mut Self>) {
+        let (scope, committed, error) = {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            let Some(state) = session.adjust else {
+                return;
+            };
+            let scope = match state.target {
+                AdjustTarget::Base => "base".to_string(),
+                AdjustTarget::Layer(index) => format!("layer:{index}"),
+            };
+            let mut committed = false;
+            let mut error = String::new();
+            if !state.params.is_identity() {
+                match session.doc.adjust_pixels(state.target, &state.params) {
+                    Ok(()) => {
+                        session.dirty = true;
+                        committed = true;
+                    }
+                    Err(err) => error = err.to_string(),
+                }
+            }
+            session.adjust = None;
+            (scope, committed, error)
+        };
+        if error.is_empty() {
+            println!(
+                "{{\"phase\":\"ui\",\"event\":\"adjust-commit\",\"applied\":{committed},\"scope\":\"{scope}\"}}"
+            );
+        } else {
+            println!(
+                "{{\"phase\":\"ui\",\"event\":\"adjust-error\",\"detail\":\"{error}\"}}"
+            );
+        }
+        if committed {
+            self.as_mut()
+                .set_status(QString::from("已应用调色（Ctrl+Z 可撤销）"));
+        }
+        self.as_mut().refresh_preview();
+    }
+
+    pub fn adjust_cancel(mut self: Pin<&mut Self>) {
+        {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            session.adjust = None;
+        }
+        println!("{{\"phase\":\"ui\",\"event\":\"adjust-cancel\"}}");
+        self.as_mut().refresh_preview();
     }
 
     // ---- 剪贴板（跨文档复制粘贴） ----
@@ -3634,6 +3987,10 @@ session
                 layers_json,
                 marks_json,
                 dirty,
+                adjust_open,
+                adjust_target_name,
+                adjust_values,
+                adjust_histogram,
             } => {
                 // The status bar's left side already shows the file name and
                 // size; a second resolution readout here was redundant, so
@@ -3668,6 +4025,24 @@ session
                 if self.marks_json().to_string() != marks_json {
                     self.as_mut()
                         .set_marks_json(QString::from(marks_json.as_str()));
+                }
+                // "调整颜色" panel state: only republished when it actually
+                // changed (the histogram JSON changes on every slider tick,
+                // which is what redraws the graph).
+                if *self.adjust_open() != adjust_open {
+                    self.as_mut().set_adjust_open(adjust_open);
+                }
+                if self.adjust_target_name().to_string() != adjust_target_name {
+                    self.as_mut()
+                        .set_adjust_target_name(QString::from(adjust_target_name.as_str()));
+                }
+                if self.adjust_values().to_string() != adjust_values {
+                    self.as_mut()
+                        .set_adjust_values(QString::from(adjust_values.as_str()));
+                }
+                if self.adjust_histogram().to_string() != adjust_histogram {
+                    self.as_mut()
+                        .set_adjust_histogram(QString::from(adjust_histogram.as_str()));
                 }
                 if *self.selected_layer() < 0 || *self.selected_layer() >= layer_count {
                     self.as_mut().set_selected_layer(-1);

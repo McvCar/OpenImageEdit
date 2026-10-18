@@ -3,7 +3,7 @@ use std::sync::Arc;
 use image::imageops::FilterType;
 use image::RgbaImage;
 
-use editcore::{Document, Rect, Size};
+use editcore::{Adjust, AdjustTarget, Document, Rect, Size};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Viewport {
@@ -280,10 +280,31 @@ impl PreviewComposer {
     }
 
     pub fn composite(&mut self, doc: &Document, target: Size) -> RgbaImage {
+        self.composite_adjusted(doc, target, None)
+    }
+
+    /// Preview composite with an optional live "调整颜色" adjustment applied to
+    /// the pixels of `scope` (the selected layer, or the base photo).
+    ///
+    /// The adjustment runs on the **preview-resolution** bitmap of the scope,
+    /// never on document pixels, so a slider drag keeps the live-gesture rule
+    /// (document untouched, `edit_epoch` stable, cached scaled layers reused).
+    /// `Adjust::apply_in_place` short-circuits when every parameter is
+    /// neutral, so an `Adjust::identity()` scope costs nothing.
+    /// Markup annotations are drawn last and are never color-adjusted.
+    pub fn composite_adjusted(
+        &mut self,
+        doc: &Document,
+        target: Size,
+        adjust: Option<(AdjustTarget, Adjust)>,
+    ) -> RgbaImage {
         let Some((sx, sy)) = self.prepare(doc, target) else {
             return RgbaImage::new(target.width.max(1), target.height.max(1));
         };
         let mut out = self.base_buffer(doc, target, sx, sy);
+        if let Some((AdjustTarget::Base, params)) = adjust {
+            params.apply_in_place(&mut out);
+        }
         for (li, layer) in doc.layers.iter().enumerate() {
             if !layer.visible || layer.opacity <= 0.0 {
                 continue;
@@ -291,10 +312,28 @@ impl PreviewComposer {
             let src = self.scaled_layer(li, &layer.image, sx, sy);
             let ox = (layer.offset.0 as f64 * sx).round() as i32;
             let oy = (layer.offset.1 as f64 * sy).round() as i32;
-            Self::blend_layer(&mut out, target, &src, ox, oy, layer.opacity);
+            match adjust {
+                Some((AdjustTarget::Layer(index), params)) if index == li => {
+                    let mut adjusted = (*src).clone();
+                    params.apply_in_place(&mut adjusted);
+                    Self::blend_layer(&mut out, target, &adjusted, ox, oy, layer.opacity);
+                }
+                _ => Self::blend_layer(&mut out, target, &src, ox, oy, layer.opacity),
+            }
         }
         Self::draw_marks(doc, &mut out, sx, sy);
         out
+    }
+
+    /// Convenience wrapper around [`PreviewComposer::composite_adjusted`].
+    pub fn composite_with_adjust(
+        &mut self,
+        doc: &Document,
+        target: Size,
+        scope: AdjustTarget,
+        adjust: &Adjust,
+    ) -> RgbaImage {
+        self.composite_adjusted(doc, target, Some((scope, *adjust)))
     }
 
     /// Preview composite while a layer is being live-resized.
@@ -316,6 +355,31 @@ impl PreviewComposer {
         to: Size,
         offset: (i32, i32),
     ) -> RgbaImage {
+        self.composite_live_scale_adjusted(
+            doc,
+            target,
+            layer_index,
+            snapshot,
+            to,
+            offset,
+            None,
+        )
+    }
+
+    /// [`PreviewComposer::composite_live_scale`] plus an optional live color
+    /// adjustment (the "调整颜色" panel can stay open while a layer handle is
+    /// dragged).
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_live_scale_adjusted(
+        &mut self,
+        doc: &Document,
+        target: Size,
+        layer_index: usize,
+        snapshot: &RgbaImage,
+        to: Size,
+        offset: (i32, i32),
+        adjust: Option<(AdjustTarget, Adjust)>,
+    ) -> RgbaImage {
         let Some((sx, sy)) = self.prepare(doc, target) else {
             return RgbaImage::new(target.width.max(1), target.height.max(1));
         };
@@ -325,6 +389,9 @@ impl PreviewComposer {
             .map(|l| if l.visible { l.opacity } else { 0.0 })
             .unwrap_or(0.0);
         let mut out = self.base_buffer(doc, target, sx, sy);
+        if let Some((AdjustTarget::Base, params)) = adjust {
+            params.apply_in_place(&mut out);
+        }
         for (li, layer) in doc.layers.iter().enumerate() {
             if !layer.visible || layer.opacity <= 0.0 || li == layer_index {
                 continue;
@@ -332,7 +399,14 @@ impl PreviewComposer {
             let src = self.scaled_layer(li, &layer.image, sx, sy);
             let ox = (layer.offset.0 as f64 * sx).round() as i32;
             let oy = (layer.offset.1 as f64 * sy).round() as i32;
-            Self::blend_layer(&mut out, target, &src, ox, oy, layer.opacity);
+            match adjust {
+                Some((AdjustTarget::Layer(index), params)) if index == li => {
+                    let mut adjusted = (*src).clone();
+                    params.apply_in_place(&mut adjusted);
+                    Self::blend_layer(&mut out, target, &adjusted, ox, oy, layer.opacity);
+                }
+                _ => Self::blend_layer(&mut out, target, &src, ox, oy, layer.opacity),
+            }
         }
         if drag_opacity > 0.0 {
             let nw = ((to.width as f64 * sx).round() as u32).max(1);
@@ -352,7 +426,15 @@ impl PreviewComposer {
             };
             let ox = (offset.0 as f64 * sx).round() as i32;
             let oy = (offset.1 as f64 * sy).round() as i32;
-            Self::blend_layer(&mut out, target, &src, ox, oy, drag_opacity);
+            let stretched = match adjust {
+                Some((AdjustTarget::Layer(index), params)) if index == layer_index => {
+                    let mut adjusted = (*src).clone();
+                    params.apply_in_place(&mut adjusted);
+                    adjusted
+                }
+                _ => (*src).clone(),
+            };
+            Self::blend_layer(&mut out, target, &stretched, ox, oy, drag_opacity);
         }
         Self::draw_marks(doc, &mut out, sx, sy);
         out
@@ -469,8 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn live_scale_preview_stretches_snapshot_without_touching_doc() {
-        let mut doc = Document::from_image(solid(40, 40, [10, 20, 30, 255]));
+    fn live_scale_preview_stretches_snapshot_without_touching_doc() {        let mut doc = Document::from_image(solid(40, 40, [10, 20, 30, 255]));
         let mut layer = Layer::new("dot", solid(10, 10, [255, 0, 0, 255]));
         layer.offset = (10, 10);
         doc.add_layer(layer).unwrap();
@@ -509,5 +590,72 @@ mod tests {
         assert_eq!(restored.get_pixel(2, 2).0, [10, 20, 30, 255]);
         // `before` and `restored` agree pixel for pixel.
         assert_eq!(before.as_raw(), restored.as_raw());
+    }
+
+    #[test]
+    fn adjust_preview_is_identity_neutral_and_never_touches_the_doc() {
+        let doc = Document::from_image(solid(40, 30, [90, 120, 200, 255]));
+        let target = Size::new(20, 15);
+        let mut composer = PreviewComposer::new();
+        let plain = composer.composite(&doc, target);
+        let neutral = composer.composite_with_adjust(
+            &doc,
+            target,
+            AdjustTarget::Base,
+            &Adjust::identity(),
+        );
+        assert_eq!(plain.as_raw(), neutral.as_raw());
+        assert_eq!(doc.base.get_pixel(5, 5).0, [90, 120, 200, 255]);
+    }
+
+    #[test]
+    fn adjust_preview_scopes_to_base_or_layer() {
+        let mut doc = Document::from_image(solid(40, 30, [100, 100, 100, 255]));
+        let mut layer = Layer::new("dot", solid(10, 10, [150, 150, 150, 255]));
+        layer.offset = (0, 0);
+        doc.add_layer(layer).unwrap();
+        let target = Size::new(40, 30);
+        let mut composer = PreviewComposer::new();
+
+        let brighter = Adjust {
+            exposure: 0.8,
+            ..Adjust::identity()
+        };
+        // Base scope: the far corner brightens, the layer stays as it was.
+        let base_adjusted =
+            composer.composite_with_adjust(&doc, target, AdjustTarget::Base, &brighter);
+        assert!(base_adjusted.get_pixel(30, 20).0[0] > 100);
+        assert_eq!(base_adjusted.get_pixel(2, 2).0, [150, 150, 150, 255]);
+
+        // Layer scope: only the layer's rect changes.
+        let layer_adjusted =
+            composer.composite_with_adjust(&doc, target, AdjustTarget::Layer(0), &brighter);
+        assert!(layer_adjusted.get_pixel(2, 2).0[0] > 150);
+        assert_eq!(layer_adjusted.get_pixel(30, 20).0, [100, 100, 100, 255]);
+    }
+
+    #[test]
+    fn adjust_preview_leaves_markup_annotations_untouched() {
+        let mut doc = Document::from_image(solid(40, 30, [100, 100, 100, 255]));
+        let mut mark = editcore::Mark::new(editcore::MarkKind::Rect);
+        mark.rect = (2.0, 2.0, 20.0, 20.0);
+        mark.stroke = 6;
+        mark.color = [255, 0, 0, 255];
+        doc.add_mark(mark).unwrap();
+        let target = Size::new(40, 30);
+        let mut composer = PreviewComposer::new();
+        let out = composer.composite_with_adjust(
+            &doc,
+            target,
+            AdjustTarget::Base,
+            &Adjust {
+                saturation: -1.0,
+                ..Adjust::identity()
+            },
+        );
+        // The red stroke stays red: marks are annotations, not photo pixels.
+        assert_eq!(out.get_pixel(2, 10).0, [255, 0, 0, 255]);
+        // The grey base is desaturated but unchanged (already neutral grey).
+        assert_eq!(out.get_pixel(30, 25).0, [100, 100, 100, 255]);
     }
 }

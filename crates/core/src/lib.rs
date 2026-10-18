@@ -1,6 +1,8 @@
 use image::RgbaImage;
 
+mod adjust;
 pub mod font;
+pub use adjust::{adjust_json, Adjust, AdjustTarget, Histogram, BINS};
 pub use font::{measure_text, FONTS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -935,6 +937,14 @@ pub enum EditOp {
     UpdateMark { index: usize, from: Mark, to: Mark },
     /// Remove an annotation; the removed mark is kept for undo.
     DeleteMark { index: usize, mark: Mark },
+    /// Bake a color adjustment into the target's pixels ("调整颜色" panel).
+    /// Only the pre-op image of the scope is stored; redo recomputes
+    /// `adjust(from)`, so a 50 MP base costs one extra image instead of two.
+    AdjustPixels {
+        target: AdjustTarget,
+        from: RgbaImage,
+        params: Adjust,
+    },
 }
 
 impl EditOp {
@@ -1065,6 +1075,25 @@ impl EditOp {
                 doc.marks.remove(*index);
                 Ok(())
             }
+            EditOp::AdjustPixels {
+                target, from, params,
+            } => {
+                let adjusted = params.apply_to(from);
+                match target {
+                    AdjustTarget::Base => {
+                        doc.base = adjusted;
+                        Ok(())
+                    }
+                    AdjustTarget::Layer(index) => {
+                        let layer = doc
+                            .layers
+                            .get_mut(*index)
+                            .ok_or(EditError::LayerIndex(*index))?;
+                        layer.image = adjusted;
+                        Ok(())
+                    }
+                }
+            }
         }
     }
 
@@ -1181,6 +1210,22 @@ impl EditOp {
                 }
                 doc.marks.insert(*index, mark.clone());
                 Ok(())
+            }
+            EditOp::AdjustPixels { target, from, .. } => {
+                match target {
+                    AdjustTarget::Base => {
+                        doc.base = from.clone();
+                        Ok(())
+                    }
+                    AdjustTarget::Layer(index) => {
+                        let layer = doc
+                            .layers
+                            .get_mut(*index)
+                            .ok_or(EditError::LayerIndex(*index))?;
+                        layer.image = from.clone();
+                        Ok(())
+                    }
+                }
             }
         }
     }
@@ -1683,6 +1728,44 @@ impl Document {
         self.execute(EditOp::EraseBasePixels {
             from,
             selection: selection.clone(),
+        })
+    }
+
+    /// Pixels a color adjustment would touch (histogram source / live scope).
+    pub fn scope_image(&self, target: AdjustTarget) -> Option<&RgbaImage> {
+        match target {
+            AdjustTarget::Base => Some(&self.base),
+            AdjustTarget::Layer(index) => self.layers.get(index).map(|layer| &layer.image),
+        }
+    }
+
+    /// Histogram of the adjustment scope ("调整颜色" panel graph + auto levels).
+    pub fn scope_histogram(&self, target: AdjustTarget) -> Option<Histogram> {
+        self.scope_image(target).map(Histogram::of)
+    }
+
+    /// Bake `params` into the scope's pixels as one undoable operation.
+    /// A neutral parameter set is a no-op (no history entry, no epoch bump).
+    pub fn adjust_pixels(
+        &mut self,
+        target: AdjustTarget,
+        params: &Adjust,
+    ) -> Result<(), EditError> {
+        let from = match target {
+            AdjustTarget::Base => self.base.clone(),
+            AdjustTarget::Layer(index) => self
+                .layers
+                .get(index)
+                .map(|layer| layer.image.clone())
+                .ok_or(EditError::LayerIndex(index))?,
+        };
+        if params.is_identity() {
+            return Ok(());
+        }
+        self.execute(EditOp::AdjustPixels {
+            target,
+            from,
+            params: *params,
         })
     }
 
@@ -2677,5 +2760,89 @@ mod tests {
         doc.resize(Size::new(40, 20)).unwrap();
         assert_eq!(doc.marks[0].rect, (4.0, 4.0, 20.0, 16.0));
         assert_eq!(doc.marks[0].stroke, 4);
+    }
+
+    // ---- 调整颜色 (color adjustment) ----
+
+    fn grey_ramp(width: u32, height: u32) -> RgbaImage {
+        RgbaImage::from_fn(width, height, |x, _| {
+            let v = (x * 255 / width.max(1)) as u8;
+            image::Rgba([v, v, v, 255])
+        })
+    }
+
+    #[test]
+    fn adjust_base_pixels_roundtrips_undo_and_redo() {
+        let mut doc = Document::from_image(grey_ramp(32, 8));
+        let before = doc.base.clone();
+        let params = Adjust {
+            exposure: 0.5,
+            ..Adjust::identity()
+        };
+        doc.adjust_pixels(AdjustTarget::Base, &params).unwrap();
+
+        assert!(doc.base.get_pixel(10, 0).0[0] > before.get_pixel(10, 0).0[0]);
+        assert!(doc.can_undo());
+        assert_eq!(doc.canvas, Size::new(32, 8));
+
+        doc.undo().unwrap();
+        assert_eq!(doc.base.as_raw(), before.as_raw());
+        doc.redo().unwrap();
+        // Redo recomputes from the stored pre-op image: deterministic.
+        assert!(doc.base.get_pixel(10, 0).0[0] > before.get_pixel(10, 0).0[0]);
+    }
+
+    #[test]
+    fn adjust_layer_pixels_only_touch_that_layer() {
+        let mut doc = Document::from_image(grey_ramp(16, 4));
+        let mut layer = Layer::new("1", RgbaImage::from_pixel(8, 4, image::Rgba([90, 90, 90, 255])));
+        layer.offset = (2, 0);
+        doc.add_layer(layer).unwrap();
+        let base_before = doc.base.clone();
+
+        doc.adjust_pixels(
+            AdjustTarget::Layer(0),
+            &Adjust {
+                saturation: -1.0,
+                exposure: 0.4,
+                ..Adjust::identity()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(doc.base.as_raw(), base_before.as_raw());
+        let px = doc.layers[0].image.get_pixel(0, 0).0;
+        assert!(px[0] > 90);
+        assert_eq!(px[0], px[1]);
+        assert_eq!(px[1], px[2]);
+    }
+
+    #[test]
+    fn adjust_pixels_rejects_bad_layer_and_skips_neutral() {
+        let mut doc = Document::from_image(blank(8, 8));
+        assert!(matches!(
+            doc.adjust_pixels(AdjustTarget::Layer(3), &Adjust::identity()),
+            Err(EditError::LayerIndex(3))
+        ));
+        // A neutral parameter set is not a history entry.
+        doc.adjust_pixels(AdjustTarget::Base, &Adjust::identity()).unwrap();
+        assert!(!doc.can_undo());
+    }
+
+    #[test]
+    fn scope_histogram_tracks_the_selected_scope() {
+        let mut doc = Document::from_image(blank(16, 16));
+        let mut layer = Layer::new("1", RgbaImage::from_pixel(16, 16, image::Rgba([255, 0, 0, 255])));
+        layer.offset = (0, 0);
+        doc.add_layer(layer).unwrap();
+
+        let base_hist = doc.scope_histogram(AdjustTarget::Base).unwrap();
+        let layer_hist = doc.scope_histogram(AdjustTarget::Layer(0)).unwrap();
+        // Base is opaque black: every pixel lands in bin 0.
+        assert_eq!(base_hist.bin_counts(0)[0], 256);
+        // The red layer: R saturates the top bin, G/B sit at the bottom.
+        assert_eq!(layer_hist.bin_counts(0)[BINS - 1], 256);
+        assert_eq!(layer_hist.bin_counts(1)[0], 256);
+        assert_eq!(layer_hist.bin_counts(2)[0], 256);
     }
 }
