@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  QT_VERSION: "6.8.3"
+  QT_ARCH: win64_msvc2022_64
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Initialize the MSVC environment (cl.exe, link.exe, rc.exe) for the
+      # C++ interop build and the resource compiler in build.rs.
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Qt
+        id: qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: ${{ env.QT_ARCH }}
+          cache: true
+
+      # Locate <QT_ROOT>/<version>/<arch> and export the variables that
+      # scripts/env.ps1 would normally provide on a dev machine.
+      - name: Configure Qt environment
+        shell: pwsh
+        run: |
+          $qmake = Get-ChildItem -Path $env:QT_ROOT_DIR -Recurse -Filter qmake.exe |
+                   Select-Object -First 1
+          if (-not $qmake) { throw "qmake.exe not found under $env:QT_ROOT_DIR" }
+          $qtRoot = $qmake.Directory.Parent.FullName
+          Add-Content $env:GITHUB_ENV "IMAGEEDIT_QT_ROOT=$qtRoot"
+          Add-Content $env:GITHUB_ENV "QMAKE=$($qmake.FullName)"
+          Add-Content $env:GITHUB_ENV "QT_VERSION_MAJOR=6"
+          # /utf-8: qmlcachegen emits UTF-8 literals into generated C++.
+          Add-Content $env:GITHUB_ENV "CFLAGS=/utf-8"
+          Add-Content $env:GITHUB_ENV "CXXFLAGS=/utf-8"
+          # The machine may carry clang-shim CC/CXX vars that break cxx builds.
+          "CC=`nCXX=" | Add-Content $env:GITHUB_ENV
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace
+
+      # End-user binary shape: GUI subsystem (console feature off), resources
+      # (icon) embedded. Builds the exact configuration package.ps1 ships.
+      - name: Build release binary
+        run: cargo build --release -p imageedit-ui --no-default-features
+
+      - name: Smoke test release binary
+        shell: pwsh
+        run: |
+          $exe = "target\release\imageedit.exe"
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          $peOff = [BitConverter]::ToInt32($bytes, 0x3C)
+          $subsystem = [BitConverter]::ToUInt16($bytes, $peOff + 24 + 68)
+          if ($subsystem -ne 2) { throw "release exe is not GUI subsystem ($subsystem)" }
+          Write-Host "release exe: GUI subsystem ok"

@@ -13,6 +13,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.82"
+description = "A lightweight Windows image editor built with Rust and Qt6/QML"
 
 [workspace.dependencies]
 imageedit-core = { path = "crates/core" }
