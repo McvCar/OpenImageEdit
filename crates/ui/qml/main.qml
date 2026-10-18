@@ -716,7 +716,8 @@ Window {
     Shortcut { sequence: "Ctrl+L"; onActivated: bridge.rotate_ccw() }
     Shortcut { sequence: "Ctrl+Shift+R"; onActivated: bridge.rotate_cw() }
     Shortcut { sequences: ["Delete", "Backspace"]
-               enabled: root.selExists || bridge.selected_layer >= 0
+               enabled: root.selExists || bridge.selected_mark >= 0
+                        || bridge.selected_layer >= 0
                         || (function () {
                             const b = findBase()
                             return b !== null && b.bd !== true && !isLocked(b)
@@ -2169,6 +2170,10 @@ Window {
                 property rect startMark: Qt.rect(0, 0, 0, 0)
                 property real startX: 0
                 property real startY: 0
+                // 当前鼠标（canvasSurface 坐标）。显式属性而非内置 mouseX：
+                // 无头探针需要能直接驱动预览几何。
+                property real curX: 0
+                property real curY: 0
                 property var brushPts: []
                 // In-progress mark geometry in image coords (move/resize).
                 property var gestureRect: null
@@ -2283,6 +2288,8 @@ Window {
                     mode = 1
                     startX = mouse.x
                     startY = mouse.y
+                    curX = mouse.x
+                    curY = mouse.y
                     brushPts = []
                     if (root.markTool === "brush")
                         brushPts.push([imgX(mouse.x), imgY(mouse.y)])
@@ -2303,6 +2310,8 @@ Window {
 
                 onPositionChanged: (mouse) => {
                     if (mode === 1) {
+                        curX = mouse.x
+                        curY = mouse.y
                         if (root.markTool === "brush") {
                             const ix = imgX(mouse.x)
                             const iy = imgY(mouse.y)
@@ -2365,6 +2374,17 @@ Window {
                     mode = 0
                     markPreview.requestPaint()
                 }
+
+                // Grab lost (another item / popup took the mouse): a stale
+                // mode would freeze the drag preview on screen forever.
+                // Cancel cleanly — no commit, no leftover preview.
+                onCanceled: {
+                    markTimer.stop()
+                    gestureRect = null
+                    brushPts = []
+                    mode = 0
+                    markPreview.requestPaint()
+                }
             }
 
             // Live move/resize throttle (same pattern as scaleTimer).
@@ -2408,8 +2428,8 @@ Window {
                     const px = v => view.pad + v * s
                     const x0 = markMa.startX
                     const y0 = markMa.startY
-                    const x1 = markMa.mouseX
-                    const y1 = markMa.mouseY
+                    const x1 = markMa.curX
+                    const y1 = markMa.curY
                     if (root.markTool === "mosaic") {
                         // 选区预览：半透明灰块 + 虚线框；真正的像素化由
                         // core 提交时渲染。
@@ -4092,7 +4112,8 @@ Window {
             deleteSelectionPixels()
             return
         }
-        if (bridge.selected_mark >= 0) {
+        // 就地编辑文本时 Delete 属于输入框，不删标记。
+        if (bridge.selected_mark >= 0 && !textPopup.visible) {
             bridge.delete_selected_mark()
             return
         }
@@ -5127,6 +5148,23 @@ Window {
         }
     }
 
+    // Headless repro of the ellipse drag preview: mid-drag state (mode 1)
+    // with the press at image (0,0) and the mouse at 90% of the image.
+    Timer {
+        id: ellipseDragProbeTimer
+        interval: 600
+        onTriggered: {
+            root.markBarVisible = true
+            root.markTool = "ellipse"
+            markMa.startX = view.pad
+            markMa.startY = view.pad
+            markMa.curX = view.pad + previewImage.width * 0.9
+            markMa.curY = view.pad + previewImage.height * 0.9
+            markMa.mode = 1
+            markPreview.requestPaint()
+        }
+    }
+
     Component.onCompleted: {
         bridge.mark("qml-completed");
         if (root.primary) {
@@ -5149,6 +5187,8 @@ Window {
                 fontProbeTimer.start();
             if (Qt.application.arguments.indexOf("--probe-color") !== -1)
                 colorProbeTimer.start();
+            if (Qt.application.arguments.indexOf("--probe-ellipsedrag") !== -1)
+                ellipseDragProbeTimer.start();
         } else if (root.fileUrl.toString().length > 0) {
             // Document window spawned for a specific file ("open in separate
             // window" setting, drag-out, etc.).
