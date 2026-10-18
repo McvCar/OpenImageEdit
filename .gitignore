@@ -7,3 +7,4 @@
 aqtinstall.log
 *.user
 .qmlls.ini
+tmp/
