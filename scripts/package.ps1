@@ -18,6 +18,13 @@ if (-not $SkipBuild) {
     $ErrorActionPreference = 'Continue'
     $buildOut = & cargo build --release --workspace 2>&1 | Out-String
     $buildExit = $LASTEXITCODE
+    if ($buildExit -eq 0) {
+        # End-user binary: drop the console feature so main.rs compiles as
+        # windows_subsystem = "windows" (no console window for users). Only
+        # the ui crate relinks; icon resources and Qt deps are unchanged.
+        $buildOut += & cargo build --release -p imageedit-ui --no-default-features 2>&1 | Out-String
+        $buildExit = $LASTEXITCODE
+    }
     $ErrorActionPreference = $oldEA
     if ($buildExit -ne 0) { throw "cargo build failed`n$buildOut" }
 }

@@ -1,3 +1,8 @@
+// End-user release builds (packaged with --no-default-features) are GUI
+// subsystem: no console window flashes next to the app. Debug/CI builds keep
+// the "console" feature so the JSON event stream stays visible.
+#![cfg_attr(all(windows, not(feature = "console")), windows_subsystem = "windows")]
+
 pub mod bridge;
 
 use std::time::Duration;

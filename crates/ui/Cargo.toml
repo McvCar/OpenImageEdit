@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+# "console": keep the Windows console subsystem so debug/CI runs print the
+# JSON event stream. The release packager builds with --no-default-features,
+# which makes main.rs switch to windows_subsystem = "windows" (no console
+# window pops up for end users).
+[features]
+default = ["console"]
+console = []
+
 [[bin]]
 name = "imageedit"
 path = "src/main.rs"
@@ -21,3 +29,6 @@ cxx-qt-lib = { version = "0.10", features = ["qt_full"] }
 
 [build-dependencies]
 cxx-qt-build = { version = "0.10" }
+# Windows only: embeds assets/app.ico (and a version block) into the exe so
+# Explorer, the taskbar and shortcuts all show the application icon.
+winresource = "0.1"
