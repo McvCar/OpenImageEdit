@@ -817,6 +817,9 @@ Window {
         // shell / DocWindow wrappers reach the Bridge through this alias.
         readonly property alias b: bridge
 
+        // 窗口变宽/变窄时让调色弹窗重新贴住按钮（placePopover 负责夹紧）。
+        onWidthChanged: if (adjustPanel.visible) placePopover(adjustPanel, adjustBtn)
+
         Bridge {
             id: bridge
 
@@ -1110,6 +1113,9 @@ Window {
                     mosaicPopover.visible = false
                     fontPopover.visible = false
                     textPopup.close(false)
+                    // 调色面板是从这条工具栏打开的：关栏 = 应用并关闭。
+                    if (bridge.adjustOpen)
+                        root.commitAdjust()
                 }
             }
         }
@@ -3887,13 +3893,18 @@ Window {
     Item {
         id: adjustPanel
         visible: bridge.adjustOpen
-        width: 300
-        height: Math.min(adjustCol.implicitHeight + 24,
-                         Math.max(260, root.height - toolbar.height - 72))
-        x: layerPanel.visible ? Math.max(8, layerPanel.x - width - 8)
-                              : root.width - width - 12
-        y: toolbar.height + 10
-        z: 75
+        width: 320
+        // 弹窗样式：贴着「调整颜色」按钮的正下方（与其它标记弹窗一致），
+        // 窗口太矮时面板内部滚动。
+        readonly property real maxHeight: Math.max(240, root.height - y - 16)
+        // 按钮在 root 里的 x（标记栏开关 / 布局变化都会改变它）→ 用于重新锚定。
+        readonly property real anchorX: adjustBtn.x + adjustBtn.parent.x
+        height: Math.min(adjustCol.implicitHeight + 24, maxHeight)
+        x: 8
+        y: toolbar.height + (markBar.visible ? markBar.height : 0) + 2
+        z: 220
+        onVisibleChanged: if (visible) placePopover(adjustPanel, adjustBtn)
+        onAnchorXChanged: if (visible) placePopover(adjustPanel, adjustBtn)
 
         Rectangle {
             anchors.fill: parent
@@ -3953,77 +3964,81 @@ Window {
                     }
                 }
 
-                // ---- 直方图 + 色阶三手柄 ----
+                // ---- 直方图（白底 + RGB 三通道叠加，对齐 macOS 预览）+ 色阶三手柄 ----
                 Item {
                     width: parent.width
                     height: 112
 
-                    Canvas {
-                        id: adjustHistCanvas
+                    Rectangle {
+                        id: adjustHistWell
                         anchors.top: parent.top
                         width: parent.width
                         height: 74
-                        renderStrategy: Canvas.Immediate
-                        renderTarget: Canvas.Image
-                        property var hist: parseHistogram(bridge.adjustHistogram)
-                        onHistChanged: requestPaint()
+                        color: "#ffffff"
+                        radius: 4
+                        border.color: "#00000030"
+                        border.width: 1
+                        clip: true
 
-                        onPaint: {
-                            const ctx = getContext("2d")
-                            const w = width
-                            const h = height
-                            ctx.clearRect(0, 0, w, h)
-                            ctx.fillStyle = "#1b1c1e"
-                            ctx.fillRect(0, 0, w, h)
+                        Canvas {
+                            id: adjustHistCanvas
+                            anchors.fill: parent
+                            renderStrategy: Canvas.Immediate
+                            renderTarget: Canvas.Image
+                            property var hist: parseHistogram(bridge.adjustHistogram)
+                            onHistChanged: requestPaint()
 
-                            const hist = adjustHistCanvas.hist
-                            const n = (hist && hist.n) ? hist.n : 64
-                            let peak = 1
-                            if (hist) {
-                                for (let i = 0; i < n; i++)
-                                    peak = Math.max(peak, hist.r[i], hist.g[i], hist.b[i])
-                            }
-                            const lg = Math.log(1 + peak)
+                            onPaint: {
+                                const ctx = getContext("2d")
+                                const w = width
+                                const h = height
+                                ctx.clearRect(0, 0, w, h)
+                                // macOS 预览的直方图是白色底板 + RGB 三通道
+                                // 半透明面积叠加；线性纵向比例（只有最高峰
+                                // 顶到上沿，其余贴近基线）。
+                                ctx.fillStyle = "#ffffff"
+                                ctx.fillRect(0, 0, w, h)
 
-                            // 色阶手柄之外的裁剪区（暗一点，提示会被裁掉）
-                            const bl = root.adjustVals.bl
-                            const wh = root.adjustVals.wh
-                            ctx.fillStyle = "rgba(0,0,0,0.45)"
-                            ctx.fillRect(0, 0, bl * w, h)
-                            ctx.fillRect(wh * w, 0, Math.max(0, w - wh * w), h)
-
-                            if (hist) {
-                                const channel = function (bins, color) {
-                                    ctx.beginPath()
-                                    ctx.moveTo(0, h)
-                                    for (let i = 0; i < n; i++) {
-                                        const x = (i + 0.5) * w / n
-                                        const y = h - (Math.log(1 + bins[i]) / lg) * (h - 3)
-                                        ctx.lineTo(x, y)
-                                    }
-                                    ctx.lineTo(w, h)
-                                    ctx.closePath()
-                                    ctx.fillStyle = color
-                                    ctx.fill()
+                                const hist = adjustHistCanvas.hist
+                                const n = (hist && hist.n) ? hist.n : 64
+                                let peak = 0
+                                if (hist) {
+                                    for (let i = 0; i < n; i++)
+                                        peak = Math.max(peak, hist.r[i], hist.g[i], hist.b[i])
                                 }
-                                // 叠加混色，接近预览面板的 RGB 直方图
-                                ctx.globalCompositeOperation = "lighter"
-                                channel(hist.r, "rgba(255,88,88,0.60)")
-                                channel(hist.g, "rgba(88,255,140,0.50)")
-                                channel(hist.b, "rgba(88,140,255,0.60)")
-                                ctx.globalCompositeOperation = "source-over"
+                                if (peak > 0) {
+                                    const bar = w / n
+                                    // 阶梯面积图：每个 bin 一条竖带。
+                                    const area = function (bins, color) {
+                                        ctx.beginPath()
+                                        ctx.moveTo(0, h)
+                                        for (let i = 0; i < n; i++) {
+                                            const y = h - Math.min(1, bins[i] / peak) * (h - 2)
+                                            ctx.lineTo(i * bar, y)
+                                            ctx.lineTo((i + 1) * bar, y)
+                                        }
+                                        ctx.lineTo(w, h)
+                                        ctx.closePath()
+                                        ctx.fillStyle = color
+                                        ctx.fill()
+                                    }
+                                    // R→G→B 依次叠加：单通道处是本色，多通道
+                                    // 重叠处压暗（预览里深色的基线就是这么来的）。
+                                    ctx.globalAlpha = 0.75
+                                    area(hist.r, "#e02020")
+                                    area(hist.g, "#12b112")
+                                    area(hist.b, "#2646e0")
+                                    ctx.globalAlpha = 1.0
+                                }
                             }
-
-                            ctx.strokeStyle = "#3c4043"
-                            ctx.lineWidth = 1
-                            ctx.strokeRect(0.5, 0.5, w - 1, h - 1)
                         }
                     }
 
                     // 三个手柄：黑场 / Gamma / 白场。
                     Item {
                         id: adjustHandles
-                        anchors.top: adjustHistCanvas.bottom
+                        // 锚到底板（而不是 Canvas 子项：跨父项锚定会被 Qt 拒绝）。
+                        anchors.top: adjustHistWell.bottom
                         width: parent.width
                         height: 20
 
@@ -5059,10 +5074,13 @@ Window {
     }
 
     function toggleAdjustPanel() {
-        if (bridge.adjustOpen)
+        if (bridge.adjustOpen) {
             commitAdjust()
-        else if (bridge.image_width > 0)
+        } else if (bridge.image_width > 0) {
+            // 面板锚定在标记栏的 ◑ 按钮下方 → 先确保标记栏可见。
+            root.markBarVisible = true
             bridge.adjust_begin()
+        }
     }
 
     // Selected-mark display bounds [x, y, w, h] relative to the preview
