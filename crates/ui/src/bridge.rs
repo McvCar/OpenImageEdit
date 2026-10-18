@@ -252,6 +252,42 @@ pub mod qobject {
             color: &QString,
         );
 
+        /// Add a Mosaic brush mark; `cell` is the pixelation block size
+        /// (the "strength"). The stroke path is "x,y x,y …" image coords.
+        #[qinvokable]
+        fn add_mosaic_mark(self: Pin<&mut Self>, points: &QString, stroke: i32, cell: i32);
+
+        /// Add a Text mark anchored at (x, y) top-left; the natural text
+        /// size is measured with the named font and stored as the mark rect.
+        #[qinvokable]
+        fn add_text_mark(
+            self: Pin<&mut Self>,
+            x: f64,
+            y: f64,
+            text: &QString,
+            font: &QString,
+            font_size: i32,
+            bold: bool,
+            italic: bool,
+            color: &QString,
+        );
+
+        /// Restyle the selected Text mark (family / size / faux styles),
+        /// undoable.
+        #[qinvokable]
+        fn update_text_style(
+            self: Pin<&mut Self>,
+            font: &QString,
+            font_size: i32,
+            bold: bool,
+            italic: bool,
+        );
+
+        /// Restyle the selected Mosaic mark's block size ("strength"),
+        /// undoable.
+        #[qinvokable]
+        fn update_mark_cell(self: Pin<&mut Self>, cell: i32);
+
         /// Begin a live move/resize of the selected mark (history-free).
         #[qinvokable]
         fn mark_drag_begin(self: Pin<&mut Self>);
@@ -763,11 +799,28 @@ impl Session {
     /// handles, hit-testing): index, kind, bounds, stroke, colors, fill.
     fn marks_json(&self) -> String {
         let hex = |c: [u8; 4]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+        let escape = |s: &str| {
+            let mut out = String::with_capacity(s.len());
+            for ch in s.chars() {
+                match ch {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => out.push(c),
+                }
+            }
+            out
+        };
         let kind = |k: MarkKind| match k {
             MarkKind::Rect => 0,
             MarkKind::Ellipse => 1,
             MarkKind::Arrow => 2,
             MarkKind::Brush => 3,
+            MarkKind::Mosaic => 4,
+            MarkKind::Text => 5,
         };
         let parts: Vec<String> = self
             .doc
@@ -776,6 +829,18 @@ impl Session {
             .enumerate()
             .map(|(i, m)| {
                 let (x0, y0, x1, y1) = m.rect;
+                let extra = match m.kind {
+                    MarkKind::Mosaic => format!(",\"cell\":{}", m.cell),
+                    MarkKind::Text => format!(
+                        ",\"t\":\"{}\",\"fn\":\"{}\",\"fs\":{},\"b\":{},\"it\":{}",
+                        escape(&m.text),
+                        escape(&m.font),
+                        m.font_size,
+                        m.bold as u8,
+                        m.italic as u8
+                    ),
+                    _ => String::new(),
+                };
                 format!(
                     "{{\"i\":{i},\"k\":{},\"x\":{x0:.1},\"y\":{y0:.1},\"w\":{:.1},\"h\":{:.1},\"s\":{},\"c\":\"{}\",\"f\":{},\"fc\":\"{}\",\"v\":{}}}",
                     kind(m.kind),
@@ -787,6 +852,7 @@ impl Session {
                     hex(m.fill_color),
                     m.visible
                 )
+                .replace("}", &format!("{}}}", extra))
             })
             .collect();
         format!("[{}]", parts.join(","))
@@ -926,6 +992,47 @@ impl qobject::Bridge {
                                 .unwrap_or(0)
                         },
                     );
+                }
+                // Batch-B smoke: one mosaic stroke + one text mark.
+                "add-b2" => {
+                    self.as_mut().add_mosaic_mark(
+                        &QString::from("120,120 160,140 200,180 240,200"),
+                        14,
+                        10,
+                    );
+                    self.as_mut().add_text_mark(
+                        300.0, 150.0, &QString::from("示例文本 Abc 123"), &QString::from("msyh"),
+                        36, true, false, &QString::from("#378add"),
+                    );
+                    self.as_mut().add_mosaic_mark(
+                        &QString::from("500,400 560,440 620,430"),
+                        18,
+                        20,
+                    );
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"marks\",\"count\":{}}}",
+                        {
+                            let guard = self.session.borrow();
+                            guard
+                                .as_ref()
+                                .map(|s| s.doc.marks.len())
+                                .unwrap_or(0)
+                        },
+                    );
+                }
+                // Dump the flattened (marks composited) canvas to a PNG for
+                // headless verification of mark rendering.
+                "dump-flat" => {
+                    let guard = self.session.borrow();
+                    if let Some(session) = guard.as_ref() {
+                        let flat = session.doc.flatten();
+                        let _ = encode(&flat, Format::Png, 92)
+                            .map(|bytes| {
+                                std::fs::write("tmp/flat.png", bytes).ok();
+                                println!("{{\"phase\":\"ui\",\"event\":\"dump-flat\",\"size\":\"{}x{}\"}}",
+                                         flat.width(), flat.height());
+                            });
+                    }
                 }
                 "marks-undo" => {
                     self.as_mut().undo();
@@ -2918,15 +3025,15 @@ session
             MarkKind::Arrow => vec![(x0, y0), (x1, y1)],
             _ => Vec::new(),
         };
-        let mark = Mark {
-            kind: k,
-            rect: (rx0, ry0, rx1, ry1),
-            points,
-            stroke: stroke.clamp(1, 255) as u8,
-            color,
-            fill: fill && matches!(k, MarkKind::Rect | MarkKind::Ellipse),
-            fill_color,
-            visible: true,
+        let mark = {
+            let mut m = Mark::new(k);
+            m.rect = (rx0, ry0, rx1, ry1);
+            m.points = points;
+            m.stroke = stroke.clamp(1, 255) as u8;
+            m.color = color;
+            m.fill = fill && matches!(k, MarkKind::Rect | MarkKind::Ellipse);
+            m.fill_color = fill_color;
+            m
         };
         {
             let mut guard = self.session.borrow_mut();
@@ -2978,15 +3085,13 @@ session
         let (min_y, max_y) = pts.iter().fold((f32::MAX, f32::MIN), |acc, p| {
             (acc.0.min(p.1), acc.1.max(p.1))
         });
-        let mark = Mark {
-            kind: MarkKind::Brush,
-            rect: (min_x, min_y, max_x, max_y),
-            points: pts,
-            stroke: stroke.clamp(1, 255) as u8,
-            color: Self::parse_color(&color.to_string()),
-            fill: false,
-            fill_color: [0, 0, 0, 0],
-            visible: true,
+        let mark = {
+            let mut m = Mark::new(MarkKind::Brush);
+            m.rect = (min_x, min_y, max_x, max_y);
+            m.points = pts;
+            m.stroke = stroke.clamp(1, 255) as u8;
+            m.color = Self::parse_color(&color.to_string());
+            m
         };
         {
             let mut guard = self.session.borrow_mut();
@@ -3008,6 +3113,177 @@ session
                 .unwrap_or(0)
         } as i32;
         self.as_mut().set_selected_mark(count - 1);
+        self.as_mut().refresh_preview();
+    }
+
+    /// Shared tail of the "add mark" invokables: select the new (last)
+    /// mark and republish state.
+    fn select_newest_mark(mut self: Pin<&mut Self>) {
+        let count = {
+            let guard = self.session.borrow();
+            guard
+                .as_ref()
+                .map(|s| s.doc.marks.len())
+                .unwrap_or(0)
+        } as i32;
+        self.as_mut().set_selected_mark(count - 1);
+        self.as_mut().refresh_preview();
+    }
+
+    pub fn add_mosaic_mark(self: Pin<&mut Self>, points: &QString, stroke: i32, cell: i32) {
+        let pts: Vec<(f32, f32)> = points
+            .to_string()
+            .split_whitespace()
+            .filter_map(|pair| {
+                let mut it = pair.split(',');
+                let x = it.next()?.parse::<f32>().ok()?;
+                let y = it.next()?.parse::<f32>().ok()?;
+                Some((x, y))
+            })
+            .collect();
+        if pts.is_empty() {
+            return;
+        }
+        let (min_x, max_x) = pts.iter().fold((f32::MAX, f32::MIN), |acc, p| {
+            (acc.0.min(p.0), acc.1.max(p.0))
+        });
+        let (min_y, max_y) = pts.iter().fold((f32::MAX, f32::MIN), |acc, p| {
+            (acc.0.min(p.1), acc.1.max(p.1))
+        });
+        let mark = {
+            let mut m = Mark::new(MarkKind::Mosaic);
+            m.rect = (min_x, min_y, max_x, max_y);
+            m.points = pts;
+            m.stroke = stroke.clamp(1, 255) as u8;
+            m.cell = cell.clamp(2, 255) as u8;
+            m
+        };
+        {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => return,
+                Some(session) => {
+                    if session.doc.add_mark(mark).is_err() {
+                        return;
+                    }
+                    session.dirty = true;
+                }
+            }
+        }
+        self.select_newest_mark();
+    }
+
+    pub fn add_text_mark(
+        self: Pin<&mut Self>,
+        x: f64,
+        y: f64,
+        text: &QString,
+        font: &QString,
+        font_size: i32,
+        bold: bool,
+        italic: bool,
+        color: &QString,
+    ) {
+        let text = text.to_string();
+        if text.trim().is_empty() {
+            return;
+        }
+        let font = font.to_string();
+        let size = (font_size as f32).clamp(4.0, 512.0);
+        let (tw, th) = editcore::measure_text(&text, &font, size, bold, italic);
+        let mark = {
+            let mut m = Mark::new(MarkKind::Text);
+            m.rect = (x as f32, y as f32, x as f32 + tw, y as f32 + th);
+            m.text = text;
+            m.font = font;
+            m.font_size = size;
+            m.bold = bold;
+            m.italic = italic;
+            m.color = Self::parse_color(&color.to_string());
+            m
+        };
+        {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => return,
+                Some(session) => {
+                    if session.doc.add_mark(mark).is_err() {
+                        return;
+                    }
+                    session.dirty = true;
+                }
+            }
+        }
+        self.select_newest_mark();
+    }
+
+    pub fn update_mark_cell(mut self: Pin<&mut Self>, cell: i32) {
+        let index = *self.selected_mark();
+        if index < 0 {
+            return;
+        }
+        let mut guard = self.session.borrow_mut();
+        let Some(session) = guard.as_mut() else {
+            return;
+        };
+        let Some(mark) = session.doc.marks.get(index as usize).cloned() else {
+            return;
+        };
+        if mark.kind != MarkKind::Mosaic || mark.cell == cell.clamp(2, 255) as u8 {
+            return;
+        }
+        let mut to = mark.clone();
+        to.cell = cell.clamp(2, 255) as u8;
+        session.dirty = true;
+        let _ = session.doc.execute(editcore::EditOp::UpdateMark {
+            index: index as usize,
+            from: mark,
+            to,
+        });
+        drop(guard);
+        self.as_mut().refresh_preview();
+    }
+
+    pub fn update_text_style(
+        mut self: Pin<&mut Self>,
+        font: &QString,
+        font_size: i32,
+        bold: bool,
+        italic: bool,
+    ) {
+        let index = *self.selected_mark();
+        if index < 0 {
+            return;
+        }
+        let grabbed = {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            let Some(mark) = session.doc.marks.get(index as usize).cloned() else {
+                return;
+            };
+            if mark.kind != MarkKind::Text {
+                return;
+            }
+            let mut to = mark.clone();
+            to.font = font.to_string();
+            to.font_size = (font_size as f32).clamp(4.0, 512.0);
+            to.bold = bold;
+            to.italic = italic;
+            // Re-measure the rect so handles keep wrapping the new text.
+            let (tw, th) =
+                editcore::measure_text(&to.text, &to.font, to.font_size, to.bold, to.italic);
+            to.rect = (mark.rect.0, mark.rect.1, mark.rect.0 + tw, mark.rect.1 + th);
+            session.dirty = true;
+            let _ = session.doc.execute(editcore::EditOp::UpdateMark {
+                index: index as usize,
+                from: mark,
+                to,
+            });
+            ()
+        };
+        let _ = grabbed;
         self.as_mut().refresh_preview();
     }
 

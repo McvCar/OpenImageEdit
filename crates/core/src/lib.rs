@@ -1,5 +1,8 @@
 use image::RgbaImage;
 
+pub mod font;
+pub use font::{measure_text, FONTS};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Size {
     pub width: u32,
@@ -170,6 +173,10 @@ pub enum MarkKind {
     Ellipse,
     Arrow,
     Brush,
+    /// Mosaic brush: pixelates the image under the stroke path.
+    Mosaic,
+    /// Text run anchored at the rect's top-left corner.
+    Text,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,9 +195,41 @@ pub struct Mark {
     /// Rect/Ellipse only: fill the interior with `fill_color`.
     pub fill: bool,
     pub fill_color: [u8; 4],
+    /// Mosaic only: pixelation block size in image px (the "strength").
+    pub cell: u8,
+    /// Text only: the string (may contain '\n'), family id, size in px and
+    /// faux bold / italic switches.
+    pub text: String,
+    pub font: String,
+    pub font_size: f32,
+    pub bold: bool,
+    pub italic: bool,
     /// Hidden marks stay in the document (and the panel list) but are not
     /// rasterized onto the canvas.
     pub visible: bool,
+}
+
+impl Mark {
+    /// A fully-defaulted mark body for the given kind; every construction
+    /// site starts from this and overrides what it needs.
+    pub fn new(kind: MarkKind) -> Self {
+        Self {
+            kind,
+            rect: (0.0, 0.0, 0.0, 0.0),
+            points: Vec::new(),
+            stroke: 4,
+            color: [226, 75, 74, 255],
+            fill: false,
+            fill_color: [0, 0, 0, 0],
+            cell: 8,
+            text: String::new(),
+            font: String::new(),
+            font_size: 28.0,
+            bold: false,
+            italic: false,
+            visible: true,
+        }
+    }
 }
 
 fn norm_rect(r: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
@@ -460,6 +499,132 @@ fn draw_mark(img: &mut RgbaImage, mark: &Mark, sx: f32, sy: f32) {
             }
             for w in mark.points.windows(2) {
                 draw_thick_segment(img, sp(w[0]), sp(w[1]), sw, mark.color);
+            }
+        }
+        MarkKind::Mosaic => {
+            if mark.points.is_empty() {
+                return;
+            }
+            // Block size scales with the preview like every other mark.
+            let cell = (mark.cell.max(2) as f32 * (sx + sy) * 0.5).max(2.0);
+            let r = sw / 2.0;
+            // Stamp along the path like the brush, but snap to a cell grid:
+            // unique cells are averaged BEFORE any painting so overlapping
+            // stamps never average already-pixelated output.
+            let mut cells: Vec<(i64, i64)> = Vec::new();
+            let push_stamp = |cells: &mut Vec<(i64, i64)>, cx: f32, cy: f32| {
+                let gx0 = ((cx - r) / cell).floor() as i64;
+                let gx1 = ((cx + r) / cell).floor() as i64;
+                let gy0 = ((cy - r) / cell).floor() as i64;
+                let gy1 = ((cy + r) / cell).floor() as i64;
+                for gy in gy0..=gy1 {
+                    for gx in gx0..=gx1 {
+                        // Cell center within the brush radius?
+                        let ccx = (gx as f32 + 0.5) * cell;
+                        let ccy = (gy as f32 + 0.5) * cell;
+                        if (ccx - cx).powi(2) + (ccy - cy).powi(2) <= r * r
+                            && !cells.contains(&(gx, gy))
+                        {
+                            cells.push((gx, gy));
+                        }
+                    }
+                }
+            };
+            if mark.points.len() == 1 {
+                let p = sp(mark.points[0]);
+                push_stamp(&mut cells, p.0, p.1);
+            }
+            for w in mark.points.windows(2) {
+                let a = sp(w[0]);
+                let b = sp(w[1]);
+                let dx = b.0 - a.0;
+                let dy = b.1 - a.1;
+                let len = (dx * dx + dy * dy).sqrt();
+                let steps = (len / (cell * 0.4).max(0.5)).ceil().max(1.0) as i32;
+                for i in 0..=steps {
+                    let t = i as f32 / steps as f32;
+                    push_stamp(&mut cells, a.0 + dx * t, a.1 + dy * t);
+                }
+            }
+            // Pass 1: average the underlying (already-composited) pixels.
+            let mut avgs = Vec::with_capacity(cells.len());
+            for &(gx, gy) in &cells {
+                let x0 = (gx as f32 * cell).floor().max(0.0) as i32;
+                let y0 = (gy as f32 * cell).floor().max(0.0) as i32;
+                let x1 = ((gx as f32 + 1.0) * cell).ceil().min(img.width() as f32) as i32;
+                let y1 = ((gy as f32 + 1.0) * cell).ceil().min(img.height() as f32) as i32;
+                let (mut sr, mut sg, mut sb, mut sa) = (0u64, 0u64, 0u64, 0u64);
+                let mut n = 0u64;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let p = img.get_pixel(x as u32, y as u32).0;
+                        sr += p[0] as u64;
+                        sg += p[1] as u64;
+                        sb += p[2] as u64;
+                        sa += p[3] as u64;
+                        n += 1;
+                    }
+                }
+                if n == 0 {
+                    continue;
+                }
+                avgs.push([
+                    (sr / n) as u8,
+                    (sg / n) as u8,
+                    (sb / n) as u8,
+                    (sa / n) as u8,
+                ]);
+            }
+            // Pass 2: paint every cell opaque with its average.
+            for (idx, &(gx, gy)) in cells.iter().enumerate() {
+                let c = avgs[idx];
+                if c[3] == 0 {
+                    continue;
+                }
+                let x0 = gx as f32 * cell;
+                let y0 = gy as f32 * cell;
+                fill_rect_px(img, x0, y0, x0 + cell, y0 + cell, c);
+            }
+        }
+        MarkKind::Text => {
+            if mark.text.is_empty() {
+                return;
+            }
+            let layout = crate::font::layout_text(
+                &mark.text,
+                &mark.font,
+                mark.font_size,
+                mark.bold,
+                mark.italic,
+            );
+            if layout.width == 0 || layout.height == 0 {
+                return;
+            }
+            // The rendered text exactly fills its (possibly resized) rect:
+            // blit the natural coverage buffer with per-axis scale factors.
+            let (rx0, ry0, rx1, ry1) = mark.rect;
+            let (x0, y0) = (rx0.min(rx1) * sx, ry0.min(ry1) * sy);
+            let dw = ((rx1 - rx0).abs() * sx).round().max(1.0);
+            let dh = ((ry1 - ry0).abs() * sy).round().max(1.0);
+            let fx = dw / layout.width as f32;
+            let fy = dh / layout.height as f32;
+            for dy in 0..dh as i32 {
+                let syi = ((dy as f32 + 0.5) / fy) as u32;
+                let syi = syi.min(layout.height - 1);
+                for dx in 0..dw as i32 {
+                    let sxi = ((dx as f32 + 0.5) / fx) as u32;
+                    let sxi = sxi.min(layout.width - 1);
+                    let a = layout.coverage[(syi * layout.width + sxi) as usize];
+                    if a == 0 {
+                        continue;
+                    }
+                    blend_px(
+                        img,
+                        x0 as i32 + dx,
+                        y0 as i32 + dy,
+                        [mark.color[0], mark.color[1], mark.color[2], a],
+                    );
+                }
             }
         }
     }
@@ -2244,16 +2409,13 @@ mod tests {
     }
 
     fn rect_mark(fill: bool) -> Mark {
-        Mark {
-            kind: MarkKind::Rect,
-            rect: (2.0, 2.0, 10.0, 8.0),
-            points: Vec::new(),
-            stroke: 2,
-            color: [255, 0, 0, 255],
-            fill,
-            fill_color: [0, 255, 0, 255],
-            visible: true,
-        }
+        let mut m = Mark::new(MarkKind::Rect);
+        m.rect = (2.0, 2.0, 10.0, 8.0);
+        m.stroke = 2;
+        m.color = [255, 0, 0, 255];
+        m.fill = fill;
+        m.fill_color = [0, 255, 0, 255];
+        m
     }
 
     fn blank(w: u32, h: u32) -> RgbaImage {
@@ -2327,15 +2489,14 @@ mod tests {
     #[test]
     fn ellipse_mark_paints_ring_and_interior() {
         let mut doc = Document::from_image(blank(32, 32));
-        doc.add_mark(Mark {
-            kind: MarkKind::Ellipse,
-            rect: (4.0, 4.0, 28.0, 28.0),
-            points: Vec::new(),
-            stroke: 2,
-            color: [255, 0, 0, 255],
-            fill: true,
-            fill_color: [0, 0, 255, 255],
-            visible: true,
+        doc.add_mark({
+            let mut m = Mark::new(MarkKind::Ellipse);
+            m.rect = (4.0, 4.0, 28.0, 28.0);
+            m.stroke = 2;
+            m.color = [255, 0, 0, 255];
+            m.fill = true;
+            m.fill_color = [0, 0, 255, 255];
+            m
         })
         .unwrap();
         let flat = doc.flatten();
@@ -2348,15 +2509,13 @@ mod tests {
     #[test]
     fn arrow_mark_draws_shaft_and_head() {
         let mut doc = Document::from_image(blank(48, 24));
-        doc.add_mark(Mark {
-            kind: MarkKind::Arrow,
-            rect: (4.0, 12.0, 40.0, 12.0),
-            points: vec![(4.0, 12.0), (40.0, 12.0)],
-            stroke: 2,
-            color: [255, 255, 0, 255],
-            fill: false,
-            fill_color: [0, 0, 0, 0],
-            visible: true,
+        doc.add_mark({
+            let mut m = Mark::new(MarkKind::Arrow);
+            m.rect = (4.0, 12.0, 40.0, 12.0);
+            m.points = vec![(4.0, 12.0), (40.0, 12.0)];
+            m.stroke = 2;
+            m.color = [255, 255, 0, 255];
+            m
         })
         .unwrap();
         let flat = doc.flatten();
@@ -2369,15 +2528,13 @@ mod tests {
     #[test]
     fn brush_mark_stamps_a_thick_line() {
         let mut doc = Document::from_image(blank(32, 32));
-        doc.add_mark(Mark {
-            kind: MarkKind::Brush,
-            rect: (4.0, 16.0, 28.0, 16.0),
-            points: vec![(4.0, 16.0), (28.0, 16.0)],
-            stroke: 4,
-            color: [0, 255, 255, 255],
-            fill: false,
-            fill_color: [0, 0, 0, 0],
-            visible: true,
+        doc.add_mark({
+            let mut m = Mark::new(MarkKind::Brush);
+            m.rect = (4.0, 16.0, 28.0, 16.0);
+            m.points = vec![(4.0, 16.0), (28.0, 16.0)];
+            m.stroke = 4;
+            m.color = [0, 255, 255, 255];
+            m
         })
         .unwrap();
         let flat = doc.flatten();
@@ -2385,6 +2542,68 @@ mod tests {
         // 4px stroke → ±2px around the path (pixel centers at .5 offsets).
         assert_eq!(flat.get_pixel(16, 17).0, [0, 255, 255, 255]);
         assert_eq!(flat.get_pixel(16, 21).0, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn mosaic_mark_averages_block_content() {
+        // Black base with a 2x2 white square at (8..10, 8..10): the cell
+        // (8..12, 8..12) averages to floor((255*4 + 0*12) / 16) = 63.
+        let mut base = blank(32, 32);
+        for y in 8..10 {
+            for x in 8..10 {
+                base.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let mut doc = Document::from_image(base);
+        doc.add_mark({
+            let mut m = Mark::new(MarkKind::Mosaic);
+            m.rect = (8.0, 8.0, 12.0, 12.0);
+            m.points = vec![(10.0, 10.0)];
+            m.stroke = 8;
+            m.cell = 4;
+            m
+        })
+        .unwrap();
+        let flat = doc.flatten();
+        for y in 8..12 {
+            for x in 8..12 {
+                assert_eq!(flat.get_pixel(x, y).0, [63, 63, 63, 255]);
+            }
+        }
+        // Outside the mosaic band: untouched.
+        assert_eq!(flat.get_pixel(5, 5).0, [0, 0, 0, 255]);
+        assert_eq!(flat.get_pixel(20, 20).0, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn text_mark_rasterizes_colored_pixels() {
+        let mut doc = Document::from_image(blank(160, 80));
+        let (tw, th) = editcore_measures();
+        doc.add_mark({
+            let mut m = Mark::new(MarkKind::Text);
+            m.text = "测试Test".into();
+            m.font = "msyh".into();
+            m.font_size = 32.0;
+            m.color = [0, 255, 0, 255];
+            m.rect = (4.0, 4.0, 4.0 + tw, 4.0 + th);
+            m
+        })
+        .unwrap();
+        let flat = doc.flatten();
+        let mut greens = 0;
+        for y in 0..80 {
+            for x in 0..160 {
+                if flat.get_pixel(x, y).0 == [0, 255, 0, 255] {
+                    greens += 1;
+                }
+            }
+        }
+        assert!(greens > 20, "expected anti-aliased ink, got {greens} px");
+    }
+
+    // Helper so the text test stays readable: natural size at 32px.
+    fn editcore_measures() -> (f32, f32) {
+        crate::font::measure_text("测试Test", "msyh", 32.0, false, false)
     }
 
     #[test]

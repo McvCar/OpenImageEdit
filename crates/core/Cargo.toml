@@ -11,3 +11,4 @@ name = "editcore"
 [dependencies]
 image = { workspace = true }
 thiserror = { workspace = true }
+ab_glyph = "0.2"

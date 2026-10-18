@@ -576,7 +576,8 @@ Window {
         readonly property var selLayerBox: findLayerBox()
         // ---- 标记工具栏（markup toolbar）----
         property bool markBarVisible: false
-        // Active drawing tool: "none" | "rect" | "ellipse" | "arrow" | "brush"
+        // Active drawing tool: "none" | "rect" | "ellipse" | "arrow"
+        //                   | "brush" | "text" | "mosaic"
         property string markTool: "none"
         // Style for the NEXT mark; with a mark selected the popovers restyle
         // it instead (see applyMarkStyle).
@@ -584,6 +585,13 @@ Window {
         property string markColor: "#e24b4a"
         property bool markFill: false
         property string markFillColor: "#f5e14a"
+        // Mosaic block size in image px (the "strength"); one of the 5 steps.
+        property int markMosaic: 12
+        // Text tool state (font family id from core::font::FONTS).
+        property string markFont: "msyh"
+        property int markFontSize: 28
+        property bool markBold: false
+        property bool markItalic: false
         readonly property var markList: parseMarks(bridge.marks_json)
         readonly property bool probeDialog: Qt.application.arguments.indexOf("--probe-dialog") !== -1
         readonly property bool probeSettings: Qt.application.arguments.indexOf("--probe-settings") !== -1
@@ -877,6 +885,11 @@ Window {
                 if (!root.markBarVisible) {
                     root.markTool = "none"
                     bridge.select_mark(-1)
+                    widthPopover.visible = false
+                    colorPopover.visible = false
+                    mosaicPopover.visible = false
+                    fontPopover.visible = false
+                    textPopup.close(false)
                 }
             }
         }
@@ -975,17 +988,74 @@ Window {
                 selected: root.markTool === "brush"
                 onClicked: root.markTool = "brush"
             }
+            IconButton {
+                glyph: "T"
+                tip: "打字标记"
+                selected: root.markTool === "text"
+                onClicked: root.markTool = "text"
+            }
+            IconButton {
+                glyph: "▦"
+                tip: "马赛克画笔"
+                selected: root.markTool === "mosaic"
+                onClicked: root.markTool = "mosaic"
+            }
 
             Rectangle { width: 9; height: 18; color: "transparent"
                 Rectangle { anchors.centerIn: parent; width: 1; height: 18; color: "#3c4043" } }
+
+            // 字体控制：仅打字工具激活时显示。
+            IconButton {
+                id: fontBtn
+                glyph: "Aa"
+                tip: "字体"
+                visible: root.markTool === "text"
+                selected: fontPopover.visible
+                onClicked: {
+                    mosaicPopover.visible = false
+                    fontPopover.visible = !fontPopover.visible
+                }
+                Text {
+                    anchors.bottom: parent.bottom
+                    anchors.right: parent.right
+                    anchors.margins: 2
+                    text: root.markFontSize
+                    color: "#9aa3b2"
+                    font.pixelSize: 9
+                }
+            }
+
+            // 马赛克强度：仅马赛克工具激活时显示。
+            IconButton {
+                id: mosaicBtn
+                glyph: "▦"
+                tip: "马赛克强度"
+                visible: root.markTool === "mosaic"
+                selected: mosaicPopover.visible
+                onClicked: {
+                    fontPopover.visible = false
+                    mosaicPopover.visible = !mosaicPopover.visible
+                }
+                Text {
+                    anchors.bottom: parent.bottom
+                    anchors.right: parent.right
+                    anchors.margins: 2
+                    text: root.markMosaic
+                    color: "#9aa3b2"
+                    font.pixelSize: 9
+                }
+            }
 
             IconButton {
                 id: widthBtn
                 glyph: "─"
                 tip: "笔画粗细"
+                visible: root.markTool !== "text"
                 selected: widthPopover.visible
                 onClicked: {
                     colorPopover.visible = false
+                    fontPopover.visible = false
+                    mosaicPopover.visible = false
                     widthPopover.visible = !widthPopover.visible
                 }
                 Text {
@@ -1004,6 +1074,8 @@ Window {
                 selected: colorPopover.visible
                 onClicked: {
                     widthPopover.visible = false
+                    fontPopover.visible = false
+                    mosaicPopover.visible = false
                     colorPopover.visible = !colorPopover.visible
                 }
                 Rectangle {
@@ -1047,6 +1119,10 @@ Window {
                   ? "选择一个标记工具后在画布上拖拽绘制"
                   : (root.markTool === "brush"
                      ? "按住拖拽绘制笔画"
+                     : root.markTool === "text"
+                     ? "点击画布放置光标，输入文本后按 Enter 提交"
+                     : root.markTool === "mosaic"
+                     ? "按住拖拽涂抹马赛克 · 强度可调"
                      : "按住拖拽绘制 · 点击已有标记可移动/缩放")
             color: "#6b7076"
             font.pixelSize: 11
@@ -1118,13 +1194,261 @@ Window {
         }
     }
 
+    // 马赛克强度弹窗：5 档块尺寸，选中档高亮。
+    Rectangle {
+        id: mosaicPopover
+        visible: false
+        z: 220
+        width: 190
+        height: 5 * 30 + 12
+        color: "#2a2d31"
+        border.color: "#3c4043"
+        radius: 6
+        x: toolbar.width - width - 180
+        y: toolbar.height + (markBar.visible ? markBar.height : 0) + 2
+
+        Column {
+            anchors.fill: parent
+            anchors.margins: 6
+
+            Repeater {
+                model: [
+                    { cell: 4,  label: "细腻" },
+                    { cell: 8,  label: "较细" },
+                    { cell: 12, label: "适中" },
+                    { cell: 18, label: "较粗" },
+                    { cell: 26, label: "强烈" }
+                ]
+
+                delegate: Item {
+                    required property var modelData
+                    width: parent.width
+                    height: 30
+
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: 4
+                        color: root.markMosaic === modelData.cell ? "#3d5a80"
+                               : mosaicHover.containsMouse ? "#3a3d42" : "transparent"
+                    }
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.left: parent.left
+                        anchors.leftMargin: 12
+                        width: modelData.cell * 1.4 + 8
+                        height: modelData.cell * 1.4 + 8
+                        radius: 2
+                        color: "#7a7f86"
+                    }
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.left: parent.left
+                        anchors.leftMargin: 70
+                        text: modelData.label + "（" + modelData.cell + "px）"
+                        color: "#d5d8dd"
+                        font.pixelSize: 12
+                    }
+                    Text {
+                        visible: root.markMosaic === modelData.cell
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.right: parent.right
+                        anchors.rightMargin: 12
+                        text: "✓"
+                        color: "#ffffff"
+                        font.pixelSize: 13
+                    }
+                    MouseArea {
+                        id: mosaicHover
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            root.markMosaic = modelData.cell
+                            // 选中标记是马赛克时同步改它的强度。
+                            if (bridge.selected_mark >= 0)
+                                bridge.update_mark_cell(root.markMosaic)
+                            mosaicPopover.visible = false
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 字体弹窗：字体族 + 字号 + 加粗/斜体（打字工具）。
+    Rectangle {
+        id: fontPopover
+        visible: false
+        z: 220
+        width: 240
+        height: 300
+        color: "#2a2d31"
+        border.color: "#3c4043"
+        radius: 6
+        x: toolbar.width - width - 180
+        y: toolbar.height + (markBar.visible ? markBar.height : 0) + 2
+
+        Column {
+            anchors.fill: parent
+            anchors.margins: 8
+            spacing: 6
+
+            Text {
+                text: "字体"
+                color: "#9aa3b2"
+                font.pixelSize: 11
+            }
+
+            // 字体族列表（与 core::font::FONTS 一一对应）。
+            Column {
+                width: parent.width
+                spacing: 2
+
+                Repeater {
+                    model: [
+                        { id: "msyh",   name: "微软雅黑", qml: "Microsoft YaHei" },
+                        { id: "simsun", name: "宋体",     qml: "SimSun" },
+                        { id: "simhei", name: "黑体",     qml: "SimHei" },
+                        { id: "simkai", name: "楷体",     qml: "KaiTi" },
+                        { id: "arial",  name: "Arial",    qml: "Arial" }
+                    ]
+
+                    delegate: Item {
+                        required property var modelData
+                        width: parent.width
+                        height: 30
+
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: 4
+                            color: root.markFont === modelData.id ? "#3d5a80"
+                                   : fontHover.containsMouse ? "#3a3d42" : "transparent"
+                        }
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.left: parent.left
+                            anchors.leftMargin: 10
+                            text: modelData.name
+                            color: "#e9eaec"
+                            font.pixelSize: 13
+                            font.family: modelData.qml
+                        }
+                        Text {
+                            visible: root.markFont === modelData.id
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.right: parent.right
+                            anchors.rightMargin: 10
+                            text: "✓"
+                            color: "#ffffff"
+                            font.pixelSize: 13
+                        }
+                        MouseArea {
+                            id: fontHover
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                root.markFont = modelData.id
+                                applyTextFont()
+                            }
+                        }
+                    }
+                }
+            }
+
+            Text {
+                text: "字号"
+                color: "#9aa3b2"
+                font.pixelSize: 11
+            }
+
+            Flow {
+                width: parent.width
+                spacing: 4
+
+                Repeater {
+                    model: [12, 16, 20, 24, 28, 36, 48, 64]
+
+                    delegate: Rectangle {
+                        required property int modelData
+                        width: 36
+                        height: 24
+                        radius: 4
+                        color: root.markFontSize === modelData ? "#3d5a80" : "#33373c"
+                        Text {
+                            anchors.centerIn: parent
+                            text: parent.modelData
+                            color: "#e9eaec"
+                            font.pixelSize: 11
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                root.markFontSize = parent.modelData
+                                applyTextFont()
+                            }
+                        }
+                    }
+                }
+            }
+
+            Row {
+                spacing: 6
+
+                Rectangle {
+                    width: 40
+                    height: 26
+                    radius: 4
+                    color: root.markBold ? "#3d5a80" : "#33373c"
+                    Text {
+                        anchors.centerIn: parent
+                        text: "B"
+                        color: "#e9eaec"
+                        font.pixelSize: 13
+                        font.bold: true
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            root.markBold = !root.markBold
+                            applyTextFont()
+                        }
+                    }
+                }
+                Rectangle {
+                    width: 40
+                    height: 26
+                    radius: 4
+                    color: root.markItalic ? "#3d5a80" : "#33373c"
+                    Text {
+                        anchors.centerIn: parent
+                        text: "I"
+                        color: "#e9eaec"
+                        font.pixelSize: 13
+                        font.italic: true
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            root.markItalic = !root.markItalic
+                            applyTextFont()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 颜色弹窗：描边/填充切换 + 预置色板。
     Rectangle {
         id: colorPopover
         visible: false
         z: 220
-        width: 236
-        height: 150
+        width: 250
+        height: 208
         color: "#2a2d31"
         border.color: "#3c4043"
         radius: 6
@@ -1231,13 +1555,78 @@ Window {
             }
         }
 
-        Text {
-            anchors.right: parent.right
+        // 自定义颜色：hex 输入 + 实时预览色块。
+        Row {
+            anchors.left: parent.left
+            anchors.leftMargin: 10
             anchors.bottom: parent.bottom
-            anchors.margins: 8
-            text: "自定义颜色…（下一批）"
-            color: "#5f646b"
-            font.pixelSize: 10
+            anchors.bottomMargin: 8
+            spacing: 8
+
+            Text {
+                anchors.verticalCenter: parent.verticalCenter
+                text: "自定义"
+                color: "#9aa3b2"
+                font.pixelSize: 11
+            }
+
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: 20
+                height: 20
+                radius: 3
+                color: customHexInput.valid ? "#" + customHexInput.text : "#33373c"
+                border.color: "#5a5e64"
+                border.width: 1
+            }
+
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: 96
+                height: 22
+                radius: 4
+                color: "#222428"
+                border.color: customHexInput.activeFocus ? "#378add" : "#3c4043"
+                border.width: 1
+
+                TextInput {
+                    id: customHexInput
+                    anchors.fill: parent
+                    anchors.leftMargin: 6
+                    anchors.rightMargin: 6
+                    verticalAlignment: TextInput.AlignVCenter
+                    color: "#e9eaec"
+                    font.pixelSize: 12
+                    font.family: "Consolas"
+                    text: "e24b4a"
+                    maximumLength: 6
+                    // 6 位十六进制才有效（不含 #，输入更顺手）。
+                    readonly property bool valid: /^[0-9a-fA-F]{6}$/.test(text)
+                    selectByMouse: true
+                    onAccepted: customHexApply()
+                }
+            }
+
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: 44
+                height: 22
+                radius: 4
+                color: customHexApplyMa.containsMouse ? "#3d5a80" : "#33373c"
+                Text {
+                    anchors.centerIn: parent
+                    text: "应用"
+                    color: "#e9eaec"
+                    font.pixelSize: 11
+                }
+                MouseArea {
+                    id: customHexApplyMa
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: customHexApply()
+                }
+            }
         }
     }
 
@@ -1246,10 +1635,13 @@ Window {
         z: 215
         anchors.fill: parent
         visible: widthPopover.visible || colorPopover.visible
+                 || mosaicPopover.visible || fontPopover.visible
         enabled: visible
         onPressed: (mouse) => {
             widthPopover.visible = false
             colorPopover.visible = false
+            mosaicPopover.visible = false
+            fontPopover.visible = false
             mouse.accepted = true
         }
     }
@@ -1652,6 +2044,11 @@ Window {
                 }
 
                 onPressed: (mouse) => {
+                    // 打字工具：点击画布放置输入光标（不进入绘制模式）。
+                    if (root.markTool === "text") {
+                        textPopup.openAt(mouse.x, mouse.y)
+                        return
+                    }
                     const h = handleAt(mouse.x, mouse.y)
                     if (h !== "") {
                         resizeRole = h
@@ -1670,14 +2067,14 @@ Window {
                     startX = mouse.x
                     startY = mouse.y
                     brushPts = []
-                    if (root.markTool === "brush")
+                    if (root.markTool === "brush" || root.markTool === "mosaic")
                         brushPts.push([imgX(mouse.x), imgY(mouse.y)])
                     markPreview.requestPaint()
                 }
 
                 onPositionChanged: (mouse) => {
                     if (mode === 1) {
-                        if (root.markTool === "brush") {
+                        if (root.markTool === "brush" || root.markTool === "mosaic") {
                             const ix = imgX(mouse.x)
                             const iy = imgY(mouse.y)
                             const last = brushPts.length > 0
@@ -1716,6 +2113,12 @@ Window {
                                 bridge.add_brush_mark(
                                     brushPts.map(p => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" "),
                                     root.markStroke, root.markColor)
+                            }
+                        } else if (root.markTool === "mosaic") {
+                            if (brushPts.length >= 1) {
+                                bridge.add_mosaic_mark(
+                                    brushPts.map(p => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" "),
+                                    root.markStroke, root.markMosaic)
                             }
                         } else if (Math.abs(x1 - x0) >= 1 || Math.abs(y1 - y0) >= 1) {
                             const k = root.markTool === "rect" ? 0
@@ -1780,6 +2183,18 @@ Window {
                     const y0 = markMa.startY
                     const x1 = markMa.mouseX
                     const y1 = markMa.mouseY
+                    if (root.markTool === "mosaic") {
+                        // 预览用半透明灰块近似；真正的像素化由 core 提交时渲染。
+                        ctx.fillStyle = "rgba(128,128,128,0.55)"
+                        const cell = Math.max(2, root.markMosaic * s)
+                        for (var mi = 0; mi < markMa.brushPts.length; mi++) {
+                            const p = markMa.brushPts[mi]
+                            const bx = px(p[0]) - cell / 2
+                            const by = px(p[1]) - cell / 2
+                            ctx.fillRect(bx, by, cell, cell)
+                        }
+                        return
+                    }
                     if (root.markTool === "brush") {
                         ctx.beginPath()
                         for (var i = 0; i < markMa.brushPts.length; i++) {
@@ -1884,6 +2299,60 @@ Window {
                     y: box ? view.pad + (role.indexOf("n") !== -1 ? box[1] - 4
                              : role.indexOf("s") !== -1 ? box[1] + box[3] - 4
                              : box[1] + box[3] / 2 - 4) : 0
+                }
+            }
+
+            // 打字工具的文本输入框：Enter 提交为文本标记，Esc 取消。
+            // 定位在 canvasSurface 坐标（点击处），提交时换算成图片坐标。
+            Rectangle {
+                id: textPopup
+                visible: false
+                z: 80
+                width: Math.max(150, Math.min(340, textInput.implicitWidth + 28))
+                height: Math.max(38, root.markFontSize * 1.5 + 16)
+                color: "#222428"
+                border.color: "#378add"
+                border.width: 1
+                radius: 4
+
+                property real imgXPos: 0
+                property real imgYPos: 0
+
+                function openAt(mx, my) {
+                    imgXPos = markMa.imgX(mx)
+                    imgYPos = markMa.imgY(my)
+                    x = Math.min(Math.max(mx - 4, 4), parent.width - width - 4)
+                    y = Math.min(Math.max(my - height / 2, 4), parent.height - height - 4)
+                    textInput.text = ""
+                    visible = true
+                    textInput.forceActiveFocus()
+                }
+                function close(commit) {
+                    if (commit && textInput.text.trim() !== "") {
+                        bridge.add_text_mark(imgXPos, imgYPos, textInput.text,
+                                             root.markFont, root.markFontSize,
+                                             root.markBold, root.markItalic,
+                                             root.markColor)
+                    }
+                    visible = false
+                    textInput.text = ""
+                }
+
+                TextInput {
+                    id: textInput
+                    anchors.fill: parent
+                    anchors.leftMargin: 10
+                    anchors.rightMargin: 10
+                    verticalAlignment: TextInput.AlignVCenter
+                    color: root.markColor
+                    font.family: qmlFontFamily(root.markFont)
+                    font.pixelSize: root.markFontSize
+                    font.bold: root.markBold
+                    font.italic: root.markItalic
+                    selectByMouse: true
+                    clip: true
+                    onAccepted: textPopup.close(true)
+                    Keys.onEscapePressed: textPopup.close(false)
                 }
             }
 
@@ -2638,6 +3107,11 @@ Window {
                             text: (markRow.modelData.k === 0 ? "▭ 矩形"
                                    : markRow.modelData.k === 1 ? "◯ 椭圆"
                                    : markRow.modelData.k === 2 ? "↗ 箭头"
+                                   : markRow.modelData.k === 4 ? "▦ 马赛克"
+                                   : markRow.modelData.k === 5
+                                   ? "T 文本：" + (markRow.modelData.t.length > 8
+                                       ? markRow.modelData.t.slice(0, 8) + "…"
+                                       : markRow.modelData.t)
                                    : "✏ 画笔")
                                   + "  " + (markRow.index + 1)
                             color: "#d5d8dd"
@@ -2647,7 +3121,11 @@ Window {
                             anchors.right: parent.right
                             anchors.rightMargin: 8
                             anchors.verticalCenter: parent.verticalCenter
-                            text: markRow.modelData.s + "px  " + markRow.modelData.c
+                            text: markRow.modelData.k === 5
+                                  ? markRow.modelData.fs + "px " + markRow.modelData.fn
+                                  : markRow.modelData.k === 4
+                                  ? "强度 " + markRow.modelData.cell + "px"
+                                  : markRow.modelData.s + "px  " + markRow.modelData.c
                             color: "#6b7076"
                             font.pixelSize: 10
                         }
@@ -3195,13 +3673,19 @@ Window {
     // overrides every MouseArea's cursorShape, so this is the single
     // authoritative cursor decision.
     function canvasCursor(x, y) {
-        // 标记工具激活：手柄 → 缩放光标；标记上 → 移动；其余 → 十字。
+        // 文本输入中：普通箭头。
+        if (textPopup.visible)
+            return Qt.ArrowCursor
+        // 标记工具激活：手柄 → 缩放光标；标记上 → 移动；文本工具 → 工字；
+        // 其余 → 十字。
         if (root.markTool !== "none") {
             const h = markMa.handleAt(x, y)
             if (h !== "")
                 return markMa.handleCursor(h)
             if (markMa.markAt(x, y) >= 0)
                 return Qt.SizeAllCursor
+            if (root.markTool === "text")
+                return Qt.IBeamCursor
             return Qt.CrossCursor
         }
         const ix = x - view.pad
@@ -3525,6 +4009,15 @@ Window {
     }
 
     function onEscape() {
+        if (textPopup.visible) { textPopup.close(false); return }
+        if (widthPopover.visible || colorPopover.visible
+            || mosaicPopover.visible || fontPopover.visible) {
+            widthPopover.visible = false
+            colorPopover.visible = false
+            mosaicPopover.visible = false
+            fontPopover.visible = false
+            return
+        }
         if (layerContext.visible) { layerContext.visible = false; return }
         if (root.renamingIndex >= 0) { root.renamingIndex = -1; return }
         if (confirmOverlay.visible) { confirmCancel(); return }
@@ -3642,6 +4135,36 @@ Window {
         if (bridge.selected_mark >= 0)
             bridge.update_mark_style(root.markStroke, root.markColor,
                                      root.markFill, root.markFillColor)
+    }
+
+    // 颜色弹窗：把自定义 hex 应用到当前目标（描边或填充）。
+    function customHexApply() {
+        if (!customHexInput.valid)
+            return
+        const hex = "#" + customHexInput.text.toLowerCase()
+        if (colorPopover.editingFill) {
+            root.markFillColor = hex
+            root.markFill = true
+        } else {
+            root.markColor = hex
+        }
+        applyMarkStyle()
+    }
+
+    // 字体弹窗：把字体设置应用到选中的文本标记。
+    function applyTextFont() {
+        if (bridge.selected_mark >= 0)
+            bridge.update_text_style(root.markFont, root.markFontSize,
+                                     root.markBold, root.markItalic)
+    }
+
+    // 字体 id → QML font.family（用于输入框/面板预览）。
+    function qmlFontFamily(id) {
+        return id === "simsun" ? "SimSun"
+             : id === "simhei" ? "SimHei"
+             : id === "simkai" ? "KaiTi"
+             : id === "arial" ? "Arial"
+             : "Microsoft YaHei"
     }
 
     function findSelLayer() {
@@ -4309,6 +4832,37 @@ Window {
         }
     }
 
+    // Batch-B popover probes: open one popover each for headless screenshots.
+    Timer {
+        id: mosaicProbeTimer
+        interval: 600
+        onTriggered: {
+            root.markBarVisible = true
+            root.markTool = "mosaic"
+            mosaicPopover.visible = true
+        }
+    }
+
+    Timer {
+        id: fontProbeTimer
+        interval: 600
+        onTriggered: {
+            root.markBarVisible = true
+            root.markTool = "text"
+            fontPopover.visible = true
+        }
+    }
+
+    Timer {
+        id: colorProbeTimer
+        interval: 600
+        onTriggered: {
+            root.markBarVisible = true
+            root.markTool = "rect"
+            colorPopover.visible = true
+        }
+    }
+
     Component.onCompleted: {
         bridge.mark("qml-completed");
         if (root.primary) {
@@ -4325,6 +4879,12 @@ Window {
                 layersProbeTimer.start();
             if (root.probeMarks)
                 marksProbeTimer.start();
+            if (Qt.application.arguments.indexOf("--probe-mosaic") !== -1)
+                mosaicProbeTimer.start();
+            if (Qt.application.arguments.indexOf("--probe-font") !== -1)
+                fontProbeTimer.start();
+            if (Qt.application.arguments.indexOf("--probe-color") !== -1)
+                colorProbeTimer.start();
         } else if (root.fileUrl.toString().length > 0) {
             // Document window spawned for a specific file ("open in separate
             // window" setting, drag-out, etc.).
