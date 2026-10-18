@@ -817,8 +817,16 @@ Window {
         // shell / DocWindow wrappers reach the Bridge through this alias.
         readonly property alias b: bridge
 
-        // 窗口变宽/变窄时让调色弹窗重新贴住按钮（placePopover 负责夹紧）。
-        onWidthChanged: if (adjustPanel.visible) placePopover(adjustPanel, adjustBtn)
+        // 窗口变宽/变窄时让调色弹窗重新贴住按钮（placePopover 负责夹紧）；
+        // 用户自己拖过位置的话只做边界夹紧。
+        onWidthChanged: {
+            if (!adjustPanel.visible)
+                return
+            if (adjustPanel.userMoved)
+                adjustPanel.moveTo(adjustPanel.x, adjustPanel.y)
+            else
+                placePopover(adjustPanel, adjustBtn)
+        }
 
         Bridge {
             id: bridge
@@ -3895,16 +3903,34 @@ Window {
         visible: bridge.adjustOpen
         width: 320
         // 弹窗样式：贴着「调整颜色」按钮的正下方（与其它标记弹窗一致），
-        // 窗口太矮时面板内部滚动。
-        readonly property real maxHeight: Math.max(240, root.height - y - 16)
+        // 窗口太矮时面板内部滚动。高度与 y 无关，拖动时不会越拖越矮。
+        readonly property real maxHeight: Math.max(240, root.height - toolbar.height - 24)
         // 按钮在 root 里的 x（标记栏开关 / 布局变化都会改变它）→ 用于重新锚定。
         readonly property real anchorX: adjustBtn.x + adjustBtn.parent.x
         height: Math.min(adjustCol.implicitHeight + 24, maxHeight)
         x: 8
         y: toolbar.height + (markBar.visible ? markBar.height : 0) + 2
         z: 220
-        onVisibleChanged: if (visible) placePopover(adjustPanel, adjustBtn)
-        onAnchorXChanged: if (visible) placePopover(adjustPanel, adjustBtn)
+        // 用户拖动过标题栏之后就不再自动贴回按钮；每次重新打开复位。
+        property bool userMoved: false
+        onVisibleChanged: {
+            if (visible) {
+                userMoved = false
+                placePopover(adjustPanel, adjustBtn)
+            }
+        }
+        onAnchorXChanged: if (visible && !userMoved) placePopover(adjustPanel, adjustBtn)
+        // 窗口变矮 / 面板内容变高时，把用户拖过的位置重新夹回窗口内。
+        onHeightChanged: if (visible && userMoved) moveTo(x, y)
+
+        // 拖动标题栏移动弹窗（限制在窗口内，别拖丢）。
+        function moveTo(nx, ny) {
+            userMoved = true
+            x = Math.max(4, Math.min(Math.max(4, root.width - width - 4), nx))
+            const minY = toolbar.height + 2
+            const maxY = Math.max(minY, root.height - height - 8)
+            y = Math.max(minY, Math.min(maxY, ny))
+        }
 
         Rectangle {
             anchors.fill: parent
@@ -3929,10 +3955,38 @@ Window {
                 width: adjustFlick.width
                 spacing: 7
 
-                // ---- 标题栏：标题 + 作用对象 + 应用并关闭 ----
+                // ---- 标题栏：拖动这里可移动弹窗；右侧 ✕ = 应用并关闭 ----
                 Item {
+                    id: adjustTitleBar
                     width: parent.width
                     height: 26
+
+                    // 拖动区先声明（在 ✕ 按钮之下），按钮仍能正常点击。
+                    MouseArea {
+                        id: adjustDragArea
+                        anchors.fill: parent
+                        anchors.leftMargin: -10
+                        anchors.rightMargin: -2
+                        cursorShape: Qt.SizeAllCursor
+                        property real pressX: 0
+                        property real pressY: 0
+                        property real fromX: 0
+                        property real fromY: 0
+                        onPressed: (mouse) => {
+                            const p = mapToItem(root, mouse.x, mouse.y)
+                            pressX = p.x
+                            pressY = p.y
+                            fromX = adjustPanel.x
+                            fromY = adjustPanel.y
+                        }
+                        onPositionChanged: (mouse) => {
+                            if (!pressed)
+                                return
+                            const p = mapToItem(root, mouse.x, mouse.y)
+                            adjustPanel.moveTo(fromX + (p.x - pressX),
+                                               fromY + (p.y - pressY))
+                        }
+                    }
 
                     Text {
                         id: adjustTitle
@@ -5973,6 +6027,15 @@ Window {
         }
     }
 
+    // Probe: --probe-adjustdrag simulates a title-bar drag (moves the popover)
+    // so a headless screenshot can verify the drag path + window clamping.
+    Timer {
+        id: adjustDragProbeTimer
+        interval: 1300
+        onTriggered: if (adjustPanel.visible)
+                         adjustPanel.moveTo(adjustPanel.x + 150, adjustPanel.y + 130)
+    }
+
     Component.onCompleted: {
         bridge.mark("qml-completed");
         if (root.primary) {
@@ -6001,6 +6064,8 @@ Window {
                 markBarProbeTimer.start();
             if (root.probeAdjust)
                 adjustProbeTimer.start();
+            if (Qt.application.arguments.indexOf("--probe-adjustdrag") !== -1)
+                adjustDragProbeTimer.start();
         } else if (root.fileUrl.toString().length > 0) {
             // Document window spawned for a specific file ("open in separate
             // window" setting, drag-out, etc.).
