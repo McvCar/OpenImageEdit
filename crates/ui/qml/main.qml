@@ -287,6 +287,9 @@ Window {
     // this item's coordinates; parent is sized to the preview area.
     component DashedRect: Canvas {
         id: dashed
+        // 同 markPreview：Cooperative 策略会丢弃单次重绘请求。
+        renderStrategy: Canvas.Immediate
+        renderTarget: Canvas.Image
         property real rx: 0
         property real ry: 0
         property real rw: 0
@@ -2262,37 +2265,55 @@ Window {
                     return true
                 }
 
+                // Clamp a canvasSurface point into the image display rect.
+                // Pad-area presses (aiming at image corner 0,0) must not
+                // create marks with negative / overflowing rect coords.
+                function clampCanvas(x, y) {
+                    const xa = view.pad
+                    const ya = view.pad
+                    const xb = view.pad + previewImage.width
+                    const yb = view.pad + previewImage.height
+                    return [Math.max(xa, Math.min(xb, x)),
+                            Math.max(ya, Math.min(yb, y))]
+                }
+
                 onPressed: (mouse) => {
                     // 正在就地编辑文本：点击别处先提交编辑。
                     if (textPopup.visible) {
                         textPopup.close(true)
                         return
                     }
-                    const h = handleAt(mouse.x, mouse.y)
-                    if (h !== "") {
-                        resizeRole = h
-                        if (beginGesture(3, mouse))
-                            return
-                    }
-                    const hit = markAt(mouse.x, mouse.y)
-                    if (hit >= 0) {
-                        bridge.select_mark(hit)
-                        if (beginGesture(2, mouse))
-                            return
-                    }
-                    if (bridge.selected_mark >= 0)
-                        bridge.select_mark(-1)
-                    // 没有选中绘制工具：只做选中/取消，不绘制。
-                    if (root.markTool === "none")
+                    if (root.markTool === "none") {
+                        // 选择模式：手柄缩放 → 标记移动 → 点空白取消选中。
+                        const h = handleAt(mouse.x, mouse.y)
+                        if (h !== "") {
+                            resizeRole = h
+                            if (beginGesture(3, mouse))
+                                return
+                        }
+                        const hit = markAt(mouse.x, mouse.y)
+                        if (hit >= 0) {
+                            bridge.select_mark(hit)
+                            if (beginGesture(2, mouse))
+                                return
+                        }
+                        if (bridge.selected_mark >= 0)
+                            bridge.select_mark(-1)
                         return
+                    }
+                    // 绘制工具激活：总是开始新绘制（手柄/移动属于选择模式）。
+                    // 起点钳制到图片范围——瞄准图片 (0,0) 时鼠标极易落在
+                    // 左侧 pad 区，不钳制会产生负坐标标记（渲染被裁剪成
+                    // 角落小残块，且选中框伸进 pad 区）。
                     mode = 1
-                    startX = mouse.x
-                    startY = mouse.y
-                    curX = mouse.x
-                    curY = mouse.y
+                    const p = clampCanvas(mouse.x, mouse.y)
+                    startX = p[0]
+                    startY = p[1]
+                    curX = p[0]
+                    curY = p[1]
                     brushPts = []
                     if (root.markTool === "brush")
-                        brushPts.push([imgX(mouse.x), imgY(mouse.y)])
+                        brushPts.push([imgX(startX), imgY(startY)])
                     markPreview.requestPaint()
                 }
 
@@ -2310,11 +2331,12 @@ Window {
 
                 onPositionChanged: (mouse) => {
                     if (mode === 1) {
-                        curX = mouse.x
-                        curY = mouse.y
+                        const p = clampCanvas(mouse.x, mouse.y)
+                        curX = p[0]
+                        curY = p[1]
                         if (root.markTool === "brush") {
-                            const ix = imgX(mouse.x)
-                            const iy = imgY(mouse.y)
+                            const ix = imgX(curX)
+                            const iy = imgY(curY)
                             const last = brushPts.length > 0
                                          ? brushPts[brushPts.length - 1] : null
                             if (!last || Math.abs(ix - last[0]) + Math.abs(iy - last[1]) >= 2)
@@ -2340,12 +2362,12 @@ Window {
                 onReleased: (mouse) => {
                     if (mode === 1) {
                         const s = toImageScale()
-                        // 不做画布边界钳制：预览画到画布外时，放手后的
-                        // 标记若被裁剪会显得"变小"。core 渲染时自然裁剪。
+                        // 用跟踪的 curX/curY（已钳制到图片范围）而不是
+                        // mouse.x/y：提交的 rect 与预览完全一致。
                         const x0 = (startX - view.pad) * s
                         const y0 = (startY - view.pad) * s
-                        const x1 = (mouse.x - view.pad) * s
-                        const y1 = (mouse.y - view.pad) * s
+                        const x1 = (curX - view.pad) * s
+                        const y1 = (curY - view.pad) * s
                         if (root.markTool === "brush") {
                             if (brushPts.length >= 2) {
                                 bridge.add_brush_mark(
@@ -2410,15 +2432,41 @@ Window {
             }
 
             // 绘制中的标记预览（display 坐标，松手后由 core 接管渲染）。
+            // 拖拽期间持续触发重绘：Canvas 会丢弃单次 requestPaint（尤其
+            // 场景静止/光标停顿时），不补拍的话预览就冻结在早期帧——
+            // 即"拖动时小椭圆、放手后变大"的元凶。
+            Timer {
+                id: markPreviewTimer
+                interval: 16
+                repeat: true
+                running: markMa.mode === 1
+                onTriggered: markPreview.requestPaint()
+            }
+
             Canvas {
                 id: markPreview
                 anchors.fill: parent
                 visible: markMa.mode === 1
+                // Immediate + Image：requestPaint 时在调用线程同步重绘。
+                // 默认 Cooperative 策略会在场景静止时丢弃单次重绘请求
+                //（实测：onPaint 执行了但屏幕永不更新）——拖拽中某一帧
+                // 丢失后预览就永久冻结，即"拖动时小椭圆、放手后变大"。
+                renderStrategy: Canvas.Immediate
+                renderTarget: Canvas.Image
                 onPaint: {
-                    var ctx = getContext("2d")
-                    ctx.clearRect(0, 0, width, height)
-                    if (markMa.mode !== 1)
-                        return
+                    try {
+                        var ctx = getContext("2d")
+                        ctx.clearRect(0, 0, width, height)
+                        if (markMa.mode !== 1)
+                            return
+                        paintImpl(ctx)
+                    } catch (e) {
+                        // onPaint 抛异常会让 Canvas 停留在上一帧内容
+                        //（"冻结预览"），这里保证错误可见且不扩散。
+                        bridge.mark("PAINT-ERR " + e)
+                    }
+                }
+                function paintImpl(ctx) {
                     const s = toDispScale()
                     ctx.lineWidth = Math.max(1, root.markStroke * s)
                     ctx.strokeStyle = root.markColor
@@ -5150,18 +5198,44 @@ Window {
 
     // Headless repro of the ellipse drag preview: mid-drag state (mode 1)
     // with the press at image (0,0) and the mouse at 90% of the image.
+    // Two-phase: paint at 30%, then move the cursor to 90% and requestPaint
+    // again — if the second frame never shows, the Canvas update pipeline
+    // itself is dropping paints (the frozen-preview bug).
     Timer {
         id: ellipseDragProbeTimer
-        interval: 600
+        interval: 1500
         onTriggered: {
             root.markBarVisible = true
             root.markTool = "ellipse"
             markMa.startX = view.pad
             markMa.startY = view.pad
+            markMa.curX = view.pad + previewImage.width * 0.3
+            markMa.curY = view.pad + previewImage.height * 0.3
+            markMa.mode = 1
+            bridge.mark("probe phase1 requestPaint")
+            markPreview.requestPaint()
+            phase2Timer.start()
+        }
+    }
+    Timer {
+        id: phase2Timer
+        interval: 2000
+        onTriggered: {
             markMa.curX = view.pad + previewImage.width * 0.9
             markMa.curY = view.pad + previewImage.height * 0.9
-            markMa.mode = 1
+            bridge.mark("probe phase2 requestPaint")
             markPreview.requestPaint()
+        }
+    }
+
+    // Prepare-only: enable the mark bar + ellipse tool, then let a REAL
+    // (posted) mouse drag drive the interaction.
+    Timer {
+        id: markBarProbeTimer
+        interval: 600
+        onTriggered: {
+            root.markBarVisible = true
+            root.markTool = "ellipse"
         }
     }
 
@@ -5189,6 +5263,8 @@ Window {
                 colorProbeTimer.start();
             if (Qt.application.arguments.indexOf("--probe-ellipsedrag") !== -1)
                 ellipseDragProbeTimer.start();
+            if (Qt.application.arguments.indexOf("--probe-markbar") !== -1)
+                markBarProbeTimer.start();
         } else if (root.fileUrl.toString().length > 0) {
             // Document window spawned for a specific file ("open in separate
             // window" setting, drag-out, etc.).
