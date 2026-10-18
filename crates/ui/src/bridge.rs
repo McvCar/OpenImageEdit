@@ -636,15 +636,19 @@ impl Session {
         // locked-by-default row: not reorderable, not deletable while locked
         // (see §4.8 of the UX plan). v reports visibility (deleted/hidden),
         // bd reports base_deleted so the panel can distinguish "hidden" from
-        // "deleted" (Delete key flow) for the base row.
-        parts.push(format!(
-            "{{\"i\":-1,\"n\":\"背景\",\"v\":{},\"bd\":{},\"o\":100,\"l\":{},\"x\":0,\"y\":0,\"w\":{},\"h\":{},\"base\":true}}",
-            !base_deleted && !self.doc.base_hidden,
-            base_deleted,
-            base_locked,
-            self.doc.canvas.width,
-            self.doc.canvas.height
-        ));
+        // "deleted" (Delete key flow) for the base row. Once the base has
+        // been converted into a regular layer (panel unlock) the synthetic
+        // row disappears entirely — the layer row speaks for itself.
+        if !self.doc.base_converted {
+            parts.push(format!(
+                "{{\"i\":-1,\"n\":\"背景\",\"v\":{},\"bd\":{},\"o\":100,\"l\":{},\"x\":0,\"y\":0,\"w\":{},\"h\":{},\"base\":true}}",
+                !base_deleted && !self.doc.base_hidden,
+                base_deleted,
+                base_locked,
+                self.doc.canvas.width,
+                self.doc.canvas.height
+            ));
+        }
         format!("[{}]", parts.join(","))
     }
 
@@ -715,6 +719,9 @@ impl qobject::Bridge {
                 "prev" => self.as_mut().navigate(-1),
                 "copy" => self.as_mut().copy_selected_layer(),
                 "cut" => self.as_mut().cut_selected_layer(),
+                // Panel "unlock base" flow: converts the base into a
+                // regular bottom layer (smoke-test / automation hook).
+                "unlock-base" => self.as_mut().set_base_locked(false),
                 other if other.starts_with("opacity:") => {
                     match other
                         .strip_prefix("opacity:")
@@ -2242,13 +2249,34 @@ session
     }
 
     pub fn set_base_locked(mut self: Pin<&mut Self>, locked: bool) {
-        {
+        let converted = {
             let mut guard = self.session.borrow_mut();
-            if let Some(session) = guard.as_mut() {
-                session.base_locked = locked;
+            match guard.as_mut() {
+                Some(session) => {
+                    session.base_locked = locked;
+                    // Unlocking converts the base into a regular bottom
+                    // layer once: from then on it moves / scales / deletes
+                    // / renames exactly like any other layer, and the
+                    // synthetic base row disappears from the panel.
+                    if !locked {
+                        matches!(session.doc.convert_base_to_layer(), Ok(()))
+                    } else {
+                        false
+                    }
+                }
+                None => false,
             }
+        };
+        if converted {
+            // Inserting at index 0 shifts every other layer index, so a
+            // stale selection must go; a layer was added too, so
+            // layer_count / undo state changed and a full refresh (not
+            // just layers_json) is required.
+            self.as_mut().set_selected_layer(-1);
+            self.as_mut().refresh_preview();
+        } else {
+            self.as_mut().refresh_layers_only();
         }
-        self.as_mut().refresh_layers_only();
     }
 
     /// Eye toggle on the base row: hide/show the background (undoable).
@@ -2287,6 +2315,10 @@ session
                 Some(session) => {
                     if session.base_locked {
                         Err("背景已锁定，先点击锁图标解锁".into())
+                    } else if session.doc.base_converted {
+                        // The base row no longer exists as such; deletion
+                        // goes through the normal layer path.
+                        Ok(false)
                     } else if session.doc.base_deleted {
                         Ok(false)
                     } else {

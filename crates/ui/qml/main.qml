@@ -578,6 +578,7 @@ Window {
         readonly property bool probeSettings: Qt.application.arguments.indexOf("--probe-settings") !== -1
         readonly property bool probeMenu: Qt.application.arguments.indexOf("--probe-menu") !== -1
         readonly property bool probeResize: Qt.application.arguments.indexOf("--probe-resize") !== -1
+        readonly property bool probeLayers: Qt.application.arguments.indexOf("--probe-layers") !== -1
         // Ids inside an inline component are invisible from outside, so the
         // shell / DocWindow wrappers reach the Bridge through this alias.
         readonly property alias b: bridge
@@ -764,10 +765,10 @@ Window {
         // How many icon slots fit between the title and the chrome.
         property int capacity: barActions.length
         function updateCapacity() {
-            // 30px icon + 2px spacing each; reserve title, layers/settings,
+            // 30px icon + 2px spacing each; reserve title, layers button,
             // "…", window buttons and margins.
             const chrome = titleText.implicitWidth + 8 + 16 + menuBtn.width
-                           + layersBtn.width + settingsBtn.width + 8
+                           + layersBtn.width + 8
                            + winRow.width + 24
             const avail = Math.max(0, toolbar.width - chrome)
             const per = 32
@@ -848,17 +849,6 @@ Window {
                     onClicked: modelData.run()
                 }
             }
-        }
-
-        IconButton {
-            id: settingsBtn
-            anchors.right: layersBtn.left
-            anchors.rightMargin: 2
-            anchors.verticalCenter: parent.verticalCenter
-            glyph: "⚙"
-            tip: "设置…"
-            visible: true
-            onClicked: settingsOverlay.visible = true
         }
 
         IconButton {
@@ -1486,6 +1476,9 @@ Window {
             anchors.leftMargin: 10
             visible: bridge.fileName.length > 0
             text: bridge.fileName
+                  + (bridge.image_width > 0
+                     ? "   ·   " + bridge.image_width + "×" + bridge.image_height
+                     : "")
                   + (bridge.fileSizeStr.length > 0 ? "   ·   " + bridge.fileSizeStr : "")
             color: "#9aa3b2"
             font.pixelSize: 12
@@ -1551,7 +1544,7 @@ Window {
 
             Text {
                 width: parent.width
-                text: "图层（最上 = 顶层）"
+                text: "图层"
                 color: "#e9eaec"
                 font.pixelSize: 13
                 font.bold: true
@@ -1639,7 +1632,10 @@ Window {
                             if (!reordering)
                                 return
                             const pitch = 38  // row 34 + spacing 4
-                            const docLen = root.layerList.length - 1  // exclude base row
+                            // Non-base row count: the synthetic base row
+                            // (present only while the base is still locked)
+                            // is never a valid reorder target.
+                            const docLen = nonBaseRowCount()
                             const colY = layerRow.mapToItem(layerRepeaterColumn, 0, mouse.y).y
                             let t = Math.floor(colY / pitch + 0.5)
                             t = Math.max(0, Math.min(t, docLen - 1))
@@ -1649,7 +1645,7 @@ Window {
                         }
                         onReleased: {
                             if (reordering && toPos >= 0 && toPos !== fromPos) {
-                                const docLen = root.layerList.length - 1
+                                const docLen = nonBaseRowCount()
                                 // Display position p ↔ doc index docLen-1-p.
                                 bridge.reorder_layer(docLen - 1 - fromPos,
                                                      docLen - 1 - toPos)
@@ -1742,9 +1738,6 @@ Window {
                         visible: !renameInput.visible
                         text: layerRow.row
                               ? layerRow.row.n
-                                + (layerRow.isBase
-                                   ? (layerRow.row.l === true ? "（背景）" : "（已解锁，Delete 删除）")
-                                   : "")
                                 + (layerRow.row.o !== undefined && layerRow.row.o < 100 ? "  " + layerRow.row.o + "%" : "")
                                 // Selection is shown by row highlight only.
                               : ""
@@ -2557,6 +2550,17 @@ Window {
         return null
     }
 
+    // Number of real (non-synthetic-base) rows. The base row exists only
+    // while the base is still locked; after the panel unlock converts it
+    // into a regular layer it no longer occupies a slot here.
+    function nonBaseRowCount() {
+        let n = 0
+        for (var i = 0; i < root.layerList.length; i++)
+            if (root.layerList[i].base !== true)
+                n++
+        return n
+    }
+
     // Topmost visible UNLOCKED non-base layer whose content box contains the
     // canvasSurface-space point (mx, my); null when the point is empty
     // canvas. layerList is display-ordered (index 0 = top), so the first
@@ -3092,6 +3096,13 @@ Window {
         onTriggered: openResizeDialog()
     }
 
+    // Probe timer: --probe-layers shows the layer panel automatically.
+    Timer {
+        id: layersProbeTimer
+        interval: 600
+        onTriggered: root.panelVisible = true
+    }
+
     Component.onCompleted: {
         bridge.mark("qml-completed");
         if (root.primary) {
@@ -3104,6 +3115,8 @@ Window {
                 menuProbeTimer.start();
             if (root.probeResize)
                 resizeProbeTimer.start();
+            if (root.probeLayers)
+                layersProbeTimer.start();
         } else if (root.fileUrl.toString().length > 0) {
             // Document window spawned for a specific file ("open in separate
             // window" setting, drag-out, etc.).

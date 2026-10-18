@@ -206,6 +206,12 @@ pub struct Document {
     /// True while the base layer is hidden by the user (eye toggle in the
     /// panel). Non-destructive and undoable.
     pub base_hidden: bool,
+    /// True once the base image has been converted into a regular layer
+    /// ("unlock" in the panel): it becomes movable / scalable / deletable
+    /// like any other layer, and the synthetic base row disappears. The
+    /// base field stays as a transparent canvas of the same size so crop /
+    /// rotate / canvas-resize keep working unchanged.
+    pub base_converted: bool,
     /// Auto-naming counter: new layers (extract/paste) are named by their
     /// creation order ("1", "2", ...). Not part of snapshots on purpose, so
     /// names keep increasing across undo/redo.
@@ -318,6 +324,8 @@ pub struct DocumentSnapshot {
     pub base_deleted: bool,
     /// Base hidden by the user (eye toggle).
     pub base_hidden: bool,
+    /// Base already converted into a regular layer (panel unlock).
+    pub base_converted: bool,
 }
 
 impl Document {
@@ -329,6 +337,7 @@ impl Document {
             layers: self.layers.clone(),
             base_deleted: self.base_deleted,
             base_hidden: self.base_hidden,
+            base_converted: self.base_converted,
         }
     }
 
@@ -340,6 +349,7 @@ impl Document {
         self.layers = snapshot.layers;
         self.base_deleted = snapshot.base_deleted;
         self.base_hidden = snapshot.base_hidden;
+        self.base_converted = snapshot.base_converted;
     }
 }
 
@@ -380,6 +390,11 @@ pub enum EditOp {
     /// (clipped when shrinking, transparent padding when growing). The
     /// pre-op snapshot makes undo exact (same pattern as `ResizeDocument`).
     CanvasResize { from: DocumentSnapshot, to: Size },
+    /// "Unlock" the base layer: its pixels become a regular layer at the
+    /// bottom of the stack (movable / scalable / deletable like any other
+    /// layer) and the base itself becomes a transparent canvas of the same
+    /// size. The pre-op snapshot makes undo exact.
+    BaseToLayer { from: DocumentSnapshot },
 }
 
 impl EditOp {
@@ -484,6 +499,10 @@ impl EditOp {
                 apply_canvas_resize(doc, *to);
                 Ok(())
             }
+            EditOp::BaseToLayer { .. } => {
+                apply_base_to_layer(doc);
+                Ok(())
+            }
         }
     }
 
@@ -575,6 +594,10 @@ impl EditOp {
                 doc.restore(from.clone());
                 Ok(())
             }
+            EditOp::BaseToLayer { from } => {
+                doc.restore(from.clone());
+                Ok(())
+            }
         }
     }
 }
@@ -615,6 +638,25 @@ fn apply_view(doc: &mut Document, view: Rect) {
 fn apply_delete_base(doc: &mut Document) {
     doc.base = RgbaImage::new(doc.canvas.width, doc.canvas.height);
     doc.base_deleted = true;
+}
+
+/// "Unlock" the base: its pixels become a regular layer at the bottom of the
+/// stack (offset by `view` so the visible region matches exactly) and the
+/// base becomes a transparent image of the same size. Canvas size, `view`
+/// and therefore crop / rotate / canvas-resize behavior stay unchanged; the
+/// composite output is pixel-identical before and after.
+fn apply_base_to_layer(doc: &mut Document) {
+    if doc.base_converted {
+        return;
+    }
+    let mut layer = Layer::new("背景", doc.base.clone());
+    layer.offset = (doc.view.x, doc.view.y);
+    let empty = RgbaImage::new(doc.base.width(), doc.base.height());
+    doc.base = empty;
+    doc.layers.insert(0, layer);
+    doc.base_deleted = false;
+    doc.base_hidden = false;
+    doc.base_converted = true;
 }
 
 fn erase_base_pixels(doc: &mut Document, selection: &Selection) {    let canvas_rect = Rect::new(0, 0, doc.canvas.width, doc.canvas.height);
@@ -726,6 +768,7 @@ impl Document {
             layers: Vec::new(),
             base_deleted: false,
             base_hidden: false,
+            base_converted: false,
             next_layer_seq: 0,
             history: History::new(256),
         }
@@ -932,6 +975,18 @@ impl Document {
             return Ok(());
         }
         self.execute(EditOp::SetBaseVisible { from, to })
+    }
+
+    /// "Unlock" the base layer: convert it into a regular layer at the
+    /// bottom of the stack so it can be moved / scaled / deleted / renamed
+    /// like any other layer. Idempotent: converting twice is a no-op (the
+    /// second call adds no history entry).
+    pub fn convert_base_to_layer(&mut self) -> Result<(), EditError> {
+        if self.base_converted {
+            return Ok(());
+        }
+        let from = self.snapshot();
+        self.execute(EditOp::BaseToLayer { from })
     }
 
     pub fn undo(&mut self) -> Result<(), EditError> {
@@ -1305,6 +1360,61 @@ mod tests {
         doc.redo().unwrap();
         assert!(doc.base_deleted);
         assert_eq!(doc.base.get_pixel(15, 15).0, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn convert_base_to_layer_roundtrips_and_composites_identically() {
+        let mut doc = Document::from_image(checker(16, 16));
+        let before = doc.flatten();
+
+        doc.convert_base_to_layer().unwrap();
+        assert!(doc.base_converted);
+        // The base pixels now live in a regular bottom layer named 背景.
+        assert_eq!(doc.layers.len(), 1);
+        assert_eq!(doc.layers[0].name, "背景");
+        assert_eq!(doc.layers[0].offset, (0, 0));
+        assert_eq!(doc.layers[0].image.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert!(!doc.layers[0].locked);
+        // The base itself is a transparent canvas of the same size; the
+        // composite output is pixel-identical.
+        assert_eq!(doc.base.width(), 16);
+        assert_eq!(doc.base.get_pixel(0, 0).0, [0, 0, 0, 0]);
+        assert_eq!(doc.canvas.width, 16);
+        assert_eq!(doc.flatten(), before);
+
+        // Converting twice must not push a second history entry.
+        let depth = doc.history.undo.len();
+        doc.convert_base_to_layer().unwrap();
+        assert_eq!(doc.history.undo.len(), depth);
+
+        // The converted layer behaves like any other layer: movable and
+        // deletable. After deletion no trace remains in the layer list.
+        doc.translate_layer(0, 4, 2).unwrap();
+        assert_eq!(doc.layers[0].offset, (4, 2));
+        doc.remove_layer(0).unwrap();
+        assert!(doc.layers.is_empty());
+        assert_eq!(doc.flatten(), RgbaImage::new(16, 16));
+
+        // Undo the deletion: the layer (still converted) comes back.
+        doc.undo().unwrap();
+        assert_eq!(doc.layers.len(), 1);
+        assert_eq!(doc.layers[0].offset, (4, 2));
+        assert!(doc.base_converted);
+
+        // Undo past translate AND the conversion restores the original
+        // locked-in-base state exactly.
+        doc.undo().unwrap();
+        doc.undo().unwrap();
+        assert!(!doc.base_converted);
+        assert!(doc.layers.is_empty());
+        assert_eq!(doc.base.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(doc.flatten(), before);
+
+        // Redo re-applies the conversion.
+        doc.redo().unwrap();
+        assert!(doc.base_converted);
+        assert_eq!(doc.layers.len(), 1);
+        assert_eq!(doc.layers[0].image.get_pixel(0, 0).0, [255, 0, 0, 255]);
     }
 
     #[test]
