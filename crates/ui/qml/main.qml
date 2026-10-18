@@ -18,6 +18,7 @@ Window {
     visibility: content.fullscreen ? Window.FullScreen : Window.Windowed
     title: content.b.image_width > 0
            ? "ImageEdit — " + content.b.image_width + "×" + content.b.image_height
+             + (content.b.dirty ? " *" : "")
            : "ImageEdit"
 
     onAfterRendering: content.afterFrame()
@@ -685,6 +686,7 @@ Window {
         visibility: content.fullscreen ? Window.FullScreen : Window.Windowed
         title: content.b.image_width > 0
                ? "ImageEdit — " + content.b.image_width + "×" + content.b.image_height
+                 + (content.b.dirty ? " *" : "")
                : "ImageEdit"
 
         onAfterRendering: content.afterFrame()
@@ -946,8 +948,10 @@ Window {
     // open settings/resize panel.
     Shortcut { sequence: "Left"; enabled: canNavigate(); onActivated: navigateRel(-1) }
     Shortcut { sequence: "Right"; enabled: canNavigate(); onActivated: navigateRel(1) }
+    // 回车：模态确认框 = 默认动作（保存并打开/切换/关闭）；否则裁剪/粘贴。
     Shortcut { sequences: ["Return", "Enter"]
-               enabled: root.pasteFloating || root.selExists
+               enabled: confirmOverlay.visible || root.pasteFloating
+                        || root.selExists
                onActivated: onEnter() }
 
     Shortcut { sequence: "Left";  enabled: bridge.selected_layer >= 0; onActivated: nudgeLayer(-1, 0) }
@@ -1130,7 +1134,12 @@ Window {
             anchors.verticalCenter: parent.verticalCenter
             width: Math.min(implicitWidth, 220)
             elide: Text.ElideRight
-            text: "ImageEdit"
+            // Same content as the (offscreen) window title: unsaved changes
+            // are flagged with a trailing asterisk.
+            text: b.image_width > 0
+                  ? "ImageEdit — " + b.image_width + "×" + b.image_height
+                    + (b.dirty ? " *" : "")
+                  : "ImageEdit"
             color: "#c9cdd2"
             font.pixelSize: 12
             onImplicitWidthChanged: toolbar.updateCapacity()
@@ -5623,6 +5632,11 @@ Window {
     }
 
     function onEnter() {
+        // 模态确认框：回车 = 默认动作（保存并打开/切换/关闭）。
+        if (confirmOverlay.visible) {
+            confirmSaveProceed()
+            return
+        }
         if (root.pasteFloating) {
             settlePaste()
             return
@@ -6117,17 +6131,21 @@ Window {
                         active: true
                         onClicked: confirmCancel()
                     }
+                    // Default action: highlighted, triggered by Enter. Saves
+                    // first, then continues the pending open/nav/close.
                     ToolButton {
-                        label: "保存并关闭"
-                        active: root.confirmMode === "close"
-                        onClicked: confirmSaveAndClose()
+                        label: root.confirmMode === "open" ? "保存并打开"
+                             : root.confirmMode === "nav" ? "保存并切换"
+                             : "保存并关闭"
+                        active: true
+                        selected: true
+                        onClicked: confirmSaveProceed()
                     }
                     ToolButton {
                         label: root.confirmMode === "open" ? "放弃并打开"
                              : root.confirmMode === "nav" ? "放弃并切换"
                              : "放弃并关闭"
                         active: true
-                        selected: true
                         onClicked: confirmProceed()
                     }
                 }
@@ -6581,10 +6599,31 @@ Window {
         root.confirmMode = ""
     }
 
-    function confirmSaveAndClose() {
+    // Default (highlighted) action of the unsaved-changes dialog: save the
+    // edited image, then continue whatever the user originally asked for
+    // (open another file / navigate / close the window).
+    function confirmSaveProceed() {
+        const mode = root.confirmMode
         bridge.save_edited()
-        root.confirmMode = "close"
-        confirmProceed()
+        confirmOverlay.visible = false
+        root.confirmMode = ""
+        if (mode === "open") {
+            const url = root.pendingOpenUrl
+            root.pendingOpenUrl = null
+            if (url)
+                openFile(url)
+        } else if (mode === "nav") {
+            const dir = root.pendingNavDir
+            root.pendingNavDir = 0
+            bridge.navigate(dir)
+        } else if (mode === "close") {
+            root.forceClose = true
+            // Close ONLY this window; the app quits automatically once the
+            // last window goes away (Qt quitOnLastWindowClosed).
+            const w = Window.window
+            if (w)
+                w.close()
+        }
     }
 
     function confirmCancel() {
