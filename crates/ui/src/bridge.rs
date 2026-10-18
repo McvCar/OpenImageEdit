@@ -441,8 +441,11 @@ pub mod qobject {
         #[qinvokable]
         fn cut_selected_layer(self: Pin<&mut Self>);
 
+        /// Paste the process-wide layer clipboard as a new layer. Returns
+        /// `false` when nothing was pasted (empty clipboard / no document), so
+        /// the QML side only enters the "floating placement" state on success.
         #[qinvokable]
-        fn paste_clipboard(self: Pin<&mut Self>);
+        fn paste_clipboard(self: Pin<&mut Self>) -> bool;
 
         // ---- 图层属性 ----
 
@@ -850,11 +853,16 @@ impl Session {
         let doc = Document::from_image(decoded.image);
         let zoom = fit_zoom(doc.canvas, viewport);
         let ms = t0.elapsed().as_millis().min(i32::MAX as u128) as i32;
+        // A relative CLI path ("photo.jpg") must not leak into the session: the
+        // status-bar path, the "save a copy" target and the "open the same file
+        // in a new window" flow all need an absolute one. `absolute` keeps the
+        // normal form (no \\?\ prefix, unlike canonicalize).
+        let source = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         Ok((
             Self {
                 id: SESSION_SEQ.fetch_add(1, Ordering::Relaxed),
                 doc,
-                source: Some(path.to_path_buf()),
+                source: Some(source),
                 zoom,
                 fit: true,
                 render_count: 0,
@@ -1216,7 +1224,11 @@ impl qobject::Bridge {
                 "delete-selected" => self.as_mut().delete_selected_layer(),
                 "layer-up" => self.as_mut().move_selected_up(),
                 "layer-down" => self.as_mut().move_selected_down(),
-                "paste" => self.as_mut().paste_clipboard(),
+                "paste" => {
+                    if self.as_mut().paste_clipboard() {
+                        println!("{{\"phase\":\"ui\",\"event\":\"script-paste-ok\"}}");
+                    }
+                }
                 "next" => self.as_mut().navigate(1),
                 "prev" => self.as_mut().navigate(-1),
                 "copy" => self.as_mut().copy_selected_layer(),
@@ -3046,18 +3058,21 @@ session
         self.as_mut().delete_selected_layer();
     }
 
-    pub fn paste_clipboard(mut self: Pin<&mut Self>) {
+    pub fn paste_clipboard(mut self: Pin<&mut Self>) -> bool {
         let clipboard = clipboard().lock().unwrap().clone();
         let Some(clip) = clipboard else {
-            self.as_mut().set_status(QString::from("剪贴板为空"));
-            return;
+            self.as_mut().set_status(QString::from(
+                "剪贴板为空（跨窗口复制请用同一程序的「新窗口」，另起的程序不共享）",
+            ));
+            println!("{{\"phase\":\"ui\",\"event\":\"paste-empty\"}}");
+            return false;
         };
         let viewport = *self.viewport.borrow();
         const PASTE_SHIFT: i32 = 12;
         let result: Result<usize, String> = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
-                None => Err("no document".into()),
+                None => Err("这个窗口还没有打开图片".into()),
                 Some(session) => {
                     let canvas = session.doc.canvas;
                     let count = *self.paste_counter.borrow() as i32;
@@ -3096,8 +3111,13 @@ session
                 }
                 self.as_mut().refresh_preview();
                 println!("{{\"phase\":\"ui\",\"event\":\"pasted\",\"index\":{index}}}");
+                true
             }
-            Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
+            Err(message) => {
+                self.as_mut().set_status(QString::from(message.as_str()));
+                println!("{{\"phase\":\"ui\",\"event\":\"paste-failed\",\"reason\":\"{}\"}}", message);
+                false
+            }
         }
     }
 

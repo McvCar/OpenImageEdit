@@ -671,9 +671,16 @@ Window {
     // instance, no CLI handling (that stays with the primary window).
     // newWindowFn is injected by the shell factory so the inline component
     // never needs to reference the shell (which would create a cycle).
-    component DocWindow: Window {        id: docWin
+    component DocWindow: Window {
+        id: docWin
 
         property var newWindowFn: null
+        // File to open on first show. The shell factory passes it through when a
+        // second image is opened in its own window ("在新窗口打开" setting, a
+        // dropped file, ...). Without this property Qt rejected the initial
+        // property assignment and the new window stayed BLANK, which also made
+        // "copy a layer in window A, paste in window B" look broken.
+        property url fileUrl: ""
 
         width: 1100
         height: 760
@@ -698,6 +705,8 @@ Window {
         EditorContent {
             id: content
             anchors.fill: parent
+            primary: false
+            fileUrl: docWin.fileUrl
             onRequestNewWindow: (fileUrl) => {
                 if (docWin.newWindowFn)
                     docWin.newWindowFn(fileUrl)
@@ -5533,9 +5542,12 @@ Window {
             settlePaste()
         root.selW = 0
         root.selH = 0
-        bridge.paste_clipboard()
-        root.pasteFloating = true
-        root.floatingOps = 1
+        // Only a successful paste enters the floating placement state —
+        // otherwise Esc would "roll back" an unrelated edit.
+        if (bridge.paste_clipboard()) {
+            root.pasteFloating = true
+            root.floatingOps = 1
+        }
     }
 
     function settlePaste() {
@@ -6789,9 +6801,13 @@ Window {
     }
 
     // Probe: --probe-clipboard copies a layer in the FIRST window, opens a
-    // second document window and pastes there (cross-window clipboard check).
-    readonly property url clipboardProbeUrl:
-        "file:///D:/_APP_CODE/ImageEdit/tmp/photo-test2.jpg"
+    // second window on the same file and pastes there (cross-window clipboard
+    // check; also covers the DocWindow `fileUrl` hand-off). Launch it with an
+    // ABSOLUTE image path so the second window can reopen the file.
+    function clipboardProbeUrl() {
+        const p = bridge.sourcePath
+        return p.length > 0 ? "file:///" + p.replace(/\\/g, "/") : ""
+    }
     Timer {
         id: clipboardProbeA
         interval: 1200
@@ -6800,35 +6816,30 @@ Window {
             if (bridge.selected_layer < 0)
                 bridge.select_layer(0)
             root.doCopy()
-            console.log("PROBE-A windows layer=" + bridge.selected_layer
-                        + " layers=" + bridge.layer_count
-                        + " status=" + bridge.status)
+            console.log("PROBE-A window1: copied layer=" + bridge.selected_layer
+                        + " layers=" + bridge.layer_count)
             clipboardProbeB.start()
         }
     }
     Timer {
         id: clipboardProbeB
-        interval: 200
-        onTriggered: root.requestNewWindow("")
-    }
-    Timer {
-        id: clipboardProbeC
-        interval: 1500
-        running: root.probeClipboard && !root.primary
+        interval: 300
         onTriggered: {
-            console.log("PROBE-C window2 open, has image=" + (bridge.image_width > 0))
-            bridge.open_file(root.clipboardProbeUrl)
-            clipboardProbeD.start()
+            console.log("PROBE-URL sourcePath='" + bridge.sourcePath
+                        + "' url='" + root.clipboardProbeUrl() + "'")
+            root.requestNewWindow(root.clipboardProbeUrl())
         }
     }
     Timer {
-        id: clipboardProbeD
-        interval: 1800
+        id: clipboardProbePaste
+        interval: 3200
+        running: root.probeClipboard && !root.primary
         onTriggered: {
-            console.log("PROBE-D before paste: layers=" + bridge.layer_count
-                        + " selected=" + bridge.selected_layer)
+            console.log("PROBE-B window2: open=" + (bridge.image_width > 0)
+                        + " size=" + bridge.image_width + "x" + bridge.image_height
+                        + " layers=" + bridge.layer_count)
             root.doPaste()
-            console.log("PROBE-D after paste: layers=" + bridge.layer_count
+            console.log("PROBE-B window2: after paste layers=" + bridge.layer_count
                         + " selected=" + bridge.selected_layer
                         + " status=" + bridge.status)
         }
