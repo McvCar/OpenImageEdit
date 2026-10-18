@@ -1312,7 +1312,9 @@ Window {
         anchors.top: markBar.visible ? markBar.bottom : toolbar.bottom
         anchors.bottom: statusBar.top
         anchors.left: parent.left
-        anchors.right: parent.right
+        // 图层面板悬浮在右侧：fit/居中必须按扣掉面板后的可见区域算，
+        // 否则适应窗口时图片右边会被面板盖住。
+        anchors.right: layerPanel.visible ? layerPanel.left : parent.right
         clip: true
         boundsBehavior: Flickable.StopAtBounds
         // Panning happens ONLY via wheel/touchpad and middle-drag (panMa);
@@ -1585,6 +1587,8 @@ Window {
                     const tol = 4 / Math.max(toDispScale(), 0.0001)
                     for (var i = root.markList.length - 1; i >= 0; i--) {
                         const m = root.markList[i]
+                        if (m.v === false)
+                            continue
                         if (ix >= m.x - tol && ix <= m.x + m.w + tol
                             && iy >= m.y - tol && iy <= m.y + m.h + tol)
                             return m.i
@@ -1701,14 +1705,12 @@ Window {
                 onReleased: (mouse) => {
                     if (mode === 1) {
                         const s = toImageScale()
-                        const W = bridge.image_width
-                        const H = bridge.image_height
-                        const cx = v => Math.max(0, Math.min(W, v))
-                        const cy = v => Math.max(0, Math.min(H, v))
-                        const x0 = cx((startX - view.pad) * s)
-                        const y0 = cy((startY - view.pad) * s)
-                        const x1 = cx((mouse.x - view.pad) * s)
-                        const y1 = cy((mouse.y - view.pad) * s)
+                        // 不做画布边界钳制：预览画到画布外时，放手后的
+                        // 标记若被裁剪会显得"变小"。core 渲染时自然裁剪。
+                        const x0 = (startX - view.pad) * s
+                        const y0 = (startY - view.pad) * s
+                        const x1 = (mouse.x - view.pad) * s
+                        const y1 = (mouse.y - view.pad) * s
                         if (root.markTool === "brush") {
                             if (brushPts.length >= 2) {
                                 bridge.add_brush_mark(
@@ -1798,10 +1800,15 @@ Window {
                         return
                     }
                     if (root.markTool === "ellipse") {
+                        // core 的椭圆描边画在边界内侧（ring），预览保持一致：
+                        // 半径先内收半个线宽。
+                        const shrink = Math.max(1, root.markStroke * s) / 2
+                        const ecx = (x0 + x1) / 2
+                        const ecy = (y0 + y1) / 2
+                        const erx = Math.max(0.5, Math.abs(x1 - x0) / 2 - shrink)
+                        const ery = Math.max(0.5, Math.abs(y1 - y0) / 2 - shrink)
                         ctx.beginPath()
-                        ctx.ellipse((x0 + x1) / 2, (y0 + y1) / 2,
-                                    Math.abs(x1 - x0) / 2, Math.abs(y1 - y0) / 2,
-                                    0, 0, Math.PI * 2)
+                        ctx.ellipse(ecx, ecy, erx, ery, 0, 0, Math.PI * 2)
                         if (root.markFill)
                             ctx.fill()
                         ctx.stroke()
@@ -1837,8 +1844,11 @@ Window {
                 id: markSelViz
                 visible: bridge.selected_mark >= 0 && root.markBarVisible
                          && markMa.mode === 0
-                x: previewImage.x
-                y: previewImage.y
+                // canvasSurface 坐标：画布原点 = (pad, pad)。不能用
+                // previewImage.x/y（那是 Flickable 内容坐标，图片居中时
+                // ≠ pad，选中框会整体漂移）。
+                x: view.pad
+                y: view.pad
                 width: previewImage.width
                 height: previewImage.height
                 rx: box ? box[0] : 0
@@ -2588,7 +2598,7 @@ Window {
                 }
                 }
 
-                // ---- 标记分区：画布上的全部矢量标记（点击选中，右键删除）----
+                // ---- 标记分区：画布上的全部矢量标记（左键选中，Delete 删除）----
                 Rectangle {
                     width: parent.width
                     height: 1
@@ -2599,7 +2609,7 @@ Window {
                 Text {
                     id: markSectionHdr
                     width: layerRepeaterColumn.width
-                    text: "标记（" + root.markList.length + "）· 左键选中，右键删除"
+                    text: "标记（" + root.markList.length + "）· 左键选中，按 Delete 删除"
                     color: "#e9eaec"
                     font.pixelSize: 12
                     font.bold: true
@@ -2614,14 +2624,16 @@ Window {
                         required property var modelData
                         required property int index
                         readonly property bool isSel: modelData.i === bridge.selected_mark
+                        readonly property bool isVisible: modelData.v !== false
                         width: layerRepeaterColumn.width
                         height: 26
                         radius: 4
                         color: isSel ? "#3d5a80"
                              : (markRowMa.containsMouse ? "#3a3e44" : "#33373c")
+                        opacity: isVisible ? 1.0 : 0.45
 
                         Text {
-                            x: 8
+                            x: 32
                             anchors.verticalCenter: parent.verticalCenter
                             text: (markRow.modelData.k === 0 ? "▭ 矩形"
                                    : markRow.modelData.k === 1 ? "◯ 椭圆"
@@ -2639,19 +2651,58 @@ Window {
                             color: "#6b7076"
                             font.pixelSize: 10
                         }
+                        // 行点击=选中。声明在眼睛之前，眼睛在其上层接收点击。
                         MouseArea {
                             id: markRowMa
                             anchors.fill: parent
                             hoverEnabled: true
-                            acceptedButtons: Qt.LeftButton | Qt.RightButton
+                            acceptedButtons: Qt.LeftButton
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: (mouse) => {
-                                if (mouse.button === Qt.RightButton) {
-                                    bridge.select_mark(markRow.modelData.i)
-                                    bridge.delete_selected_mark()
-                                } else {
-                                    bridge.select_mark(markRow.modelData.i)
+                            onClicked: bridge.select_mark(markRow.modelData.i)
+                        }
+                        // 眼睛：切换该标记的显示/隐藏（可撤销）。
+                        Item {
+                            id: markEye
+                            x: 6
+                            width: 22
+                            height: parent.height
+
+                            Canvas {
+                                id: markEyeIcon
+                                anchors.centerIn: parent
+                                width: 16
+                                height: 16
+                                property bool on: markRow.isVisible
+                                onOnChanged: requestPaint()
+                                onPaint: {
+                                    var ctx = getContext("2d")
+                                    ctx.clearRect(0, 0, width, height)
+                                    ctx.lineWidth = 1.4
+                                    var c = on ? "#d5d8dd" : "#8a9099"
+                                    ctx.strokeStyle = c
+                                    ctx.fillStyle = c
+                                    ctx.beginPath()
+                                    ctx.ellipse(8, 8, 6.5, 4.2, 0, 0, Math.PI * 2)
+                                    ctx.stroke()
+                                    if (on) {
+                                        ctx.beginPath()
+                                        ctx.arc(8, 8, 1.8, 0, Math.PI * 2)
+                                        ctx.fill()
+                                    } else {
+                                        ctx.beginPath()
+                                        ctx.moveTo(3.5, 12.5)
+                                        ctx.lineTo(12.5, 3.5)
+                                        ctx.stroke()
+                                    }
                                 }
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                anchors.margins: -4
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: bridge.set_mark_visible(
+                                    markRow.modelData.i, markRow.isVisible === false)
                             }
                         }
                     }

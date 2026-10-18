@@ -160,7 +160,9 @@ pub fn composite_for_preview(doc: &Document, target: Size) -> RgbaImage {
 
     // Markup annotations ride on top of the preview, scaled to target px.
     for mark in &doc.marks {
-        mark.draw_scaled(&mut out, sx as f32, sy as f32);
+        if mark.visible {
+            mark.draw_scaled(&mut out, sx as f32, sy as f32);
+        }
     }
     out
 }

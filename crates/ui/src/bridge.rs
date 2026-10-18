@@ -268,6 +268,10 @@ pub mod qobject {
         #[qinvokable]
         fn delete_selected_mark(self: Pin<&mut Self>);
 
+        /// Show/hide a mark (undoable via UpdateMark).
+        #[qinvokable]
+        fn set_mark_visible(self: Pin<&mut Self>, index: i32, visible: bool);
+
         /// Restyle the selected mark (width / colors / fill), undoable.
         #[qinvokable]
         fn update_mark_style(
@@ -773,14 +777,15 @@ impl Session {
             .map(|(i, m)| {
                 let (x0, y0, x1, y1) = m.rect;
                 format!(
-                    "{{\"i\":{i},\"k\":{},\"x\":{x0:.1},\"y\":{y0:.1},\"w\":{:.1},\"h\":{:.1},\"s\":{},\"c\":\"{}\",\"f\":{},\"fc\":\"{}\"}}",
+                    "{{\"i\":{i},\"k\":{},\"x\":{x0:.1},\"y\":{y0:.1},\"w\":{:.1},\"h\":{:.1},\"s\":{},\"c\":\"{}\",\"f\":{},\"fc\":\"{}\",\"v\":{}}}",
                     kind(m.kind),
                     x1 - x0,
                     y1 - y0,
                     m.stroke,
                     hex(m.color),
                     m.fill,
-                    hex(m.fill_color)
+                    hex(m.fill_color),
+                    m.visible
                 )
             })
             .collect();
@@ -889,6 +894,37 @@ impl qobject::Bridge {
                                 .unwrap_or(0)
                         },
                         self.selected_mark(),
+                    );
+                }
+                // Two ellipses (one drawn each direction) + select the second,
+                // for headless selection-box alignment checks.
+                "add-ellipse" => {
+                    self.as_mut().add_shape_mark(
+                        1, 100.0, 100.0, 260.0, 220.0, 4, &QString::from("#e24b4a"),
+                        false, &QString::from("#e24b4a"),
+                    );
+                    self.as_mut().add_shape_mark(
+                        1, 500.0, 200.0, 380.0, 320.0, 4, &QString::from("#e24b4a"),
+                        false, &QString::from("#e24b4a"),
+                    );
+                    self.as_mut().select_mark(1);
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"marks\",\"count\":2,\"selected\":{}}}",
+                        self.selected_mark(),
+                    );
+                }
+                // Hide the first mark via the panel eye path (headless check).
+                "mark-hide" => {
+                    self.as_mut().set_mark_visible(0, false);
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"mark-hide\",\"count\":{}}}",
+                        {
+                            let guard = self.session.borrow();
+                            guard
+                                .as_ref()
+                                .map(|s| s.doc.marks.len())
+                                .unwrap_or(0)
+                        },
                     );
                 }
                 "marks-undo" => {
@@ -2890,6 +2926,7 @@ session
             color,
             fill: fill && matches!(k, MarkKind::Rect | MarkKind::Ellipse),
             fill_color,
+            visible: true,
         };
         {
             let mut guard = self.session.borrow_mut();
@@ -2949,6 +2986,7 @@ session
             color: Self::parse_color(&color.to_string()),
             fill: false,
             fill_color: [0, 0, 0, 0],
+            visible: true,
         };
         {
             let mut guard = self.session.borrow_mut();
@@ -3054,6 +3092,33 @@ session
             session.dirty = true;
         }
         self.as_mut().set_selected_mark(-1);
+        self.as_mut().refresh_preview();
+    }
+
+    pub fn set_mark_visible(mut self: Pin<&mut Self>, index: i32, visible: bool) {
+        if index < 0 {
+            return;
+        }
+        {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            let Some(mark) = session.doc.marks.get(index as usize).cloned() else {
+                return;
+            };
+            if mark.visible == visible {
+                return;
+            }
+            let mut to = mark.clone();
+            to.visible = visible;
+            session.dirty = true;
+            let _ = session.doc.execute(editcore::EditOp::UpdateMark {
+                index: index as usize,
+                from: mark,
+                to,
+            });
+        }
         self.as_mut().refresh_preview();
     }
 

@@ -188,6 +188,9 @@ pub struct Mark {
     /// Rect/Ellipse only: fill the interior with `fill_color`.
     pub fill: bool,
     pub fill_color: [u8; 4],
+    /// Hidden marks stay in the document (and the panel list) but are not
+    /// rasterized onto the canvas.
+    pub visible: bool,
 }
 
 fn norm_rect(r: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
@@ -1560,7 +1563,9 @@ impl Document {
         }
         // Markup annotations always sit on top of every layer.
         for mark in &self.marks {
-            mark.draw(&mut out);
+            if mark.visible {
+                mark.draw(&mut out);
+            }
         }
         out
     }
@@ -2247,6 +2252,7 @@ mod tests {
             color: [255, 0, 0, 255],
             fill,
             fill_color: [0, 255, 0, 255],
+            visible: true,
         }
     }
 
@@ -2301,6 +2307,24 @@ mod tests {
     }
 
     #[test]
+    fn hidden_mark_is_skipped_and_undo_restores_it() {
+        let mut doc = Document::from_image(blank(32, 32));
+        let mark = rect_mark(false);
+        doc.add_mark(mark.clone()).unwrap();
+        // (3,3) sits in the 2px stroke ring of rect (2,2)-(10,8).
+        assert_eq!(doc.flatten().get_pixel(3, 3).0, [255, 0, 0, 255]);
+
+        let mut hidden = mark.clone();
+        hidden.visible = false;
+        doc.update_mark(0, hidden).unwrap();
+        assert_eq!(doc.flatten().get_pixel(3, 3).0, [0, 0, 0, 255]);
+
+        doc.undo().unwrap();
+        assert_eq!(doc.flatten().get_pixel(3, 3).0, [255, 0, 0, 255]);
+        assert!(doc.marks[0].visible);
+    }
+
+    #[test]
     fn ellipse_mark_paints_ring_and_interior() {
         let mut doc = Document::from_image(blank(32, 32));
         doc.add_mark(Mark {
@@ -2311,6 +2335,7 @@ mod tests {
             color: [255, 0, 0, 255],
             fill: true,
             fill_color: [0, 0, 255, 255],
+            visible: true,
         })
         .unwrap();
         let flat = doc.flatten();
@@ -2331,6 +2356,7 @@ mod tests {
             color: [255, 255, 0, 255],
             fill: false,
             fill_color: [0, 0, 0, 0],
+            visible: true,
         })
         .unwrap();
         let flat = doc.flatten();
@@ -2351,6 +2377,7 @@ mod tests {
             color: [0, 255, 255, 255],
             fill: false,
             fill_color: [0, 0, 0, 0],
+            visible: true,
         })
         .unwrap();
         let flat = doc.flatten();
