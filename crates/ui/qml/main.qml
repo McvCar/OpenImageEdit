@@ -803,6 +803,7 @@ Window {
         property real pendingWhite: 1
         property bool levelsDirty: false
         readonly property bool probeAdjust: Qt.application.arguments.indexOf("--probe-adjust") !== -1
+        readonly property bool probeClipboard: Qt.application.arguments.indexOf("--probe-clipboard") !== -1
         readonly property bool probeRuler: Qt.application.arguments.indexOf("--probe-ruler") !== -1
         readonly property bool probePicker: Qt.application.arguments.indexOf("--probe-picker") !== -1
         // ---- 尺子（测量坐标）----
@@ -6784,6 +6785,52 @@ Window {
             root.markBarVisible = true
             if (!bridge.pickerOpen && bridge.image_width > 0)
                 bridge.picker_begin()
+        }
+    }
+
+    // Probe: --probe-clipboard copies a layer in the FIRST window, opens a
+    // second document window and pastes there (cross-window clipboard check).
+    readonly property url clipboardProbeUrl:
+        "file:///D:/_APP_CODE/ImageEdit/tmp/photo-test2.jpg"
+    Timer {
+        id: clipboardProbeA
+        interval: 1200
+        running: root.probeClipboard && root.primary
+        onTriggered: {
+            if (bridge.selected_layer < 0)
+                bridge.select_layer(0)
+            root.doCopy()
+            console.log("PROBE-A windows layer=" + bridge.selected_layer
+                        + " layers=" + bridge.layer_count
+                        + " status=" + bridge.status)
+            clipboardProbeB.start()
+        }
+    }
+    Timer {
+        id: clipboardProbeB
+        interval: 200
+        onTriggered: root.requestNewWindow("")
+    }
+    Timer {
+        id: clipboardProbeC
+        interval: 1500
+        running: root.probeClipboard && !root.primary
+        onTriggered: {
+            console.log("PROBE-C window2 open, has image=" + (bridge.image_width > 0))
+            bridge.open_file(root.clipboardProbeUrl)
+            clipboardProbeD.start()
+        }
+    }
+    Timer {
+        id: clipboardProbeD
+        interval: 1800
+        onTriggered: {
+            console.log("PROBE-D before paste: layers=" + bridge.layer_count
+                        + " selected=" + bridge.selected_layer)
+            root.doPaste()
+            console.log("PROBE-D after paste: layers=" + bridge.layer_count
+                        + " selected=" + bridge.selected_layer
+                        + " status=" + bridge.status)
         }
     }
 

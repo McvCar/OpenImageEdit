@@ -1,5 +1,7 @@
 /target
 /.tools
+/tools
+/.workbuddy
 /build
 /.qt
 /dist
