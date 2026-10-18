@@ -473,16 +473,24 @@ Window {
                 property real px: 0
                 property real py: 0
 
+                // Deltas MUST be measured in a stable coordinate frame — the
+                // SAME rule as the dot handles above: the strip itself moves
+                // with the box while dragging, so its local mouse coords feed
+                // back into resizeFn and the edge oscillates (visible jitter).
+                // Map to the handles item, which never moves during a drag.
                 onPressed: (mouse) => {
-                    px = mouse.x
-                    py = mouse.y
+                    const p = mapToItem(handles, mouse.x, mouse.y)
+                    px = p.x
+                    py = p.y
                     startRect = Qt.rect(handles.bx, handles.by, handles.bw, handles.bh)
                     handles.engaged = true
                 }
                 onPositionChanged: (mouse) => {
-                    if (pressed && handles.resizeFn)
-                        handles.resizeFn(startRect, role, mouse.x - px, mouse.y - py,
+                    if (pressed && handles.resizeFn) {
+                        const p = mapToItem(handles, mouse.x, mouse.y)
+                        handles.resizeFn(startRect, role, p.x - px, p.y - py,
                                          (mouse.modifiers & Qt.ShiftModifier) !== 0)
+                    }
                 }
                 onReleased: handles.engaged = false
             }
@@ -911,7 +919,7 @@ Window {
                 root.markBarVisible = !root.markBarVisible
                 if (!root.markBarVisible) {
                     root.markTool = "none"
-                    bridge.select_mark(-1)
+                    // 标记选中态保留：标记与图层统一交互，不依赖工具栏。
                     widthPopover.visible = false
                     colorPopover.visible = false
                     mosaicPopover.visible = false
@@ -1023,8 +1031,11 @@ Window {
                 onClicked: {
                     if (bridge.image_width <= 0)
                         return
-                    mosaicPopover.visible = false
+                    // 字体按钮是普通动作按钮：取消其它工具按钮的选中态，
+                    // 避免点了 T 还残留矩形/椭圆等绘制工具。
+                    root.markTool = "none"
                     widthPopover.visible = false
+                    mosaicPopover.visible = false
                     colorPopover.visible = false
                     bridge.add_text_mark(
                         bridge.image_width / 2 - 40, bridge.image_height / 2,
@@ -2071,6 +2082,8 @@ Window {
                 onPressed: (mouse) => {
                     const hit = root.selExists ? null : topLayerAt(mouse.x, mouse.y)
                     if (hit !== null) {
+                        if (bridge.selected_mark >= 0)
+                            bridge.select_mark(-1)   // 标记/图层选中互斥
                         bridge.select_layer(hit.i)
                         pickDrag = true
                         pickMoved = false
@@ -2160,9 +2173,12 @@ Window {
             MouseArea {
                 id: markMa
                 anchors.fill: parent
-                // 工具栏开着即可选中/移动/双击编辑已有标记；绘制新标记
-                // 需要先选中一个绘制工具（markTool）。
-                enabled: root.markBarVisible && bridge.image_width > 0
+                // 标记与图层统一交互：标记元素随时可选中/拖动/缩放/双击编辑
+                // （不再要求打开标记工具栏）；绘制新元素仍需 markTool 激活，
+                // 且只发生在空白处——按在已有标记上 = 只拖拽/调整。
+                // 与图层的分工：未命中标记时按下事件放行（accepted=false）
+                // 给下层的 selDragMouse（图层拾取/移动/框选）。
+                enabled: bridge.image_width > 0
                 hoverEnabled: true
                 cursorShape: undefined
                 acceptedButtons: Qt.LeftButton
@@ -2283,38 +2299,44 @@ Window {
                         textPopup.close(true)
                         return
                     }
-                    if (root.markTool === "none") {
-                        // 选择模式：手柄缩放 → 标记移动 → 点空白取消选中。
-                        const h = handleAt(mouse.x, mouse.y)
-                        if (h !== "") {
-                            resizeRole = h
-                            if (beginGesture(3, mouse))
-                                return
-                        }
-                        const hit = markAt(mouse.x, mouse.y)
-                        if (hit >= 0) {
-                            bridge.select_mark(hit)
-                            if (beginGesture(2, mouse))
-                                return
-                        }
-                        if (bridge.selected_mark >= 0)
-                            bridge.select_mark(-1)
+                    // 1) 选中标记的缩放手柄（任何工具下都优先）。
+                    const h = handleAt(mouse.x, mouse.y)
+                    if (h !== "") {
+                        resizeRole = h
+                        if (beginGesture(3, mouse))
+                            return
+                    }
+                    // 2) 命中已有标记 → 选中并拖动。绘制工具激活时也是如此：
+                    //    点中标记元素只允许拖拽/调整，不产生新元素。
+                    const hit = markAt(mouse.x, mouse.y)
+                    if (hit >= 0) {
+                        if (bridge.selected_layer >= 0)
+                            bridge.select_layer(-1)   // 标记/图层选中互斥
+                        bridge.select_mark(hit)
+                        if (beginGesture(2, mouse))
+                            return
+                    }
+                    // 3) 绘制工具激活 + 空白处 → 绘制新元素。起点钳制到图片
+                    //    范围——瞄准图片 (0,0) 时鼠标极易落在 pad 区，不钳制
+                    //    会产生负坐标标记（渲染被裁剪成角落小残块）。
+                    if (root.markTool !== "none") {
+                        mode = 1
+                        const p = clampCanvas(mouse.x, mouse.y)
+                        startX = p[0]
+                        startY = p[1]
+                        curX = p[0]
+                        curY = p[1]
+                        brushPts = []
+                        if (root.markTool === "brush")
+                            brushPts.push([imgX(startX), imgY(startY)])
+                        markPreview.requestPaint()
                         return
                     }
-                    // 绘制工具激活：总是开始新绘制（手柄/移动属于选择模式）。
-                    // 起点钳制到图片范围——瞄准图片 (0,0) 时鼠标极易落在
-                    // 左侧 pad 区，不钳制会产生负坐标标记（渲染被裁剪成
-                    // 角落小残块，且选中框伸进 pad 区）。
-                    mode = 1
-                    const p = clampCanvas(mouse.x, mouse.y)
-                    startX = p[0]
-                    startY = p[1]
-                    curX = p[0]
-                    curY = p[1]
-                    brushPts = []
-                    if (root.markTool === "brush")
-                        brushPts.push([imgX(startX), imgY(startY)])
-                    markPreview.requestPaint()
+                    // 4) 空白处 + 无绘制工具 → 取消标记选中，事件下放给下层
+                    //    的图层交互（选中图层 / 移动 / 框选 / 点空取消）。
+                    if (bridge.selected_mark >= 0)
+                        bridge.select_mark(-1)
+                    mouse.accepted = false
                 }
 
                 // 双击文本标记 → 就地编辑内容。
@@ -2560,10 +2582,11 @@ Window {
                 }
             }
 
-            // 选中标记的边框 + 8 向手柄（display 坐标）。
+            // 选中标记的边框 + 8 向手柄（display 坐标）。标记随时可选中，
+            // 不依赖标记工具栏是否打开。
             DashedRect {
                 id: markSelViz
-                visible: bridge.selected_mark >= 0 && root.markBarVisible
+                visible: bridge.selected_mark >= 0
                          && markMa.mode === 0
                 // canvasSurface 坐标：画布原点 = (pad, pad)。不能用
                 // previewImage.x/y（那是 Flickable 内容坐标，图片居中时
@@ -2583,7 +2606,7 @@ Window {
             }
 
             Repeater {
-                model: bridge.selected_mark >= 0 && root.markBarVisible
+                model: bridge.selected_mark >= 0
                        && markMa.mode === 0 ? 8 : 0
 
                 delegate: Rectangle {
@@ -3987,8 +4010,8 @@ Window {
                 return Qt.SizeAllCursor
             return Qt.CrossCursor
         }
-        // 工具栏开着但未选绘制工具：悬停标记仍可移动/编辑。
-        if (root.markBarVisible && markMa.markAt(x, y) >= 0)
+        // 未选绘制工具时：悬停标记仍可移动/编辑（标记不依赖工具栏）。
+        if (markMa.markAt(x, y) >= 0)
             return Qt.SizeAllCursor
         const ix = x - view.pad
         const iy = y - view.pad

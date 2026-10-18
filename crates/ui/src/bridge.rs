@@ -2652,10 +2652,22 @@ session
             return;
         }
         {
+            let src = self.scale_start.borrow();
+            let Some((src_image, _)) = src.as_ref() else {
+                return;
+            };
             let mut guard = self.session.borrow_mut();
             if let Some(session) = guard.as_mut() {
-                // Live preview: fast (Triangle) resample, no history entry.
-                let _ = session.doc.scale_layer_live(ix, Size::new(w as u32, h as u32), (ox, oy));
+                // Live preview: fast (Triangle) resample from the drag-start
+                // snapshot each tick (never from the already-rescaled layer —
+                // progressive resampling degraded quality and made each tick
+                // oscillate in cost), no history entry.
+                let _ = session.doc.scale_layer_live(
+                    ix,
+                    src_image,
+                    Size::new(w as u32, h as u32),
+                    (ox, oy),
+                );
             }
         }
         self.refresh_preview();
