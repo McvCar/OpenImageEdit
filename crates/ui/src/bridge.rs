@@ -32,7 +32,6 @@ const MAX_DISPLAY_EDGE: u32 = 32767;
 const MIN_ZOOM: f64 = 0.02;
 const MAX_ZOOM: f64 = 16.0;
 const ZOOM_STEP: f64 = 1.25;
-const SAVE_QUALITY: u8 = 92;
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -71,6 +70,8 @@ pub mod qobject {
         #[qproperty(QString, checker_light, cxx_name = "checkerLight")]
         #[qproperty(QString, checker_dark, cxx_name = "checkerDark")]
         #[qproperty(bool, open_in_new_window, cxx_name = "openInNewWindow")]
+        #[qproperty(i32, save_quality, cxx_name = "saveQuality")]
+        #[qproperty(QString, source_path, cxx_name = "sourcePath")]
         #[namespace = "imageedit"]
         type Bridge = super::BridgeRust;
 
@@ -105,6 +106,17 @@ pub mod qobject {
 
         #[qinvokable]
         fn update_open_in_new_window(self: Pin<&mut Self>, value: bool);
+
+        /// Save quality 1-100 (settings panel slider). Lossy formats encode
+        /// with it directly; lossless PNG maps it to compression effort.
+        #[qinvokable]
+        fn update_save_quality(self: Pin<&mut Self>, value: i32);
+
+        /// Export a single layer's pixels as a PNG next to the source file,
+        /// named `layout_<编号>.png` (编号 = numeric layer name or doc
+        /// position). Returns the written path for logging.
+        #[qinvokable]
+        fn export_layer_png(self: Pin<&mut Self>, index: i32);
 
         #[qinvokable]
         fn set_viewport(self: Pin<&mut Self>, width: i32, height: i32);
@@ -199,7 +211,6 @@ pub mod qobject {
         fn set_base_locked(self: Pin<&mut Self>, locked: bool);
 
         #[qinvokable]
-        #[qinvokable]
         fn delete_base_layer(self: Pin<&mut Self>);
 
         #[qinvokable]
@@ -276,6 +287,10 @@ struct AppConfig {
     checker_light: String,
     checker_dark: String,
     open_in_new_window: bool,
+    /// Save quality (1-100). Lossy formats (JPEG/WebP) use it directly;
+    /// lossless PNG maps it to the compression effort (< 50 = max
+    /// compression / smallest file).
+    save_quality: u8,
 }
 
 impl Default for AppConfig {
@@ -284,6 +299,7 @@ impl Default for AppConfig {
             checker_light: "#ffffff".to_string(),
             checker_dark: "#cccccc".to_string(),
             open_in_new_window: false,
+            save_quality: 92,
         }
     }
 }
@@ -309,6 +325,11 @@ impl AppConfig {
                         }
                         "checker_dark" if !value.is_empty() => cfg.checker_dark = value.to_string(),
                         "open_in_new_window" => cfg.open_in_new_window = value == "true",
+                        "save_quality" => {
+                            if let Ok(q) = value.parse::<u8>() {
+                                cfg.save_quality = q.clamp(1, 100);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -323,8 +344,8 @@ impl AppConfig {
                 let _ = std::fs::create_dir_all(dir);
             }
             let text = format!(
-                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\n",
-                self.checker_light, self.checker_dark, self.open_in_new_window
+                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\n",
+                self.checker_light, self.checker_dark, self.open_in_new_window, self.save_quality
             );
             let _ = std::fs::write(path, text);
         }
@@ -373,6 +394,11 @@ pub struct BridgeRust {
     checker_light: QString,
     checker_dark: QString,
     open_in_new_window: bool,
+    /// Save quality 1-100 (mirrors the settings.ini value for QML).
+    save_quality: i32,
+    /// Full path of the loaded file ("" when no file), for the clickable
+    /// status-bar path button.
+    source_path: QString,
     paste_counter: RefCell<u32>,
     /// Opacity of the selected layer before the current live slider drag, so
     /// the committed history op can record the true pre-drag value.
@@ -416,6 +442,8 @@ impl Default for BridgeRust {
             checker_light: QString::from(cfg.checker_light.as_str()),
             checker_dark: QString::from(cfg.checker_dark.as_str()),
             open_in_new_window: cfg.open_in_new_window,
+            save_quality: cfg.save_quality as i32,
+            source_path: QString::default(),
             paste_counter: RefCell::new(0),
             opacity_live: RefCell::new(None),
             drag_start_offset: RefCell::new(None),
@@ -445,6 +473,9 @@ struct Session {
     dirty: bool,
     /// UI lock for the base row (blocks delete). Plain flag, not undoable.
     base_locked: bool,
+    /// Save quality snapshot from AppConfig at session creation (updated
+    /// live by `update_save_quality`).
+    save_quality: u8,
 }
 
 struct Rendered {
@@ -516,7 +547,7 @@ fn extension_for(format: Format) -> &'static str {
 }
 
 impl Session {
-    fn open(path: &Path, viewport: Size) -> Result<(Self, i32), String> {
+    fn open(path: &Path, viewport: Size, save_quality: u8) -> Result<(Self, i32), String> {
         let t0 = Instant::now();
         let decoded = decode_path(path, DecodeOptions::default()).map_err(|e| e.to_string())?;
         let doc = Document::from_image(decoded.image);
@@ -532,6 +563,7 @@ impl Session {
                 render_count: 0,
                 dirty: false,
                 base_locked: true,
+                save_quality,
             },
             ms,
         ))
@@ -608,7 +640,8 @@ impl Session {
     }
 
     fn write_to(&self, path: &Path, format: Format) -> Result<(), String> {
-        let bytes = encode(&self.doc.flatten(), format, SAVE_QUALITY).map_err(|e| e.to_string())?;
+        let bytes = encode(&self.doc.flatten(), format, self.save_quality)
+            .map_err(|e| e.to_string())?;
         std::fs::write(path, bytes).map_err(|e| e.to_string())
     }
 
@@ -1052,6 +1085,7 @@ println!(
             checker_light: self.checker_light().to_string(),
             checker_dark: self.checker_dark().to_string(),
             open_in_new_window: *self.open_in_new_window(),
+            save_quality: (*self.save_quality()).clamp(1, 100) as u8,
         }
         .save();
     }
@@ -1080,6 +1114,84 @@ println!(
         self.persist_config();
     }
 
+    pub fn update_save_quality(mut self: Pin<&mut Self>, value: i32) {
+        let q = value.clamp(1, 100);
+        if *self.save_quality() == q {
+            return;
+        }
+        self.as_mut().set_save_quality(q);
+        self.persist_config();
+        // Apply to the live document immediately (no reload needed).
+        if let Some(s) = self.session.borrow_mut().as_mut() {
+            s.save_quality = q as u8;
+        }
+    }
+
+    /// Export a single layer's pixels as `layout_<编号>.png` next to the
+    /// source file. 编号 = the layer's numeric auto-name ("1", "2", ...) or
+    /// its 1-based stack position when the name isn't numeric. Existing
+    /// files are never overwritten — `_2`, `_3`... suffixes are appended.
+    pub fn export_layer_png(mut self: Pin<&mut Self>, index: i32) {
+        let result: Result<PathBuf, String> = {
+            let guard = self.session.borrow();
+            match guard.as_ref() {
+                None => Err("没有可导出的图层".into()),
+                Some(session) => {
+                    if index < 0 || index as usize >= session.doc.layers.len() {
+                        Err("图层不存在".into())
+                    } else {
+                        let layer = &session.doc.layers[index as usize];
+                        let dir = match &session.source {
+                            Some(src) => match src.parent() {
+                                Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+                                _ => std::path::PathBuf::from("."),
+                            },
+                            // No source file: export into the default save dir.
+                            None => match session.default_save_path().0.parent() {
+                                Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+                                _ => std::path::PathBuf::from("."),
+                            },
+                        };
+                        // Number: numeric name wins, else stack position (1-based).
+                        let number = layer
+                            .name
+                            .parse::<u32>()
+                            .ok()
+                            .unwrap_or((index + 1) as u32);
+                        let mut path = dir.join(format!("layout_{}.png", number));
+                        let mut suffix = 2u32;
+                        while path.exists() {
+                            path = dir.join(format!("layout_{}_{}.png", number, suffix));
+                            suffix += 1;
+                        }
+                        let write_result = encode(&layer.image, Format::Png, session.save_quality)
+                            .map_err(|e| e.to_string())
+                            .and_then(|bytes| {
+                                std::fs::write(&path, bytes).map_err(|e| e.to_string())
+                            })
+                            .map(|()| path);
+                        write_result
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(path) => {
+                self.as_mut().set_status(QString::from(format!(
+                    "已导出图层：{}",
+                    path.to_string_lossy()
+                )));
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"layer-exported\",\"path\":\"{}\"}}",
+                    path.to_string_lossy().replace('\\', "/")
+                );
+            }
+            Err(message) => {
+                self.as_mut().set_status(QString::from(message.as_str()));
+            }
+        }
+    }
+
     /// Refresh the status-bar file info from the session's source path.
     fn update_file_info(mut self: Pin<&mut Self>) {
         let info = self
@@ -1095,17 +1207,19 @@ println!(
                 let size = std::fs::metadata(&path)
                     .map(|m| human_size(m.len()))
                     .unwrap_or_default();
-                (name, size)
+                (name, size, path.to_string_lossy().to_string())
             });
         match info {
-            Some((name, size)) => {
+            Some((name, size, full)) => {
                 self.as_mut().set_file_name(QString::from(name.as_str()));
                 self.as_mut()
                     .set_file_size_str(QString::from(size.as_str()));
+                self.as_mut().set_source_path(QString::from(full.as_str()));
             }
             None => {
                 self.as_mut().set_file_name(QString::from(""));
                 self.as_mut().set_file_size_str(QString::from(""));
+                self.as_mut().set_source_path(QString::from(""));
             }
         }
     }
@@ -2501,7 +2615,7 @@ session
             "{{\"phase\":\"ui\",\"event\":\"load\",\"file\":\"{}\"}}",
             path.to_string_lossy().replace('\\', "/")
         );
-        match Session::open(path, viewport) {
+        match Session::open(path, viewport, (*self.save_quality()).clamp(1, 100) as u8) {
             Ok((session, ms)) => {
                 self.as_mut().set_load_failed(false);
                 self.as_mut().set_decode_ms(ms);

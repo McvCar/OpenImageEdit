@@ -157,7 +157,27 @@ pub fn encode(
                 image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
             encoder.encode_image(&rgb)?;
         }
-        Format::Png => image.write_to(&mut out, Format::Png)?,
+        // Lossless: `quality` maps to compression effort. >= 50 keeps the
+        // default compression (unchanged historical behavior); < 50 spends
+        // more time on `Best` compression to produce the smallest file.
+        Format::Png => {
+            use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+            use image::{ExtendedColorType, ImageEncoder};
+            let compression = if quality >= 50 {
+                CompressionType::Default
+            } else {
+                CompressionType::Best
+            };
+            let encoder = PngEncoder::new_with_quality(&mut out, compression, FilterType::Adaptive);
+            encoder.write_image(
+                image.as_raw(),
+                image.width(),
+                image.height(),
+                ExtendedColorType::Rgba8,
+            )?;
+        }
+        // image 0.25's bundled WebP encoder is lossless-only, so `quality`
+        // has no effect here (same for TIFF/BMP/GIF).
         Format::WebP => image.write_to(&mut out, Format::WebP)?,
         Format::Tiff => image.write_to(&mut out, Format::Tiff)?,
         Format::Bmp => image.write_to(&mut out, Format::Bmp)?,
@@ -221,6 +241,18 @@ mod tests {
     #[test]
     fn decodes_gif() {
         roundtrip(Format::Gif);
+    }
+
+    #[test]
+    fn png_low_quality_is_smaller_and_still_lossless() {
+        let src = gradient(97, 61);
+        let hi = encode(&src, Format::Png, 90).unwrap();
+        let lo = encode(&src, Format::Png, 30).unwrap();
+        // Best-compression tier must never grow the file.
+        assert!(lo.len() <= hi.len());
+        // Pixels are untouched either way (PNG stays lossless).
+        let decoded = decode_bytes(&lo, DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.image.as_raw(), src.as_raw());
     }
 
     #[test]

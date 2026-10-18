@@ -1469,19 +1469,95 @@ Window {
             font.pixelSize: 12
         }
 
-        Text {
+        // File name / resolution / size. When a real file is loaded this is
+        // a button: click copies the full path (hidden TextEdit.copy()
+        // helper), hover shows a hint tooltip.
+        Item {
             id: fileInfo
             anchors.verticalCenter: parent.verticalCenter
             anchors.left: parent.left
             anchors.leftMargin: 10
+            height: parent.height
             visible: bridge.fileName.length > 0
-            text: bridge.fileName
-                  + (bridge.image_width > 0
-                     ? "   ·   " + bridge.image_width + "×" + bridge.image_height
-                     : "")
-                  + (bridge.fileSizeStr.length > 0 ? "   ·   " + bridge.fileSizeStr : "")
-            color: "#9aa3b2"
-            font.pixelSize: 12
+            width: fileInfoText.implicitWidth
+            readonly property bool hasPath: bridge.sourcePath.length > 0
+            property bool hovering: false
+            property bool copied: false
+
+            Text {
+                id: fileInfoText
+                anchors.verticalCenter: parent.verticalCenter
+                text: fileInfo.copied
+                      ? "已复制完整路径 ✓"
+                      : bridge.fileName
+                        + (bridge.image_width > 0
+                           ? "   ·   " + bridge.image_width + "×" + bridge.image_height
+                           : "")
+                        + (bridge.fileSizeStr.length > 0 ? "   ·   " + bridge.fileSizeStr : "")
+                color: fileInfo.copied ? "#7fc3ff"
+                       : (fileInfo.hasPath && fileInfo.hovering ? "#c9dcf5" : "#9aa3b2")
+                font.pixelSize: 12
+                font.underline: fileInfo.hasPath && fileInfo.hovering && !fileInfo.copied
+            }
+
+            // Hand-rolled tooltip (no QtQuick.Controls dependency).
+            Rectangle {
+                id: fileInfoTip
+                visible: false
+                z: 1000
+                x: 0
+                y: parent.height + 4
+                width: fileInfoTipText.implicitWidth + 16
+                height: 22
+                radius: 4
+                color: "#111214"
+                border.color: "#3c4043"
+                Text {
+                    id: fileInfoTipText
+                    anchors.centerIn: parent
+                    text: "点击复制完整路径"
+                    color: "#d7dade"
+                    font.pixelSize: 11
+                }
+            }
+            Timer {
+                id: fileInfoTipDelay
+                interval: 500
+                onTriggered: fileInfoTip.visible = fileInfo.hasPath && fileInfo.hovering
+            }
+
+            MouseArea {
+                id: fileInfoMa
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: fileInfo.hasPath ? Qt.PointingHandCursor : Qt.ArrowCursor
+                onContainsMouseChanged: {
+                    if (containsMouse) {
+                        fileInfo.hovering = true
+                        if (fileInfo.hasPath && !fileInfo.copied)
+                            fileInfoTipDelay.restart()
+                        else
+                            fileInfoTip.visible = false
+                    } else {
+                        fileInfo.hovering = false
+                        fileInfoTip.visible = false
+                        fileInfoTipDelay.stop()
+                    }
+                }
+                onClicked: {
+                    if (!fileInfo.hasPath)
+                        return
+                    copyToClipboard(bridge.sourcePath)
+                    fileInfo.copied = true
+                    fileInfoTip.visible = false
+                    fileInfoCopiedReset.restart()
+                }
+            }
+            Timer {
+                id: fileInfoCopiedReset
+                interval: 2000
+                onTriggered: fileInfo.copied = false
+            }
         }
 
         Text {
@@ -1612,6 +1688,7 @@ Window {
                         anchors.fill: parent
                         hoverEnabled: true
                         enabled: layerRow.row !== null
+                        acceptedButtons: Qt.LeftButton | Qt.RightButton
                         cursorShape: layerRow.isBase ? Qt.ArrowCursor : Qt.PointingHandCursor
                         property bool reordering: false
                         property int fromPos: -1
@@ -1619,6 +1696,14 @@ Window {
                         property real pressY: 0
 
                         onPressed: (mouse) => {
+                            if (mouse.button === Qt.RightButton) {
+                                if (!layerRow.isBase && layerRow.row)
+                                    openLayerContext(layerRow.row.i,
+                                                     layerRow.row.l === true,
+                                                     layerRow.mapToItem(layerPanel,
+                                                                        mouse.x, mouse.y))
+                                return
+                            }
                             pressY = mouse.y
                             reordering = false
                         }
@@ -1643,7 +1728,9 @@ Window {
                             dropIndicator.y = t * pitch - 2
                             dropIndicator.visible = t !== fromPos
                         }
-                        onReleased: {
+                        onReleased: (mouse) => {
+                            if (mouse.button === Qt.RightButton)
+                                return
                             if (reordering && toPos >= 0 && toPos !== fromPos) {
                                 const docLen = nonBaseRowCount()
                                 // Display position p ↔ doc index docLen-1-p.
@@ -1930,6 +2017,63 @@ Window {
             // Reorder = drag rows; delete = Delete/Backspace on the selected
             // row; visibility = the eye icon (per §4.8 of the UX plan).
         }
+
+        // Click-away catcher for the layer row context menu.
+        MouseArea {
+            z: 99
+            anchors.fill: parent
+            visible: layerContext.visible
+            enabled: layerContext.visible
+            onPressed: (mouse) => {
+                layerContext.visible = false
+                mouse.accepted = true
+            }
+        }
+
+        // Right-click menu on a layer row: delete / export PNG.
+        Rectangle {
+            id: layerContext
+            visible: false
+            z: 100
+            width: 232
+            height: ctxCol.height + 10
+            color: "#2a2d31"
+            border.color: "#3c4043"
+            radius: 6
+            property int targetIndex: -1
+            property bool targetLocked: false
+
+            Column {
+                id: ctxCol
+                anchors.top: parent.top
+                anchors.topMargin: 5
+                anchors.horizontalCenter: parent.horizontalCenter
+                spacing: 0
+
+                MenuRow {
+                    label: "删除图层"
+                    active: layerContext.targetIndex >= 0 && !layerContext.targetLocked
+                    onActivated: {
+                        layerContext.visible = false
+                        const i = layerContext.targetIndex
+                        if (i >= 0) {
+                            bridge.select_layer(i)
+                            bridge.delete_selected_layer()
+                        }
+                    }
+                }
+                MenuRow {
+                    label: "导出 PNG"
+                    active: layerContext.targetIndex >= 0
+                    onActivated: {
+                        layerContext.visible = false
+                        const i = layerContext.targetIndex
+                        if (i >= 0)
+                            bridge.export_layer_png(i)
+                    }
+                }
+            }
+        }
     }
 
     Item {
@@ -1941,6 +2085,9 @@ Window {
         // Canvas-only mode: change the canvas resolution WITHOUT resampling
         // the image (content is re-anchored to the new center).
         property bool canvasOnly: false
+        // Percent mode: scale by a percentage of the current resolution
+        // instead of typing absolute pixel dimensions.
+        property bool percentMode: false
         // Clear text-field focus on close, otherwise the hidden TextInput
         // keeps consuming Ctrl+Z / Ctrl+Y as text undo and the document
         // undo/redo shortcuts appear dead (bug: dead after resize dialog).
@@ -1996,8 +2143,25 @@ Window {
                 }
                 Rectangle { width: parent.width; height: 1; color: "#3c4043" }
 
+                // Mode switch: absolute pixels vs percentage of current size.
                 Row {
                     spacing: 8
+
+                    ToolButton {
+                        label: "按分辨率"
+                        selected: !resizeOverlay.percentMode
+                        onClicked: resizeOverlay.percentMode = false
+                    }
+                    ToolButton {
+                        label: "按百分比"
+                        selected: resizeOverlay.percentMode
+                        onClicked: resizeOverlay.percentMode = true
+                    }
+                }
+
+                Row {
+                    spacing: 8
+                    visible: !resizeOverlay.percentMode
 
                     Text {
                         text: "宽"
@@ -2085,9 +2249,72 @@ Window {
                     }
                 }
 
+                // Percent input: one field, width/height scale together.
+                Row {
+                    spacing: 8
+                    visible: resizeOverlay.percentMode
+
+                    Text {
+                        text: "缩放"
+                        color: "#b8bcc0"
+                        font.pixelSize: 12
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Item {
+                        width: 64
+                        height: 26
+                        anchors.verticalCenter: parent.verticalCenter
+
+                        Rectangle {
+                            anchors.fill: parent
+                            color: "#1b1c1e"
+                            border.color: resizePct.activeFocus ? "#6aa9ff" : "#3c4043"
+                            border.width: resizePct.activeFocus ? 2 : 1
+                            radius: 3
+                        }
+
+                        TextInput {
+                            id: resizePct
+                            anchors.fill: parent
+                            anchors.margins: 5
+                            text: "100"
+                            font.pixelSize: 13
+                            color: "#e9eaec"
+                            verticalAlignment: TextInput.AlignVCenter
+                            validator: IntValidator { bottom: 1; top: 1000 }
+                            selectByMouse: true
+                            onActiveFocusChanged: if (activeFocus) selectAll()
+                            onAccepted: commitResize()
+                        }
+                    }
+
+                    Text {
+                        text: "%"
+                        color: "#6b7076"
+                        font.pixelSize: 11
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Text {
+                        text: {
+                            const p = parseInt(resizePct.text)
+                            if (isNaN(p) || p < 1)
+                                return "目标：—"
+                            const w = Math.max(1, Math.round(bridge.image_width * p / 100))
+                            const h = Math.max(1, Math.round(bridge.image_height * p / 100))
+                            return "目标：" + w + " × " + h
+                        }
+                        color: "#8f96a3"
+                        font.pixelSize: 11
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                }
+
                 CheckRow {
                     id: ratioCheck
                     label: "保持宽高比"
+                    visible: !resizeOverlay.percentMode
                     checked: resizeOverlay.keepRatio
                     active: !resizeOverlay.canvasOnly
                     onToggled: resizeOverlay.keepRatio = !resizeOverlay.keepRatio
@@ -2446,15 +2673,25 @@ Window {
     function openResizeDialog() {
         resizeW.text = String(bridge.image_width)
         resizeH.text = String(bridge.image_height)
+        resizePct.text = "100"
         resizeOverlay.keepRatio = true
         resizeOverlay.canvasOnly = false
+        resizeOverlay.percentMode = false
         resizeOverlay.visible = true
     }
 
     function commitResize() {
         let w = parseInt(resizeW.text)
         let h = parseInt(resizeH.text)
-        if (resizeOverlay.keepRatio && !resizeOverlay.canvasOnly) {
+        if (resizeOverlay.percentMode) {
+            // Uniform scale: width and height move together, keepRatio has
+            // no meaning here.
+            const p = parseInt(resizePct.text)
+            if (isNaN(p) || p < 1)
+                return
+            w = Math.max(1, Math.round(bridge.image_width * p / 100))
+            h = Math.max(1, Math.round(bridge.image_height * p / 100))
+        } else if (resizeOverlay.keepRatio && !resizeOverlay.canvasOnly) {
             if (isNaN(h))
                 h = parseInt(linkedHeight())
             if (isNaN(w))
@@ -2470,6 +2707,7 @@ Window {
     }
 
     function onEscape() {
+        if (layerContext.visible) { layerContext.visible = false; return }
         if (root.renamingIndex >= 0) { root.renamingIndex = -1; return }
         if (confirmOverlay.visible) { confirmCancel(); return }
         if (resizeOverlay.visible) { resizeOverlay.visible = false; return }
@@ -2513,6 +2751,33 @@ Window {
         if (bridge.selected_layer < 0)
             return
         bridge.translate_selected(dx, dy)
+    }
+
+    // Hidden helper: TextEdit.copy() puts the (selected) text on the system
+    // clipboard without needing a C++ clipboard bridge.
+    TextEdit {
+        id: clipHelper
+        visible: false
+        width: 0
+        height: 0
+    }
+
+    function copyToClipboard(text) {
+        clipHelper.text = text
+        clipHelper.selectAll()
+        clipHelper.copy()
+        clipHelper.text = ""
+    }
+
+    // Open the right-click layer menu at `panelPos` (layerPanel coords),
+    // clamped so it never spills outside the panel.
+    function openLayerContext(index, locked, panelPos) {
+        layerContext.targetIndex = index
+        layerContext.targetLocked = locked
+        layerContext.x = Math.max(0, Math.min(panelPos.x, layerPanel.width - layerContext.width))
+        layerContext.y = Math.max(0, Math.min(panelPos.y,
+                                              layerPanel.height - layerContext.height - 8))
+        layerContext.visible = true
     }
 
     function parseLayers(s) {
@@ -2898,7 +3163,83 @@ Window {
 
                 Rectangle { width: parent.width; height: 1; color: "#3c4043" }
 
-                // ---- 2. open behavior ----
+                // ---- 2. save quality ----
+                Text {
+                    text: "保存质量"
+                    color: "#b8bcc0"
+                    font.pixelSize: 12
+                }
+                Row {
+                    spacing: 8
+
+                    ToolButton {
+                        label: "−"
+                        active: bridge.saveQuality > 1
+                        onClicked: {
+                            bridge.update_save_quality(bridge.saveQuality - 5)
+                            qualityInput.text = bridge.saveQuality
+                        }
+                    }
+
+                    Item {
+                        width: 56
+                        height: 26
+                        anchors.verticalCenter: parent.verticalCenter
+
+                        Rectangle {
+                            anchors.fill: parent
+                            color: "#1b1c1e"
+                            border.color: qualityInput.activeFocus ? "#6aa9ff" : "#3c4043"
+                            border.width: qualityInput.activeFocus ? 2 : 1
+                            radius: 3
+                        }
+
+                        TextInput {
+                            id: qualityInput
+                            anchors.fill: parent
+                            anchors.margins: 5
+                            text: bridge.saveQuality
+                            font.pixelSize: 13
+                            color: "#e9eaec"
+                            verticalAlignment: TextInput.AlignVCenter
+                            validator: IntValidator { bottom: 1; top: 100 }
+                            selectByMouse: true
+                            onActiveFocusChanged: if (activeFocus) selectAll()
+                            onEditingFinished: {
+                                const v = parseInt(text)
+                                if (!isNaN(v))
+                                    bridge.update_save_quality(v)
+                                text = bridge.saveQuality
+                            }
+                        }
+                    }
+
+                    ToolButton {
+                        label: "+"
+                        active: bridge.saveQuality < 100
+                        onClicked: {
+                            bridge.update_save_quality(bridge.saveQuality + 5)
+                            qualityInput.text = bridge.saveQuality
+                        }
+                    }
+
+                    Text {
+                        text: "（1-100）"
+                        color: "#6b7076"
+                        font.pixelSize: 11
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                }
+                Text {
+                    width: parent.width
+                    text: "控制「另存副本 / 另存为 / 导出」的质量：\n· JPG：数值越低文件越小（有损压缩）\n· PNG 无损：质量 < 50 时改用最大压缩，文件最小、保存稍慢"
+                    color: "#8f96a3"
+                    font.pixelSize: 11
+                }
+
+                Rectangle { width: parent.width; height: 1; color: "#3c4043" }
+
+                // ---- 3. open behavior ----
                 Text {
                     text: "打开文件时"
                     color: "#b8bcc0"
@@ -2950,7 +3291,7 @@ Window {
 
                 Rectangle { width: parent.width; height: 1; color: "#3c4043" }
 
-                // ---- 3. default viewer ----
+                // ---- 4. default viewer ----
                 Text {
                     text: "默认图片查看器"
                     color: "#b8bcc0"
