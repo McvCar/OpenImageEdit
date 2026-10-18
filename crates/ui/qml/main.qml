@@ -572,6 +572,21 @@ Window {
         property real scaleH: 0
         property int renamingIndex: -1
         readonly property var layerList: parseLayers(bridge.layers_json)
+        // The layer PANEL rebuilds its Repeater whenever the model array is
+        // replaced. Bounds (x/y/w/h) change on every live-drag tick, which
+        // would rebuild the whole list ~30x/s; the panel only shows
+        // identity/flags, so rebind it only when those actually change.
+        // Canvas outlines etc. keep using layerList (live bounds).
+        readonly property string layerPanelSig: {
+            let s = ""
+            for (var i = 0; i < layerList.length; i++) {
+                const l = layerList[i]
+                s += l.i + ":" + l.n + ":" + l.v + ":" + l.l + ":" + Math.round(l.o) + ";"
+            }
+            return s
+        }
+        property var layerPanelList: layerList
+        onLayerPanelSigChanged: layerPanelList = layerList
         readonly property var selLayer: findSelLayer()
         readonly property var selLayerBox: findLayerBox()
         // ---- 标记工具栏（markup toolbar）----
@@ -974,27 +989,27 @@ Window {
 
             IconButton {
                 glyph: "▭"
-                tip: "矩形标记"
+                tip: "矩形标记（再点一次取消）"
                 selected: root.markTool === "rect"
-                onClicked: root.markTool = "rect"
+                onClicked: root.setMarkTool("rect")
             }
             IconButton {
                 glyph: "◯"
-                tip: "椭圆标记"
+                tip: "椭圆标记（再点一次取消）"
                 selected: root.markTool === "ellipse"
-                onClicked: root.markTool = "ellipse"
+                onClicked: root.setMarkTool("ellipse")
             }
             IconButton {
                 glyph: "↗"
-                tip: "箭头标记"
+                tip: "箭头标记（再点一次取消）"
                 selected: root.markTool === "arrow"
-                onClicked: root.markTool = "arrow"
+                onClicked: root.setMarkTool("arrow")
             }
             IconButton {
                 glyph: "✏"
-                tip: "自由画笔"
+                tip: "自由画笔（再点一次取消）"
                 selected: root.markTool === "brush"
-                onClicked: root.markTool = "brush"
+                onClicked: root.setMarkTool("brush")
             }
             IconButton {
                 glyph: "T"
@@ -1015,9 +1030,9 @@ Window {
                 }
             }
             IconButton {
-                tip: "马赛克（划选区打码）"
+                tip: "马赛克（划选区打码，再点一次取消）"
                 selected: root.markTool === "mosaic"
-                onClicked: root.markTool = "mosaic"
+                onClicked: root.setMarkTool("mosaic")
                 // 像素块图标：3x3 深浅交错的小方块，比 ▦ 更直观。
                 Grid {
                     anchors.centerIn: parent
@@ -3024,7 +3039,10 @@ Window {
 
                 Repeater {
                     id: layerRepeater
-                    model: root.layerList
+                    // Panel list updates only when layer identity/flags
+                    // change (not on every live-drag bounds tick) — see
+                    // layerPanelSig on the root item.
+                    model: root.layerPanelList
 
                 delegate: Rectangle {
                     id: layerRow
@@ -4262,6 +4280,15 @@ Window {
             Math.round(root.selW * scale), Math.round(root.selH * scale))
         root.selW = 0
         root.selH = 0
+    }
+
+    // 再点一次已选中的标记工具 = 取消（回到 none，不绘制只选择）。
+    function setMarkTool(tool) {
+        root.markTool = (root.markTool === tool) ? "none" : tool
+        if (root.markTool === "none") {
+            widthPopover.visible = false
+            mosaicPopover.visible = false
+        }
     }
 
     function nudgeLayer(dx, dy) {

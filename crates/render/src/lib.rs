@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use image::imageops::FilterType;
 use image::RgbaImage;
 
@@ -97,74 +99,158 @@ pub fn render_for_viewport(doc: &Document, viewport: Viewport) -> RgbaImage {
 /// layer, so dragging stays real-time even on large canvases. Semantics
 /// mirror `Document::composite_pixel` (order, opacity, alpha math).
 pub fn composite_for_preview(doc: &Document, target: Size) -> RgbaImage {
-    if target.width == 0 || target.height == 0 || doc.canvas.width == 0 || doc.canvas.height == 0 {
-        return RgbaImage::new(target.width.max(1), target.height.max(1));
+    PreviewComposer::new().composite(doc, target)
+}
+
+/// One cached, preview-scaled bitmap (base or layer) plus its scaled size.
+type CachedScaled = (u32, u32, Arc<RgbaImage>);
+
+/// Reusable preview composer.
+///
+/// `composite_for_preview` resamples EVERY visible layer to the preview
+/// target on every call; a live layer drag calls it ~30x/s, so on large
+/// canvases each tick paid a full-canvas resample per layer (brutal in
+/// debug builds). This composer caches each scaled bitmap between ticks:
+///
+/// * cache key = `Document::edit_epoch` + target size — any committed edit
+///   (execute / undo / redo) bumps the epoch and drops the cache;
+/// * history-free live mutations (drag offsets, live mark moves) do NOT
+///   bump the epoch, so every drag tick reuses the scaled bitmaps and only
+///   pays the blend (O(preview px per layer)).
+///
+/// The blend applies `layer.opacity` at draw time, so opacity changes stay
+/// correct even without a cache miss.
+pub struct PreviewComposer {
+    epoch: u64,
+    target: (u32, u32),
+    base: Option<CachedScaled>,
+    layers: Vec<Option<CachedScaled>>,
+}
+
+impl Default for PreviewComposer {
+    fn default() -> Self {
+        Self::new()
     }
-    let sx = target.width as f64 / doc.canvas.width as f64;
-    let sy = target.height as f64 / doc.canvas.height as f64;
+}
 
-    let mut out = if doc.base_hidden {
-        RgbaImage::new(target.width, target.height)
-    } else {
-        resize_to(&crop_region(&doc.base, doc.view), target)
-    };
-
-    for layer in &doc.layers {
-        if !layer.visible || layer.opacity <= 0.0 {
-            continue;
+impl PreviewComposer {
+    pub fn new() -> Self {
+        Self {
+            epoch: u64::MAX,
+            target: (0, 0),
+            base: None,
+            layers: Vec::new(),
         }
-        let nw = ((layer.image.width() as f64 * sx).round() as u32).max(1);
-        let nh = ((layer.image.height() as f64 * sy).round() as u32).max(1);
-        let scaled = resize_to(&layer.image, Size::new(nw, nh));
-        let ox = (layer.offset.0 as f64 * sx).round() as i32;
-        let oy = (layer.offset.1 as f64 * sy).round() as i32;
+    }
 
-        // Row-slice fast path: whole rows are handed out as byte slices so
-        // the per-tick cost stays low even in debug builds.
-        let x0 = ox.max(0) as u32;
-        let x1 = (ox + nw as i32).min(target.width as i32).max(0) as u32;
-        if x0 >= x1 {
-            continue;
+    fn cached_hit(
+        slot: &Option<CachedScaled>,
+        nw: u32,
+        nh: u32,
+    ) -> Option<Arc<RgbaImage>> {
+        match slot {
+            Some((w, h, img)) if *w == nw && *h == nh => Some(img.clone()),
+            _ => None,
         }
-        let src_stride = nw as usize * 4;
-        let src_buf = scaled.into_raw();
-        let out_stride = target.width as usize * 4;
-        let mut out_buf = out.into_raw();
-        for ty in 0..target.height {
-            let ly = ty as i64 - oy as i64;
-            if ly < 0 || ly >= nh as i64 {
+    }
+
+    pub fn composite(&mut self, doc: &Document, target: Size) -> RgbaImage {
+        if target.width == 0 || target.height == 0 || doc.canvas.width == 0 || doc.canvas.height == 0 {
+            return RgbaImage::new(target.width.max(1), target.height.max(1));
+        }
+        let key = (doc.edit_epoch, target.width, target.height);
+        if (self.epoch, self.target.0, self.target.1) != key {
+            self.epoch = doc.edit_epoch;
+            self.target = (target.width, target.height);
+            self.base = None;
+            self.layers = vec![None; doc.layers.len()];
+        }
+        let sx = target.width as f64 / doc.canvas.width as f64;
+        let sy = target.height as f64 / doc.canvas.height as f64;
+
+        let mut out = if doc.base_hidden {
+            RgbaImage::new(target.width, target.height)
+        } else {
+            // The base contributes doc.view (crop) scaled to the target.
+            let nw = ((doc.view.width as f64 * sx).round() as u32).max(1);
+            let nh = ((doc.view.height as f64 * sy).round() as u32).max(1);
+            match Self::cached_hit(&self.base, nw, nh) {
+                Some(img) => (*img).clone(),
+                None => {
+                    let img = resize_to(&crop_region(&doc.base, doc.view), target);
+                    self.base = Some((nw, nh, Arc::new(img.clone())));
+                    img
+                }
+            }
+        };
+
+        for (li, layer) in doc.layers.iter().enumerate() {
+            if !layer.visible || layer.opacity <= 0.0 {
                 continue;
             }
-            let srow = &src_buf[ly as usize * src_stride..(ly as usize + 1) * src_stride];
-            let orow =
-                &mut out_buf[ty as usize * out_stride..(ty as usize + 1) * out_stride];
-            for tx in x0..x1 {
-                let lx = tx as i64 - ox as i64;
-                let so = lx as usize * 4;
-                let sa = srow[so + 3] as f32 / 255.0 * layer.opacity;
-                if sa <= 0.0 {
+            let nw = ((layer.image.width() as f64 * sx).round() as u32).max(1);
+            let nh = ((layer.image.height() as f64 * sy).round() as u32).max(1);
+            let slot = self.layers.get(li).cloned().flatten();
+            let src: Arc<RgbaImage> = match Self::cached_hit(&slot, nw, nh) {
+                Some(img) => img,
+                None => {
+                    let img = Arc::new(resize_to(&layer.image, Size::new(nw, nh)));
+                    if li < self.layers.len() {
+                        self.layers[li] = Some((nw, nh, img.clone()));
+                    }
+                    img
+                }
+            };
+            let ox = (layer.offset.0 as f64 * sx).round() as i32;
+            let oy = (layer.offset.1 as f64 * sy).round() as i32;
+
+            // Row-slice fast path: whole rows are handed out as byte slices so
+            // the per-tick cost stays low even in debug builds.
+            let x0 = ox.max(0) as u32;
+            let x1 = (ox + nw as i32).min(target.width as i32).max(0) as u32;
+            if x0 >= x1 {
+                continue;
+            }
+            let src_stride = nw as usize * 4;
+            let src_buf: &[u8] = src.as_raw();
+            let out_stride = target.width as usize * 4;
+            let mut out_buf = out.into_raw();
+            for ty in 0..target.height {
+                let ly = ty as i64 - oy as i64;
+                if ly < 0 || ly >= nh as i64 {
                     continue;
                 }
-                let oo = tx as usize * 4;
-                let inv = 1.0 - sa;
-                for c in 0..3 {
-                    orow[oo + c] =
-                        (srow[so + c] as f32 * sa + orow[oo + c] as f32 * inv).round() as u8;
+                let srow = &src_buf[ly as usize * src_stride..(ly as usize + 1) * src_stride];
+                let orow =
+                    &mut out_buf[ty as usize * out_stride..(ty as usize + 1) * out_stride];
+                for tx in x0..x1 {
+                    let lx = tx as i64 - ox as i64;
+                    let so = lx as usize * 4;
+                    let sa = srow[so + 3] as f32 / 255.0 * layer.opacity;
+                    if sa <= 0.0 {
+                        continue;
+                    }
+                    let oo = tx as usize * 4;
+                    let inv = 1.0 - sa;
+                    for c in 0..3 {
+                        orow[oo + c] =
+                            (srow[so + c] as f32 * sa + orow[oo + c] as f32 * inv).round() as u8;
+                    }
+                    orow[oo + 3] = ((sa + orow[oo + 3] as f32 / 255.0 * inv) * 255.0).round() as u8;
                 }
-                orow[oo + 3] = ((sa + orow[oo + 3] as f32 / 255.0 * inv) * 255.0).round() as u8;
+            }
+            out = RgbaImage::from_raw(target.width, target.height, out_buf)
+                .expect("preview buffer size preserved");
+        }
+
+        // Markup annotations ride on top of the preview, scaled to target px.
+        for mark in &doc.marks {
+            if mark.visible {
+                mark.draw_scaled(&mut out, sx as f32, sy as f32);
             }
         }
-        out = RgbaImage::from_raw(target.width, target.height, out_buf)
-            .expect("preview buffer size preserved");
+        out
     }
-
-    // Markup annotations ride on top of the preview, scaled to target px.
-    for mark in &doc.marks {
-        if mark.visible {
-            mark.draw_scaled(&mut out, sx as f32, sy as f32);
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -242,5 +328,37 @@ mod tests {
         let preview = composite_for_preview(&doc, Size::new(40, 40));
         assert_eq!(preview.get_pixel(2, 2).0, [255, 255, 255, 255]);
         assert_eq!(preview.get_pixel(20, 20).0, [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn composer_cache_follows_live_drag_and_epoch_invalidation() {
+        let mut doc = Document::from_image(solid(40, 40, [10, 20, 30, 255]));
+        let mut layer = Layer::new("dot", solid(10, 10, [255, 0, 0, 255]));
+        layer.offset = (0, 0);
+        doc.add_layer(layer).unwrap();
+        let target = Size::new(40, 40);
+
+        let mut composer = PreviewComposer::new();
+        let first = composer.composite(&doc, target);
+        assert_eq!(first.get_pixel(2, 2).0, [255, 0, 0, 255]);
+
+        // Live drag tick: offset changes WITHOUT an epoch bump (history-free
+        // mutation) — the cached scaled bitmap must still land at the new
+        // offset.
+        doc.layers[0].offset = (20, 20);
+        let second = composer.composite(&doc, target);
+        assert_eq!(second.get_pixel(22, 22).0, [255, 0, 0, 255]);
+        assert_eq!(second.get_pixel(2, 2).0, [10, 20, 30, 255]);
+
+        // Committed edit bumps the epoch: cache is rebuilt and reflects the
+        // new content.
+        doc.set_layer_opacity(0, 0.5).unwrap();
+        let third = composer.composite(&doc, target);
+        let px = third.get_pixel(22, 22).0;
+        // 0.5 alpha red over the base color: 255*0.5+10*0.5=132.5→133,
+        // 20*0.5=10, 30*0.5=15.
+        assert_eq!(px[0], 133);
+        assert_eq!(px[1], 10);
+        assert_eq!(px[2], 15);
     }
 }

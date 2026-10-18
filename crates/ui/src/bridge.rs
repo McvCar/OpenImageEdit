@@ -612,6 +612,9 @@ struct Session {
     /// Mark index hidden from the PREVIEW only while its text is being
     /// edited inline in QML (the TextInput overlays the real mark). -1 = none.
     preview_hidden_mark: i32,
+    /// Cached preview-scaled base/layers; invalidated by doc.edit_epoch so
+    /// live drag ticks skip the per-layer resample.
+    composer: render::PreviewComposer,
 }
 
 struct Rendered {
@@ -702,6 +705,7 @@ impl Session {
                 base_locked: true,
                 save_quality,
                 preview_hidden_mark: -1,
+                composer: render::PreviewComposer::new(),
             },
             ms,
         ))
@@ -739,11 +743,11 @@ impl Session {
             let idx = hidden_idx as usize;
             let saved = self.doc.marks[idx].visible;
             self.doc.marks[idx].visible = false;
-            let img = render::composite_for_preview(&self.doc, target);
+            let img = self.composer.composite(&self.doc, target);
             self.doc.marks[idx].visible = saved;
             img
         } else {
-            render::composite_for_preview(&self.doc, target)
+            self.composer.composite(&self.doc, target)
         };
         // BMP on purpose: uncompressed means both the encode here and Qt's
         // decode are near memcpy speed. PNG compression dominated each live
@@ -3614,10 +3618,17 @@ session
                 self.as_mut().set_can_redo(can_redo);
                 self.as_mut().set_layer_count(layer_count);
                 self.as_mut().set_dirty(dirty);
-                self.as_mut()
-                    .set_layers_json(QString::from(layers_json.as_str()));
-                self.as_mut()
-                    .set_marks_json(QString::from(marks_json.as_str()));
+                // Publish JSON properties only when they actually changed:
+                // QML re-parses them (and rebuilds the list panels) on every
+                // change signal, which churned every live-drag tick.
+                if self.layers_json().to_string() != layers_json {
+                    self.as_mut()
+                        .set_layers_json(QString::from(layers_json.as_str()));
+                }
+                if self.marks_json().to_string() != marks_json {
+                    self.as_mut()
+                        .set_marks_json(QString::from(marks_json.as_str()));
+                }
                 if *self.selected_layer() < 0 || *self.selected_layer() >= layer_count {
                     self.as_mut().set_selected_layer(-1);
                 }

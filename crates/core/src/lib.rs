@@ -712,6 +712,12 @@ pub struct Document {
     /// Vector markup annotations (rect / ellipse / arrow / brush / …) drawn
     /// on top of the composite at render time. Canvas-space coordinates.
     pub marks: Vec<Mark>,
+    /// Monotonic counter bumped by every committed / structural change
+    /// (execute, undo, redo). Preview caches key on it: any real edit
+    /// invalidates them, while history-free live mutations (layer offset
+    /// during a drag, live mark moves) deliberately do NOT bump it so each
+    /// drag tick can reuse cached scaled layers.
+    pub edit_epoch: u64,
     /// Auto-naming counter: new layers (extract/paste) are named by their
     /// creation order ("1", "2", ...). Not part of snapshots on purpose, so
     /// names keep increasing across undo/redo.
@@ -1367,6 +1373,7 @@ impl Document {
             base_deleted: false,
             base_hidden: false,
             base_converted: false,
+            edit_epoch: 0,
             next_layer_seq: 0,
             history: History::new(256),
         }
@@ -1375,6 +1382,7 @@ impl Document {
     pub fn execute(&mut self, op: EditOp) -> Result<(), EditError> {
         op.apply(self)?;
         self.history.push(op);
+        self.edit_epoch = self.edit_epoch.wrapping_add(1);
         Ok(())
     }
 
@@ -1590,6 +1598,9 @@ impl Document {
             image::imageops::FilterType::Triangle,
         );
         layer.offset = offset;
+        // Pixels changed without going through execute(): bump the epoch so
+        // preview caches never serve a stale bitmap during live-scale drags.
+        self.edit_epoch = self.edit_epoch.wrapping_add(1);
         Ok(())
     }
 
@@ -1630,6 +1641,7 @@ impl Document {
         let op = self.history.undo.pop().ok_or(EditError::NothingToUndo)?;
         op.revert(self)?;
         self.history.redo.push(op);
+        self.edit_epoch = self.edit_epoch.wrapping_add(1);
         Ok(())
     }
 
@@ -1637,6 +1649,7 @@ impl Document {
         let op = self.history.redo.pop().ok_or(EditError::NothingToRedo)?;
         op.apply(self)?;
         self.history.undo.push(op);
+        self.edit_epoch = self.edit_epoch.wrapping_add(1);
         Ok(())
     }
 
