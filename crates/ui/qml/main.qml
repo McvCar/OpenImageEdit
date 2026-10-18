@@ -1033,7 +1033,7 @@ Window {
     // Redo: explicit keys — StandardKey.Redo maps inconsistently across
     // platforms/layouts, plain strings fire reliably (Ctrl+Y and ⇧Ctrl+Z).
     Shortcut { sequences: ["Ctrl+Shift+Z", "Ctrl+Y"]; onActivated: bridge.redo() }
-    Shortcut { sequences: [StandardKey.Save]; onActivated: root.saveOrSaveAs() }
+    Shortcut { sequences: [StandardKey.Save]; onActivated: saveOrSaveAs() }
     Shortcut { sequences: [StandardKey.Copy]; onActivated: doCopy() }
     Shortcut { sequences: [StandardKey.Cut]; onActivated: doCut() }
     Shortcut { sequences: [StandardKey.Paste]; onActivated: doPaste() }
@@ -1133,7 +1133,7 @@ Window {
             { l: "适应窗口 (Ctrl+9)", ok: bridge.image_width > 0, run: function () { bridge.zoom_fit() } },
             { l: "100% 实际大小 (Ctrl+0)", ok: bridge.image_width > 0, run: function () { bridge.zoom_actual() } },
             { l: "", ok: true, sep: true },
-            { l: "保存 (Ctrl+S)", ok: bridge.image_width > 0, run: function () { root.saveOrSaveAs() } },
+            { l: "保存 (Ctrl+S)", ok: bridge.image_width > 0, run: function () { saveOrSaveAs() } },
             { l: "另存为… (Ctrl+Shift+S)", ok: true, run: function () { saveDialog.open() } },
             { l: "", ok: true, sep: true },
             { l: "设置…", ok: true, run: function () { settingsOverlay.visible = true } },
