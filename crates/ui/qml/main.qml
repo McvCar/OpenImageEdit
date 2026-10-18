@@ -835,6 +835,9 @@ Window {
         readonly property bool probeClipboard: Qt.application.arguments.indexOf("--probe-clipboard") !== -1
         readonly property bool probeRuler: Qt.application.arguments.indexOf("--probe-ruler") !== -1
         readonly property bool probePicker: Qt.application.arguments.indexOf("--probe-picker") !== -1
+        // Exercises the Ctrl+S / menu 保存 path (saveOrSaveAs → save_edited)
+        // so QML scope errors on that route fail loudly in probe runs.
+        readonly property bool probeSave: Qt.application.arguments.indexOf("--probe-save") !== -1
         // ---- 尺子（测量坐标）----
         // 开关只是显示层，不动文档；坐标全部是「相对画布」的图像像素坐标。
         property bool rulerOn: false
@@ -6667,7 +6670,7 @@ Window {
     // no source file (pasted image, new window) has nothing to overwrite, so
     // fall back to the Save-As dialog.
     function saveOrSaveAs() {
-        if (bridge.file_name.length > 0)
+        if (bridge.fileName.length > 0)
             bridge.save_edited()
         else
             saveDialog.open()
@@ -6680,7 +6683,7 @@ Window {
         const mode = root.confirmMode
         // No source file: saving needs a destination first; let the user
         // pick one instead of discarding the edits silently.
-        if (bridge.file_name.length === 0) {
+        if (bridge.fileName.length === 0) {
             confirmOverlay.visible = false
             root.confirmMode = ""
             saveDialog.open()
@@ -6912,6 +6915,16 @@ Window {
                         + " selected=" + bridge.selected_layer
                         + " status=" + bridge.status)
         }
+    }
+
+    // Probe: --probe-save triggers the Ctrl+S path (saveOrSaveAs) on the
+    // primary window; a successful save logs the usual "saved" event with
+    // the ORIGINAL file path (overwrite semantics).
+    Timer {
+        id: saveProbeTimer
+        interval: 900
+        running: root.probeSave && root.primary
+        onTriggered: saveOrSaveAs()
     }
 
     // Probe timer: --probe-adjust opens the 调整颜色 panel (live preview of the
