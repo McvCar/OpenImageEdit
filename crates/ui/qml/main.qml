@@ -2309,15 +2309,54 @@ Window {
         onContentHeightChanged: centerContent()
         onWidthChanged: {
             centerContent()
-            bridge.set_viewport(width, height)
+            requestViewport()
         }
         onHeightChanged: {
             centerContent()
-            bridge.set_viewport(width, height)
+            requestViewport()
         }
-        Connections {
-            target: bridge
-            function onFitModeChanged() { view.centerContent() }
+
+        // ---- 窗口缩放节流 ------------------------------------------------
+        // 适应窗口模式下每次 viewport 变化都要重跑一遍全预览重合成 + BMP
+        // 编码写盘；拖动窗口边框时这类事件每秒几十次，debug 构建下界面直接
+        // 卡死（实测每步 ~500ms）。对策：拖动期间一个像素都不渲染，只用
+        // 「预测显示尺寸」把现有预览拉伸（视觉上跟手），停手 120ms 后再渲染
+        // 一次真图。预测公式与 Rust 的 fit_zoom / display_size 一致，因此
+        // 渲染落地时不会跳变。
+        readonly property bool viewportPending: viewportTimer.running
+        readonly property real fitScalePreview: {
+            if (!bridge.fit_mode || bridge.image_width <= 0 || bridge.image_height <= 0)
+                return 0
+            return Math.min(width / bridge.image_width,
+                            height / bridge.image_height, 1.0)
+        }
+        // 画布当前应当显示的尺寸：待渲染期间用预测值，其余用 bridge 的真值。
+        readonly property real shownWidth: {
+            if (viewportPending && fitScalePreview > 0)
+                return Math.max(1, Math.round(bridge.image_width * fitScalePreview))
+            return Math.max(1, bridge.display_width)
+        }
+        readonly property real shownHeight: {
+            if (viewportPending && fitScalePreview > 0)
+                return Math.max(1, Math.round(bridge.image_height * fitScalePreview))
+            return Math.max(1, bridge.display_height)
+        }
+
+        function requestViewport() {
+            if (!bridge.fit_mode) {
+                // 非适应窗口：显示尺寸与 viewport 无关，同步告知即可（不渲染）。
+                bridge.set_viewport(width, height)
+                return
+            }
+            viewportTimer.restart()
+        }
+
+        // 拖动结束后才真正重渲染（Qt 在系统的缩放循环里通常不派发定时器，
+        // 所以拖动全程零渲染）。
+        Timer {
+            id: viewportTimer
+            interval: 120
+            onTriggered: bridge.set_viewport(view.width, view.height)
         }
 
         // Clamp-and-shift the visible region by (dx, dy) viewport px.
@@ -2362,8 +2401,8 @@ Window {
         Image {
             id: previewImage
 
-            width: Math.max(1, bridge.display_width)
-            height: Math.max(1, bridge.display_height)
+            width: view.shownWidth
+            height: view.shownHeight
             x: (view.contentWidth - width) / 2
             y: (view.contentHeight - height) / 2
             cache: false

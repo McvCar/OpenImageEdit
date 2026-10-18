@@ -733,6 +733,11 @@ struct Session {
     /// Cached preview-scaled base/layers; invalidated by doc.edit_epoch so
     /// live drag ticks skip the per-layer resample.
     composer: render::PreviewComposer,
+    /// Display size of the last rendered preview. A window resize almost
+    /// always shifts the fit zoom by a fraction of a pixel, which would
+    /// otherwise re-render (and re-encode the BMP) for a preview identical to
+    /// the one already on screen.
+    last_display: Size,
     /// Open "调整颜色" panel: the scope captured when it opened plus the live
     /// parameters. Document pixels are NOT touched until `adjust_commit`.
     adjust: Option<AdjustLive>,
@@ -800,6 +805,16 @@ fn display_size(canvas: Size, zoom: f64) -> Size {
     )
 }
 
+/// Two display sizes that differ by at most 2px on each axis are treated as
+/// "the preview already on screen": re-rendering for them costs a full preview
+/// composite (hundreds of ms in debug) and changes nothing visible.
+fn size_close(a: Size, b: Size) -> bool {
+    const TOL: u32 = 2;
+    let dw = a.width.abs_diff(b.width);
+    let dh = a.height.abs_diff(b.height);
+    dw <= TOL && dh <= TOL
+}
+
 fn preview_target(display: Size) -> Size {
     let longest = display.width.max(display.height);
     if longest <= MAX_PREVIEW_EDGE {
@@ -849,6 +864,7 @@ impl Session {
                 preview_hidden_mark: -1,
                 live_scale: None,
                 composer: render::PreviewComposer::new(),
+                last_display: Size::new(0, 0),
                 adjust: None,
             },
             ms,
@@ -872,12 +888,14 @@ impl Session {
     }
 
     fn render(&mut self) -> Result<Rendered, String> {
+        let prof_t0 = Instant::now();
         let canvas = self.doc.canvas;
         let display = display_size(canvas, self.zoom);
         let target = preview_target(display);
         if target.pixels() == 0 {
             return Err("empty canvas".into());
         }
+        self.last_display = display;
         // Inline text editing: the mark being edited is hidden from the
         // preview only (restored right after the composite; never undoable).
         // An in-flight layer resize routes the composite through the
@@ -900,12 +918,14 @@ impl Session {
         } else {
             self.composite_for_preview(target, adjust)
         };
+        let composite_ms = prof_t0.elapsed().as_millis();
         // BMP on purpose: uncompressed means both the encode here and Qt's
         // decode are near memcpy speed. PNG compression dominated each live
         // drag tick (tens of ms); BMP keeps the preview path real-time. The
         // URL keeps changing (forces Qt to re-read) while temp files stay
         // bounded; the session id keeps concurrent windows separate.
         let bytes = encode(&image, Format::Bmp, 90).map_err(|e| e.to_string())?;
+        let encode_ms = prof_t0.elapsed().as_millis();
         self.render_count = self.render_count.wrapping_add(1);
         let path = std::env::temp_dir().join(format!(
             "imageedit-preview-{}-{}.bmp",
@@ -913,6 +933,14 @@ impl Session {
             self.render_count % 2
         ));
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"render-profile\",\"composite\":{},\"encode\":{},\"write\":{},\"target\":\"{}x{}\"}}",
+            composite_ms,
+            encode_ms - composite_ms,
+            prof_t0.elapsed().as_millis(),
+            target.width,
+            target.height
+        );
         // The panel graph reflects the adjusted preview (like Preview), so it
         // is computed from the composited pixels and only while it is open.
         let histogram = if self.adjust.is_some() {
@@ -1869,17 +1897,22 @@ println!(
             return;
         }
         *self.viewport.borrow_mut() = size;
-        let refresh = {
+        let (refresh, unchanged) = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
                 Some(session) if session.fit => {
                     session.refit(size);
-                    true
+                    let display = display_size(session.doc.canvas, session.zoom);
+                    (true, size_close(display, session.last_display))
                 }
-                _ => false,
+                _ => (false, false),
             }
         };
-        if refresh {
+        // Same display size after the refit (the common case while dragging a
+        // window edge 1–2px at a time): the rendered preview on screen is
+        // already what this resize asks for, so skip the render entirely. A 2px
+        // tolerance keeps micro-resizes free; the stretched 0.2% is invisible.
+        if refresh && !unchanged {
             self.as_mut().refresh_preview();
         }
     }
@@ -4158,6 +4191,7 @@ session
     }
 
     fn refresh_preview(mut self: Pin<&mut Self>) {
+        let render_t0 = Instant::now();
         let outcome = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
@@ -4165,6 +4199,7 @@ session
                 None => return,
             }
         };
+        let render_ms = render_t0.elapsed().as_millis().min(i32::MAX as u128) as i32;
         match outcome {
             Refresh::Ok {
                 url,
@@ -4255,7 +4290,7 @@ session
                 self.as_mut().set_default_save_url(QString::from(save_url.as_str()));
                 self.as_mut().set_status(QString::from(status.as_str()));
                 println!(
-                    "{{\"phase\":\"ui\",\"event\":\"preview-ready\",\"zoom\":{zoom_percent},\"display\":\"{}x{}\",\"preview\":\"{}x{}\",\"undo\":{can_undo},\"redo\":{can_redo}}}",
+                    "{{\"phase\":\"ui\",\"event\":\"preview-ready\",\"zoom\":{zoom_percent},\"display\":\"{}x{}\",\"preview\":\"{}x{}\",\"undo\":{can_undo},\"redo\":{can_redo},\"ms\":{render_ms}}}",
                     display.width, display.height, preview.width, preview.height
                 );
                 // Last: updating preview_url triggers Image loading, which may
