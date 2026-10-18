@@ -157,6 +157,311 @@ impl Selection {
     }
 }
 
+// ---- 标记（markup annotations）------------------------------------------
+//
+// Vector annotations drawn ON TOP of the flattened image at render / export
+// time. They never touch pixels until composition, so adding / moving /
+// restyling one is cheap and fully undoable. Coordinates are canvas-space
+// f32; stroke widths are image pixels at full resolution.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkKind {
+    Rect,
+    Ellipse,
+    Arrow,
+    Brush,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mark {
+    pub kind: MarkKind,
+    /// Normalized bounds `(x0, y0, x1, y1)` with x1 >= x0, y1 >= y0 — the
+    /// drag box for Rect/Ellipse and the tight bounding box of `points`
+    /// otherwise. The UI uses it for hit-testing and resize handles.
+    pub rect: (f32, f32, f32, f32),
+    /// Arrow: exactly [start, end]. Brush: polyline vertices.
+    pub points: Vec<(f32, f32)>,
+    /// Stroke width in image pixels.
+    pub stroke: u8,
+    /// Stroke color RGBA.
+    pub color: [u8; 4],
+    /// Rect/Ellipse only: fill the interior with `fill_color`.
+    pub fill: bool,
+    pub fill_color: [u8; 4],
+}
+
+fn norm_rect(r: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+    (
+        r.0.min(r.2),
+        r.1.min(r.3),
+        r.0.max(r.2),
+        r.1.max(r.3),
+    )
+}
+
+impl Mark {
+    /// Translate every coordinate by (dx, dy).
+    pub fn translated(&self, dx: f32, dy: f32) -> Mark {
+        let mut m = self.clone();
+        m.rect = (m.rect.0 + dx, m.rect.1 + dy, m.rect.2 + dx, m.rect.3 + dy);
+        for p in &mut m.points {
+            *p = (p.0 + dx, p.1 + dy);
+        }
+        m
+    }
+
+    /// Linearly map the mark's geometry from `from` bounds to `to` bounds
+    /// (handle-driven resize: every point keeps its relative position inside
+    /// the box).
+    pub fn mapped(&self, from: (f32, f32, f32, f32), to: (f32, f32, f32, f32)) -> Mark {
+        let (fx0, fy0, fx1, fy1) = from;
+        let (tx0, ty0, tx1, ty1) = norm_rect(to);
+        let sx = if fx1 - fx0 > f32::EPSILON {
+            (tx1 - tx0) / (fx1 - fx0)
+        } else {
+            1.0
+        };
+        let sy = if fy1 - fy0 > f32::EPSILON {
+            (ty1 - ty0) / (fy1 - fy0)
+        } else {
+            1.0
+        };
+        let mut m = self.clone();
+        m.rect = (
+            tx0 + (m.rect.0 - fx0) * sx,
+            ty0 + (m.rect.1 - fy0) * sy,
+            tx0 + (m.rect.2 - fx0) * sx,
+            ty0 + (m.rect.3 - fy0) * sy,
+        );
+        for p in &mut m.points {
+            *p = (tx0 + (p.0 - fx0) * sx, ty0 + (p.1 - fy0) * sy);
+        }
+        m
+    }
+
+    /// Rasterize onto a canvas-resolution image.
+    pub fn draw(&self, img: &mut RgbaImage) {
+        draw_mark(img, self, 1.0, 1.0);
+    }
+
+    /// Rasterize onto a preview image (`sx`/`sy` = preview px per image px).
+    pub fn draw_scaled(&self, img: &mut RgbaImage, sx: f32, sy: f32) {
+        draw_mark(img, self, sx, sy);
+    }
+}
+
+fn blend_px(img: &mut RgbaImage, x: i32, y: i32, c: [u8; 4]) {
+    if x < 0 || y < 0 || x >= img.width() as i32 || y >= img.height() as i32 || c[3] == 0 {
+        return;
+    }
+    let p = img.get_pixel_mut(x as u32, y as u32);
+    let a = c[3] as f32 / 255.0;
+    let inv = 1.0 - a;
+    for i in 0..3 {
+        p.0[i] = (c[i] as f32 * a + p.0[i] as f32 * inv).round() as u8;
+    }
+    p.0[3] = ((a + p.0[3] as f32 / 255.0 * inv) * 255.0).round() as u8;
+}
+
+fn fill_rect_px(img: &mut RgbaImage, x0: f32, y0: f32, x1: f32, y1: f32, c: [u8; 4]) {
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    for y in y0.floor() as i32..y1.ceil() as i32 {
+        for x in x0.floor() as i32..x1.ceil() as i32 {
+            // Pixel centers, so partial bands don't paint one extra row.
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            if px >= x0 && px <= x1 && py >= y0 && py <= y1 {
+                blend_px(img, x, y, c);
+            }
+        }
+    }
+}
+
+fn stroke_rect_px(img: &mut RgbaImage, x0: f32, y0: f32, x1: f32, y1: f32, w: f32, c: [u8; 4]) {
+    let w = w.min((x1 - x0) / 2.0).min((y1 - y0) / 2.0);
+    if w <= 0.0 {
+        return;
+    }
+    fill_rect_px(img, x0, y0, x1, y0 + w, c);
+    fill_rect_px(img, x0, y1 - w, x1, y1, c);
+    fill_rect_px(img, x0, y0 + w, x0 + w, y1 - w, c);
+    fill_rect_px(img, x1 - w, y0 + w, x1, y1 - w, c);
+}
+
+/// Fill an ellipse inscribed in (x0,y0)-(x1,y1). With `ring > 0` only the
+/// outer ring of that thickness (the stroke) is painted instead of the whole
+/// interior — a per-pixel test, so strokes never overwrite the fill color.
+fn fill_ellipse_px(
+    img: &mut RgbaImage,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    c: [u8; 4],
+    ring: f32,
+) {
+    let cx = (x0 + x1) / 2.0;
+    let cy = (y0 + y1) / 2.0;
+    let rx = ((x1 - x0) / 2.0).max(0.5);
+    let ry = ((y1 - y0) / 2.0).max(0.5);
+    let irx = (rx - ring).max(0.0);
+    let iry = (ry - ring).max(0.0);
+    for y in y0.floor() as i32..=(y1.ceil() as i32) {
+        for x in x0.floor() as i32..=(x1.ceil() as i32) {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            if (dx / rx).powi(2) + (dy / ry).powi(2) > 1.0 {
+                continue;
+            }
+            if ring > 0.0 && irx > 0.0 && iry > 0.0 {
+                let d = (dx / irx).powi(2) + (dy / iry).powi(2);
+                if d <= 1.0 {
+                    continue;
+                }
+            }
+            blend_px(img, x, y, c);
+        }
+    }
+}
+
+fn stamp_brush(img: &mut RgbaImage, cx: f32, cy: f32, r: f32, c: [u8; 4]) {
+    let r = r.max(0.5);
+    let r2 = r * r;
+    for y in (cy - r).floor() as i32..=(cy + r).ceil() as i32 {
+        for x in (cx - r).floor() as i32..=(cx + r).ceil() as i32 {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            if dx * dx + dy * dy <= r2 {
+                blend_px(img, x, y, c);
+            }
+        }
+    }
+}
+
+fn draw_thick_segment(
+    img: &mut RgbaImage,
+    a: (f32, f32),
+    b: (f32, f32),
+    w: f32,
+    c: [u8; 4],
+) {
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    let len = (dx * dx + dy * dy).sqrt();
+    let r = (w / 2.0).max(0.5);
+    // Dense enough that stamps overlap into a smooth line.
+    let steps = (len / (r * 0.6).max(0.4)).ceil().max(1.0) as i32;
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        stamp_brush(img, a.0 + dx * t, a.1 + dy * t, r, c);
+    }
+}
+
+fn fill_triangle_px(img: &mut RgbaImage, p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), c: [u8; 4]) {
+    let area = (p1.0 - p0.0) * (p2.1 - p0.1) - (p2.0 - p0.0) * (p1.1 - p0.1);
+    if area.abs() < f32::EPSILON {
+        return;
+    }
+    let min_x = p0.0.min(p1.0).min(p2.0).floor() as i32;
+    let max_x = p0.0.max(p1.0).max(p2.0).ceil() as i32;
+    let min_y = p0.1.min(p1.1).min(p2.1).floor() as i32;
+    let max_y = p0.1.max(p1.1).max(p2.1).ceil() as i32;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let q = (x as f32 + 0.5, y as f32 + 0.5);
+            let mut sign = 0.0f32;
+            let mut inside = true;
+            let pts = [p0, p1, p2, p0];
+            for i in 0..3 {
+                let a = pts[i];
+                let b = pts[i + 1];
+                let e = (b.0 - a.0) * (q.1 - a.1) - (b.1 - a.1) * (q.0 - a.0);
+                let s = if e > 0.0 {
+                    1.0
+                } else if e < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                };
+                if i == 0 {
+                    sign = s;
+                } else if s != 0.0 && s != sign {
+                    inside = false;
+                    break;
+                }
+            }
+            if inside {
+                blend_px(img, x, y, c);
+            }
+        }
+    }
+}
+
+fn draw_mark(img: &mut RgbaImage, mark: &Mark, sx: f32, sy: f32) {
+    let sw = (mark.stroke as f32 * (sx + sy) * 0.5).max(1.0);
+    let sp = |p: (f32, f32)| (p.0 * sx, p.1 * sy);
+    match mark.kind {
+        MarkKind::Rect | MarkKind::Ellipse => {
+            let (rx0, ry0, rx1, ry1) = mark.rect;
+            let (x0, x1) = (rx0.min(rx1) * sx, rx0.max(rx1) * sx);
+            let (y0, y1) = (ry0.min(ry1) * sy, ry0.max(ry1) * sy);
+            if x1 - x0 < 0.5 || y1 - y0 < 0.5 {
+                return;
+            }
+            if mark.fill {
+                if matches!(mark.kind, MarkKind::Rect) {
+                    fill_rect_px(img, x0, y0, x1, y1, mark.fill_color);
+                } else {
+                    fill_ellipse_px(img, x0, y0, x1, y1, mark.fill_color, 0.0);
+                }
+            }
+            if matches!(mark.kind, MarkKind::Rect) {
+                stroke_rect_px(img, x0, y0, x1, y1, sw, mark.color);
+            } else {
+                fill_ellipse_px(img, x0, y0, x1, y1, mark.color, sw);
+            }
+        }
+        MarkKind::Arrow => {
+            if mark.points.len() < 2 {
+                return;
+            }
+            let a = sp(mark.points[0]);
+            let b = sp(mark.points[1]);
+            let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+            let len = (dx * dx + dy * dy).sqrt();
+            if len < f32::EPSILON {
+                return;
+            }
+            let (ux, uy) = (dx / len, dy / len);
+            let head = (sw * 3.5).max(10.0).min(len * 0.5);
+            let base = (b.0 - ux * head, b.1 - uy * head);
+            draw_thick_segment(img, a, base, sw, mark.color);
+            let hw = head * 0.55;
+            fill_triangle_px(
+                img,
+                b,
+                (base.0 - uy * hw, base.1 + ux * hw),
+                (base.0 + uy * hw, base.1 - ux * hw),
+                mark.color,
+            );
+        }
+        MarkKind::Brush => {
+            if mark.points.is_empty() {
+                return;
+            }
+            if mark.points.len() == 1 {
+                let p = sp(mark.points[0]);
+                stamp_brush(img, p.0, p.1, sw / 2.0, mark.color);
+            }
+            for w in mark.points.windows(2) {
+                draw_thick_segment(img, sp(w[0]), sp(w[1]), sw, mark.color);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layer {
     pub name: String,
@@ -212,6 +517,9 @@ pub struct Document {
     /// base field stays as a transparent canvas of the same size so crop /
     /// rotate / canvas-resize keep working unchanged.
     pub base_converted: bool,
+    /// Vector markup annotations (rect / ellipse / arrow / brush / …) drawn
+    /// on top of the composite at render time. Canvas-space coordinates.
+    pub marks: Vec<Mark>,
     /// Auto-naming counter: new layers (extract/paste) are named by their
     /// creation order ("1", "2", ...). Not part of snapshots on purpose, so
     /// names keep increasing across undo/redo.
@@ -223,6 +531,8 @@ pub struct Document {
 pub enum EditError {
     #[error("layer index {0} out of range")]
     LayerIndex(usize),
+    #[error("mark index {0} out of range")]
+    MarkIndex(usize),
     #[error("selection is empty")]
     EmptySelection,
     #[error("crop rect is empty or outside the image")]
@@ -302,6 +612,26 @@ fn transform_document(doc: &mut Document, transform: Transform) {
             Transform::FlipVertical => (ox, ch - (oy + lh)),
         };
     }
+    // Marks live in canvas coordinates, so they follow the exact same
+    // mapping as layer offsets (f32 points; the rect re-normalizes).
+    let (cw, ch) = (canvas.width as f32, canvas.height as f32);
+    let map_pt = |x: f32, y: f32| -> (f32, f32) {
+        match transform {
+            Transform::Rotate90Cw => (ch - y, x),
+            Transform::Rotate90Ccw => (y, cw - x),
+            Transform::Rotate180 => (cw - x, ch - y),
+            Transform::FlipHorizontal => (cw - x, y),
+            Transform::FlipVertical => (x, ch - y),
+        }
+    };
+    for mark in &mut doc.marks {
+        let (x0, y0) = map_pt(mark.rect.0, mark.rect.1);
+        let (x1, y1) = map_pt(mark.rect.2, mark.rect.3);
+        mark.rect = norm_rect((x0, y0, x1, y1));
+        for p in &mut mark.points {
+            *p = map_pt(p.0, p.1);
+        }
+    }
     // `view` lives in base coordinates, so it maps against the base dimensions
     // (layers use canvas dimensions, since their offsets are canvas-relative).
     let base_before = Size::new(doc.base.width(), doc.base.height());
@@ -326,6 +656,8 @@ pub struct DocumentSnapshot {
     pub base_hidden: bool,
     /// Base already converted into a regular layer (panel unlock).
     pub base_converted: bool,
+    /// Vector markup annotations.
+    pub marks: Vec<Mark>,
 }
 
 impl Document {
@@ -338,6 +670,7 @@ impl Document {
             base_deleted: self.base_deleted,
             base_hidden: self.base_hidden,
             base_converted: self.base_converted,
+            marks: self.marks.clone(),
         }
     }
 
@@ -350,6 +683,7 @@ impl Document {
         self.base_deleted = snapshot.base_deleted;
         self.base_hidden = snapshot.base_hidden;
         self.base_converted = snapshot.base_converted;
+        self.marks = snapshot.marks;
     }
 }
 
@@ -395,6 +729,14 @@ pub enum EditOp {
     /// layer) and the base itself becomes a transparent canvas of the same
     /// size. The pre-op snapshot makes undo exact.
     BaseToLayer { from: DocumentSnapshot },
+    /// Add a markup annotation on top of the composition. `index` is always
+    /// the current list length (marks stack in creation order).
+    AddMark { index: usize, mark: Mark },
+    /// Restyle / move / resize an existing annotation. `from` is the mark
+    /// before the change (undo restores it verbatim).
+    UpdateMark { index: usize, from: Mark, to: Mark },
+    /// Remove an annotation; the removed mark is kept for undo.
+    DeleteMark { index: usize, mark: Mark },
 }
 
 impl EditOp {
@@ -503,6 +845,28 @@ impl EditOp {
                 apply_base_to_layer(doc);
                 Ok(())
             }
+            EditOp::AddMark { index, mark } => {
+                if *index > doc.marks.len() {
+                    return Err(EditError::MarkIndex(*index));
+                }
+                doc.marks.insert(*index, mark.clone());
+                Ok(())
+            }
+            EditOp::UpdateMark { index, to, .. } => {
+                let m = doc
+                    .marks
+                    .get_mut(*index)
+                    .ok_or(EditError::MarkIndex(*index))?;
+                *m = to.clone();
+                Ok(())
+            }
+            EditOp::DeleteMark { index, .. } => {
+                if *index >= doc.marks.len() {
+                    return Err(EditError::MarkIndex(*index));
+                }
+                doc.marks.remove(*index);
+                Ok(())
+            }
         }
     }
 
@@ -596,6 +960,28 @@ impl EditOp {
             }
             EditOp::BaseToLayer { from } => {
                 doc.restore(from.clone());
+                Ok(())
+            }
+            EditOp::AddMark { index, .. } => {
+                if *index >= doc.marks.len() {
+                    return Err(EditError::MarkIndex(*index));
+                }
+                doc.marks.remove(*index);
+                Ok(())
+            }
+            EditOp::UpdateMark { index, from, .. } => {
+                let m = doc
+                    .marks
+                    .get_mut(*index)
+                    .ok_or(EditError::MarkIndex(*index))?;
+                *m = from.clone();
+                Ok(())
+            }
+            EditOp::DeleteMark { index, mark } => {
+                if *index > doc.marks.len() {
+                    return Err(EditError::MarkIndex(*index));
+                }
+                doc.marks.insert(*index, mark.clone());
                 Ok(())
             }
         }
@@ -725,6 +1111,10 @@ fn apply_canvas_resize(doc: &mut Document, to: Size) {
         layer.offset.0 += dx as i32;
         layer.offset.1 += dy as i32;
     }
+    // Marks ride along with the same center-anchor shift.
+    for mark in &mut doc.marks {
+        *mark = mark.translated(dx as f32, dy as f32);
+    }
 }
 
 fn apply_resize(doc: &mut Document, to: Size) {
@@ -755,6 +1145,21 @@ fn apply_resize(doc: &mut Document, to: Size) {
             ((layer.offset.1 as f64) * sy).round() as i32,
         );
     }
+    // Marks scale with the document; the stroke width follows the mean axis
+    // factor (clamped to >= 1px so hairlines never disappear entirely).
+    let ss = ((sx + sy) / 2.0).max(1.0 / 3.0);
+    for mark in &mut doc.marks {
+        mark.rect = (
+            (mark.rect.0 as f64 * sx) as f32,
+            (mark.rect.1 as f64 * sy) as f32,
+            (mark.rect.2 as f64 * sx) as f32,
+            (mark.rect.3 as f64 * sy) as f32,
+        );
+        for p in &mut mark.points {
+            *p = ((p.0 as f64 * sx) as f32, (p.1 as f64 * sy) as f32);
+        }
+        mark.stroke = ((mark.stroke as f64 * ss).round() as i64).clamp(1, 255) as u8;
+    }
 }
 
 impl Document {
@@ -766,6 +1171,7 @@ impl Document {
             base: image,
             view: Rect::new(0, 0, canvas.width, canvas.height),
             layers: Vec::new(),
+            marks: Vec::new(),
             base_deleted: false,
             base_hidden: false,
             base_converted: false,
@@ -845,6 +1251,45 @@ impl Document {
         let index = self.layers.len();
         self.execute(EditOp::AddLayer { layer, index })?;
         Ok(index)
+    }
+
+    /// Append a markup annotation (drawn on top of the composite). Returns
+    /// its index (creation order, topmost last).
+    pub fn add_mark(&mut self, mark: Mark) -> Result<usize, EditError> {
+        let index = self.marks.len();
+        self.execute(EditOp::AddMark { index, mark })?;
+        Ok(index)
+    }
+
+    /// Replace a markup annotation (move / resize / restyle), undoable.
+    pub fn update_mark(&mut self, index: usize, to: Mark) -> Result<(), EditError> {
+        let from = self
+            .marks
+            .get(index)
+            .cloned()
+            .ok_or(EditError::MarkIndex(index))?;
+        self.execute(EditOp::UpdateMark { index, from, to })
+    }
+
+    /// History-free live preview of [`Document::update_mark`] for handle
+    /// drags; the committing call records the true pre-drag mark.
+    pub fn update_mark_live(&mut self, index: usize, mark: Mark) -> Result<(), EditError> {
+        let m = self
+            .marks
+            .get_mut(index)
+            .ok_or(EditError::MarkIndex(index))?;
+        *m = mark;
+        Ok(())
+    }
+
+    /// Remove a markup annotation, undoable.
+    pub fn delete_mark(&mut self, index: usize) -> Result<(), EditError> {
+        let mark = self
+            .marks
+            .get(index)
+            .cloned()
+            .ok_or(EditError::MarkIndex(index))?;
+        self.execute(EditOp::DeleteMark { index, mark })
     }
 
     pub fn remove_layer(&mut self, index: usize) -> Result<(), EditError> {
@@ -1112,6 +1557,10 @@ impl Document {
             for x in 0..self.canvas.width {
                 out.put_pixel(x, y, self.composite_pixel(x as i32, y as i32));
             }
+        }
+        // Markup annotations always sit on top of every layer.
+        for mark in &self.marks {
+            mark.draw(&mut out);
         }
         out
     }
@@ -1787,5 +2236,156 @@ mod tests {
         let flat = doc.flatten();
         assert_eq!(flat.get_pixel(5, 5).0, [255, 255, 255, 255]);
         assert_eq!(flat.get_pixel(0, 0).0, [0, 0, 0, 255]);
+    }
+
+    fn rect_mark(fill: bool) -> Mark {
+        Mark {
+            kind: MarkKind::Rect,
+            rect: (2.0, 2.0, 10.0, 8.0),
+            points: Vec::new(),
+            stroke: 2,
+            color: [255, 0, 0, 255],
+            fill,
+            fill_color: [0, 255, 0, 255],
+        }
+    }
+
+    fn blank(w: u32, h: u32) -> RgbaImage {
+        RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]))
+    }
+
+    #[test]
+    fn rect_mark_renders_stroke_fill_and_history_roundtrips() {
+        let mut doc = Document::from_image(blank(16, 16));
+        let index = doc.add_mark(rect_mark(true)).unwrap();
+        assert_eq!(index, 0);
+
+        let flat = doc.flatten();
+        // Stroke bands (2px) on the border, fill color in the interior.
+        assert_eq!(flat.get_pixel(2, 2).0, [255, 0, 0, 255]);
+        assert_eq!(flat.get_pixel(9, 3).0, [255, 0, 0, 255]);
+        assert_eq!(flat.get_pixel(5, 5).0, [0, 255, 0, 255]);
+        // Outside the mark: untouched.
+        assert_eq!(flat.get_pixel(0, 0).0, [0, 0, 0, 255]);
+
+        // Move + undo + redo roundtrip.
+        let moved = doc.marks[0].translated(3.0, 1.0);
+        doc.update_mark(0, moved.clone()).unwrap();
+        assert_eq!(doc.marks[0].rect, (5.0, 3.0, 13.0, 9.0));
+        doc.undo().unwrap();
+        assert_eq!(doc.marks[0].rect, (2.0, 2.0, 10.0, 8.0));
+        doc.redo().unwrap();
+        assert_eq!(doc.marks[0].rect, (5.0, 3.0, 13.0, 9.0));
+
+        // Delete + undo restores the exact mark.
+        doc.delete_mark(0).unwrap();
+        assert!(doc.marks.is_empty());
+        doc.undo().unwrap();
+        assert_eq!(doc.marks.len(), 1);
+        assert_eq!(doc.marks[0], moved);
+        // add→update→undo→redo left undo = [add, update]; three undos walk
+        // back delete → update → add, leaving an empty (pre-add) state with
+        // the whole chain replayable via redo.
+        doc.undo().unwrap();
+        doc.undo().unwrap();
+        assert!(doc.marks.is_empty() && doc.can_redo());
+    }
+
+    #[test]
+    fn rect_mark_without_fill_keeps_interior_transparent() {
+        let mut doc = Document::from_image(blank(16, 16));
+        doc.add_mark(rect_mark(false)).unwrap();
+        let flat = doc.flatten();
+        assert_eq!(flat.get_pixel(5, 5).0, [0, 0, 0, 255]);
+        assert_eq!(flat.get_pixel(2, 4).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn ellipse_mark_paints_ring_and_interior() {
+        let mut doc = Document::from_image(blank(32, 32));
+        doc.add_mark(Mark {
+            kind: MarkKind::Ellipse,
+            rect: (4.0, 4.0, 28.0, 28.0),
+            points: Vec::new(),
+            stroke: 2,
+            color: [255, 0, 0, 255],
+            fill: true,
+            fill_color: [0, 0, 255, 255],
+        })
+        .unwrap();
+        let flat = doc.flatten();
+        // Center = fill; just inside the outline = stroke; outside = base.
+        assert_eq!(flat.get_pixel(16, 16).0, [0, 0, 255, 255]);
+        assert_eq!(flat.get_pixel(16, 5).0, [255, 0, 0, 255]);
+        assert_eq!(flat.get_pixel(1, 1).0, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn arrow_mark_draws_shaft_and_head() {
+        let mut doc = Document::from_image(blank(48, 24));
+        doc.add_mark(Mark {
+            kind: MarkKind::Arrow,
+            rect: (4.0, 12.0, 40.0, 12.0),
+            points: vec![(4.0, 12.0), (40.0, 12.0)],
+            stroke: 2,
+            color: [255, 255, 0, 255],
+            fill: false,
+            fill_color: [0, 0, 0, 0],
+        })
+        .unwrap();
+        let flat = doc.flatten();
+        // Shaft midpoint and inside the head triangle near the end point.
+        assert_eq!(flat.get_pixel(20, 12).0, [255, 255, 0, 255]);
+        assert_eq!(flat.get_pixel(38, 12).0, [255, 255, 0, 255]);
+        assert_eq!(flat.get_pixel(20, 2).0, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn brush_mark_stamps_a_thick_line() {
+        let mut doc = Document::from_image(blank(32, 32));
+        doc.add_mark(Mark {
+            kind: MarkKind::Brush,
+            rect: (4.0, 16.0, 28.0, 16.0),
+            points: vec![(4.0, 16.0), (28.0, 16.0)],
+            stroke: 4,
+            color: [0, 255, 255, 255],
+            fill: false,
+            fill_color: [0, 0, 0, 0],
+        })
+        .unwrap();
+        let flat = doc.flatten();
+        assert_eq!(flat.get_pixel(16, 16).0, [0, 255, 255, 255]);
+        // 4px stroke → ±2px around the path (pixel centers at .5 offsets).
+        assert_eq!(flat.get_pixel(16, 17).0, [0, 255, 255, 255]);
+        assert_eq!(flat.get_pixel(16, 21).0, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn marks_follow_rotate_and_canvas_resize() {
+        let mut doc = Document::from_image(blank(20, 10));
+        doc.add_mark(rect_mark(false)).unwrap();
+
+        doc.apply_transform(Transform::Rotate90Cw).unwrap();
+        // Canvas is 10x20 now; the mark maps with the same point transform.
+        let m = &doc.marks[0];
+        assert_eq!(m.rect.0.min(m.rect.2), 2.0); // old x0 == new y0 side
+        assert_eq!(doc.canvas, Size::new(10, 20));
+
+        doc.undo().unwrap();
+        let before = doc.marks[0].clone();
+        doc.resize_canvas(Size::new(30, 20)).unwrap();
+        // Center anchor: dx = (30-20)/2 = 5, dy = (20-10)/2 = 5.
+        assert_eq!(doc.marks[0].rect, (7.0, 7.0, 15.0, 13.0));
+        doc.undo().unwrap();
+        assert_eq!(doc.marks[0], before);
+    }
+
+    #[test]
+    fn resize_document_scales_marks() {
+        let mut doc = Document::from_image(blank(20, 10));
+        doc.add_mark(rect_mark(false)).unwrap();
+        doc.resize(Size::new(40, 20)).unwrap();
+        assert_eq!(doc.marks[0].rect, (4.0, 4.0, 20.0, 16.0));
+        assert_eq!(doc.marks[0].stroke, 4);
     }
 }

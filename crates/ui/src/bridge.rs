@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use cxx_qt_lib::{QString, QUrl};
 use decode::{decode_path, encode, format_from_path, DecodeOptions, Format};
-use editcore::{Document, Layer, Rect, Selection, Size, Transform};
+use editcore::{Document, Layer, Mark, MarkKind, Rect, Selection, Size, Transform};
 use image::RgbaImage;
 
 pub static PROCESS_START: OnceLock<Instant> = OnceLock::new();
@@ -64,6 +64,8 @@ pub mod qobject {
         #[qproperty(i32, layer_count)]
         #[qproperty(i32, selected_layer)]
         #[qproperty(QString, layers_json)]
+        #[qproperty(i32, selected_mark)]
+        #[qproperty(QString, marks_json)]
         #[qproperty(bool, dirty)]
         #[qproperty(QString, file_name, cxx_name = "fileName")]
         #[qproperty(QString, file_size_str, cxx_name = "fileSizeStr")]
@@ -218,6 +220,63 @@ pub mod qobject {
 
         #[qinvokable]
         fn translate_selected(self: Pin<&mut Self>, dx: i32, dy: i32);
+
+        // ---- 标记（markup annotations）----
+
+        /// Select a mark (-1 = none); selection survives refreshes.
+        #[qinvokable]
+        fn select_mark(self: Pin<&mut Self>, index: i32);
+
+        /// Add a Rect/Ellipse/Arrow mark from canvas-space geometry.
+        /// kind: 0 rect, 1 ellipse, 2 arrow. Colors are "#rrggbb".
+        #[qinvokable]
+        fn add_shape_mark(
+            self: Pin<&mut Self>,
+            kind: i32,
+            x0: f64,
+            y0: f64,
+            x1: f64,
+            y1: f64,
+            stroke: i32,
+            color: &QString,
+            fill: bool,
+            fill_color: &QString,
+        );
+
+        /// Add a freehand Brush mark; `points` is "x,y x,y …" image coords.
+        #[qinvokable]
+        fn add_brush_mark(
+            self: Pin<&mut Self>,
+            points: &QString,
+            stroke: i32,
+            color: &QString,
+        );
+
+        /// Begin a live move/resize of the selected mark (history-free).
+        #[qinvokable]
+        fn mark_drag_begin(self: Pin<&mut Self>);
+
+        /// Live-update the dragged mark to new bounds (image coords).
+        #[qinvokable]
+        fn mark_drag_update(self: Pin<&mut Self>, x: f64, y: f64, w: f64, h: f64);
+
+        /// Commit (or roll back) the live drag as a single history op.
+        #[qinvokable]
+        fn mark_drag_end(self: Pin<&mut Self>, commit: bool);
+
+        /// Delete the selected mark (undoable).
+        #[qinvokable]
+        fn delete_selected_mark(self: Pin<&mut Self>);
+
+        /// Restyle the selected mark (width / colors / fill), undoable.
+        #[qinvokable]
+        fn update_mark_style(
+            self: Pin<&mut Self>,
+            stroke: i32,
+            color: &QString,
+            fill: bool,
+            fill_color: &QString,
+        );
 
         // ---- 剪贴板（跨文档） ----
 
@@ -386,6 +445,10 @@ pub struct BridgeRust {
     layer_count: i32,
     selected_layer: i32,
     layers_json: QString,
+    /// Selected markup annotation (-1 = none); survives refreshes.
+    selected_mark: i32,
+    /// JSON list of marks for the QML overlay: bounds, kind, style.
+    marks_json: QString,
     dirty: bool,
     /// Loaded file's display name and human-readable size for the status bar.
     file_name: QString,
@@ -410,6 +473,9 @@ pub struct BridgeRust {
     /// Image + offset of the selected layer when a handle-driven scale
     /// started; live updates resample without history, end commits one op.
     scale_start: RefCell<Option<(RgbaImage, (i32, i32))>>,
+    /// The selected mark and its pre-drag geometry; live updates map
+    /// geometry without history, end commits one UpdateMark op.
+    mark_drag: RefCell<Option<(usize, Mark)>>,
     session: RefCell<Option<Session>>,
     viewport: RefCell<Size>,
 }
@@ -436,6 +502,8 @@ impl Default for BridgeRust {
             layer_count: 0,
             selected_layer: -1,
             layers_json: QString::default(),
+            selected_mark: -1,
+            marks_json: QString::default(),
             dirty: false,
             file_name: QString::default(),
             file_size_str: QString::default(),
@@ -448,6 +516,7 @@ impl Default for BridgeRust {
             opacity_live: RefCell::new(None),
             drag_start_offset: RefCell::new(None),
             scale_start: RefCell::new(None),
+            mark_drag: RefCell::new(None),
             session: RefCell::new(None),
             viewport: RefCell::new(Size::new(0, 0)),
         }
@@ -497,6 +566,7 @@ enum Refresh {
         save_url: String,
         layer_count: i32,
         layers_json: String,
+        marks_json: String,
         dirty: bool,
     },
     Err(String),
@@ -685,6 +755,38 @@ impl Session {
         format!("[{}]", parts.join(","))
     }
 
+    /// JSON list of markup annotations for the QML overlay (selection box,
+    /// handles, hit-testing): index, kind, bounds, stroke, colors, fill.
+    fn marks_json(&self) -> String {
+        let hex = |c: [u8; 4]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+        let kind = |k: MarkKind| match k {
+            MarkKind::Rect => 0,
+            MarkKind::Ellipse => 1,
+            MarkKind::Arrow => 2,
+            MarkKind::Brush => 3,
+        };
+        let parts: Vec<String> = self
+            .doc
+            .marks
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let (x0, y0, x1, y1) = m.rect;
+                format!(
+                    "{{\"i\":{i},\"k\":{},\"x\":{x0:.1},\"y\":{y0:.1},\"w\":{:.1},\"h\":{:.1},\"s\":{},\"c\":\"{}\",\"f\":{},\"fc\":\"{}\"}}",
+                    kind(m.kind),
+                    x1 - x0,
+                    y1 - y0,
+                    m.stroke,
+                    hex(m.color),
+                    m.fill,
+                    hex(m.fill_color)
+                )
+            })
+            .collect();
+        format!("[{}]", parts.join(","))
+    }
+
     fn refresh(&mut self) -> Refresh {
         match self.render() {
             Ok(rendered) => Refresh::Ok {
@@ -699,6 +801,7 @@ impl Session {
                 save_url: file_url(&self.default_save_path().0),
                 layer_count: self.doc.layers.len() as i32,
                 layers_json: self.layers_json(),
+                marks_json: self.marks_json(),
                 dirty: self.dirty,
             },
             Err(err) => Refresh::Err(err),
@@ -755,6 +858,55 @@ impl qobject::Bridge {
                 // Panel "unlock base" flow: converts the base into a
                 // regular bottom layer (smoke-test / automation hook).
                 "unlock-base" => self.as_mut().set_base_locked(false),
+                // Smoke-test the markup pipeline: rect (filled) + arrow +
+                // brush, restyle the rect, undo everything. Prints a mark
+                // event so headless runs can assert the flow worked.
+                "add-marks" => {
+                    self.as_mut().add_shape_mark(
+                        0, 10.0, 10.0, 60.0, 40.0, 3, &QString::from("#e24b4a"),
+                        true, &QString::from("#f5e14a"),
+                    );
+                    self.as_mut().add_shape_mark(
+                        2, 80.0, 20.0, 140.0, 60.0, 4, &QString::from("#378add"),
+                        false, &QString::from("#378add"),
+                    );
+                    self.as_mut().add_brush_mark(
+                        &QString::from("10,80 30,90 60,70 90,85"), 4,
+                        &QString::from("#0f6e56"),
+                    );
+                    self.as_mut().select_mark(0);
+                    self.as_mut().update_mark_style(
+                        6, &QString::from("#111111"), true,
+                        &QString::from("#ffffff"),
+                    );
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"marks\",\"count\":{},\"selected\":{}}}",
+                        {
+                            let guard = self.session.borrow();
+                            guard
+                                .as_ref()
+                                .map(|s| s.doc.marks.len())
+                                .unwrap_or(0)
+                        },
+                        self.selected_mark(),
+                    );
+                }
+                "marks-undo" => {
+                    self.as_mut().undo();
+                    self.as_mut().undo();
+                    self.as_mut().undo();
+                    self.as_mut().undo();
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"marks-undo\",\"count\":{}}}",
+                        {
+                            let guard = self.session.borrow();
+                            guard
+                                .as_ref()
+                                .map(|s| s.doc.marks.len())
+                                .unwrap_or(0)
+                        }
+                    );
+                }
                 other if other.starts_with("opacity:") => {
                     match other
                         .strip_prefix("opacity:")
@@ -2662,6 +2814,262 @@ session
         }
     }
 
+    // ---- 标记（markup annotations）----
+
+    fn parse_color(s: &str) -> [u8; 4] {
+        let t = s.trim().trim_start_matches('#');
+        if t.len() < 6 {
+            return [255, 0, 0, 255];
+        }
+        let byte = |i: usize| u8::from_str_radix(&t[i..i + 2], 16).unwrap_or(255);
+        [byte(0), byte(2), byte(4), 255]
+    }
+
+    fn mark_kind(kind: i32) -> MarkKind {
+        match kind {
+            1 => MarkKind::Ellipse,
+            2 => MarkKind::Arrow,
+            _ => MarkKind::Rect,
+        }
+    }
+
+    pub fn select_mark(mut self: Pin<&mut Self>, index: i32) {
+        self.as_mut().set_selected_mark(index);
+    }
+
+    pub fn add_shape_mark(
+        mut self: Pin<&mut Self>,
+        kind: i32,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        stroke: i32,
+        color: &QString,
+        fill: bool,
+        fill_color: &QString,
+    ) {
+        let (x0, y0, x1, y1) = (x0 as f32, y0 as f32, x1 as f32, y1 as f32);
+        let (rx0, rx1) = (x0.min(x1), x0.max(x1));
+        let (ry0, ry1) = (y0.min(y1), y0.max(y1));
+        let color = Self::parse_color(&color.to_string());
+        let fill_color = Self::parse_color(&fill_color.to_string());
+        let k = Self::mark_kind(kind);
+        let points = match k {
+            MarkKind::Arrow => vec![(x0, y0), (x1, y1)],
+            _ => Vec::new(),
+        };
+        let mark = Mark {
+            kind: k,
+            rect: (rx0, ry0, rx1, ry1),
+            points,
+            stroke: stroke.clamp(1, 255) as u8,
+            color,
+            fill: fill && matches!(k, MarkKind::Rect | MarkKind::Ellipse),
+            fill_color,
+        };
+        {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => return,
+                Some(session) => {
+                    if session.doc.add_mark(mark).is_err() {
+                        return;
+                    }
+                    session.dirty = true;
+                }
+            }
+        }
+        // Select the newly added (last) mark; a full refresh re-renders and
+        // publishes marks_json.
+        let count = {
+            let guard = self.session.borrow();
+            guard
+                .as_ref()
+                .map(|s| s.doc.marks.len())
+                .unwrap_or(0)
+        } as i32;
+        self.as_mut().set_selected_mark(count - 1);
+        self.as_mut().refresh_preview();
+    }
+
+    pub fn add_brush_mark(
+        mut self: Pin<&mut Self>,
+        points: &QString,
+        stroke: i32,
+        color: &QString,
+    ) {
+        let pts: Vec<(f32, f32)> = points
+            .to_string()
+            .split_whitespace()
+            .filter_map(|pair| {
+                let mut it = pair.split(',');
+                let x = it.next()?.parse::<f32>().ok()?;
+                let y = it.next()?.parse::<f32>().ok()?;
+                Some((x, y))
+            })
+            .collect();
+        if pts.is_empty() {
+            return;
+        }
+        let (min_x, max_x) = pts.iter().fold((f32::MAX, f32::MIN), |acc, p| {
+            (acc.0.min(p.0), acc.1.max(p.0))
+        });
+        let (min_y, max_y) = pts.iter().fold((f32::MAX, f32::MIN), |acc, p| {
+            (acc.0.min(p.1), acc.1.max(p.1))
+        });
+        let mark = Mark {
+            kind: MarkKind::Brush,
+            rect: (min_x, min_y, max_x, max_y),
+            points: pts,
+            stroke: stroke.clamp(1, 255) as u8,
+            color: Self::parse_color(&color.to_string()),
+            fill: false,
+            fill_color: [0, 0, 0, 0],
+        };
+        {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => return,
+                Some(session) => {
+                    if session.doc.add_mark(mark).is_err() {
+                        return;
+                    }
+                    session.dirty = true;
+                }
+            }
+        }
+        let count = {
+            let guard = self.session.borrow();
+            guard
+                .as_ref()
+                .map(|s| s.doc.marks.len())
+                .unwrap_or(0)
+        } as i32;
+        self.as_mut().set_selected_mark(count - 1);
+        self.as_mut().refresh_preview();
+    }
+
+    pub fn mark_drag_begin(mut self: Pin<&mut Self>) {
+        let index = *self.selected_mark();
+        if index < 0 {
+            return;
+        }
+        let grabbed = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                Some(session) => session.doc.marks.get(index as usize).cloned(),
+                None => None,
+            }
+        };
+        match grabbed {
+            Some(mark) => *self.mark_drag.borrow_mut() = Some((index as usize, mark)),
+            None => self.as_mut().set_selected_mark(-1),
+        }
+    }
+
+    pub fn mark_drag_update(mut self: Pin<&mut Self>, x: f64, y: f64, w: f64, h: f64) {
+        let Some((index, from)) = self.mark_drag.borrow().clone() else {
+            return;
+        };
+        let to = from.mapped(
+            from.rect,
+            (
+                x as f32,
+                y as f32,
+                x as f32 + w.max(1.0) as f32,
+                y as f32 + h.max(1.0) as f32,
+            ),
+        );
+        let mut guard = self.session.borrow_mut();
+        if let Some(session) = guard.as_mut() {
+            if session.doc.update_mark_live(index, to).is_ok() {
+                drop(guard);
+                self.as_mut().refresh_preview();
+            }
+        }
+    }
+
+    pub fn mark_drag_end(mut self: Pin<&mut Self>, commit: bool) {
+        let Some((index, from)) = self.mark_drag.borrow_mut().take() else {
+            return;
+        };
+        let mut guard = self.session.borrow_mut();
+        let Some(session) = guard.as_mut() else {
+            return;
+        };
+        if !commit {
+            let _ = session.doc.update_mark_live(index, from);
+            drop(guard);
+            self.as_mut().refresh_preview();
+            return;
+        }
+        // `from` is the pre-drag snapshot, so undo restores it verbatim.
+        let to = match session.doc.marks.get(index) {
+            Some(m) => m.clone(),
+            None => return,
+        };
+        session.dirty = true;
+        let _ = session.doc.execute(editcore::EditOp::UpdateMark { index, from, to });
+        drop(guard);
+        self.as_mut().refresh_preview();
+    }
+
+    pub fn delete_selected_mark(mut self: Pin<&mut Self>) {
+        let index = *self.selected_mark();
+        if index < 0 {
+            return;
+        }
+        {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            if session.doc.delete_mark(index as usize).is_err() {
+                return;
+            }
+            session.dirty = true;
+        }
+        self.as_mut().set_selected_mark(-1);
+        self.as_mut().refresh_preview();
+    }
+
+    pub fn update_mark_style(
+        mut self: Pin<&mut Self>,
+        stroke: i32,
+        color: &QString,
+        fill: bool,
+        fill_color: &QString,
+    ) {
+        let index = *self.selected_mark();
+        if index < 0 {
+            return;
+        }
+        let new_color = Self::parse_color(&color.to_string());
+        let new_fill_color = Self::parse_color(&fill_color.to_string());
+        let _from = {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            let Some(mark) = session.doc.marks.get(index as usize).cloned() else {
+                return;
+            };
+            let mut to = mark.clone();
+            to.stroke = stroke.clamp(1, 255) as u8;
+            to.color = new_color;
+            to.fill = fill && matches!(to.kind, MarkKind::Rect | MarkKind::Ellipse);
+            to.fill_color = new_fill_color;
+            session.dirty = true;
+            let _ = session.doc.execute(editcore::EditOp::UpdateMark {
+                index: index as usize,
+                from: mark,
+                to,
+            });
+        };
+        self.as_mut().refresh_preview();
+    }
+
     fn refresh_preview(mut self: Pin<&mut Self>) {
         let outcome = {
             let mut guard = self.session.borrow_mut();
@@ -2683,6 +3091,7 @@ session
                 save_url,
                 layer_count,
                 layers_json,
+                marks_json,
                 dirty,
             } => {
                 // The status bar's left side already shows the file name and
@@ -2710,8 +3119,22 @@ session
                 self.as_mut().set_dirty(dirty);
                 self.as_mut()
                     .set_layers_json(QString::from(layers_json.as_str()));
+                self.as_mut()
+                    .set_marks_json(QString::from(marks_json.as_str()));
                 if *self.selected_layer() < 0 || *self.selected_layer() >= layer_count {
                     self.as_mut().set_selected_layer(-1);
+                }
+                {
+                    let count = {
+                        let guard = self.session.borrow();
+                        guard
+                            .as_ref()
+                            .map(|s| s.doc.marks.len())
+                            .unwrap_or(0)
+                    } as i32;
+                    if *self.selected_mark() < -1 || *self.selected_mark() >= count {
+                        self.as_mut().set_selected_mark(-1);
+                    }
                 }
                 self.as_mut().set_default_save_url(QString::from(save_url.as_str()));
                 self.as_mut().set_status(QString::from(status.as_str()));

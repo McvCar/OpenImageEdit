@@ -157,6 +157,11 @@ pub fn composite_for_preview(doc: &Document, target: Size) -> RgbaImage {
         out = RgbaImage::from_raw(target.width, target.height, out_buf)
             .expect("preview buffer size preserved");
     }
+
+    // Markup annotations ride on top of the preview, scaled to target px.
+    for mark in &doc.marks {
+        mark.draw_scaled(&mut out, sx as f32, sy as f32);
+    }
     out
 }
 

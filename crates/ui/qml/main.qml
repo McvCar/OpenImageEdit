@@ -574,11 +574,23 @@ Window {
         readonly property var layerList: parseLayers(bridge.layers_json)
         readonly property var selLayer: findSelLayer()
         readonly property var selLayerBox: findLayerBox()
+        // ---- 标记工具栏（markup toolbar）----
+        property bool markBarVisible: false
+        // Active drawing tool: "none" | "rect" | "ellipse" | "arrow" | "brush"
+        property string markTool: "none"
+        // Style for the NEXT mark; with a mark selected the popovers restyle
+        // it instead (see applyMarkStyle).
+        property int markStroke: 4
+        property string markColor: "#e24b4a"
+        property bool markFill: false
+        property string markFillColor: "#f5e14a"
+        readonly property var markList: parseMarks(bridge.marks_json)
         readonly property bool probeDialog: Qt.application.arguments.indexOf("--probe-dialog") !== -1
         readonly property bool probeSettings: Qt.application.arguments.indexOf("--probe-settings") !== -1
         readonly property bool probeMenu: Qt.application.arguments.indexOf("--probe-menu") !== -1
         readonly property bool probeResize: Qt.application.arguments.indexOf("--probe-resize") !== -1
         readonly property bool probeLayers: Qt.application.arguments.indexOf("--probe-layers") !== -1
+        readonly property bool probeMarks: Qt.application.arguments.indexOf("--probe-marks") !== -1
         // Ids inside an inline component are invisible from outside, so the
         // shell / DocWindow wrappers reach the Bridge through this alias.
         readonly property alias b: bridge
@@ -748,6 +760,7 @@ Window {
             { l: "提取图层", ok: root.selExists, run: function () { commitExtract() } },
             { l: "删除选区像素 (Delete)", ok: root.selExists, run: function () { deleteSelectionPixels() } },
             { l: "图层面板", ok: true, run: function () { root.panelVisible = !root.panelVisible } },
+            { l: "标记工具栏", ok: true, run: function () { markBarBtn.clicked() } },
             { l: "", ok: true, sep: true },
             { l: "放大 (Ctrl++)", ok: true, run: function () { bridge.zoom_in() } },
             { l: "缩小 (Ctrl+-)", ok: true, run: function () { bridge.zoom_out() } },
@@ -768,7 +781,7 @@ Window {
             // 30px icon + 2px spacing each; reserve title, layers button,
             // "…", window buttons and margins.
             const chrome = titleText.implicitWidth + 8 + 16 + menuBtn.width
-                           + layersBtn.width + 8
+                           + layersBtn.width + markBarBtn.width + 8
                            + winRow.width + 24
             const avail = Math.max(0, toolbar.width - chrome)
             const per = 32
@@ -852,6 +865,23 @@ Window {
         }
 
         IconButton {
+            id: markBarBtn
+            anchors.right: layersBtn.left
+            anchors.rightMargin: 2
+            anchors.verticalCenter: parent.verticalCenter
+            glyph: "✎"
+            tip: "标记工具栏"
+            selected: root.markBarVisible
+            onClicked: {
+                root.markBarVisible = !root.markBarVisible
+                if (!root.markBarVisible) {
+                    root.markTool = "none"
+                    bridge.select_mark(-1)
+                }
+            }
+        }
+
+        IconButton {
             id: layersBtn
             anchors.right: menuBtn.left
             anchors.rightMargin: 2
@@ -901,6 +931,319 @@ Window {
                 tip: "关闭"
                 onClicked: { const w = Window.window; if (w) w.close() }
             }
+        }
+    }
+
+    // ---- 标记工具栏：主工具栏下方的第二行（开关 = 标题栏 ✎ 按钮）------
+    Rectangle {
+        id: markBar
+        visible: root.markBarVisible
+        anchors.top: toolbar.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: root.toolbarHeight
+        color: "#25272b"
+        z: 59
+
+        Row {
+            anchors.left: parent.left
+            anchors.leftMargin: 10
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 2
+
+            IconButton {
+                glyph: "▭"
+                tip: "矩形标记"
+                selected: root.markTool === "rect"
+                onClicked: root.markTool = "rect"
+            }
+            IconButton {
+                glyph: "◯"
+                tip: "椭圆标记"
+                selected: root.markTool === "ellipse"
+                onClicked: root.markTool = "ellipse"
+            }
+            IconButton {
+                glyph: "↗"
+                tip: "箭头标记"
+                selected: root.markTool === "arrow"
+                onClicked: root.markTool = "arrow"
+            }
+            IconButton {
+                glyph: "✏"
+                tip: "自由画笔"
+                selected: root.markTool === "brush"
+                onClicked: root.markTool = "brush"
+            }
+
+            Rectangle { width: 9; height: 18; color: "transparent"
+                Rectangle { anchors.centerIn: parent; width: 1; height: 18; color: "#3c4043" } }
+
+            IconButton {
+                id: widthBtn
+                glyph: "─"
+                tip: "笔画粗细"
+                selected: widthPopover.visible
+                onClicked: {
+                    colorPopover.visible = false
+                    widthPopover.visible = !widthPopover.visible
+                }
+                Text {
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    anchors.margins: 2
+                    text: root.markStroke
+                    color: "#9aa3b2"
+                    font.pixelSize: 9
+                }
+            }
+
+            IconButton {
+                id: colorBtn
+                tip: "颜色"
+                selected: colorPopover.visible
+                onClicked: {
+                    widthPopover.visible = false
+                    colorPopover.visible = !colorPopover.visible
+                }
+                Rectangle {
+                    anchors.centerIn: parent
+                    width: 14
+                    height: 14
+                    radius: 3
+                    color: root.markColor
+                    border.color: "#e9eaec"
+                    border.width: 1
+                }
+            }
+
+            IconButton {
+                glyph: "▨"
+                tip: "填充色开关（矩形/椭圆）"
+                active: root.markTool === "rect" || root.markTool === "ellipse"
+                selected: root.markFill
+                             && (root.markTool === "rect" || root.markTool === "ellipse")
+                onClicked: {
+                    root.markFill = !root.markFill
+                    applyMarkStyle()
+                }
+                Rectangle {
+                    anchors.centerIn: parent
+                    width: 14
+                    height: 14
+                    radius: 3
+                    color: root.markFillColor
+                    border.color: root.markFill ? "#e9eaec" : "#5a5e64"
+                    border.width: 1
+                }
+            }
+        }
+
+        Text {
+            anchors.right: parent.right
+            anchors.rightMargin: 12
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.markTool === "none"
+                  ? "选择一个标记工具后在画布上拖拽绘制"
+                  : (root.markTool === "brush"
+                     ? "按住拖拽绘制笔画"
+                     : "按住拖拽绘制 · 点击已有标记可移动/缩放")
+            color: "#6b7076"
+            font.pixelSize: 11
+        }
+    }
+
+    // 粗细弹窗：8 档，选中档高亮。
+    Rectangle {
+        id: widthPopover
+        visible: false
+        z: 220
+        width: 168
+        height: 8 * 30 + 12
+        color: "#2a2d31"
+        border.color: "#3c4043"
+        radius: 6
+        x: toolbar.width - width - 120
+        y: toolbar.height + (markBar.visible ? markBar.height : 0) + 2
+
+        Column {
+            anchors.fill: parent
+            anchors.margins: 6
+
+            Repeater {
+                model: [2, 3, 4, 6, 8, 12, 16, 24]
+
+                delegate: Item {
+                    required property int modelData
+                    width: parent.width
+                    height: 30
+
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: 4
+                        color: root.markStroke === modelData ? "#3d5a80"
+                               : widthHover.containsMouse ? "#3a3d42" : "transparent"
+                    }
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.left: parent.left
+                        anchors.leftMargin: 14
+                        width: 90
+                        height: modelData
+                        radius: modelData / 2
+                        color: "#d5d8dd"
+                    }
+                    Text {
+                        visible: root.markStroke === modelData
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.right: parent.right
+                        anchors.rightMargin: 12
+                        text: "✓"
+                        color: "#ffffff"
+                        font.pixelSize: 13
+                    }
+                    MouseArea {
+                        id: widthHover
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            root.markStroke = modelData
+                            applyMarkStyle()
+                            widthPopover.visible = false
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 颜色弹窗：描边/填充切换 + 预置色板。
+    Rectangle {
+        id: colorPopover
+        visible: false
+        z: 220
+        width: 236
+        height: 150
+        color: "#2a2d31"
+        border.color: "#3c4043"
+        radius: 6
+        x: toolbar.width - width - 60
+        y: toolbar.height + (markBar.visible ? markBar.height : 0) + 2
+
+        property bool editingFill: false
+
+        Row {
+            id: colorTargets
+            anchors.top: parent.top
+            anchors.topMargin: 8
+            anchors.left: parent.left
+            anchors.leftMargin: 10
+            spacing: 8
+
+            Repeater {
+                model: [
+                    { label: "描边", bind: function () { return root.markColor } },
+                    { label: "填充", bind: function () { return root.markFillColor } }
+                ]
+
+                delegate: Row {
+                    required property var modelData
+                    spacing: 4
+                    Rectangle {
+                        width: 16
+                        height: 16
+                        radius: 3
+                        anchors.verticalCenter: parent.verticalCenter
+                        color: modelData.bind()
+                        border.color: (colorPopover.editingFill === (modelData.label === "填充"))
+                                      ? "#378add" : "#5a5e64"
+                        border.width: 1
+                    }
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: modelData.label
+                        color: (colorPopover.editingFill === (modelData.label === "填充"))
+                               ? "#e9eaec" : "#9aa3b2"
+                        font.pixelSize: 11
+                    }
+                    MouseArea {
+                        width: parent.width
+                        height: parent.height
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: colorPopover.editingFill = modelData.label === "填充"
+                    }
+                }
+            }
+        }
+
+        Grid {
+            anchors.top: colorTargets.bottom
+            anchors.topMargin: 8
+            anchors.left: parent.left
+            anchors.leftMargin: 10
+            columns: 8
+            spacing: 6
+
+            Repeater {
+                model: [
+                    "#e24b4a", "#ef9f27", "#f5e14a", "#639922",
+                    "#378add", "#7f77dd", "#e94aa0", "#111111",
+                    "#ffffff", "#9aa3b2", "#4a4e54", "#0f6e56",
+                    "#993556", "#2d6a9f", "#ba7517", "#5f5e5a"
+                ]
+
+                delegate: Rectangle {
+                    required property string modelData
+                    width: 22
+                    height: 22
+                    radius: 4
+                    color: modelData
+                    border.width: 2
+                    border.color: {
+                        const cur = colorPopover.editingFill
+                                    ? root.markFillColor : root.markColor
+                        return cur.toLowerCase() === modelData.toLowerCase()
+                               ? "#378add" : "transparent"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            if (colorPopover.editingFill) {
+                                root.markFillColor = modelData
+                                root.markFill = true
+                            } else {
+                                root.markColor = modelData
+                            }
+                            applyMarkStyle()
+                        }
+                    }
+                }
+            }
+        }
+
+        Text {
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            anchors.margins: 8
+            text: "自定义颜色…（下一批）"
+            color: "#5f646b"
+            font.pixelSize: 10
+        }
+    }
+
+    // 弹窗打开时的点击捕获层。
+    MouseArea {
+        z: 215
+        anchors.fill: parent
+        visible: widthPopover.visible || colorPopover.visible
+        enabled: visible
+        onPressed: (mouse) => {
+            widthPopover.visible = false
+            colorPopover.visible = false
+            mouse.accepted = true
         }
     }
 
@@ -959,7 +1302,7 @@ Window {
     Flickable {
         id: view
 
-        anchors.top: toolbar.bottom
+        anchors.top: markBar.visible ? markBar.bottom : toolbar.bottom
         anchors.bottom: statusBar.top
         anchors.left: parent.left
         anchors.right: parent.right
@@ -1189,6 +1532,335 @@ Window {
                         if (bridge.selected_layer >= 0)
                             bridge.select_layer(-1)
                     }
+                }
+            }
+
+            // ---- 标记绘制/编辑区：标记工具激活时盖在选择交互之上 -------
+            //   按下在选中标记的 8 向手柄上 → 缩放该标记（live + 提交）
+            //   按下在任一标记上 → 选中并拖动（live + 提交）
+            //   否则 → 用当前工具绘制新标记；点击空白取消选中
+            // cursorShape: undefined — 光标由 canvasHoverHandler 统一决定。
+            MouseArea {
+                id: markMa
+                anchors.fill: parent
+                enabled: root.markTool !== "none" && bridge.image_width > 0
+                hoverEnabled: true
+                cursorShape: undefined
+                acceptedButtons: Qt.LeftButton
+
+                // 0 idle / 1 drawing / 2 moving / 3 resizing
+                property int mode: 0
+                property string resizeRole: ""
+                property rect startMark: Qt.rect(0, 0, 0, 0)
+                property real startX: 0
+                property real startY: 0
+                property var brushPts: []
+                // In-progress mark geometry in image coords (move/resize).
+                property var gestureRect: null
+
+                function imgX(mx) { return (mx - view.pad) * toImageScale() }
+                function imgY(my) { return (my - view.pad) * toImageScale() }
+
+                function handleCursor(role) {
+                    if (role === "n" || role === "s")
+                        return Qt.SizeVerCursor
+                    if (role === "e" || role === "w")
+                        return Qt.SizeHorCursor
+                    if (role === "nw" || role === "se")
+                        return Qt.SizeFDiagCursor
+                    return Qt.SizeBDiagCursor
+                }
+
+                // Topmost mark under (mx,my) in canvasSurface coords.
+                function markAt(mx, my) {
+                    const ix = imgX(mx)
+                    const iy = imgY(my)
+                    const tol = 4 / Math.max(toDispScale(), 0.0001)
+                    for (var i = root.markList.length - 1; i >= 0; i--) {
+                        const m = root.markList[i]
+                        if (ix >= m.x - tol && ix <= m.x + m.w + tol
+                            && iy >= m.y - tol && iy <= m.y + m.h + tol)
+                            return m.i
+                    }
+                    return -1
+                }
+
+                // Which resize handle (if any) is under (mx,my); 7px grab.
+                function handleAt(mx, my) {
+                    if (bridge.selected_mark < 0)
+                        return ""
+                    const box = selectedMarkBox()
+                    if (!box)
+                        return ""
+                    const pts = {
+                        "nw": [box[0], box[1]],
+                        "n":  [box[0] + box[2] / 2, box[1]],
+                        "ne": [box[0] + box[2], box[1]],
+                        "e":  [box[0] + box[2], box[1] + box[3] / 2],
+                        "se": [box[0] + box[2], box[1] + box[3]],
+                        "s":  [box[0] + box[2] / 2, box[1] + box[3]],
+                        "sw": [box[0], box[1] + box[3]],
+                        "w":  [box[0], box[1] + box[3] / 2]
+                    }
+                    for (const k in pts) {
+                        if (Math.abs(mx - pts[k][0]) <= 7 && Math.abs(my - pts[k][1]) <= 7)
+                            return k
+                    }
+                    return ""
+                }
+
+                function resizeTarget(role, r, dx, dy) {
+                    let x = r.x
+                    let y = r.y
+                    let w = r.width
+                    let h = r.height
+                    if (role.indexOf("w") !== -1) { x += dx; w -= dx }
+                    if (role.indexOf("e") !== -1) { w += dx }
+                    if (role.indexOf("n") !== -1) { y += dy; h -= dy }
+                    if (role.indexOf("s") !== -1) { h += dy }
+                    return Qt.rect(x, y, Math.max(1, w), Math.max(1, h))
+                }
+
+                function beginGesture(kind, mouse) {
+                    const m = findMark(bridge.selected_mark)
+                    if (!m)
+                        return false
+                    startMark = Qt.rect(m.x, m.y, m.w, m.h)
+                    startX = mouse.x
+                    startY = mouse.y
+                    mode = kind
+                    markTimer.lastSent = null
+                    bridge.mark_drag_begin()
+                    markTimer.start()
+                    return true
+                }
+
+                onPressed: (mouse) => {
+                    const h = handleAt(mouse.x, mouse.y)
+                    if (h !== "") {
+                        resizeRole = h
+                        if (beginGesture(3, mouse))
+                            return
+                    }
+                    const hit = markAt(mouse.x, mouse.y)
+                    if (hit >= 0) {
+                        bridge.select_mark(hit)
+                        if (beginGesture(2, mouse))
+                            return
+                    }
+                    if (bridge.selected_mark >= 0)
+                        bridge.select_mark(-1)
+                    mode = 1
+                    startX = mouse.x
+                    startY = mouse.y
+                    brushPts = []
+                    if (root.markTool === "brush")
+                        brushPts.push([imgX(mouse.x), imgY(mouse.y)])
+                    markPreview.requestPaint()
+                }
+
+                onPositionChanged: (mouse) => {
+                    if (mode === 1) {
+                        if (root.markTool === "brush") {
+                            const ix = imgX(mouse.x)
+                            const iy = imgY(mouse.y)
+                            const last = brushPts.length > 0
+                                         ? brushPts[brushPts.length - 1] : null
+                            if (!last || Math.abs(ix - last[0]) + Math.abs(iy - last[1]) >= 2)
+                                brushPts.push([ix, iy])
+                        }
+                        markPreview.requestPaint()
+                        return
+                    }
+                    if (mode === 2) {
+                        const s = toImageScale()
+                        gestureRect = Qt.rect(
+                            startMark.x + (mouse.x - startX) * s,
+                            startMark.y + (mouse.y - startY) * s,
+                            startMark.width, startMark.height)
+                    } else if (mode === 3) {
+                        gestureRect = resizeTarget(
+                            resizeRole, startMark,
+                            (mouse.x - startX) * toImageScale(),
+                            (mouse.y - startY) * toImageScale())
+                    }
+                }
+
+                onReleased: (mouse) => {
+                    if (mode === 1) {
+                        const s = toImageScale()
+                        const W = bridge.image_width
+                        const H = bridge.image_height
+                        const cx = v => Math.max(0, Math.min(W, v))
+                        const cy = v => Math.max(0, Math.min(H, v))
+                        const x0 = cx((startX - view.pad) * s)
+                        const y0 = cy((startY - view.pad) * s)
+                        const x1 = cx((mouse.x - view.pad) * s)
+                        const y1 = cy((mouse.y - view.pad) * s)
+                        if (root.markTool === "brush") {
+                            if (brushPts.length >= 2) {
+                                bridge.add_brush_mark(
+                                    brushPts.map(p => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" "),
+                                    root.markStroke, root.markColor)
+                            }
+                        } else if (Math.abs(x1 - x0) >= 1 || Math.abs(y1 - y0) >= 1) {
+                            const k = root.markTool === "rect" ? 0
+                                      : root.markTool === "ellipse" ? 1 : 2
+                            bridge.add_shape_mark(k, x0, y0, x1, y1,
+                                                  root.markStroke, root.markColor,
+                                                  root.markFill, root.markFillColor)
+                        }
+                    } else if (mode === 2 || mode === 3) {
+                        markTimer.stop()
+                        if (gestureRect)
+                            bridge.mark_drag_update(gestureRect.x, gestureRect.y,
+                                                    gestureRect.width, gestureRect.height)
+                        bridge.mark_drag_end(true)
+                        gestureRect = null
+                    }
+                    mode = 0
+                    markPreview.requestPaint()
+                }
+            }
+
+            // Live move/resize throttle (same pattern as scaleTimer).
+            Timer {
+                id: markTimer
+                interval: 40
+                repeat: true
+                property var lastSent: null
+                onTriggered: {
+                    if (!markMa.gestureRect)
+                        return
+                    const g = markMa.gestureRect
+                    const rounded = Qt.rect(Math.round(g.x), Math.round(g.y),
+                                            Math.round(g.width), Math.round(g.height))
+                    if (lastSent && lastSent.x === rounded.x && lastSent.y === rounded.y
+                        && lastSent.width === rounded.width
+                        && lastSent.height === rounded.height)
+                        return
+                    lastSent = rounded
+                    bridge.mark_drag_update(rounded.x, rounded.y,
+                                            rounded.width, rounded.height)
+                }
+            }
+
+            // 绘制中的标记预览（display 坐标，松手后由 core 接管渲染）。
+            Canvas {
+                id: markPreview
+                anchors.fill: parent
+                visible: markMa.mode === 1
+                onPaint: {
+                    var ctx = getContext("2d")
+                    ctx.clearRect(0, 0, width, height)
+                    if (markMa.mode !== 1)
+                        return
+                    const s = toDispScale()
+                    ctx.lineWidth = Math.max(1, root.markStroke * s)
+                    ctx.strokeStyle = root.markColor
+                    ctx.fillStyle = root.markFillColor
+                    ctx.lineCap = "round"
+                    ctx.lineJoin = "round"
+                    const px = v => view.pad + v * s
+                    const x0 = markMa.startX
+                    const y0 = markMa.startY
+                    const x1 = markMa.mouseX
+                    const y1 = markMa.mouseY
+                    if (root.markTool === "brush") {
+                        ctx.beginPath()
+                        for (var i = 0; i < markMa.brushPts.length; i++) {
+                            const p = markMa.brushPts[i]
+                            if (i === 0)
+                                ctx.moveTo(px(p[0]), px(p[1]))
+                            else
+                                ctx.lineTo(px(p[0]), px(p[1]))
+                        }
+                        ctx.stroke()
+                        return
+                    }
+                    if (root.markTool === "rect") {
+                        if (root.markFill) {
+                            ctx.fillRect(x0, y0, x1 - x0, y1 - y0)
+                        }
+                        ctx.strokeRect(x0, y0, x1 - x0, y1 - y0)
+                        return
+                    }
+                    if (root.markTool === "ellipse") {
+                        ctx.beginPath()
+                        ctx.ellipse((x0 + x1) / 2, (y0 + y1) / 2,
+                                    Math.abs(x1 - x0) / 2, Math.abs(y1 - y0) / 2,
+                                    0, 0, Math.PI * 2)
+                        if (root.markFill)
+                            ctx.fill()
+                        ctx.stroke()
+                        return
+                    }
+                    if (root.markTool === "arrow") {
+                        const dx = x1 - x0
+                        const dy = y1 - y0
+                        const len = Math.sqrt(dx * dx + dy * dy)
+                        if (len < 2)
+                            return
+                        const ux = dx / len
+                        const uy = dy / len
+                        const head = Math.max(root.markStroke * s * 3.5, 10)
+                        ctx.beginPath()
+                        ctx.moveTo(x0, y0)
+                        ctx.lineTo(x1 - ux * head, y1 - uy * head)
+                        ctx.stroke()
+                        const hw = head * 0.55
+                        ctx.beginPath()
+                        ctx.moveTo(x1, y1)
+                        ctx.lineTo(x1 - ux * head - uy * hw, y1 - uy * head + ux * hw)
+                        ctx.lineTo(x1 - ux * head + uy * hw, y1 - uy * head - ux * hw)
+                        ctx.closePath()
+                        ctx.fillStyle = root.markColor
+                        ctx.fill()
+                    }
+                }
+            }
+
+            // 选中标记的边框 + 8 向手柄（display 坐标）。
+            DashedRect {
+                id: markSelViz
+                visible: bridge.selected_mark >= 0 && root.markBarVisible
+                         && markMa.mode === 0
+                x: previewImage.x
+                y: previewImage.y
+                width: previewImage.width
+                height: previewImage.height
+                rx: box ? box[0] : 0
+                ry: box ? box[1] : 0
+                rw: box ? box[2] : 0
+                rh: box ? box[3] : 0
+                dashColor: "#378add"
+
+                property var box: selectedMarkBox()
+                onBoxChanged: if (visible) requestPaint()
+            }
+
+            Repeater {
+                model: bridge.selected_mark >= 0 && root.markBarVisible
+                       && markMa.mode === 0 ? 8 : 0
+
+                delegate: Rectangle {
+                    required property int index
+                    readonly property var roles: ["nw", "n", "ne", "e", "se", "s", "sw", "w"]
+                    readonly property string role: roles[index]
+                    readonly property var box: selectedMarkBox()
+                    visible: box !== null
+                    width: 8
+                    height: 8
+                    radius: 4
+                    color: "#378add"
+                    border.color: "#ffffff"
+                    border.width: 1
+                    x: box ? (role.indexOf("w") !== -1 ? box[0] - 4
+                             : role.indexOf("e") !== -1 ? box[0] + box[2] - 4
+                             : box[0] + box[2] / 2 - 4) : 0
+                    y: box ? (role.indexOf("n") !== -1 ? box[1] - 4
+                             : role.indexOf("s") !== -1 ? box[1] + box[3] - 4
+                             : box[1] + box[3] / 2 - 4) : 0
                 }
             }
 
@@ -2390,6 +3062,15 @@ Window {
     // overrides every MouseArea's cursorShape, so this is the single
     // authoritative cursor decision.
     function canvasCursor(x, y) {
+        // 标记工具激活：手柄 → 缩放光标；标记上 → 移动；其余 → 十字。
+        if (root.markTool !== "none") {
+            const h = markMa.handleAt(x, y)
+            if (h !== "")
+                return markMa.handleCursor(h)
+            if (markMa.markAt(x, y) >= 0)
+                return Qt.SizeAllCursor
+            return Qt.CrossCursor
+        }
         const ix = x - view.pad
         const iy = y - view.pad
         if (root.selExists) {
@@ -2571,6 +3252,10 @@ Window {
             deleteSelectionPixels()
             return
         }
+        if (bridge.selected_mark >= 0) {
+            bridge.delete_selected_mark()
+            return
+        }
         if (bridge.selected_layer >= 0) {
             if (!isLocked(root.selLayer))
                 bridge.delete_selected_layer()
@@ -2714,6 +3399,7 @@ Window {
         if (settingsOverlay.visible) { settingsOverlay.visible = false; return }
         if (root.scaleW > 0) { cancelLayerScale(); return }
         if (selDragMouse.dragging) { selDragMouse.dragging = false; return }
+        if (bridge.selected_mark >= 0) { bridge.select_mark(-1); return }
         if (root.pasteFloating) {
             // D3-A: roll back everything committed since the paste.
             for (var i = 0; i < root.floatingOps; i++)
@@ -2788,6 +3474,40 @@ Window {
         } catch (e) {
             return []
         }
+    }
+
+    function parseMarks(s) {
+        if (!s)
+            return []
+        try {
+            return JSON.parse(s)
+        } catch (e) {
+            return []
+        }
+    }
+
+    function findMark(index) {
+        return root.markList.find(mk => mk.i === index) || null
+    }
+
+    // Selected-mark display bounds [x, y, w, h] in canvasSurface coords
+    // (image coords × display scale + pad), or null.
+    function selectedMarkBox() {
+        if (bridge.selected_mark < 0)
+            return null
+        const m = findMark(bridge.selected_mark)
+        if (!m)
+            return null
+        const s = toDispScale()
+        return [view.pad + m.x * s, view.pad + m.y * s, m.w * s, m.h * s]
+    }
+
+    // Apply the current bar style to the selected mark (if any); otherwise
+    // the bar values simply become the defaults for the next mark.
+    function applyMarkStyle() {
+        if (bridge.selected_mark >= 0)
+            bridge.update_mark_style(root.markStroke, root.markColor,
+                                     root.markFill, root.markFillColor)
     }
 
     function findSelLayer() {
@@ -3444,6 +4164,17 @@ Window {
         onTriggered: root.panelVisible = true
     }
 
+    // Probe timer: --probe-marks opens the markup bar (rect tool preselected)
+    // and optionally draws sample marks via --script=add-marks.
+    Timer {
+        id: marksProbeTimer
+        interval: 600
+        onTriggered: {
+            root.markBarVisible = true
+            root.markTool = "rect"
+        }
+    }
+
     Component.onCompleted: {
         bridge.mark("qml-completed");
         if (root.primary) {
@@ -3458,6 +4189,8 @@ Window {
                 resizeProbeTimer.start();
             if (root.probeLayers)
                 layersProbeTimer.start();
+            if (root.probeMarks)
+                marksProbeTimer.start();
         } else if (root.fileUrl.toString().length > 0) {
             // Document window spawned for a specific file ("open in separate
             // window" setting, drag-out, etc.).
