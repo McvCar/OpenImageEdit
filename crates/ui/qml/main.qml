@@ -801,6 +801,64 @@ Window {
         property real pendingWhite: 1
         property bool levelsDirty: false
         readonly property bool probeAdjust: Qt.application.arguments.indexOf("--probe-adjust") !== -1
+        readonly property bool probeRuler: Qt.application.arguments.indexOf("--probe-ruler") !== -1
+        readonly property bool probePicker: Qt.application.arguments.indexOf("--probe-picker") !== -1
+        // ---- 尺子（测量坐标）----
+        // 开关只是显示层，不动文档；坐标全部是「相对画布」的图像像素坐标。
+        property bool rulerOn: false
+        // 鼠标在画布上的图像坐标（可为小数；落在画布外时 hoverValid=false）。
+        property real hoverFx: 0
+        property real hoverFy: 0
+        property bool hoverValid: false
+        // ---- 拾色器 ----
+        readonly property var pickerVals: parsePicker(bridge.pickerColor)
+        readonly property var pickerHist: parsePickerHistory(bridge.pickerHistory)
+        // 刚复制的那一行（按钮短暂显示「已复制」）。
+        property string pickerCopied: ""
+        // 四种色值表示（拾色器弹窗逐行复制）。
+        readonly property var pickerSpecs: {
+            const c = pickerVals
+            if (!c)
+                return []
+            return [
+                { k: "HEX",  v: c.hex },
+                { k: "RGB",  v: c.rgb },
+                { k: "HSL",  v: c.hsl },
+                { k: "CMYK", v: c.cmyk }
+            ]
+        }
+        // 选区 / 选中图层的测量框（图像像素坐标；无选中时为 null）。
+        readonly property var rulerBox: {
+            const s = toDispScale()
+            if (!rulerOn || s <= 0 || bridge.image_width <= 0)
+                return null
+            if (selExists && selW > 0 && selH > 0)
+                return { x: selX / s, y: selY / s, w: selW / s, h: selH / s }
+            if (selLayerBox !== null && selLayerBox.w > 0 && selLayerBox.h > 0)
+                return { x: selLayerBox.x, y: selLayerBox.y,
+                         w: selLayerBox.w, h: selLayerBox.h }
+            return null
+        }
+        // 选区 / 选中图层的 5 个测量点：四角 + 中心，单位是图像像素。
+        readonly property var rulerPoints: {
+            const box = rulerBox
+            if (box === null)
+                return []
+            const s = toDispScale()
+            const H = bridge.image_height
+            const fy = function (v) { return bridge.rulerBottomUp ? H - v : v }
+            const pts = [
+                { x: box.x, y: box.y },
+                { x: box.x + box.w, y: box.y },
+                { x: box.x, y: box.y + box.h },
+                { x: box.x + box.w, y: box.y + box.h },
+                { x: box.x + box.w / 2, y: box.y + box.h / 2 }
+            ]
+            return pts.map(function (p) {
+                return { px: p.x * s, py: p.y * s,
+                         label: Math.round(p.x) + ", " + Math.round(fy(p.y)) }
+            })
+        }
         // Whether the currently selected mark is a text mark (drives the
         // Aa style button and the font panel).
         readonly property bool selMarkIsText: {
@@ -1000,6 +1058,10 @@ Window {
             { l: "标记工具栏", ok: true, run: function () { markBarBtn.clicked() } },
             { l: "调整颜色… (Ctrl+E)", ok: bridge.image_width > 0,
               run: function () { root.toggleAdjustPanel() } },
+            { l: "尺子（测量坐标）", ok: bridge.image_width > 0,
+              run: function () { root.toggleRuler() } },
+            { l: "拾色器…", ok: bridge.image_width > 0,
+              run: function () { root.togglePickerPanel() } },
             { l: "", ok: true, sep: true },
             { l: "放大 (Ctrl++)", ok: true, run: function () { bridge.zoom_in() } },
             { l: "缩小 (Ctrl+-)", ok: true, run: function () { bridge.zoom_out() } },
@@ -1399,6 +1461,82 @@ Window {
                 active: bridge.image_width > 0
                 selected: bridge.adjustOpen
                 onClicked: root.toggleAdjustPanel()
+            }
+
+            Rectangle { width: 9; height: 18; color: "transparent"
+                Rectangle { anchors.centerIn: parent; width: 1; height: 18; color: "#3c4043" } }
+
+            // 尺子：显示选区 / 选中图层的四角+中心坐标，并跟随鼠标读数。
+            IconButton {
+                id: rulerBtn
+                tip: "尺子（显示坐标，用于测量）"
+                active: bridge.image_width > 0
+                selected: root.rulerOn
+                onClicked: root.toggleRuler()
+                // 直尺图标：外框 + 三根刻度。
+                Canvas {
+                    width: 22
+                    height: 22
+                    anchors.centerIn: parent
+                    // selected 变化时重绘（onPaint 里的绑定不是响应式的）。
+                    property color ink: rulerBtn.selected ? "#ffffff" : "#e9eaec"
+                    onInkChanged: requestPaint()
+                    onPaint: {
+                        const c = getContext("2d")
+                        c.clearRect(0, 0, width, height)
+                        c.strokeStyle = ink
+                        c.lineWidth = 1.4
+                        c.lineCap = "butt"
+                        c.beginPath()
+                        c.rect(1.5, 6.5, 19, 9)
+                        c.stroke()
+                        c.beginPath()
+                        c.moveTo(6.0, 6.5); c.lineTo(6.0, 11.5)
+                        c.moveTo(11.0, 6.5); c.lineTo(11.0, 14.0)
+                        c.moveTo(16.0, 6.5); c.lineTo(16.0, 11.5)
+                        c.stroke()
+                    }
+                }
+            }
+
+            // 拾色器：打开取色弹窗，点击图片取色并复制色值。
+            IconButton {
+                id: pickerBtn
+                tip: "拾色器（点击图片取色，可复制色值）"
+                active: bridge.image_width > 0
+                selected: bridge.pickerOpen
+                onClicked: root.togglePickerPanel()
+                // 吸管图标：斜置的管身 + 尖端 + 顶端胶囊。
+                Canvas {
+                    width: 22
+                    height: 22
+                    anchors.centerIn: parent
+                    property color ink: pickerBtn.selected ? "#ffffff" : "#e9eaec"
+                    onInkChanged: requestPaint()
+                    onPaint: {
+                        const c = getContext("2d")
+                        c.clearRect(0, 0, width, height)
+                        c.strokeStyle = ink
+                        c.fillStyle = ink
+                        c.lineWidth = 1.4
+                        c.save()
+                        c.translate(11, 11)
+                        c.rotate(-Math.PI / 4)
+                        c.beginPath()
+                        c.rect(-2.6, -6.0, 5.2, 8.5)
+                        c.stroke()
+                        c.beginPath()
+                        c.moveTo(-2.6, 2.5)
+                        c.lineTo(2.6, 2.5)
+                        c.lineTo(0, 8.0)
+                        c.closePath()
+                        c.fill()
+                        c.beginPath()
+                        c.rect(-3.8, -9.2, 7.6, 3.4)
+                        c.stroke()
+                        c.restore()
+                    }
+                }
             }
         }
 
@@ -2315,6 +2453,8 @@ Window {
                     settlePaste()
                 }
                 onPositionChanged: (mouse) => {
+                    if (root.rulerOn)
+                        root.noteHover(mouse.x, mouse.y)
                     if (pickDrag) {
                         curX = mouse.x
                         curY = mouse.y
@@ -2564,6 +2704,8 @@ Window {
                 }
 
                 onPositionChanged: (mouse) => {
+                    if (root.rulerOn)
+                        root.noteHover(mouse.x, mouse.y)
                     if (mode === 1) {
                         const p = clampCanvas(mouse.x, mouse.y)
                         curX = p[0]
@@ -2933,6 +3075,26 @@ Window {
                 }
             }
 
+            // ---- 拾色器取样层 ----
+            // 面板打开期间画布点击 = 取色（不再进入选区/图层手势），点击空白
+            // 不会清选区。关闭面板即恢复正常交互。
+            MouseArea {
+                id: pickerPickMa
+                anchors.fill: parent
+                z: 40
+                visible: bridge.pickerOpen && bridge.image_width > 0
+                enabled: visible
+                // undefined：光标统一由 canvasHoverHandler 决定。
+                cursorShape: undefined
+                onClicked: (mouse) => {
+                    const s = toDispScale()
+                    if (s <= 0)
+                        return
+                    bridge.picker_pick(Math.floor((mouse.x - view.pad) / s),
+                                       Math.floor((mouse.y - view.pad) / s))
+                }
+            }
+
             // Authoritative canvas cursor: a HoverHandler's cursorShape beats
             // every MouseArea's (documented precedence), and one handler over
             // the whole surface means no stacking conflicts. Coordinates are
@@ -2942,6 +3104,11 @@ Window {
                 cursorShape: panMa.pressed ? Qt.ClosedHandCursor
                                            : canvasCursor(point.position.x,
                                                           point.position.y)
+                // 尺子读数：handler 是唯一贯穿整块画布的 hover 来源（各个
+                // MouseArea 谁在上面不确定），这里补一路坐标。
+                onPointChanged: if (root.rulerOn)
+                                    root.noteHover(point.position.x, point.position.y)
+                onHoveredChanged: if (!hovered) root.clearHover()
             }
         }
 
@@ -2965,7 +3132,7 @@ Window {
         // stays readable over any image content.
         Rectangle {
             id: selBadge
-            visible: root.selExists
+            visible: root.selExists && !root.rulerOn
             z: 8
             x: previewImage.x
                + Math.max(0, Math.min(root.selX,
@@ -2992,7 +3159,9 @@ Window {
 
         EdgeHandles {
             id: selHandles
+            // 拾色器打开时隐藏：画布点击必须优先给取色，不能被选区手柄吞掉。
             visible: root.selExists && !root.selRubberBanding && bridge.image_width > 0
+                     && !bridge.pickerOpen
             z: 8
             x: previewImage.x
             y: previewImage.y
@@ -3029,8 +3198,10 @@ Window {
 
         EdgeHandles {
             id: layerHandles
+            // 拾色器打开时隐藏（同 selHandles：取色优先于缩放/移动）。
             visible: root.selLayer !== null && root.selLayer.base !== true
                      && !root.selExists && bridge.image_width > 0
+                     && !bridge.pickerOpen
             z: 8
             x: previewImage.x
             y: previewImage.y
@@ -3069,6 +3240,132 @@ Window {
                   + Math.round(root.scaleH / toDispScale()) + "　松手应用缩放 · Esc 取消"
             color: "#7fc3ff"
             font.pixelSize: 11
+        }
+
+        // ---- 尺子覆盖层（Ruler）-------------------------------------------
+        // 选中图层 / 选区：四角 + 中心显示「相对画布」的绝对坐标；鼠标位置
+        // 跟随显示当前坐标。Y 轴方向由设置决定（向下 / 向上），纯显示层。
+        Item {
+            id: rulerOverlay
+            visible: root.rulerOn && bridge.image_width > 0
+            z: 9
+            x: previewImage.x
+            y: previewImage.y
+            width: previewImage.width
+            height: previewImage.height
+
+            // 每个测量点的十字准星。
+            Repeater {
+                model: root.rulerPoints
+                delegate: Item {
+                    required property var modelData
+                    width: 13
+                    height: 13
+                    x: modelData.px - width / 2
+                    y: modelData.py - height / 2
+                    Rectangle { anchors.centerIn: parent; width: 13; height: 1; color: "#f0b23a" }
+                    Rectangle { anchors.centerIn: parent; width: 1; height: 13; color: "#f0b23a" }
+                }
+            }
+
+            // 每个测量点的坐标读数：角点朝框外排布，中心点居中。
+            Repeater {
+                model: root.rulerPoints
+                delegate: Rectangle {
+                    id: rulerChip
+                    required property var modelData
+                    required property int index
+                    readonly property bool isCenter: index === 4
+                    readonly property bool onRight: index === 1 || index === 3
+                    readonly property bool onBottom: index === 2 || index === 3
+                    width: rulerChipText.implicitWidth + 10
+                    height: 16
+                    radius: 3
+                    color: "#d91d2126"
+                    border.color: "#99f0b23a"
+                    border.width: 1
+                    x: Math.max(0, Math.min(rulerOverlay.width - width,
+                        isCenter ? modelData.px - width / 2
+                                 : (onRight ? modelData.px + 5 : modelData.px - width - 5)))
+                    y: Math.max(0, Math.min(rulerOverlay.height - height,
+                        isCenter ? modelData.py - height / 2
+                                 : (onBottom ? modelData.py + 5 : modelData.py - height - 5)))
+                    Text {
+                        id: rulerChipText
+                        anchors.centerIn: parent
+                        text: rulerChip.modelData.label
+                        color: "#ffcf7d"
+                        font.pixelSize: 10
+                        font.family: "Consolas"
+                    }
+                }
+            }
+
+            // 选区尺寸：贴在框的下边中点，和坐标一起读（W × H）。
+            Rectangle {
+                id: rulerSizeChip
+                visible: root.rulerBox !== null
+                width: rulerSizeText.implicitWidth + 10
+                height: 16
+                radius: 3
+                color: "#d91d2126"
+                border.color: "#99f0b23a"
+                border.width: 1
+                x: Math.max(0, Math.min(rulerOverlay.width - width,
+                                        (root.rulerBox !== null
+                                         ? (root.rulerBox.x + root.rulerBox.w / 2) * toDispScale()
+                                         : 0) - width / 2))
+                y: Math.max(0, Math.min(rulerOverlay.height - height,
+                                        (root.rulerBox !== null
+                                         ? (root.rulerBox.y + root.rulerBox.h) * toDispScale()
+                                         : 0) + 6))
+                Text {
+                    id: rulerSizeText
+                    anchors.centerIn: parent
+                    text: root.rulerBox !== null
+                          ? Math.round(root.rulerBox.w) + " × " + Math.round(root.rulerBox.h)
+                          : ""
+                    color: "#ffcf7d"
+                    font.pixelSize: 10
+                    font.family: "Consolas"
+                }
+            }
+
+            // 鼠标位置：十字线 + 坐标读数。
+            Item {
+                visible: root.hoverValid
+                x: root.hoverFx * toDispScale()
+                y: root.hoverFy * toDispScale()
+                Rectangle { x: -6; y: 0; width: 13; height: 1; color: "#4ad2ff" }
+                Rectangle { x: 0; y: -6; width: 1; height: 13; color: "#4ad2ff" }
+            }
+            Rectangle {
+                id: rulerHoverChip
+                visible: root.hoverValid
+                width: rulerHoverText.implicitWidth + 10
+                height: 16
+                radius: 3
+                color: "#e61d2126"
+                border.color: "#994ad2ff"
+                border.width: 1
+                x: Math.max(0, Math.min(rulerOverlay.width - width,
+                                        root.hoverFx * toDispScale() + 11))
+                y: Math.max(0, Math.min(rulerOverlay.height - height,
+                                        root.hoverFy * toDispScale() + 11))
+                Text {
+                    id: rulerHoverText
+                    anchors.centerIn: parent
+                    text: {
+                        const ix = Math.floor(root.hoverFx)
+                        const iy = Math.floor(root.hoverFy)
+                        return ix + ", "
+                               + (bridge.rulerBottomUp ? bridge.image_height - iy : iy)
+                    }
+                    color: "#9fe8ff"
+                    font.pixelSize: 10
+                    font.family: "Consolas"
+                }
+            }
         }
 
         Text {
@@ -4330,6 +4627,273 @@ Window {
         }
     }
 
+    // ---- 拾色器弹窗 ------------------------------------------------------
+    // 可拖动 / 可关闭的取色面板：面板打开期间点击画布取样，逐行显示 HEX /
+    // RGB / HSL / CMYK 并提供复制按钮（美术同学直接取色值）。
+    Item {
+        id: pickerPanel
+        visible: bridge.pickerOpen
+        width: 316
+        readonly property real maxHeight: Math.max(220, root.height - toolbar.height - 24)
+        readonly property real anchorX: pickerBtn.x + pickerBtn.parent.x
+        height: Math.min(pickerCol.implicitHeight + 24, maxHeight)
+        x: 8
+        y: toolbar.height + (markBar.visible ? markBar.height : 0) + 2
+        z: 221
+        property bool userMoved: false
+        onVisibleChanged: {
+            if (visible) {
+                userMoved = false
+                placePopover(pickerPanel, pickerBtn)
+            }
+        }
+        onAnchorXChanged: if (visible && !userMoved) placePopover(pickerPanel, pickerBtn)
+        onHeightChanged: if (visible && userMoved) moveTo(x, y)
+
+        function moveTo(nx, ny) {
+            userMoved = true
+            x = Math.max(4, Math.min(Math.max(4, root.width - width - 4), nx))
+            const minY = toolbar.height + 2
+            const maxY = Math.max(minY, root.height - height - 8)
+            y = Math.max(minY, Math.min(maxY, ny))
+        }
+
+        Rectangle {
+            anchors.fill: parent
+            radius: 8
+            color: "#2b2e33"
+            border.color: "#3c4043"
+            border.width: 1
+        }
+
+        Flickable {
+            id: pickerFlick
+            anchors.fill: parent
+            anchors.margins: 12
+            contentWidth: width
+            contentHeight: pickerCol.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            interactive: contentHeight > height
+
+            Column {
+                id: pickerCol
+                width: pickerFlick.width
+                spacing: 8
+
+                // 标题栏：拖动区先声明，✕ 后声明才能点得到。
+                Item {
+                    id: pickerTitleBar
+                    width: parent.width
+                    height: 24
+
+                    MouseArea {
+                        id: pickerDragArea
+                        anchors.fill: parent
+                        anchors.leftMargin: -10
+                        anchors.rightMargin: -2
+                        cursorShape: Qt.SizeAllCursor
+                        property real pressX: 0
+                        property real pressY: 0
+                        property real fromX: 0
+                        property real fromY: 0
+                        onPressed: (mouse) => {
+                            const p = mapToItem(root, mouse.x, mouse.y)
+                            pressX = p.x
+                            pressY = p.y
+                            fromX = pickerPanel.x
+                            fromY = pickerPanel.y
+                        }
+                        onPositionChanged: (mouse) => {
+                            if (!pressed)
+                                return
+                            const p = mapToItem(root, mouse.x, mouse.y)
+                            pickerPanel.moveTo(fromX + (p.x - pressX),
+                                               fromY + (p.y - pressY))
+                        }
+                    }
+
+                    Text {
+                        id: pickerTitle
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "拾色器"
+                        color: "#e9eaec"
+                        font.pixelSize: 13
+                        font.bold: true
+                    }
+                    Text {
+                        anchors.left: pickerTitle.right
+                        anchors.leftMargin: 8
+                        anchors.right: pickerClose.left
+                        anchors.rightMargin: 6
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: root.pickerVals ? "已取样" : "点击图片取色"
+                        color: "#8f96a3"
+                        font.pixelSize: 10
+                        elide: Text.ElideRight
+                    }
+                    IconButton {
+                        id: pickerClose
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        glyph: "✕"
+                        tip: "关闭拾色器（Esc）"
+                        onClicked: bridge.picker_close()
+                    }
+                }
+
+                // ---- 当前颜色：大色块 + HEX + 坐标 ----
+                Row {
+                    spacing: 10
+
+                    Rectangle {
+                        width: 56
+                        height: 56
+                        radius: 5
+                        color: root.pickerVals ? root.pickerVals.hex : "#1b1c1e"
+                        border.color: "#5a6069"
+                        border.width: 1
+                    }
+
+                    Column {
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: 3
+
+                        Text {
+                            text: root.pickerVals ? root.pickerVals.hex : "—"
+                            color: "#f2f3f5"
+                            font.pixelSize: 20
+                            font.family: "Consolas"
+                            font.bold: true
+                        }
+                        Text {
+                            text: root.pickerVals
+                                  ? "像素 (" + root.pickerVals.x + ", "
+                                    + root.pickerVals.y + ")"
+                                    + (root.pickerVals.a < 255
+                                       ? "　不透明度 "
+                                         + Math.round(root.pickerVals.a / 255 * 100) + "%"
+                                       : "")
+                                  : "在图片上点一下取色"
+                            color: "#8f96a3"
+                            font.pixelSize: 10
+                        }
+                    }
+                }
+
+                Rectangle { width: parent.width; height: 1; color: "#3c4043" }
+
+                // ---- 四种色值表示，每行右侧一个复制按钮 ----
+                Repeater {
+                    model: root.pickerSpecs
+                    delegate: Item {
+                        required property var modelData
+                        width: pickerCol.width
+                        height: 26
+
+                        Text {
+                            x: 0
+                            width: 44
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: modelData.k
+                            color: "#8f96a3"
+                            font.pixelSize: 11
+                        }
+                        Text {
+                            x: 48
+                            width: parent.width - 48 - 66
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: modelData.v
+                            color: "#e9eaec"
+                            font.pixelSize: 12
+                            font.family: "Consolas"
+                            elide: Text.ElideRight
+                        }
+                        ToolButton {
+                            width: 58
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            label: root.pickerCopied === modelData.k ? "已复制" : "复制"
+                            selected: root.pickerCopied === modelData.k
+                            onClicked: root.copyPickerValue(modelData.k, modelData.v)
+                        }
+                    }
+                }
+
+                // ---- 最近取色（点击切换当前色，便于反复复制）----
+                Item {
+                    width: parent.width
+                    height: visible ? pickerRecentLabel.height + 4 + 24 + 4 : 0
+                    visible: root.pickerHist.length > 0
+
+                    Text {
+                        id: pickerRecentLabel
+                        text: "最近取色（点击切换）"
+                        color: "#8f96a3"
+                        font.pixelSize: 10
+                    }
+                    Text {
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        text: "清空"
+                        color: "#8f96a3"
+                        font.pixelSize: 10
+                        MouseArea {
+                            anchors.fill: parent
+                            anchors.margins: -3
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: bridge.picker_clear()
+                        }
+                    }
+                    Row {
+                        anchors.top: pickerRecentLabel.bottom
+                        anchors.topMargin: 4
+                        spacing: 4
+
+                        Repeater {
+                            model: root.pickerHist
+
+                            delegate: Rectangle {
+                                required property var modelData
+                                required property int index
+                                width: 22
+                                height: 22
+                                radius: 3
+                                color: modelData.hex
+                                border.color: root.pickerVals
+                                              && root.pickerVals.hex === modelData.hex
+                                              ? "#6aa9ff" : "#5a6069"
+                                border.width: root.pickerVals
+                                              && root.pickerVals.hex === modelData.hex ? 2 : 1
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: bridge.picker_select(index)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    width: parent.width
+                    text: "点击图片取色 · Esc 关闭 · 拖动标题栏可移动\n"
+                          + "CMYK 为无色彩配置的近似换算"
+                    color: "#6b7076"
+                    font.pixelSize: 10
+                    wrapMode: Text.WordWrap
+                }
+            }
+        }
+    }
+
+    // 「已复制」提示的自动复位。
+    Timer {
+        id: pickerCopiedTimer
+        interval: 1200
+        onTriggered: root.pickerCopied = ""
+    }
+
     Item {
         id: resizeOverlay
         anchors.fill: parent
@@ -4647,6 +5211,9 @@ Window {
         // 文本输入中：普通箭头。
         if (textPopup.visible)
             return Qt.ArrowCursor
+        // 拾色器打开：整块画布都是取色十字。
+        if (bridge.pickerOpen)
+            return Qt.CrossCursor
         // 标记工具激活：手柄 → 缩放光标；标记上 → 移动；文本工具 → 工字；
         // 其余 → 十字。
         if (root.markTool !== "none") {
@@ -4985,6 +5552,8 @@ Window {
         if (textPopup.visible) { textPopup.close(false); return }
         // 调色面板：Esc = 放弃（像素从未被改动）。
         if (bridge.adjustOpen) { root.cancelAdjust(); return }
+        // 拾色器：Esc = 关面板（已取的色保留）。
+        if (bridge.pickerOpen) { bridge.picker_close(); return }
         if (widthPopover.visible || colorPopover.visible
             || mosaicPopover.visible || fontPopover.visible) {
             widthPopover.visible = false
@@ -5063,6 +5632,73 @@ Window {
         clipHelper.selectAll()
         clipHelper.copy()
         clipHelper.text = ""
+    }
+
+    // ---- 尺子 / 拾色器 ----
+
+    function toggleRuler() {
+        root.rulerOn = !root.rulerOn
+        if (!root.rulerOn)
+            root.hoverValid = false
+    }
+
+    function togglePickerPanel() {
+        if (bridge.pickerOpen)
+            bridge.picker_close()
+        else
+            bridge.picker_begin()
+    }
+
+    // Mouse position in image coordinates (canvasSurface space input).
+    // Fed by every area that actually receives hover; the readout only shows
+    // while the pointer is inside the canvas.
+    function noteHover(mx, my) {
+        const s = toDispScale()
+        if (!root.rulerOn || s <= 0) {
+            root.hoverValid = false
+            return
+        }
+        const ix = (mx - view.pad) / s
+        const iy = (my - view.pad) / s
+        root.hoverFx = ix
+        root.hoverFy = iy
+        root.hoverValid = ix >= 0 && iy >= 0
+                          && ix <= bridge.image_width && iy <= bridge.image_height
+    }
+
+    function clearHover() {
+        root.hoverValid = false
+    }
+
+    function parsePicker(s) {
+        if (!s)
+            return null
+        try {
+            const v = JSON.parse(s)
+            return v && v.hex !== undefined ? v : null
+        } catch (e) {
+            return null
+        }
+    }
+
+    function parsePickerHistory(s) {
+        if (!s)
+            return []
+        try {
+            const v = JSON.parse(s)
+            return Array.isArray(v) ? v : []
+        } catch (e) {
+            return []
+        }
+    }
+
+    // Copy one color notation and flash "已复制" on its row.
+    function copyPickerValue(key, value) {
+        if (!value)
+            return
+        copyToClipboard(value)
+        root.pickerCopied = key
+        pickerCopiedTimer.restart()
     }
 
     // Open the right-click layer menu at `panelPos` (layerPanel coords),
@@ -5786,6 +6422,29 @@ Window {
                         font.pixelSize: 11
                     }
                 }
+
+                Rectangle { width: parent.width; height: 1; color: "#3c4043" }
+
+                // ---- 5. 尺子（测量坐标系）----
+                Text {
+                    text: "尺子 / 测量坐标"
+                    color: "#b8bcc0"
+                    font.pixelSize: 12
+                }
+                CheckRow {
+                    label: "Y 轴从下往上（原点在左下角）"
+                    checked: bridge.rulerBottomUp
+                    onToggled: bridge.update_ruler_bottom_up(!bridge.rulerBottomUp)
+                }
+                Text {
+                    width: parent.width
+                    text: "关闭时原点在左上角（Y 向下，与屏幕顺序一致）；\n"
+                          + "打开后 Y 从画布底边往上计数，适合按图纸/排版坐标测量。\n"
+                          + "尺子开关在标记工具栏里（直尺图标的那个按钮）。"
+                    color: "#8f96a3"
+                    font.pixelSize: 11
+                }
+
             }
         }
     }
@@ -6015,6 +6674,41 @@ Window {
         }
     }
 
+    // Probe: --probe-ruler opens the mark bar, turns the ruler on and seeds a
+    // selection (plus a hover readout, since a headless run has no real
+    // pointer) so a screenshot shows the 4 corner + center labels.
+    Timer {
+        id: rulerProbeTimer
+        interval: 700
+        onTriggered: {
+            root.markBarVisible = true
+            root.rulerOn = true
+            if (!root.selExists && bridge.image_width > 0) {
+                root.selX = previewImage.width * 0.18
+                root.selY = previewImage.height * 0.22
+                root.selW = previewImage.width * 0.38
+                root.selH = previewImage.height * 0.34
+            }
+            if (bridge.image_width > 0) {
+                root.hoverFx = bridge.image_width * 0.72
+                root.hoverFy = bridge.image_height * 0.58
+                root.hoverValid = true
+            }
+        }
+    }
+
+    // Probe: --probe-picker opens the color-picker panel (colors come from
+    // --script="picker-pick:x,y;…").
+    Timer {
+        id: pickerProbeTimer
+        interval: 700
+        onTriggered: {
+            root.markBarVisible = true
+            if (!bridge.pickerOpen && bridge.image_width > 0)
+                bridge.picker_begin()
+        }
+    }
+
     // Probe timer: --probe-adjust opens the 调整颜色 panel (live preview of the
     // parameters supplied via --script=adjust:...).
     Timer {
@@ -6066,6 +6760,10 @@ Window {
                 adjustProbeTimer.start();
             if (Qt.application.arguments.indexOf("--probe-adjustdrag") !== -1)
                 adjustDragProbeTimer.start();
+            if (root.probeRuler)
+                rulerProbeTimer.start();
+            if (root.probePicker)
+                pickerProbeTimer.start();
         } else if (root.fileUrl.toString().length > 0) {
             // Document window spawned for a specific file ("open in separate
             // window" setting, drag-out, etc.).

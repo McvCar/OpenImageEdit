@@ -1,8 +1,10 @@
 use image::RgbaImage;
 
 mod adjust;
+mod color;
 pub mod font;
 pub use adjust::{adjust_json, Adjust, AdjustTarget, Histogram, BINS};
+pub use color::{cmyk_of, hsl_of, PickedColor};
 pub use font::{measure_text, FONTS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

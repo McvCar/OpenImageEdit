@@ -8,8 +8,8 @@ use std::time::Instant;
 use cxx_qt_lib::{QString, QUrl};
 use decode::{decode_path, encode, format_from_path, DecodeOptions, Format};
 use editcore::{
-    adjust_json, Adjust, AdjustTarget, Document, Histogram, Layer, Mark, MarkKind, Rect, Selection,
-    Size, Transform,
+    adjust_json, Adjust, AdjustTarget, Document, Histogram, Layer, Mark, MarkKind, PickedColor, Rect,
+    Selection, Size, Transform,
 };
 use image::RgbaImage;
 
@@ -35,6 +35,8 @@ const MAX_DISPLAY_EDGE: u32 = 32767;
 const MIN_ZOOM: f64 = 0.02;
 const MAX_ZOOM: f64 = 16.0;
 const ZOOM_STEP: f64 = 1.25;
+/// How many picked colors the 拾色器 panel keeps for re-use.
+const PICKER_HISTORY: usize = 12;
 
 #[cxx_qt::bridge]
 pub mod qobject {
@@ -82,6 +84,16 @@ pub mod qobject {
         #[qproperty(QString, adjust_target_name, cxx_name = "adjustTargetName")]
         #[qproperty(QString, adjust_values, cxx_name = "adjustValues")]
         #[qproperty(QString, adjust_histogram, cxx_name = "adjustHistogram")]
+        // ---- 尺子 (ruler) ----
+        /// Show ruler Y coordinates from the BOTTOM edge (origin at the
+        /// bottom-left, Y grows upward) instead of the top-left origin.
+        #[qproperty(bool, ruler_bottom_up, cxx_name = "rulerBottomUp")]
+        // ---- 拾色器 (color picker) ----
+        #[qproperty(bool, picker_open, cxx_name = "pickerOpen")]
+        /// JSON of the last picked color ("" until the first pick).
+        #[qproperty(QString, picker_color, cxx_name = "pickerColor")]
+        /// JSON array of recent picks, newest first.
+        #[qproperty(QString, picker_history, cxx_name = "pickerHistory")]
         #[namespace = "imageedit"]
         type Bridge = super::BridgeRust;
 
@@ -383,6 +395,35 @@ pub mod qobject {
         #[qinvokable]
         fn adjust_cancel(self: Pin<&mut Self>);
 
+        // ---- 尺子 / 拾色器 ----
+
+        /// Ruler coordinate direction: `true` = origin at the bottom-left
+        /// (Y grows upward), `false` = top-left origin (screen order). Pure
+        /// display preference; persisted to settings.ini.
+        #[qinvokable]
+        fn update_ruler_bottom_up(self: Pin<&mut Self>, value: bool);
+
+        /// Open the color-picker panel (clicks on the canvas then pick pixels).
+        #[qinvokable]
+        fn picker_begin(self: Pin<&mut Self>);
+
+        /// Close the color-picker panel (the picked colors are kept).
+        #[qinvokable]
+        fn picker_close(self: Pin<&mut Self>);
+
+        /// Sample the composed pixel at image coordinates `(x, y)` and publish
+        /// it as the current color + push it onto the recent list.
+        #[qinvokable]
+        fn picker_pick(self: Pin<&mut Self>, x: i32, y: i32);
+
+        /// Re-select one of the recent colors (does not add a new entry).
+        #[qinvokable]
+        fn picker_select(self: Pin<&mut Self>, index: i32);
+
+        /// Clear the recent-color list.
+        #[qinvokable]
+        fn picker_clear(self: Pin<&mut Self>);
+
         // ---- 剪贴板（跨文档） ----
 
         #[qinvokable]
@@ -455,6 +496,9 @@ struct AppConfig {
     /// lossless PNG maps it to the compression effort (< 50 = max
     /// compression / smallest file).
     save_quality: u8,
+    /// Ruler Y direction: `false` = origin top-left (screen order),
+    /// `true` = origin bottom-left (Y grows upward).
+    ruler_bottom_up: bool,
 }
 
 impl Default for AppConfig {
@@ -464,6 +508,7 @@ impl Default for AppConfig {
             checker_dark: "#cccccc".to_string(),
             open_in_new_window: false,
             save_quality: 92,
+            ruler_bottom_up: false,
         }
     }
 }
@@ -489,6 +534,7 @@ impl AppConfig {
                         }
                         "checker_dark" if !value.is_empty() => cfg.checker_dark = value.to_string(),
                         "open_in_new_window" => cfg.open_in_new_window = value == "true",
+                        "ruler_bottom_up" => cfg.ruler_bottom_up = value == "true",
                         "save_quality" => {
                             if let Ok(q) = value.parse::<u8>() {
                                 cfg.save_quality = q.clamp(1, 100);
@@ -508,8 +554,12 @@ impl AppConfig {
                 let _ = std::fs::create_dir_all(dir);
             }
             let text = format!(
-                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\n",
-                self.checker_light, self.checker_dark, self.open_in_new_window, self.save_quality
+                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\nruler_bottom_up={}\n",
+                self.checker_light,
+                self.checker_dark,
+                self.open_in_new_window,
+                self.save_quality,
+                self.ruler_bottom_up
             );
             let _ = std::fs::write(path, text);
         }
@@ -575,6 +625,15 @@ pub struct BridgeRust {
     adjust_values: QString,
     /// JSON of the 256-bin RGB histogram of the current preview.
     adjust_histogram: QString,
+    /// Ruler Y direction (see [`AppConfig::ruler_bottom_up`]).
+    ruler_bottom_up: bool,
+    /// "拾色器" panel: open flag + the last pick ("" before the first one).
+    picker_open: bool,
+    picker_color: QString,
+    /// Recent picks, newest first, as a JSON array.
+    picker_history: QString,
+    /// Recent picks in decoded form (the JSON is rebuilt from this).
+    picker_recent: RefCell<Vec<PickedColor>>,
     paste_counter: RefCell<u32>,
     /// Opacity of the selected layer before the current live slider drag, so
     /// the committed history op can record the true pre-drag value.
@@ -626,6 +685,11 @@ impl Default for BridgeRust {
             adjust_target_name: QString::default(),
             adjust_values: QString::default(),
             adjust_histogram: QString::default(),
+            ruler_bottom_up: cfg.ruler_bottom_up,
+            picker_open: false,
+            picker_color: QString::default(),
+            picker_history: QString::from("[]"),
+            picker_recent: RefCell::new(Vec::new()),
             paste_counter: RefCell::new(0),
             opacity_live: RefCell::new(None),
             drag_start_offset: RefCell::new(None),
@@ -1129,6 +1193,24 @@ impl qobject::Bridge {
                 "prev" => self.as_mut().navigate(-1),
                 "copy" => self.as_mut().copy_selected_layer(),
                 "cut" => self.as_mut().cut_selected_layer(),
+                // ---- 尺子 / 拾色器 ----
+                "ruler-bottom-up" => self.as_mut().update_ruler_bottom_up(true),
+                "ruler-top-down" => self.as_mut().update_ruler_bottom_up(false),
+                "picker-open" => self.as_mut().picker_begin(),
+                "picker-close" => self.as_mut().picker_close(),
+                "picker-clear" => self.as_mut().picker_clear(),
+                // `picker-pick:120,340` — sample one image pixel (repeatable).
+                other if other.starts_with("picker-pick:") => {
+                    if !*self.picker_open() {
+                        self.as_mut().picker_begin();
+                    }
+                    let spec = other.strip_prefix("picker-pick:").unwrap_or("");
+                    if let Some((x, y)) = spec.split_once(',') {
+                        if let (Ok(x), Ok(y)) = (x.trim().parse::<i32>(), y.trim().parse::<i32>()) {
+                            self.as_mut().picker_pick(x, y);
+                        }
+                    }
+                }
                 // Panel "unlock base" flow: converts the base into a
                 // regular bottom layer (smoke-test / automation hook).
                 "unlock-base" => self.as_mut().set_base_locked(false),
@@ -1642,6 +1724,7 @@ println!(
             checker_dark: self.checker_dark().to_string(),
             open_in_new_window: *self.open_in_new_window(),
             save_quality: (*self.save_quality()).clamp(1, 100) as u8,
+            ruler_bottom_up: *self.ruler_bottom_up(),
         }
         .save();
     }
@@ -2665,6 +2748,116 @@ session
         }
         println!("{{\"phase\":\"ui\",\"event\":\"adjust-cancel\"}}");
         self.as_mut().refresh_preview();
+    }
+
+    // ---- 尺子 / 拾色器 ----
+
+    pub fn update_ruler_bottom_up(mut self: Pin<&mut Self>, value: bool) {
+        if *self.ruler_bottom_up() == value {
+            return;
+        }
+        self.as_mut().set_ruler_bottom_up(value);
+        self.persist_config();
+    }
+
+    pub fn picker_begin(mut self: Pin<&mut Self>) {
+        if *self.picker_open() {
+            return;
+        }
+        self.as_mut().set_picker_open(true);
+        println!("{{\"phase\":\"ui\",\"event\":\"picker-open\"}}");
+    }
+
+    pub fn picker_close(mut self: Pin<&mut Self>) {
+        if !*self.picker_open() {
+            return;
+        }
+        self.as_mut().set_picker_open(false);
+        println!("{{\"phase\":\"ui\",\"event\":\"picker-close\"}}");
+    }
+
+    /// Sample the COMPOSED pixel (layers + opacity + baked adjustments) at
+    /// image coordinates. Marks are annotations, not pixels, so they are not
+    /// sampled — the picker reports the artwork's color.
+    pub fn picker_pick(mut self: Pin<&mut Self>, x: i32, y: i32) {
+        let sample = {
+            let guard = self.session.borrow();
+            match guard.as_ref() {
+                None => None,
+                Some(session) => {
+                    let w = session.doc.canvas.width as i32;
+                    let h = session.doc.canvas.height as i32;
+                    if w <= 0 || h <= 0 {
+                        None
+                    } else {
+                        // Clicks land in the 64px work-area pad around the
+                        // canvas; clamp so an edge click still reports the
+                        // nearest real pixel instead of dropping the pick.
+                        let cx = x.clamp(0, w - 1);
+                        let cy = y.clamp(0, h - 1);
+                        let px = session.doc.composite_pixel(cx, cy);
+                        Some(PickedColor::new(cx, cy, px.0))
+                    }
+                }
+            }
+        };
+        let Some(sample) = sample else {
+            return;
+        };
+        self.as_mut().set_picker_color(QString::from(sample.to_json().as_str()));
+        {
+            // Newest first, consecutive duplicates collapse into one entry.
+            let mut recent = self.picker_recent.borrow_mut();
+            if recent.first() != Some(&sample) {
+                recent.insert(0, sample);
+                recent.truncate(PICKER_HISTORY);
+            }
+        }
+        self.as_mut().publish_picker_history();
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"picker-pick\",\"x\":{},\"y\":{},\"hex\":\"{}\"}}",
+            sample.x,
+            sample.y,
+            sample.hex()
+        );
+    }
+
+    pub fn picker_select(mut self: Pin<&mut Self>, index: i32) {
+        let picked = {
+            let recent = self.picker_recent.borrow();
+            if index < 0 {
+                None
+            } else {
+                recent.get(index as usize).copied()
+            }
+        };
+        let Some(sample) = picked else {
+            return;
+        };
+        self.as_mut().set_picker_color(QString::from(sample.to_json().as_str()));
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"picker-select\",\"index\":{index},\"hex\":\"{}\"}}",
+            sample.hex()
+        );
+    }
+
+    pub fn picker_clear(mut self: Pin<&mut Self>) {
+        self.picker_recent.borrow_mut().clear();
+        self.as_mut().publish_picker_history();
+        self.as_mut().set_picker_color(QString::default());
+        println!("{{\"phase\":\"ui\",\"event\":\"picker-clear\"}}");
+    }
+
+    /// Rebuild the recent-list JSON from `picker_recent`.
+    fn publish_picker_history(mut self: Pin<&mut Self>) {
+        let json = {
+            let recent = self.picker_recent.borrow();
+            let parts: Vec<String> = recent.iter().map(|c| c.to_json()).collect();
+            format!("[{}]", parts.join(","))
+        };
+        if self.picker_history().to_string() != json {
+            self.as_mut().set_picker_history(QString::from(json.as_str()));
+        }
     }
 
     // ---- 剪贴板（跨文档复制粘贴） ----
