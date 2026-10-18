@@ -3967,16 +3967,16 @@ Window {
                 // ---- 直方图（白底 + RGB 三通道叠加，对齐 macOS 预览）+ 色阶三手柄 ----
                 Item {
                     width: parent.width
-                    height: 112
+                    height: 122
 
                     Rectangle {
                         id: adjustHistWell
                         anchors.top: parent.top
                         width: parent.width
-                        height: 74
+                        height: 84
                         color: "#ffffff"
                         radius: 4
-                        border.color: "#00000030"
+                        border.color: "#b9bdc4"
                         border.width: 1
                         clip: true
 
@@ -3987,6 +3987,11 @@ Window {
                             renderTarget: Canvas.Image
                             property var hist: parseHistogram(bridge.adjustHistogram)
                             onHistChanged: requestPaint()
+                            // 裁剪区随色阶手柄变化重绘。
+                            property real blk: root.adjustVals.bl
+                            property real wht: root.adjustVals.wh
+                            onBlkChanged: requestPaint()
+                            onWhtChanged: requestPaint()
 
                             onPaint: {
                                 const ctx = getContext("2d")
@@ -4030,6 +4035,19 @@ Window {
                                     area(hist.b, "#2646e0")
                                     ctx.globalAlpha = 1.0
                                 }
+
+                                // 色阶范围外的裁剪区：左侧压黑、右侧蒙白。截图里
+                                // 直方图左边那条深灰、右边那条浅灰就是这个（提示
+                                // 这部分像素会被裁成纯黑/纯白）。
+                                if (adjustHistCanvas.blk > 0.002) {
+                                    ctx.fillStyle = "rgba(0,0,0,0.55)"
+                                    ctx.fillRect(0, 0, adjustHistCanvas.blk * w, h)
+                                }
+                                if (adjustHistCanvas.wht < 0.998) {
+                                    ctx.fillStyle = "rgba(255,255,255,0.72)"
+                                    ctx.fillRect(adjustHistCanvas.wht * w, 0,
+                                                 Math.max(0, w - adjustHistCanvas.wht * w), h)
+                                }
                             }
                         }
                     }
@@ -4056,11 +4074,10 @@ Window {
                         }
 
                         Repeater {
-                            model: [{ kind: "black", glyph: "▲" },
-                                    { kind: "mid", glyph: "▲" },
-                                    { kind: "white", glyph: "▲" }]
+                            model: [{ kind: "black" }, { kind: "mid" }, { kind: "white" }]
 
                             delegate: Item {
+                                id: handleItem
                                 required property var modelData
                                 readonly property real pos: {
                                     const v = root.adjustVals
@@ -4070,23 +4087,61 @@ Window {
                                         return v.wh
                                     return v.bl + (v.wh - v.bl) * v.mh
                                 }
-                                x: Math.max(0, Math.min(adjustHandles.width - 12,
-                                                       pos * adjustHandles.width - 6))
-                                width: 12
-                                height: 22
+                                readonly property bool active: handleMa.containsMouse
+                                                                || handleMa.pressed
+                                x: Math.max(0, Math.min(adjustHandles.width - 16,
+                                                       pos * adjustHandles.width - 8))
+                                width: 16
+                                height: 20
 
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: "▲"
-                                    color: handleMa.containsMouse || handleMa.pressed
-                                           ? "#7fc3ff" : "#e9eaec"
-                                    font.pixelSize: 11
+                                // macOS 预览式手柄：顶部三角 + 圆角矩形本体，
+                                // 悬停/拖动时整体变蓝。
+                                Canvas {
+                                    id: knobCanvas
+                                    anchors.fill: parent
+                                    renderStrategy: Canvas.Immediate
+                                    renderTarget: Canvas.Image
+                                    property bool hot: handleItem.active
+                                    onHotChanged: requestPaint()
+
+                                    function paintKnob(active) {
+                                        const ctx = getContext("2d")
+                                        const w = width
+                                        const h = height
+                                        ctx.clearRect(0, 0, w, h)
+                                        const cx = w / 2
+                                        const tip = 0.5
+                                        const shoulder = 7
+                                        const bottom = h - 0.5
+                                        const edge = 6
+                                        ctx.beginPath()
+                                        ctx.moveTo(cx, tip)
+                                        ctx.lineTo(cx + 3.5, shoulder - 2)
+                                        ctx.lineTo(cx + edge, shoulder)
+                                        ctx.lineTo(cx + edge, bottom - 2.5)
+                                        ctx.quadraticCurveTo(cx + edge, bottom, cx + edge - 2.5, bottom)
+                                        ctx.lineTo(cx - edge + 2.5, bottom)
+                                        ctx.quadraticCurveTo(cx - edge, bottom, cx - edge, bottom - 2.5)
+                                        ctx.lineTo(cx - edge, shoulder)
+                                        ctx.lineTo(cx - 3.5, shoulder - 2)
+                                        ctx.closePath()
+                                        ctx.fillStyle = active ? "#c6e3ff" : "#f4f5f7"
+                                        ctx.fill()
+                                        ctx.strokeStyle = active ? "#4f9dff" : "#8d949d"
+                                        ctx.lineWidth = 1
+                                        ctx.stroke()
+                                        // 中间的握柄横线
+                                        ctx.fillStyle = active ? "#4f9dff" : "#b9bec6"
+                                        ctx.fillRect(cx - 3, bottom - 8, 6, 2)
+                                    }
+
+                                    onPaint: paintKnob(hot)
                                 }
 
                                 MouseArea {
                                     id: handleMa
                                     anchors.fill: parent
-                                    anchors.margins: -4
+                                    anchors.margins: -3
                                     hoverEnabled: true
                                     cursorShape: Qt.SizeHorCursor
                                     onPressed: (mouse) => adjustHandles.setHandle(

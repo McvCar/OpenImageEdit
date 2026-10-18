@@ -573,7 +573,7 @@ pub struct BridgeRust {
     adjust_target_name: QString,
     /// JSON of the live parameters (slider positions + level handles).
     adjust_values: QString,
-    /// JSON of the 64-bin RGB histogram of the current preview.
+    /// JSON of the 256-bin RGB histogram of the current preview.
     adjust_histogram: QString,
     paste_counter: RefCell<u32>,
     /// Opacity of the selected layer before the current live slider drag, so

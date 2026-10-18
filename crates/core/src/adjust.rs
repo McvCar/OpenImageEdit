@@ -19,7 +19,10 @@
 use image::RgbaImage;
 
 /// Number of bins per RGB channel in [`Histogram`].
-pub const BINS: usize = 64;
+///
+/// 256 bins (one per input level) keep the panel graph as thin, spiky bars like
+/// the macOS Preview histogram; coarser bins render as wide blocks.
+pub const BINS: usize = 256;
 
 /// Which pixels a color adjustment is baked into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,7 +260,7 @@ impl Adjust {
     }
 }
 
-/// 64-bin RGB histogram of an image (used for the panel graph and for
+/// Per-level RGB histogram of an image (used for the panel graph and for
 /// "auto levels").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Histogram {
@@ -371,7 +374,7 @@ impl Histogram {
         self.auto_bounds(0.004, 0.996)
     }
 
-    /// JSON for the QML graph canvas: `{"n":64,"r":[…],"g":[…],"b":[…]}`.
+    /// JSON for the QML graph canvas: `{"n":256,"r":[…],"g":[…],"b":[…]}`.
     pub fn to_json(&self) -> String {
         fn bins(values: &[u32; BINS]) -> String {
             let parts: Vec<String> = values.iter().map(|v| v.to_string()).collect();
