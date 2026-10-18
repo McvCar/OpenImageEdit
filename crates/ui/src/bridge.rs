@@ -907,6 +907,29 @@ impl qobject::Bridge {
                         }
                     );
                 }
+                // Live-drag smoke test: select mark 0 and move it WITHOUT
+                // committing, so a screenshot shows the live-rendered state.
+                "mark-live" => {
+                    // Seed one mark, then simulate a live drag (begin + update
+                    // without commit) so headless runs can assert the live path.
+                    self.as_mut().add_shape_mark(
+                        0, 10.0, 10.0, 60.0, 40.0, 3, &QString::from("#e24b4a"),
+                        false, &QString::from("#e24b4a"),
+                    );
+                    self.as_mut().select_mark(0);
+                    self.as_mut().mark_drag_begin();
+                    self.as_mut().mark_drag_update(30.0, 15.0, 50.0, 30.0);
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"mark-live\",\"rect\":{:?}}}",
+                        {
+                            let guard = self.session.borrow();
+                            guard
+                                .as_ref()
+                                .and_then(|s| s.doc.marks.first())
+                                .map(|m| m.rect)
+                        }
+                    );
+                }
                 other if other.starts_with("opacity:") => {
                     match other
                         .strip_prefix("opacity:")

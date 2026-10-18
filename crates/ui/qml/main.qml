@@ -1147,20 +1147,28 @@ Window {
                     { label: "填充", bind: function () { return root.markFillColor } }
                 ]
 
-                delegate: Row {
+                delegate: Item {
                     required property var modelData
-                    spacing: 4
+                    // 固定尺寸：Row 子项的尺寸不得反向依赖 Row 自身，
+                    // 否则触发 polish() 循环，Qt 会放弃整轮布局（连主工具栏
+                    // 的图标 Row 都不再排版）。宽 = 16 色块 + 4 间距 + 文本。
+                    width: 16 + 4 + swatchLabel.implicitWidth
+                    height: 16
+
                     Rectangle {
+                        x: 0
+                        y: 0
                         width: 16
                         height: 16
                         radius: 3
-                        anchors.verticalCenter: parent.verticalCenter
                         color: modelData.bind()
                         border.color: (colorPopover.editingFill === (modelData.label === "填充"))
                                       ? "#378add" : "#5a5e64"
                         border.width: 1
                     }
                     Text {
+                        id: swatchLabel
+                        x: 20
                         anchors.verticalCenter: parent.verticalCenter
                         text: modelData.label
                         color: (colorPopover.editingFill === (modelData.label === "填充"))
@@ -1168,8 +1176,7 @@ Window {
                         font.pixelSize: 11
                     }
                     MouseArea {
-                        width: parent.width
-                        height: parent.height
+                        anchors.fill: parent
                         cursorShape: Qt.PointingHandCursor
                         onClicked: colorPopover.editingFill = modelData.label === "填充"
                     }
@@ -1589,18 +1596,23 @@ Window {
                 function handleAt(mx, my) {
                     if (bridge.selected_mark < 0)
                         return ""
-                    const box = selectedMarkBox()
-                    if (!box)
+                    const b = selectedMarkBox()
+                    if (!b)
                         return ""
+                    // canvasSurface coords: the box is preview-relative.
+                    const bx = view.pad + b[0]
+                    const by = view.pad + b[1]
+                    const bw = b[2]
+                    const bh = b[3]
                     const pts = {
-                        "nw": [box[0], box[1]],
-                        "n":  [box[0] + box[2] / 2, box[1]],
-                        "ne": [box[0] + box[2], box[1]],
-                        "e":  [box[0] + box[2], box[1] + box[3] / 2],
-                        "se": [box[0] + box[2], box[1] + box[3]],
-                        "s":  [box[0] + box[2] / 2, box[1] + box[3]],
-                        "sw": [box[0], box[1] + box[3]],
-                        "w":  [box[0], box[1] + box[3] / 2]
+                        "nw": [bx, by],
+                        "n":  [bx + bw / 2, by],
+                        "ne": [bx + bw, by],
+                        "e":  [bx + bw, by + bh / 2],
+                        "se": [bx + bw, by + bh],
+                        "s":  [bx + bw / 2, by + bh],
+                        "sw": [bx, by + bh],
+                        "w":  [bx, by + bh / 2]
                     }
                     for (const k in pts) {
                         if (Math.abs(mx - pts[k][0]) <= 7 && Math.abs(my - pts[k][1]) <= 7)
@@ -1855,10 +1867,11 @@ Window {
                     color: "#378add"
                     border.color: "#ffffff"
                     border.width: 1
-                    x: box ? (role.indexOf("w") !== -1 ? box[0] - 4
+                    // canvasSurface 坐标 = 预览相对坐标 + pad。
+                    x: box ? view.pad + (role.indexOf("w") !== -1 ? box[0] - 4
                              : role.indexOf("e") !== -1 ? box[0] + box[2] - 4
                              : box[0] + box[2] / 2 - 4) : 0
-                    y: box ? (role.indexOf("n") !== -1 ? box[1] - 4
+                    y: box ? view.pad + (role.indexOf("n") !== -1 ? box[1] - 4
                              : role.indexOf("s") !== -1 ? box[1] + box[3] - 4
                              : box[1] + box[3] / 2 - 4) : 0
                 }
@@ -2573,6 +2586,75 @@ Window {
                         }
                     }
                 }
+                }
+
+                // ---- 标记分区：画布上的全部矢量标记（点击选中，右键删除）----
+                Rectangle {
+                    width: parent.width
+                    height: 1
+                    color: "#3c4043"
+                    visible: root.markList.length > 0
+                }
+
+                Text {
+                    id: markSectionHdr
+                    width: layerRepeaterColumn.width
+                    text: "标记（" + root.markList.length + "）· 左键选中，右键删除"
+                    color: "#e9eaec"
+                    font.pixelSize: 12
+                    font.bold: true
+                    visible: root.markList.length > 0
+                }
+
+                Repeater {
+                    model: root.markList
+
+                    delegate: Rectangle {
+                        id: markRow
+                        required property var modelData
+                        required property int index
+                        readonly property bool isSel: modelData.i === bridge.selected_mark
+                        width: layerRepeaterColumn.width
+                        height: 26
+                        radius: 4
+                        color: isSel ? "#3d5a80"
+                             : (markRowMa.containsMouse ? "#3a3e44" : "#33373c")
+
+                        Text {
+                            x: 8
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: (markRow.modelData.k === 0 ? "▭ 矩形"
+                                   : markRow.modelData.k === 1 ? "◯ 椭圆"
+                                   : markRow.modelData.k === 2 ? "↗ 箭头"
+                                   : "✏ 画笔")
+                                  + "  " + (markRow.index + 1)
+                            color: "#d5d8dd"
+                            font.pixelSize: 11
+                        }
+                        Text {
+                            anchors.right: parent.right
+                            anchors.rightMargin: 8
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: markRow.modelData.s + "px  " + markRow.modelData.c
+                            color: "#6b7076"
+                            font.pixelSize: 10
+                        }
+                        MouseArea {
+                            id: markRowMa
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            acceptedButtons: Qt.LeftButton | Qt.RightButton
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: (mouse) => {
+                                if (mouse.button === Qt.RightButton) {
+                                    bridge.select_mark(markRow.modelData.i)
+                                    bridge.delete_selected_mark()
+                                } else {
+                                    bridge.select_mark(markRow.modelData.i)
+                                }
+                            }
+                        }
+                    }
                 }
             }
                 // Drop-position line shown while dragging a row to reorder.
@@ -3490,8 +3572,9 @@ Window {
         return root.markList.find(mk => mk.i === index) || null
     }
 
-    // Selected-mark display bounds [x, y, w, h] in canvasSurface coords
-    // (image coords × display scale + pad), or null.
+    // Selected-mark display bounds [x, y, w, h] relative to the preview
+    // image origin (image coords × display scale, NO pad — callers that
+    // live in canvasSurface add view.pad themselves).
     function selectedMarkBox() {
         if (bridge.selected_mark < 0)
             return null
@@ -3499,7 +3582,7 @@ Window {
         if (!m)
             return null
         const s = toDispScale()
-        return [view.pad + m.x * s, view.pad + m.y * s, m.w * s, m.h * s]
+        return [m.x * s, m.y * s, m.w * s, m.h * s]
     }
 
     // Apply the current bar style to the selected mark (if any); otherwise
