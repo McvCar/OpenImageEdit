@@ -1057,14 +1057,19 @@ Window {
                onActivated: root.toggleAdjustPanel() }
     Shortcut { sequence: "Ctrl+L"; onActivated: bridge.rotate_ccw() }
     Shortcut { sequence: "Ctrl+Shift+R"; onActivated: bridge.rotate_cw() }
+    // Delete/Backspace 在文本输入（文本标记就地编辑 / 字号输入 / 图层
+    // 重命名）获得焦点时必须禁用：QML Shortcut 先于焦点项拦截按键，
+    // 不禁用会吞掉输入框的退格键，还会误删选中的标记/图层。
     Shortcut { sequences: ["Delete", "Backspace"]
-               enabled: root.selExists || bridge.selected_mark >= 0
+               enabled: !textPopup.visible && !sizeInput.activeFocus
+                        && root.renamingIndex < 0
+                        && (root.selExists || bridge.selected_mark >= 0
                         || bridge.selected_layer >= 0
                         || (function () {
                             const b = findBase()
                             return b !== null && b.bd !== true && !isLocked(b)
                                 && bridge.layer_count > 0
-                        })()
+                        })())
                onActivated: onDeleteKey() }
     Shortcut { sequence: "Ctrl+A"
                enabled: bridge.image_width > 0 && root.renamingIndex < 0
@@ -5583,17 +5588,17 @@ Window {
         root.selH = 0
     }
 
-    // Delete / Backspace: with a selection → erase selection pixels;
-    // otherwise delete the selected unlocked layer; with nothing selected and
-    // an unlocked (deleted-pending) base → remove the background.
+    // Delete / Backspace: 显式选中的标记最优先（持久选区 + 选中标记时，
+    // Delete 的意图是删标记——选区像素删除先按一次 Esc 取消标记选中，
+    // 与 Esc 的取消层级一致）；然后是选区像素 → 选中图层 → 可删的背景。
     function onDeleteKey() {
-        if (root.selExists) {
-            deleteSelectionPixels()
-            return
-        }
         // 就地编辑文本时 Delete 属于输入框，不删标记。
         if (bridge.selected_mark >= 0 && !textPopup.visible) {
             bridge.delete_selected_mark()
+            return
+        }
+        if (root.selExists) {
+            deleteSelectionPixels()
             return
         }
         if (bridge.selected_layer >= 0) {
