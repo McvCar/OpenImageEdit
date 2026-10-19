@@ -166,6 +166,13 @@ pub mod qobject {
         #[qinvokable]
         fn zoom_out(self: Pin<&mut Self>);
 
+        /// Interactive zoom: apply a cumulative factor. QML queues wheel
+        /// ticks during a gesture (stretching the stale preview to the
+        /// predicted display size) and calls this ONCE per gesture — one
+        /// full recomposite instead of one per wheel notch.
+        #[qinvokable]
+        fn zoom_step(self: Pin<&mut Self>, factor: f64);
+
         #[qinvokable]
         fn zoom_fit(self: Pin<&mut Self>);
 
@@ -2039,6 +2046,16 @@ println!(
     pub fn zoom_out(mut self: Pin<&mut Self>) {
         if let Some(session) = self.session.borrow_mut().as_mut() {
             session.zoom_by(1.0 / ZOOM_STEP);
+        }
+        self.as_mut().refresh_preview();
+    }
+
+    pub fn zoom_step(mut self: Pin<&mut Self>, factor: f64) {
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        if let Some(session) = self.session.borrow_mut().as_mut() {
+            session.zoom_by(factor);
         }
         self.as_mut().refresh_preview();
     }

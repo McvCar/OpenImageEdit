@@ -1038,8 +1038,8 @@ Window {
     Shortcut { sequence: "Shift+Up";    enabled: bridge.selected_layer >= 0; onActivated: nudgeLayer(0, -10) }
     Shortcut { sequence: "Shift+Down";  enabled: bridge.selected_layer >= 0; onActivated: nudgeLayer(0, 10) }
 
-    Shortcut { sequences: [StandardKey.ZoomIn, "Ctrl+="]; onActivated: bridge.zoom_in() }
-    Shortcut { sequences: [StandardKey.ZoomOut]; onActivated: bridge.zoom_out() }
+    Shortcut { sequences: [StandardKey.ZoomIn, "Ctrl+="]; onActivated: view.queueZoom(1.25) }
+    Shortcut { sequences: [StandardKey.ZoomOut]; onActivated: view.queueZoom(1 / 1.25) }
     // Preview-aligned: ⌘0 actual size, ⌘9 zoom-to-fit (old keys kept as aliases).
     Shortcut { sequences: ["Ctrl+0", "Ctrl+1"]; onActivated: bridge.zoom_actual() }
     Shortcut { sequences: ["Ctrl+9"]; onActivated: bridge.zoom_fit() }
@@ -1109,9 +1109,9 @@ Window {
               run: function () { openResizeDialog() } },
             { g: "", t: "", ok: true, sep: true },
             { g: "＋", t: "放大 (Ctrl+滚轮)", ok: true,
-              run: function () { bridge.zoom_in() } },
+              run: function () { view.queueZoom(1.25) } },
             { g: "－", t: "缩小 (Ctrl+滚轮)", ok: true,
-              run: function () { bridge.zoom_out() } }
+              run: function () { view.queueZoom(1 / 1.25) } }
         ]
 
         // Everything the bar shows as icons, plus the full text-only set.
@@ -1142,8 +1142,8 @@ Window {
             { l: "拾色器…", ok: bridge.image_width > 0,
               run: function () { root.togglePickerPanel() } },
             { l: "", ok: true, sep: true },
-            { l: "放大 (Ctrl++)", ok: true, run: function () { bridge.zoom_in() } },
-            { l: "缩小 (Ctrl+-)", ok: true, run: function () { bridge.zoom_out() } },
+            { l: "放大 (Ctrl++)", ok: true, run: function () { view.queueZoom(1.25) } },
+            { l: "缩小 (Ctrl+-)", ok: true, run: function () { view.queueZoom(1 / 1.25) } },
             { l: "适应窗口 (Ctrl+9)", ok: bridge.image_width > 0, run: function () { bridge.zoom_fit() } },
             { l: "100% 实际大小 (Ctrl+0)", ok: bridge.image_width > 0, run: function () { bridge.zoom_actual() } },
             { l: "", ok: true, sep: true },
@@ -2420,12 +2420,17 @@ Window {
                             height / bridge.image_height, 1.0)
         }
         // 画布当前应当显示的尺寸：待渲染期间用预测值，其余用 bridge 的真值。
+        // 缩放手势的预测优先（fit 已被 zoom_by 置 false）。
         readonly property real shownWidth: {
+            if (zoomPending && predictedZoom > 0)
+                return Math.max(1, Math.round(bridge.image_width * predictedZoom))
             if (viewportPending && fitScalePreview > 0)
                 return Math.max(1, Math.round(bridge.image_width * fitScalePreview))
             return Math.max(1, bridge.display_width)
         }
         readonly property real shownHeight: {
+            if (zoomPending && predictedZoom > 0)
+                return Math.max(1, Math.round(bridge.image_height * predictedZoom))
             if (viewportPending && fitScalePreview > 0)
                 return Math.max(1, Math.round(bridge.image_height * fitScalePreview))
             return Math.max(1, bridge.display_height)
@@ -2446,6 +2451,38 @@ Window {
             id: viewportTimer
             interval: 120
             onTriggered: bridge.set_viewport(view.width, view.height)
+        }
+
+        // ---- 缩放节流 ------------------------------------------------------
+        // Ctrl+滚轮每一格原来都同步跑一遍全量重合成 + BMP 编码（预览目标
+        // 最长边可到 4096px，大图下每步数百 ms），连滚直接卡死。对策与窗口
+        // 缩放相同：手势期间只累积倍率，用「当前 zoom × 累积倍率」预测显示
+        // 尺寸把现有预览拉伸（视觉跟手），停手 120ms 后渲染一次真图。预测
+        // 公式与 Rust 的 zoom_by / display_size 一致（ZOOM_STEP=1.25，clamp
+        // 0.02..16），渲染落地时不跳变。
+        readonly property bool zoomPending: zoomTimer.running
+        property real pendingZoom: 1.0
+        readonly property real predictedZoom: {
+            if (!zoomPending || bridge.zoom_percent <= 0)
+                return 0
+            const z = Math.min(16.0, Math.max(0.02,
+                (bridge.zoom_percent / 100.0) * pendingZoom))
+            // 与 Rust display_size 一致：显示最长边 clamp 32767。
+            const longest = Math.max(bridge.image_width, bridge.image_height)
+            return Math.min(z, 32767.0 / longest)
+        }
+        function queueZoom(factor) {
+            pendingZoom = Math.min(16.0, Math.max(0.02, pendingZoom * factor))
+            zoomTimer.restart()
+        }
+        Timer {
+            id: zoomTimer
+            interval: 120
+            onTriggered: {
+                const f = view.pendingZoom
+                view.pendingZoom = 1.0
+                bridge.zoom_step(f)
+            }
         }
 
         // Clamp-and-shift the visible region by (dx, dy) viewport px.
@@ -3544,9 +3581,9 @@ Window {
             }
             if ((event.modifiers & Qt.ControlModifier) !== 0) {
                 if (event.angleDelta.y > 0)
-                    bridge.zoom_in()
+                    view.queueZoom(1.25)
                 else if (event.angleDelta.y < 0)
-                    bridge.zoom_out()
+                    view.queueZoom(1 / 1.25)
                 event.accepted = true
                 return
             }
