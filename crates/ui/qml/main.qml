@@ -814,7 +814,7 @@ Window {
         property int markMosaic: 12
         // Text tool state (font family id from core::font::FONTS).
         property string markFont: "msyh"
-        property int markFontSize: 28
+        property int markFontSize: 36
         property bool markBold: false
         property bool markItalic: false
         property bool markUnderline: false
@@ -1895,13 +1895,31 @@ Window {
                     MouseArea {
                         anchors.fill: parent
                     }
-                    Text {
+                    // 字号：默认步进档显示 + 可输入任意自定义值（4-512），
+                    // Enter 或失焦提交；▲▼ 步进仍可用。
+                    TextInput {
+                        id: sizeInput
                         anchors.verticalCenter: parent.verticalCenter
                         anchors.left: parent.left
                         anchors.leftMargin: 12
+                        width: 48
                         text: root.markFontSize
                         color: "#e9eaec"
                         font.pixelSize: 13
+                        validator: IntValidator { bottom: 4; top: 512 }
+                        selectByMouse: true
+                        onActiveFocusChanged: if (activeFocus) selectAll()
+                        onEditingFinished: {
+                            const v = parseInt(text, 10)
+                            if (!isNaN(v)) {
+                                const clamped = Math.max(4, Math.min(512, v))
+                                if (clamped !== root.markFontSize) {
+                                    root.markFontSize = clamped
+                                    root.applyTextFont()
+                                }
+                            }
+                            text = root.markFontSize
+                        }
                     }
                     Column {
                         anchors.verticalCenter: parent.verticalCenter
@@ -6068,6 +6086,8 @@ Window {
     }
 
     // 字号档位步进（macOS 风格 stepper 用）：dir = +1 / -1。
+    // 自定义值（不在档位表内）向上/向下取相邻档；sizeInput 显式回写是
+    // 因为用户手动输入会打断 text 的声明式绑定。
     function stepMarkFontSize(dir) {
         const steps = [12, 16, 20, 24, 28, 36, 48, 64]
         let i = 0
@@ -6076,6 +6096,7 @@ Window {
                 i = k
         i = Math.max(0, Math.min(steps.length - 1, i + dir))
         root.markFontSize = steps[i]
+        sizeInput.text = steps[i]
         applyTextFont()
     }
 
