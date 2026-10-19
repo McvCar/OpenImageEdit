@@ -957,6 +957,17 @@ Window {
             }
         }
 
+        // ---- 后台解码：轮询应用解码结果 --------------------------------
+        // 大图在 worker 线程解码，这里以 50ms 轮询取结果；结果落地后
+        // bridge.loading 翻回 false，Timer 自动停。
+        Timer {
+            id: decodePollTimer
+            interval: 50
+            repeat: true
+            running: bridge.loading && !root.quitting
+            onTriggered: bridge.poll_decode()
+        }
+
         function raiseWindow() {
             const w = Window.window
             if (!w)
@@ -2388,6 +2399,11 @@ Window {
             centerContent()
             requestViewport()
         }
+        // Startup safety net: when the first layout lands directly on the
+        // final size, onWidthChanged/onHeightChanged never fire (no "change")
+        // and the bridge would keep a 0x0 viewport — fit zoom then opens at
+        // 100%. Reporting once at completion closes that race.
+        Component.onCompleted: requestViewport()
 
         // ---- 窗口缩放节流 ------------------------------------------------
         // 适应窗口模式下每次 viewport 变化都要重跑一遍全预览重合成 + BMP
@@ -6527,6 +6543,50 @@ Window {
                             font.pixelSize: 12
                         }
                     }
+                }
+
+                MouseArea {
+                    id: downsampleRow
+                    width: 16 + 8 + dsLbl.implicitWidth
+                    height: Math.max(16, dsLbl.implicitHeight)
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: bridge.update_large_downsample(!bridge.largeDownsample)
+
+                    Item {
+                        width: 16
+                        height: 16
+                        anchors.verticalCenter: parent.verticalCenter
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: 4
+                            color: "transparent"
+                            border.color: bridge.largeDownsample ? "#6aa9ff" : "#5a6069"
+                            border.width: 2
+                        }
+                        Rectangle {
+                            anchors.centerIn: parent
+                            width: 8
+                            height: 8
+                            radius: 2
+                            color: "#6aa9ff"
+                            visible: bridge.largeDownsample
+                        }
+                    }
+                    Text {
+                        id: dsLbl
+                        x: 24
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "超大图降采样（最长边 8192px）"
+                        color: "#d5d8dd"
+                        font.pixelSize: 12
+                    }
+                }
+                Text {
+                    width: parent.width
+                    text: "打开最长边超过 8192px 的图片时自动降到工作分辨率，打开更快、编辑更流畅。\n注意：另存/保存的分辨率也会是降采样后的；取消勾选则保留原始分辨率。"
+                    color: "#8f96a3"
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
                 }
 
                 Rectangle { width: parent.width; height: 1; color: "#3c4043" }

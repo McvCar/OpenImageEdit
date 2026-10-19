@@ -3,10 +3,11 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::time::Instant;
 
 use cxx_qt_lib::{QString, QUrl};
-use decode::{decode_path, encode, format_from_path, DecodeOptions, Format};
+use decode::{decode_path, encode, format_from_path, DecodeOptions, Decoded, Format};
 use editcore::{
     adjust_json, Adjust, AdjustTarget, Document, Histogram, Layer, Mark, MarkKind, PickedColor, Rect,
     Selection, Size, Transform,
@@ -79,6 +80,13 @@ pub mod qobject {
         #[qproperty(bool, open_in_new_window, cxx_name = "openInNewWindow")]
         #[qproperty(i32, save_quality, cxx_name = "saveQuality")]
         #[qproperty(QString, source_path, cxx_name = "sourcePath")]
+        // ---- 后台解码 ----
+        /// True while an image is being decoded off the UI thread; the QML
+        /// poll timer calls `poll_decode()` until it flips back to false.
+        #[qproperty(bool, loading)]
+        /// Downsampling-first open for very large images (longest edge
+        /// capped at 8192 px). `false` keeps the original resolution.
+        #[qproperty(bool, large_downsample, cxx_name = "largeDownsample")]
         // ---- 调整颜色 (color adjustment) panel ----
         #[qproperty(bool, adjust_open, cxx_name = "adjustOpen")]
         #[qproperty(QString, adjust_target_name, cxx_name = "adjustTargetName")]
@@ -133,6 +141,15 @@ pub mod qobject {
         /// with it directly; lossless PNG maps it to compression effort.
         #[qinvokable]
         fn update_save_quality(self: Pin<&mut Self>, value: i32);
+
+        /// Drain the background decode job: applies the finished result on
+        /// the UI thread (no-op while the decode thread is still running).
+        #[qinvokable]
+        fn poll_decode(self: Pin<&mut Self>);
+
+        /// Toggle downsampling-first open for very large images.
+        #[qinvokable]
+        fn update_large_downsample(self: Pin<&mut Self>, value: bool);
 
         /// Export a single layer's pixels as a PNG next to the source file,
         /// named `layout_<编号>.png` (编号 = numeric layer name or doc
@@ -510,6 +527,9 @@ struct AppConfig {
     /// Ruler Y direction: `false` = origin top-left (screen order),
     /// `true` = origin bottom-left (Y grows upward).
     ruler_bottom_up: bool,
+    /// Downsampling-first open cap for the longest edge. `0` disables it and
+    /// keeps the original resolution (files above 300 MP are still rejected).
+    max_dimension: i32,
 }
 
 impl Default for AppConfig {
@@ -520,6 +540,7 @@ impl Default for AppConfig {
             open_in_new_window: true,
             save_quality: 92,
             ruler_bottom_up: false,
+            max_dimension: 8192,
         }
     }
 }
@@ -551,6 +572,11 @@ impl AppConfig {
                                 cfg.save_quality = q.clamp(1, 100);
                             }
                         }
+                        "max_dimension" => {
+                            if let Ok(d) = value.parse::<i32>() {
+                                cfg.max_dimension = d.max(0);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -565,12 +591,13 @@ impl AppConfig {
                 let _ = std::fs::create_dir_all(dir);
             }
             let text = format!(
-                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\nruler_bottom_up={}\n",
+                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\nruler_bottom_up={}\nmax_dimension={}\n",
                 self.checker_light,
                 self.checker_dark,
                 self.open_in_new_window,
                 self.save_quality,
-                self.ruler_bottom_up
+                self.ruler_bottom_up,
+                self.max_dimension
             );
             let _ = std::fs::write(path, text);
         }
@@ -638,6 +665,15 @@ pub struct BridgeRust {
     adjust_histogram: QString,
     /// Ruler Y direction (see [`AppConfig::ruler_bottom_up`]).
     ruler_bottom_up: bool,
+    /// True while an image decodes off the UI thread (see `loading`).
+    loading: bool,
+    /// Downsampling-first open for very large images (see `large_downsample`).
+    large_downsample: bool,
+    /// In-flight background decode. The worker thread only sends into the
+    /// channel; the UI thread drains it from `poll_decode()`. Replacing the
+    /// option drops the old receiver, so a superseded job's result is simply
+    /// discarded (the thread itself cannot touch any Qt state).
+    decode_job: RefCell<Option<mpsc::Receiver<DecodeMsg>>>,
     /// "拾色器" panel: open flag + the last pick ("" before the first one).
     picker_open: bool,
     picker_color: QString,
@@ -697,6 +733,9 @@ impl Default for BridgeRust {
             adjust_values: QString::default(),
             adjust_histogram: QString::default(),
             ruler_bottom_up: cfg.ruler_bottom_up,
+            loading: false,
+            large_downsample: cfg.max_dimension != 0,
+            decode_job: RefCell::new(None),
             picker_open: false,
             picker_color: QString::default(),
             picker_history: QString::from("[]"),
@@ -752,6 +791,10 @@ struct Session {
     /// Open "调整颜色" panel: the scope captured when it opened plus the live
     /// parameters. Document pixels are NOT touched until `adjust_commit`.
     adjust: Option<AdjustLive>,
+    /// Original (width, height) when downsampling-first open shrank this
+    /// document. The status bar keeps a persistent hint (refreshes rebuild
+    /// the status text, so a one-shot message would be wiped instantly).
+    downsampled_from: Option<(u32, u32)>,
 }
 
 /// Live "调整颜色" state (history-free until the panel commits).
@@ -760,6 +803,15 @@ struct AdjustLive {
     target: AdjustTarget,
     params: Adjust,
 }
+
+/// Message from the background decode worker (see `BridgeRust::decode_job`).
+struct DecodeMsg {
+    path: PathBuf,
+    result: Result<(Decoded, i32), String>,
+}
+
+/// Longest-edge cap applied when the user enables downsampling-first open.
+const DOWNSAMPLE_EDGE: u32 = 8192;
 
 /// Session-side state for a live layer resize gesture.
 struct LiveScaleState {
@@ -855,9 +907,10 @@ fn extension_for(format: Format) -> &'static str {
 }
 
 impl Session {
-    fn open(path: &Path, viewport: Size, save_quality: u8) -> Result<(Self, i32), String> {
+    /// Build a session from already-decoded pixels (the decode itself runs
+    /// either inline for automation or on the worker thread for the UI).
+    fn from_decoded(path: &Path, decoded: Decoded, viewport: Size, save_quality: u8) -> (Self, i32) {
         let t0 = Instant::now();
-        let decoded = decode_path(path, DecodeOptions::default()).map_err(|e| e.to_string())?;
         let doc = Document::from_image(decoded.image);
         let zoom = fit_zoom(doc.canvas, viewport);
         let ms = t0.elapsed().as_millis().min(i32::MAX as u128) as i32;
@@ -866,7 +919,7 @@ impl Session {
         // in a new window" flow all need an absolute one. `absolute` keeps the
         // normal form (no \\?\ prefix, unlike canonicalize).
         let source = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-        Ok((
+        (
             Self {
                 id: SESSION_SEQ.fetch_add(1, Ordering::Relaxed),
                 doc,
@@ -882,9 +935,25 @@ impl Session {
                 composer: render::PreviewComposer::new(),
                 last_display: Size::new(0, 0),
                 adjust: None,
+                downsampled_from: decoded.downsampled_from,
             },
             ms,
-        ))
+        )
+    }
+
+    /// Synchronous open (automation only: --selftest / --script / probes run
+    /// script ops immediately after the load, so the document must exist).
+    fn open(
+        path: &Path,
+        viewport: Size,
+        save_quality: u8,
+        opts: DecodeOptions,
+    ) -> Result<(Self, i32), String> {
+        let t0 = Instant::now();
+        let decoded = decode_path(path, opts).map_err(|e| e.to_string())?;
+        let decode_ms = t0.elapsed().as_millis().min(i32::MAX as u128) as i32;
+        let (session, _) = Self::from_decoded(path, decoded, viewport, save_quality);
+        Ok((session, decode_ms))
     }
 
     fn refit(&mut self, viewport: Size) {
@@ -1211,7 +1280,16 @@ impl qobject::Bridge {
             println!("{{\"phase\":\"ui\",\"event\":\"no-input\"}}");
             return;
         };
-        self.as_mut().load_path(Path::new(&file));
+        // Automation runs (any -- flag: selftest, scripts, probes) decode
+        // synchronously because the script ops right after expect a loaded
+        // document. Plain double-click runs decode in the background so a
+        // huge image never blocks the window from showing up.
+        let automation = std::env::args().any(|a| a.starts_with("--"));
+        if automation {
+            self.as_mut().load_path_sync(Path::new(&file));
+        } else {
+            self.as_mut().load_path(Path::new(&file));
+        }
 
         if let Some(script) = script {
             self.as_mut().run_script(&script);
@@ -1778,6 +1856,7 @@ println!(
             open_in_new_window: *self.open_in_new_window(),
             save_quality: (*self.save_quality()).clamp(1, 100) as u8,
             ruler_bottom_up: *self.ruler_bottom_up(),
+            max_dimension: if *self.large_downsample() { 8192 } else { 0 },
         }
         .save();
     }
@@ -1803,6 +1882,14 @@ println!(
             return;
         }
         self.as_mut().set_open_in_new_window(value);
+        self.persist_config();
+    }
+
+    pub fn update_large_downsample(mut self: Pin<&mut Self>, value: bool) {
+        if *self.large_downsample() == value {
+            return;
+        }
+        self.as_mut().set_large_downsample(value);
         self.persist_config();
     }
 
@@ -3637,14 +3724,128 @@ session
         }
     }
 
+    /// Decode options derived from the current preferences.
+    fn decode_opts(&self) -> DecodeOptions {
+        DecodeOptions {
+            max_pixels: Some(300_000_000),
+            max_dimension: if *self.large_downsample() {
+                Some(DOWNSAMPLE_EDGE)
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Interactive load: hand the file to the worker thread and return
+    /// immediately, so even a huge image never freezes the UI. The current
+    /// document stays visible until the decode lands (or fails).
     fn load_path(mut self: Pin<&mut Self>, path: &Path) {
-        let viewport = *self.viewport.borrow();
         println!(
             "{{\"phase\":\"ui\",\"event\":\"load\",\"file\":\"{}\"}}",
             path.to_string_lossy().replace('\\', "/")
         );
-        match Session::open(path, viewport, (*self.save_quality()).clamp(1, 100) as u8) {
+        let (tx, rx) = mpsc::channel::<DecodeMsg>();
+        let thread_path = path.to_path_buf();
+        let opts = self.decode_opts();
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let result = decode_path(&thread_path, opts).map_err(|e| e.to_string());
+            let ms = t0.elapsed().as_millis().min(i32::MAX as u128) as i32;
+            let _ = tx.send(DecodeMsg {
+                path: thread_path,
+                result: result.map(|d| (d, ms)),
+            });
+        });
+        // Dropping the previous receiver (if any) discards its result.
+        *self.decode_job.borrow_mut() = Some(rx);
+        self.as_mut().set_loading(true);
+        self.as_mut()
+            .set_status(QString::from("正在打开…"));
+    }
+
+    /// Drain the finished decode job (QML poll timer drives this). Applying
+    /// happens here on the UI thread, so no Qt state is ever touched from
+    /// the worker.
+    pub fn poll_decode(mut self: Pin<&mut Self>) {
+        let msg = {
+            let mut job = self.decode_job.borrow_mut();
+            let Some(rx) = job.as_ref() else {
+                return;
+            };
+            match rx.try_recv() {
+                Ok(msg) => {
+                    *job = None;
+                    Some(msg)
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    *job = None;
+                    None
+                }
+            }
+        };
+        if msg.is_none() {
+            return;
+        }
+        self.as_mut().set_loading(false);
+        let Some(msg) = msg else {
+            return;
+        };
+        let viewport = *self.viewport.borrow();
+        match msg.result {
+            Ok((decoded, decode_ms)) => {
+                let Decoded {
+                    info,
+                    downsampled_from,
+                    ..
+                } = decoded;
+                let (session, _) = Session::from_decoded(
+                    &msg.path,
+                    decoded,
+                    viewport,
+                    (*self.save_quality()).clamp(1, 100) as u8,
+                );
+                self.as_mut().set_load_failed(false);
+                self.as_mut().set_decode_ms(decode_ms);
+                *self.session.borrow_mut() = Some(session);
+                self.as_mut().update_file_info();
+                self.as_mut().refresh_preview();
+                if let Some((w, h)) = downsampled_from {
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"downsampled\",\"from\":\"{}x{}\",\"to\":\"{}x{}\"}}",
+                        w, h, info.width, info.height
+                    );
+                }
+            }
+            Err(err) => {
+                *self.session.borrow_mut() = None;
+                eprintln!("{{\"phase\":\"ui\",\"error\":\"decode-failed\",\"detail\":\"{err}\"}}");
+                let status = format!("decode-error: {err}");
+                self.as_mut().set_status(QString::from(status.as_str()));
+                self.as_mut().set_preview_url(QString::from(""));
+                self.as_mut().set_load_failed(true);
+                self.as_mut().update_file_info();
+            }
+        }
+    }
+
+    /// Synchronous load for automation (the script ops that follow `start()`
+    /// assume the document already exists).
+    fn load_path_sync(mut self: Pin<&mut Self>, path: &Path) {
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"load\",\"file\":\"{}\"}}",
+            path.to_string_lossy().replace('\\', "/")
+        );
+        let viewport = *self.viewport.borrow();
+        let opts = self.decode_opts();
+        match Session::open(path, viewport, (*self.save_quality()).clamp(1, 100) as u8, opts) {
             Ok((session, ms)) => {
+                if let Some((w, h)) = session.downsampled_from {
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"downsampled\",\"from\":\"{}x{}\",\"to\":\"{}x{}\"}}",
+                        w, h, session.doc.canvas.width, session.doc.canvas.height
+                    );
+                }
                 self.as_mut().set_load_failed(false);
                 self.as_mut().set_decode_ms(ms);
                 *self.session.borrow_mut() = Some(session);
@@ -4270,7 +4471,7 @@ session
                 // The status bar's left side already shows the file name and
                 // size; a second resolution readout here was redundant, so
                 // only keep the preview-degraded hint when it matters.
-                let status = if preview == display {
+                let mut status = if preview == display {
                     String::new()
                 } else {
                     format!(
@@ -4280,6 +4481,22 @@ session
                         preview.height
                     )
                 };
+                // Persistent downsampling hint: refreshes rebuild the status
+                // text, so the "save resolution differs" notice must live here
+                // or the first viewport change would wipe it.
+                if let Some((w, h)) = self
+                    .session
+                    .borrow()
+                    .as_ref()
+                    .and_then(|s| s.downsampled_from)
+                {
+                    let hint = format!("已降采样 {}×{} → {}×{}", w, h, canvas.width, canvas.height);
+                    if status.is_empty() {
+                        status = hint;
+                    } else {
+                        status = format!("{status} · {hint}");
+                    }
+                }
                 self.as_mut().set_image_width(canvas.width as i32);
                 self.as_mut().set_image_height(canvas.height as i32);
                 self.as_mut().set_display_width(display.width as i32);

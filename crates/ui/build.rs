@@ -1,6 +1,11 @@
 use cxx_qt_build::{CxxQtBuilder, QmlModule};
 
 fn main() {
+    // cxx-qt-build's own rerun-if-changed directives do not cover the QML
+    // source, so a QML-only edit rebuilt nothing and the qrc silently kept
+    // embedding the stale main.qml (the "界面与最新源码不一致" trap). Watch
+    // the QML tree explicitly.
+    println!("cargo:rerun-if-changed=qml");
     CxxQtBuilder::new_qml_module(QmlModule::new("com.imageedit").qml_file("qml/main.qml"))
         .qt_module("Quick")
         .qt_module("Qml")

@@ -26,12 +26,19 @@ pub enum DecodeError {
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeOptions {
     pub max_pixels: Option<u64>,
+    /// Downsampling-first open: when the longest edge exceeds this value the
+    /// image is decoded once, then resampled (Lanczos3, aspect preserved)
+    /// before it enters the document. Bounds memory and every downstream
+    /// operation (preview composite, undo snapshots, transforms) to the
+    /// working resolution. `None` keeps the original pixels.
+    pub max_dimension: Option<u32>,
 }
 
 impl Default for DecodeOptions {
     fn default() -> Self {
         Self {
             max_pixels: Some(300_000_000),
+            max_dimension: None,
         }
     }
 }
@@ -54,6 +61,9 @@ pub struct Decoded {
     pub info: ImageInfo,
     pub image: RgbaImage,
     pub frame_count: usize,
+    /// Original (width, height) when `max_dimension` shrank the bitmap,
+    /// `None` when the image kept its source resolution.
+    pub downsampled_from: Option<(u32, u32)>,
 }
 
 pub fn detect_format(bytes: &[u8]) -> Option<Format> {
@@ -123,6 +133,27 @@ fn decode_with(
     }
 
     let image = reader.decode()?.to_rgba8();
+    // Downsampling-first: only the header probe above can reject early, so
+    // the shrink happens right after decode (before the bitmap is handed to
+    // the document). Lanczos3 keeps the working copy sharp enough to edit.
+    let (image, downsampled_from) = match options.max_dimension {
+        Some(limit) if limit > 0 => {
+            let (w, h) = (image.width(), image.height());
+            let longest = w.max(h);
+            if longest > limit {
+                let scale = limit as f64 / longest as f64;
+                let nw = ((w as f64 * scale).round() as u32).max(1);
+                let nh = ((h as f64 * scale).round() as u32).max(1);
+                (
+                    image::imageops::resize(&image, nw, nh, image::imageops::FilterType::Lanczos3),
+                    Some((w, h)),
+                )
+            } else {
+                (image, None)
+            }
+        }
+        _ => (image, None),
+    };
     let frame_count = if format == Format::Gif {
         count_gif_frames(bytes).unwrap_or(1)
     } else {
@@ -136,6 +167,7 @@ fn decode_with(
         },
         image,
         frame_count,
+        downsampled_from,
     })
 }
 
@@ -263,6 +295,7 @@ mod tests {
             &bytes,
             DecodeOptions {
                 max_pixels: Some(100),
+                max_dimension: None,
             },
         );
         match result {
@@ -280,5 +313,38 @@ mod tests {
             decode_bytes(b"not an image", DecodeOptions::default()),
             Err(DecodeError::UnsupportedFormat)
         ));
+    }
+
+    #[test]
+    fn downsamples_when_longest_edge_exceeds_limit() {
+        let src = gradient(200, 100);
+        let bytes = encode(&src, Format::Png, 90).unwrap();
+        let decoded = decode_bytes(
+            &bytes,
+            DecodeOptions {
+                max_pixels: None,
+                max_dimension: Some(100),
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded.image.dimensions(), (100, 50));
+        assert_eq!(decoded.info.width, 100);
+        assert_eq!(decoded.downsampled_from, Some((200, 100)));
+    }
+
+    #[test]
+    fn keeps_original_when_within_limit() {
+        let src = gradient(97, 61);
+        let bytes = encode(&src, Format::Png, 90).unwrap();
+        let decoded = decode_bytes(
+            &bytes,
+            DecodeOptions {
+                max_pixels: None,
+                max_dimension: Some(8192),
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded.image.as_raw(), src.as_raw());
+        assert_eq!(decoded.downsampled_from, None);
     }
 }
