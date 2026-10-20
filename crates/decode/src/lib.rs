@@ -10,6 +10,10 @@ pub use image::ImageFormat as Format;
 pub enum DecodeError {
     #[error("unsupported format")]
     UnsupportedFormat,
+    /// Formats the app can open but not write (DDS / HDR in image 0.25).
+    /// Surfaces as a clear status message instead of a generic failure.
+    #[error("{0} 为只读格式，可打开查看，请另存为 PNG / TIFF 等格式")]
+    ReadOnlyFormat(String),
     #[error("image is {width}x{height} ({pixels} px), exceeds limit of {limit} px")]
     TooLarge {
         width: u32,
@@ -209,11 +213,20 @@ pub fn encode(
             )?;
         }
         // image 0.25's bundled WebP encoder is lossless-only, so `quality`
-        // has no effect here (same for TIFF/BMP/GIF).
+        // has no effect here (same for TIFF/BMP/GIF/TGA/QOI/PNM/ICO).
         Format::WebP => image.write_to(&mut out, Format::WebP)?,
         Format::Tiff => image.write_to(&mut out, Format::Tiff)?,
         Format::Bmp => image.write_to(&mut out, Format::Bmp)?,
         Format::Gif => image.write_to(&mut out, Format::Gif)?,
+        Format::Tga => image.write_to(&mut out, Format::Tga)?,
+        Format::Qoi => image.write_to(&mut out, Format::Qoi)?,
+        Format::Pnm => image.write_to(&mut out, Format::Pnm)?,
+        Format::Ico => image.write_to(&mut out, Format::Ico)?,
+        // Read-only in image 0.25: DDS has no encoder (BCn compression is a
+        // GPU-domain job), HDR only accepts f32 input we don't keep around.
+        Format::Dds | Format::Hdr => {
+            return Err(DecodeError::ReadOnlyFormat(format!("{format:?}")))
+        }
         _ => return Err(DecodeError::UnsupportedFormat),
     }
     Ok(out.into_inner())
@@ -312,6 +325,105 @@ mod tests {
         assert!(matches!(
             decode_bytes(b"not an image", DecodeOptions::default()),
             Err(DecodeError::UnsupportedFormat)
+        ));
+    }
+
+    #[test]
+    fn roundtrips_interchange_formats() {
+        // QOI / PNM / ICO have magic bytes: full decode_bytes pipeline
+        // (magic detect + decode). TGA has NO magic in the format itself,
+        // so guess_format can't see it — decode it with the explicit
+        // format the extension-based open path uses.
+        for format in [Format::Qoi, Format::Pnm, Format::Ico] {
+            let src = gradient(33, 21);
+            let bytes = encode(&src, format, 90).unwrap();
+            let decoded = decode_bytes(&bytes, DecodeOptions::default()).unwrap();
+            assert_eq!(decoded.info.format, format, "{format:?}");
+            assert_eq!(decoded.image, src, "{format:?}");
+        }
+        let src = gradient(33, 21);
+        let bytes = encode(&src, Format::Tga, 90).unwrap();
+        let decoded = ImageReader::with_format(Cursor::new(bytes), Format::Tga)
+            .decode()
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(decoded, src);
+    }
+
+    #[test]
+    fn hdr_decodes_to_rgba8() {
+        // Generate a real Radiance file via the f32 DynamicImage path, then
+        // read it back through our decode pipeline (u8 conversion included).
+        let float = image::DynamicImage::ImageRgb32F(
+            image::Rgb32FImage::from_fn(8, 6, |x, _| {
+                image::Rgb([(x as f32 / 8.0) * 3.0, 0.25, 0.5]) // >1.0 = HDR
+            }),
+        );
+        let mut bytes = Vec::new();
+        float
+            .write_to(&mut std::io::Cursor::new(&mut bytes), Format::Hdr)
+            .unwrap();
+        let decoded = decode_bytes(&bytes, DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.info.format, Format::Hdr);
+        assert_eq!((decoded.info.width, decoded.info.height), (8, 6));
+        // (0,0): value 0.0 clamps to 0. (7,0): 3.0*7/8 clamps to 255.
+        assert_eq!(decoded.image.get_pixel(0, 0).0[0], 0);
+        assert_eq!(decoded.image.get_pixel(7, 0).0[0], 255);
+    }
+
+    #[test]
+    fn dds_dxt5_decodes() {
+        // Hand-assembled minimal DXT5 DDS (4x4, single block):
+        // alpha block = a0 255 / a1 0 with zero indices -> every pixel a0;
+        // color block = c0 == pure red (0xF800), zero indices -> every pixel
+        // c0. Exercises the FourCC path that engine textures actually use.
+        let mut dds = Vec::new();
+        dds.extend_from_slice(b"DDS ");
+        dds.extend_from_slice(&124u32.to_le_bytes()); // header size
+        dds.extend_from_slice(&0x1007u32.to_le_bytes()); // CAPS|HEIGHT|WIDTH|PIXELFORMAT
+        dds.extend_from_slice(&4u32.to_le_bytes()); // height
+        dds.extend_from_slice(&4u32.to_le_bytes()); // width
+        dds.extend_from_slice(&16u32.to_le_bytes()); // pitch (bytes per row)
+        dds.extend_from_slice(&0u32.to_le_bytes()); // depth
+        dds.extend_from_slice(&0u32.to_le_bytes()); // mipmaps
+        dds.extend_from_slice(&[0u8; 44]); // reserved
+        dds.extend_from_slice(&32u32.to_le_bytes()); // pixel format size
+        dds.extend_from_slice(&0x4u32.to_le_bytes()); // DDPF_FOURCC
+        dds.extend_from_slice(b"DXT5"); // fourcc
+        dds.extend_from_slice(&[0u8; 20]); // bitcounts/masks unused for FourCC
+        dds.extend_from_slice(&0x1000u32.to_le_bytes()); // caps texture
+        dds.extend_from_slice(&0u32.to_le_bytes()); // caps2
+        dds.extend_from_slice(&0u32.to_le_bytes()); // caps3
+        dds.extend_from_slice(&0u32.to_le_bytes()); // caps4
+        dds.extend_from_slice(&0u32.to_le_bytes()); // reserved2
+        assert_eq!(dds.len(), 128);
+        // One DXT5 block: 8B alpha + 8B color, all index bits zero.
+        let mut block = vec![255u8, 0]; // a0, a1
+        block.extend_from_slice(&[0u8; 6]); // alpha indices -> a0
+        block.extend_from_slice(&0xF800u16.to_le_bytes()); // c0 red
+        block.extend_from_slice(&0xF800u16.to_le_bytes()); // c1
+        block.extend_from_slice(&[0u8; 4]); // color indices -> c0
+        dds.extend_from_slice(&block);
+        assert_eq!(dds.len(), 128 + 16);
+
+        let decoded = decode_bytes(&dds, DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.info.format, Format::Dds);
+        assert_eq!((decoded.info.width, decoded.info.height), (4, 4));
+        for p in decoded.image.pixels() {
+            assert_eq!(p.0, [255, 0, 0, 255]);
+        }
+    }
+
+    #[test]
+    fn dds_and_hdr_save_are_rejected_clearly() {
+        let src = gradient(8, 6);
+        assert!(matches!(
+            encode(&src, Format::Dds, 90),
+            Err(DecodeError::ReadOnlyFormat(_))
+        ));
+        assert!(matches!(
+            encode(&src, Format::Hdr, 90),
+            Err(DecodeError::ReadOnlyFormat(_))
         ));
     }
 

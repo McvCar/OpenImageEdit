@@ -981,7 +981,7 @@ Window {
         id: openDialog
         title: "打开图片"
         nameFilters: [
-            "图片文件 (*.jpg *.jpeg *.png *.gif *.bmp *.tif *.tiff *.webp)",
+            "图片文件 (*.jpg *.jpeg *.jfif *.png *.gif *.bmp *.tif *.tiff *.webp *.tga *.dds *.ico *.qoi *.pbm *.pgm *.ppm *.pnm *.hdr)",
             "所有文件 (*)"
         ]
         onAccepted: confirmThenOpen(selectedFile)
@@ -1009,7 +1009,7 @@ Window {
         title: "另存为"
         fileMode: FileDialog.SaveFile
         defaultSuffix: "png"
-        nameFilters: ["PNG (*.png)", "JPEG (*.jpg)", "WebP (*.webp)", "TIFF (*.tiff)", "BMP (*.bmp)"]
+        nameFilters: ["PNG (*.png)", "JPEG (*.jpg)", "WebP (*.webp)", "TIFF (*.tiff)", "BMP (*.bmp)", "TGA (*.tga)", "QOI (*.qoi)", "ICO (*.ico)"]
         onAccepted: bridge.save_as(selectedFile)
     }
 

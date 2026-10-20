@@ -27,6 +27,13 @@ image = { version = "0.25", default-features = false, features = [
     "bmp",
     "tiff",
     "webp",
+    # Artist / developer interchange formats (all pure Rust, no new DLLs).
+    "tga",   # game texture exchange
+    "dds",   # engine textures (READ-ONLY: DXT1/3/5 + uncompressed)
+    "ico",   # app / favicon icons
+    "qoi",   # compact lossless
+    "pnm",   # pbm/pgm/ppm pipelines
+    "hdr",   # radiance float maps (read; write via DynamicImage)
 ] }
 anyhow = "1"
 thiserror = "2"
