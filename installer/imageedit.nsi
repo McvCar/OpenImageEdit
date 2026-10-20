@@ -11,6 +11,10 @@ Unicode True
 !define APP_VERSION "0.1.0"
 !define PROG_ID "ImageEdit.Document"
 !define REG_CLASSES "Software\Classes"
+; Explorer PSD thumbnail handler (crates/thumbnail). Must match
+; CLSID_THUMB_PROVIDER_STR in crates/thumbnail/src/lib.rs.
+!define THUMB_CLSID "{43B34785-3F16-49F5-BAB6-069B487ED407}"
+!define THUMB_SHELLEX "{e357fccd-a995-4577-b039-fa759f30b17e}"
 
 !define MUI_ABORTWARNING
 
@@ -144,6 +148,20 @@ Section "关联 WebP 图片 (.webp)" SecWebp
     skip_webp:
 SectionEnd
 
+; --- Explorer thumbnail handler -------------------------------------------
+; Registers the PSD thumbnail COM DLL per-user (HKCU, no admin needed).
+; Explorer loads it in an isolated process; keys are written even when the
+; user has Photoshop installed (Photoshop ships no thumbnail handler).
+
+Section "资源管理器 PSD 缩略图预览" SecThumb
+    IfSilent skip_thumb
+    WriteRegStr HKCU "${REG_CLASSES}\CLSID\${THUMB_CLSID}\InprocServer32" "" "$INSTDIR\imageedit_thumb.dll"
+    WriteRegStr HKCU "${REG_CLASSES}\CLSID\${THUMB_CLSID}\InprocServer32" "ThreadingModel" "Apartment"
+    WriteRegStr HKCU "${REG_CLASSES}\.psd\ShellEx\${THUMB_SHELLEX}" "" "${THUMB_CLSID}"
+    Call NotifyShell
+    skip_thumb:
+SectionEnd
+
 ; --- Helpers --------------------------------------------------------------
 
 ; Register (or refresh) the ImageEdit.Document ProgId.
@@ -169,6 +187,7 @@ FunctionEnd
     !insertmacro MUI_DESCRIPTION_TEXT ${SecGif} "双击 .gif 文件时使用 ${APP_NAME} 打开。"
     !insertmacro MUI_DESCRIPTION_TEXT ${SecTiff} "双击 .tif / .tiff 文件时使用 ${APP_NAME} 打开。"
     !insertmacro MUI_DESCRIPTION_TEXT ${SecWebp} "双击 .webp 文件时使用 ${APP_NAME} 打开。"
+    !insertmacro MUI_DESCRIPTION_TEXT ${SecThumb} "在资源管理器中直接显示 .psd 文件的缩略图（图层合并的合成预览）。"
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 ; --- Uninstaller -----------------------------------------------------------
@@ -217,6 +236,9 @@ Section "Uninstall"
     DeleteRegKey /ifempty HKCU "${REG_CLASSES}\.tiff\OpenWithProgids"
     DeleteRegKey /ifempty HKCU "${REG_CLASSES}\.webp\OpenWithProgids"
     DeleteRegKey HKCU "${REG_CLASSES}\${PROG_ID}"
+    ; Thumbnail handler registration.
+    DeleteRegKey HKCU "${REG_CLASSES}\CLSID\${THUMB_CLSID}"
+    DeleteRegKey HKCU "${REG_CLASSES}\.psd\ShellEx\${THUMB_SHELLEX}"
     System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
 
     DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"

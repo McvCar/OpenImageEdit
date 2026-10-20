@@ -6,6 +6,7 @@ members = [
     "crates/render",
     "crates/ui",
     "crates/bench",
+    "crates/thumbnail",
 ]
 
 [workspace.package]
@@ -49,3 +50,12 @@ strip = true
 [profile.bench]
 lto = "thin"
 codegen-units = 1
+
+# Release build for the Explorer thumbnail COM DLL. `panic = "unwind"` is
+# mandatory: the DLL is loaded into explorer.exe, and `catch_unwind` in the
+# provider is the last line of defence against residual panics in the PSD
+# dependency chain. Build with:
+#   cargo build -p imageedit-thumbnail --profile thumb
+[profile.thumb]
+inherits = "release"
+panic = "unwind"

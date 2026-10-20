@@ -37,6 +37,26 @@ Copy-Item (Join-Path $repoRoot 'target\release\imageedit.exe') $distDir
 # shipping it in the public archive just bloats the download.
 # Copy-Item (Join-Path $repoRoot 'target\release\imageedit-bench.exe') $distDir
 
+# Explorer thumbnail shell extension (COM in-proc DLL). Built with the
+# dedicated `thumb` profile: same optimizations as release but panic=unwind
+# so the provider's catch_unwind can stop PSD parse panics from taking down
+# explorer.exe (the workspace release profile uses panic=abort).
+$thumbOut = & cargo build -p imageedit-thumbnail --profile thumb 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { throw "thumbnail DLL build failed`n$thumbOut" }
+Copy-Item (Join-Path $repoRoot 'target\thumb\imageedit_thumb.dll') $distDir
+# Per-user registration helpers for zip users (the NSIS installer writes
+# the same HKCU keys itself, no regsvr32 needed there).
+Set-Content -LiteralPath (Join-Path $distDir 'register-psd-thumbnail.cmd') -Value @'
+@echo off
+rem Registers the ImageEdit PSD thumbnail handler for the current user.
+regsvr32 /s "%~dp0imageedit_thumb.dll"
+'@ -Encoding Ascii
+Set-Content -LiteralPath (Join-Path $distDir 'unregister-psd-thumbnail.cmd') -Value @'
+@echo off
+rem Removes the ImageEdit PSD thumbnail handler registration.
+regsvr32 /s /u "%~dp0imageedit_thumb.dll"
+'@ -Encoding Ascii
+
 $oldEA = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
 $depOut = & (Join-Path $env:IMAGEEDIT_QT_BIN 'windeployqt.exe') --release --no-translations `

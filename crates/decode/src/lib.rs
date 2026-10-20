@@ -272,12 +272,15 @@ fn psd_mode_name(mode: u16) -> &'static str {
 /// flattened composite (channel data of the merged image, RLE or raw).
 /// Layer editing and saving back to PSD are out of scope.
 ///
+/// Public so the Explorer thumbnail shell extension (`crates/thumbnail`)
+/// reuses the exact same guarded pipeline.
+///
 /// The `psd` crate signals malformed input by panicking (slice index out of
 /// range) instead of returning errors, and the release profile builds with
 /// `panic = "abort"` — so a corrupt file would take the whole app down.
 /// `validate_psd_sections` bounds every length/offset the composite path
 /// touches up front and turns those cases into a clear `DecodeError`.
-fn decode_psd_bytes(bytes: &[u8], options: DecodeOptions) -> Result<Decoded, DecodeError> {
+pub fn decode_psd_bytes(bytes: &[u8], options: DecodeOptions) -> Result<Decoded, DecodeError> {
     let (width, height, depth, mode) =
         psd_header(bytes).ok_or(DecodeError::UnsupportedFormat)?;
     let channels = u16::from_be_bytes([bytes[12], bytes[13]]);
