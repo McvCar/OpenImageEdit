@@ -33,7 +33,9 @@ if (Test-Path -LiteralPath $distDir) { Remove-Item -LiteralPath $distDir -Recurs
 New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 
 Copy-Item (Join-Path $repoRoot 'target\release\imageedit.exe') $distDir
-Copy-Item (Join-Path $repoRoot 'target\release\imageedit-bench.exe') $distDir
+# End-user zip: the bench harness is a dev tool (target\release keeps it);
+# shipping it in the public archive just bloats the download.
+# Copy-Item (Join-Path $repoRoot 'target\release\imageedit-bench.exe') $distDir
 
 $oldEA = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
@@ -48,7 +50,19 @@ if ($depExit -ne 0) { throw "windeployqt failed`n$depOut" }
 # QML modules and DLLs that this app never imports. QtQuick.Dialogs.quickimpl
 # only needs QtQuick + QtQuick.Templates + QtQuick.Layouts, so the whole
 # QtQuick.Controls stack (and its style DLLs) can go.
+#
+# Image formats: ALL Qt image-format plugins are dead weight here — decoding
+# runs through the Rust `image` crate and the QML preview only ever loads BMP
+# data URLs, which QtGui handles with its BUILT-IN handler (no plugin). Same
+# story for the network stack: Qt6Qml hard-links Qt6Network.dll (must stay)
+# but the app opens no connections, so the TLS / network-information / touch
+# / svg-icon-engine plugins windeployqt drags in are never loaded.
 $pruneDirs = @(
+    'imageformats',
+    'iconengines',
+    'tls',
+    'networkinformation',
+    'generic',
     'qml\QML',
     'qml\QtQuick\Controls',
     'qml\QtQuick\NativeStyle',
@@ -83,6 +97,7 @@ $pruneFiles = @(
     'Qt6QuickEffects.dll',
     'Qt6QuickShapes.dll',
     'Qt6LabsFolderListModel.dll',
+    'Qt6Svg.dll',
     'opengl32sw.dll'
 )
 
