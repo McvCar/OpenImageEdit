@@ -14,6 +14,10 @@ pub enum DecodeError {
     /// Surfaces as a clear status message instead of a generic failure.
     #[error("{0} 为只读格式，可打开查看，请另存为 PNG / TIFF 等格式")]
     ReadOnlyFormat(String),
+    /// PSD is preview-only (flattened composite); this error carries the
+    /// concrete reason a particular file can't be previewed.
+    #[error("PSD 打开失败：{0}")]
+    Psd(String),
     #[error("image is {width}x{height} ({pixels} px), exceeds limit of {limit} px")]
     TooLarge {
         width: u32,
@@ -25,6 +29,27 @@ pub enum DecodeError {
     Image(#[from] image::ImageError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Format of the decoded source. Everything `image` handles natively shares
+/// its `ImageFormat`; PSD is parsed by the `psd` crate and has no
+/// `ImageFormat` variant of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceFormat {
+    Image(Format),
+    Psd,
+}
+
+impl PartialEq<Format> for SourceFormat {
+    fn eq(&self, other: &Format) -> bool {
+        matches!(self, SourceFormat::Image(f) if f == other)
+    }
+}
+
+impl PartialEq<SourceFormat> for Format {
+    fn eq(&self, other: &SourceFormat) -> bool {
+        other == self
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -49,7 +74,7 @@ impl Default for DecodeOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageInfo {
-    pub format: Format,
+    pub format: SourceFormat,
     pub width: u32,
     pub height: u32,
 }
@@ -68,6 +93,9 @@ pub struct Decoded {
     /// Original (width, height) when `max_dimension` shrank the bitmap,
     /// `None` when the image kept its source resolution.
     pub downsampled_from: Option<(u32, u32)>,
+    /// Status-bar hint the decoder wants the user to see after opening
+    /// (e.g. "PSD preview: layers were merged"). `None` for plain formats.
+    pub note: Option<String>,
 }
 
 pub fn detect_format(bytes: &[u8]) -> Option<Format> {
@@ -79,42 +107,82 @@ pub fn format_from_path(path: &Path) -> Option<Format> {
 }
 
 pub fn probe_bytes(bytes: &[u8]) -> Result<ImageInfo, DecodeError> {
+    if let Some((width, height)) = psd_dimensions(bytes) {
+        return Ok(ImageInfo {
+            format: SourceFormat::Psd,
+            width,
+            height,
+        });
+    }
     let format = detect_format(bytes).ok_or(DecodeError::UnsupportedFormat)?;
     let reader = ImageReader::with_format(Cursor::new(bytes), format);
     let (width, height) = reader.into_dimensions()?;
     Ok(ImageInfo {
-        format,
+        format: SourceFormat::Image(format),
         width,
         height,
     })
 }
 
 pub fn probe_path(path: &Path) -> Result<ImageInfo, DecodeError> {
+    if is_psd_path(path) {
+        let bytes = std::fs::read(path)?;
+        return probe_bytes(&bytes);
+    }
     let format = format_from_path(path).ok_or(DecodeError::UnsupportedFormat)?;
     let reader = ImageReader::open(path)?;
     let (width, height) = reader.into_dimensions()?;
     Ok(ImageInfo {
-        format,
+        format: SourceFormat::Image(format),
         width,
         height,
     })
 }
 
 pub fn decode_bytes(bytes: &[u8], options: DecodeOptions) -> Result<Decoded, DecodeError> {
+    if bytes.starts_with(PSD_MAGIC) {
+        return decode_psd_bytes(bytes, options);
+    }
     let format = detect_format(bytes).ok_or(DecodeError::UnsupportedFormat)?;
     decode_with(bytes, format, options)
 }
 
 pub fn decode_path(path: &Path, options: DecodeOptions) -> Result<Decoded, DecodeError> {
-    let format = format_from_path(path)
-        .or_else(|| {
-            std::fs::read(path)
-                .ok()
-                .and_then(|bytes| detect_format(&bytes))
-        })
-        .ok_or(DecodeError::UnsupportedFormat)?;
     let bytes = std::fs::read(path)?;
+    if bytes.starts_with(PSD_MAGIC) {
+        return decode_psd_bytes(&bytes, options);
+    }
+    let format = format_from_path(path)
+        .or_else(|| detect_format(&bytes))
+        .ok_or(DecodeError::UnsupportedFormat)?;
     decode_with(&bytes, format, options)
+}
+
+/// Longest-edge downsampling shared by the `image` and PSD paths: decode
+/// happens at full resolution, then Lanczos3 shrinks before the bitmap
+/// enters the document. Returns `(image, original_dimensions)`.
+fn apply_max_dimension(
+    image: RgbaImage,
+    max_dimension: Option<u32>,
+) -> (RgbaImage, Option<(u32, u32)>) {
+    match max_dimension {
+        Some(limit) if limit > 0 => {
+            let (w, h) = (image.width(), image.height());
+            let longest = w.max(h);
+            if longest > limit {
+                let scale = limit as f64 / longest as f64;
+                let nw = ((w as f64 * scale).round() as u32).max(1);
+                let nh = ((h as f64 * scale).round() as u32).max(1);
+                (
+                    image::imageops::resize(&image, nw, nh, image::imageops::FilterType::Lanczos3),
+                    Some((w, h)),
+                )
+            } else {
+                (image, None)
+            }
+        }
+        _ => (image, None),
+    }
 }
 
 fn decode_with(
@@ -140,24 +208,7 @@ fn decode_with(
     // Downsampling-first: only the header probe above can reject early, so
     // the shrink happens right after decode (before the bitmap is handed to
     // the document). Lanczos3 keeps the working copy sharp enough to edit.
-    let (image, downsampled_from) = match options.max_dimension {
-        Some(limit) if limit > 0 => {
-            let (w, h) = (image.width(), image.height());
-            let longest = w.max(h);
-            if longest > limit {
-                let scale = limit as f64 / longest as f64;
-                let nw = ((w as f64 * scale).round() as u32).max(1);
-                let nh = ((h as f64 * scale).round() as u32).max(1);
-                (
-                    image::imageops::resize(&image, nw, nh, image::imageops::FilterType::Lanczos3),
-                    Some((w, h)),
-                )
-            } else {
-                (image, None)
-            }
-        }
-        _ => (image, None),
-    };
+    let (image, downsampled_from) = apply_max_dimension(image, options.max_dimension);
     let frame_count = if format == Format::Gif {
         count_gif_frames(bytes).unwrap_or(1)
     } else {
@@ -165,14 +216,189 @@ fn decode_with(
     };
     Ok(Decoded {
         info: ImageInfo {
-            format,
+            format: SourceFormat::Image(format),
             width: image.width(),
             height: image.height(),
         },
         image,
         frame_count,
         downsampled_from,
+        note: None,
     })
+}
+
+// ---- PSD (preview-only) ----
+
+const PSD_MAGIC: &[u8; 4] = b"8BPS";
+
+fn is_psd_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("psd"))
+}
+
+/// Parse the 26-byte PSD file header: (width, height, depth, color mode).
+/// Widths/heights/mode are big-endian per the Adobe spec.
+fn psd_header(bytes: &[u8]) -> Option<(u32, u32, u16, u16)> {
+    if bytes.len() < 26 || !bytes.starts_with(PSD_MAGIC) {
+        return None;
+    }
+    let u16be = |o: usize| u16::from_be_bytes([bytes[o], bytes[o + 1]]);
+    let u32be =
+        |o: usize| u32::from_be_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    Some((u32be(18), u32be(14), u16be(22), u16be(24)))
+}
+
+fn psd_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let (width, height, _, _) = psd_header(bytes)?;
+    Some((width, height))
+}
+
+fn psd_mode_name(mode: u16) -> &'static str {
+    match mode {
+        0 => "Bitmap",
+        1 => "灰度",
+        2 => "Indexed",
+        3 => "RGB",
+        4 => "CMYK",
+        7 => "Multichannel",
+        8 => "Duotone",
+        9 => "Lab",
+        _ => "未知模式",
+    }
+}
+
+/// PSD preview-only path: parse with the `psd` crate and return the
+/// flattened composite (channel data of the merged image, RLE or raw).
+/// Layer editing and saving back to PSD are out of scope.
+///
+/// The `psd` crate signals malformed input by panicking (slice index out of
+/// range) instead of returning errors, and the release profile builds with
+/// `panic = "abort"` — so a corrupt file would take the whole app down.
+/// `validate_psd_sections` bounds every length/offset the composite path
+/// touches up front and turns those cases into a clear `DecodeError`.
+fn decode_psd_bytes(bytes: &[u8], options: DecodeOptions) -> Result<Decoded, DecodeError> {
+    let (width, height, depth, mode) =
+        psd_header(bytes).ok_or(DecodeError::UnsupportedFormat)?;
+    let channels = u16::from_be_bytes([bytes[12], bytes[13]]);
+    if width == 0 || height == 0 {
+        return Err(DecodeError::Psd("画布尺寸为 0".into()));
+    }
+    if depth != 8 {
+        return Err(DecodeError::Psd(format!(
+            "仅支持 8 位/通道（此文件为 {depth} 位），请先在 Photoshop 中转换为 8 位"
+        )));
+    }
+    if !matches!(mode, 1 | 3) {
+        return Err(DecodeError::Psd(format!(
+            "仅支持 RGB / 灰度模式（此文件为 {}），请先在 Photoshop 中转换",
+            psd_mode_name(mode)
+        )));
+    }
+    if let Some(limit) = options.max_pixels {
+        if width as u64 * height as u64 > limit {
+            return Err(DecodeError::TooLarge {
+                width,
+                height,
+                pixels: width as u64 * height as u64,
+                limit,
+            });
+        }
+    }
+    validate_psd_sections(bytes, width, height, channels)?;
+    let psd = psd::Psd::from_bytes(bytes).map_err(|e| DecodeError::Psd(e.to_string()))?;
+    let rgba = psd.rgba();
+    let image = RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| DecodeError::Psd("合成图数据与画布尺寸不符".into()))?;
+    let (image, downsampled_from) = apply_max_dimension(image, options.max_dimension);
+    Ok(Decoded {
+        info: ImageInfo {
+            format: SourceFormat::Psd,
+            width: image.width(),
+            height: image.height(),
+        },
+        image,
+        frame_count: 1,
+        downsampled_from,
+        note: Some("PSD 预览：图层已合并，请另存为 PNG 等格式导出".into()),
+    })
+}
+
+/// Bound every offset the `psd` crate will index into. Header layout
+/// (big-endian): 26-byte header, then color-mode / image-resources /
+/// layer-and-mask sections (each `u32 length + data`), then the image data
+/// section (`u16 compression` + channel data).
+fn validate_psd_sections(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    channels: u16,
+) -> Result<(), DecodeError> {
+    if channels == 0 || channels > 56 {
+        return Err(DecodeError::Psd(format!("通道数异常：{channels}")));
+    }
+    let u32be = |o: usize| {
+        if o + 4 > bytes.len() {
+            return Err(DecodeError::Psd("文件头部区段被截断".into()));
+        }
+        Ok(u32::from_be_bytes([
+            bytes[o],
+            bytes[o + 1],
+            bytes[o + 2],
+            bytes[o + 3],
+        ]))
+    };
+    let mut off = 26usize;
+    for name in ["色彩模式", "图像资源", "图层与蒙版"] {
+        let len = u32be(off)? as usize;
+        off += 4;
+        let end = off.saturating_add(len);
+        if end > bytes.len() {
+            return Err(DecodeError::Psd(format!(
+                "{name}区段长度 {len} 超出文件边界，文件已损坏"
+            )));
+        }
+        off = end;
+    }
+    if off + 2 > bytes.len() {
+        return Err(DecodeError::Psd("图像数据区段被截断".into()));
+    }
+    let compression = u16::from_be_bytes([bytes[off], bytes[off + 1]]);
+    let data = off + 2;
+    let pixels = width as usize * height as usize;
+    let chans = channels as usize;
+    match compression {
+        0 => {
+            // Raw planar: exactly channels * pixels bytes are read.
+            if bytes.len().saturating_sub(data) < chans * pixels {
+                return Err(DecodeError::Psd("原始通道数据不足，文件已损坏".into()));
+            }
+        }
+        1 => {
+            // RLE: `channels * height` big-endian u16 row counts first, then
+            // the packed rows. The crate sums each channel's counts and slices
+            // with the result — reject anything that would index out of range.
+            let table_len = chans * height as usize * 2;
+            if bytes.len().saturating_sub(data) < table_len {
+                return Err(DecodeError::Psd("RLE 行长度表被截断，文件已损坏".into()));
+            }
+            let mut total = table_len;
+            for c in 0..chans * height as usize {
+                let o = data + c * 2;
+                let row = u16::from_be_bytes([bytes[o], bytes[o + 1]]) as usize;
+                total = total.saturating_add(row);
+                if total > bytes.len() - data {
+                    return Err(DecodeError::Psd("RLE 行长度超出数据边界，文件已损坏".into()));
+                }
+            }
+        }
+        other => {
+            return Err(DecodeError::Psd(format!(
+                "压缩方式 {other} 不受支持（仅 RAW / RLE），请另存为兼容性 PSD"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn count_gif_frames(bytes: &[u8]) -> Option<usize> {
@@ -458,5 +684,111 @@ mod tests {
         .unwrap();
         assert_eq!(decoded.image.as_raw(), src.as_raw());
         assert_eq!(decoded.downsampled_from, None);
+    }
+
+    /// Minimal valid 8-bit RGB PSD: header + empty color-mode/resource/
+    /// layer sections + raw planar image data (no compression). This is
+    /// exactly what "Maximize Compatibility" stores as the merged composite.
+    fn minimal_rgb_psd(width: u32, height: u32, pixels: &[[u8; 3]]) -> Vec<u8> {
+        let mut psd = Vec::new();
+        psd.extend_from_slice(b"8BPS");
+        psd.extend_from_slice(&1u16.to_be_bytes()); // version (PSD)
+        psd.extend_from_slice(&[0u8; 6]); // reserved
+        psd.extend_from_slice(&3u16.to_be_bytes()); // channels: R,G,B
+        psd.extend_from_slice(&height.to_be_bytes());
+        psd.extend_from_slice(&width.to_be_bytes());
+        psd.extend_from_slice(&8u16.to_be_bytes()); // depth
+        psd.extend_from_slice(&3u16.to_be_bytes()); // mode: RGB
+        psd.extend_from_slice(&0u32.to_be_bytes()); // color mode data: empty
+        psd.extend_from_slice(&0u32.to_be_bytes()); // image resources: empty
+        psd.extend_from_slice(&0u32.to_be_bytes()); // layer & mask: empty
+        psd.extend_from_slice(&0u16.to_be_bytes()); // compression: raw
+        for plane in 0..3 {
+            for px in pixels {
+                psd.push(px[plane]);
+            }
+        }
+        psd
+    }
+
+    #[test]
+    fn psd_preview_decodes_composite() {
+        let (w, h) = (8u32, 6u32);
+        let mut pixels = vec![[0u8; 3]; (w * h) as usize];
+        for (i, px) in pixels.iter_mut().enumerate() {
+            px[0] = (i % 256) as u8;
+            px[1] = ((i * 7) % 256) as u8;
+            px[2] = ((i * 13) % 256) as u8;
+        }
+        let bytes = minimal_rgb_psd(w, h, &pixels);
+        let info = probe_bytes(&bytes).unwrap();
+        assert_eq!(info.format, SourceFormat::Psd);
+        assert_eq!((info.width, info.height), (w, h));
+
+        let decoded = decode_bytes(&bytes, DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.info.format, SourceFormat::Psd);
+        assert_eq!(decoded.image.dimensions(), (w, h));
+        assert_eq!(decoded.frame_count, 1);
+        assert!(decoded.note.is_some(), "PSD preview must carry the note");
+        for (i, px) in pixels.iter().enumerate() {
+            let got = decoded.image.get_pixel((i as u32) % w, (i as u32) / w).0;
+            assert_eq!(got, [px[0], px[1], px[2], 255], "pixel {i}");
+        }
+    }
+
+    #[test]
+    fn psd_rejects_16bit_and_cmyk_with_clear_errors() {
+        let (w, h) = (4u32, 4u32);
+        let mut pixels = vec![[0u8; 3]; (w * h) as usize];
+        let mut depth16 = minimal_rgb_psd(w, h, &pixels);
+        depth16[22] = 0;
+        depth16[23] = 16; // depth field
+        assert!(matches!(
+            decode_bytes(&depth16, DecodeOptions::default()),
+            Err(DecodeError::Psd(_))
+        ));
+
+        let mut cmyk = minimal_rgb_psd(w, h, &pixels);
+        cmyk[24] = 0;
+        cmyk[25] = 4; // color mode: CMYK
+        match decode_bytes(&cmyk, DecodeOptions::default()) {
+            Err(DecodeError::Psd(msg)) => assert!(msg.contains("CMYK"), "{msg}"),
+            other => panic!("expected Psd error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn psd_corrupt_rle_is_rejected_not_panicking() {
+        // The psd crate panics (slice index) on malformed RLE row tables, and
+        // release builds use panic=abort — validation must reject first.
+        let (w, h) = (4u32, 4u32);
+        let pixels = vec![[10u8, 20, 30]; (w * h) as usize];
+        let mut bytes = minimal_rgb_psd(w, h, &pixels);
+        let comp_off = 26 + 12; // header + 3 empty sections -> compression u16
+        bytes[comp_off] = 0x00; // compression = 1 (RLE)...
+        bytes[comp_off + 1] = 0x01;
+        for b in &mut bytes[comp_off + 2..comp_off + 2 + 24] {
+            *b = 0xFF; // row counts of 65535 -> sums far past the file end
+        }
+        match decode_bytes(&bytes, DecodeOptions::default()) {
+            Err(DecodeError::Psd(msg)) => assert!(msg.contains("RLE"), "{msg}"),
+            other => panic!("expected Psd error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn psd_downsample_path_applies_max_dimension() {
+        let (w, h) = (200u32, 100u32);
+        let bytes = minimal_rgb_psd(w, h, &vec![[30, 60, 90]; (w * h) as usize]);
+        let decoded = decode_bytes(
+            &bytes,
+            DecodeOptions {
+                max_pixels: None,
+                max_dimension: Some(100),
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded.image.dimensions(), (100, 50));
+        assert_eq!(decoded.downsampled_from, Some((200, 100)));
     }
 }

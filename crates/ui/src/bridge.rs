@@ -802,6 +802,8 @@ struct Session {
     /// document. The status bar keeps a persistent hint (refreshes rebuild
     /// the status text, so a one-shot message would be wiped instantly).
     downsampled_from: Option<(u32, u32)>,
+    /// Decoder hint shown in the status bar (e.g. PSD flattened preview).
+    note: Option<String>,
 }
 
 /// Live "调整颜色" state (history-free until the panel commits).
@@ -943,6 +945,7 @@ impl Session {
                 last_display: Size::new(0, 0),
                 adjust: None,
                 downsampled_from: decoded.downsampled_from,
+                note: decoded.note,
             },
             ms,
         )
@@ -4512,6 +4515,15 @@ session
                         status = hint;
                     } else {
                         status = format!("{status} · {hint}");
+                    }
+                }
+                // Decoder hints (PSD flattened preview) survive refreshes the
+                // same way the downsampling notice does.
+                if let Some(note) = self.session.borrow().as_ref().and_then(|s| s.note.clone()) {
+                    if status.is_empty() {
+                        status = note;
+                    } else {
+                        status = format!("{status} · {note}");
                     }
                 }
                 self.as_mut().set_image_width(canvas.width as i32);

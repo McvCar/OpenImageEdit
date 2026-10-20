@@ -981,7 +981,7 @@ Window {
         id: openDialog
         title: "打开图片"
         nameFilters: [
-            "图片文件 (*.jpg *.jpeg *.jfif *.png *.gif *.bmp *.tif *.tiff *.webp *.tga *.dds *.ico *.qoi *.pbm *.pgm *.ppm *.pnm *.hdr)",
+            "图片文件 (*.jpg *.jpeg *.jfif *.png *.gif *.bmp *.tif *.tiff *.webp *.tga *.dds *.ico *.qoi *.pbm *.pgm *.ppm *.pnm *.hdr *.psd)",
             "所有文件 (*)"
         ]
         onAccepted: confirmThenOpen(selectedFile)
