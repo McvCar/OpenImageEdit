@@ -592,6 +592,12 @@ fn draw_mark(img: &mut RgbaImage, mark: &Mark, sx: f32, sy: f32) {
                     }
                 }
                 if n == 0 {
+                    // Cell entirely outside the image (mark dragged past the
+                    // canvas edge): push a placeholder so `avgs` stays 1:1
+                    // with `cells` — pass 2 indexes avgs[idx] and the alpha-0
+                    // check below skips the cell. Skipping the push instead
+                    // misaligned the two lists (index-out-of-bounds abort).
+                    avgs.push([0, 0, 0, 0]);
                     continue;
                 }
                 avgs.push([
@@ -2738,6 +2744,36 @@ mod tests {
         // Outside the mosaic band: untouched.
         assert_eq!(flat.get_pixel(5, 5).0, [0, 0, 0, 255]);
         assert_eq!(flat.get_pixel(20, 20).0, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn mosaic_stamp_partially_outside_canvas_does_not_panic() {
+        // Regression: stamp cells lying entirely outside the image skipped
+        // their average push in pass 1, so pass 2 indexed avgs[] out of
+        // bounds (len < cells.len()) — an abort during live drag past the
+        // canvas edge. Empty cells must keep the two lists 1:1.
+        let mut base = blank(32, 32);
+        for y in 2..4 {
+            for x in 28..30 {
+                base.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let mut doc = Document::from_image(base);
+        doc.add_mark({
+            let mut m = Mark::new(MarkKind::Mosaic);
+            m.rect = (28.0, 0.0, 36.0, 8.0);
+            m.points = vec![(32.0, 4.0)]; // center exactly on the right edge
+            m.stroke = 8;
+            m.cell = 4;
+            m
+        })
+        .unwrap();
+        let flat = doc.flatten();
+        // Cells overlapping the canvas still average their pixels (white dot
+        // + black -> mid gray), out-of-canvas cells are skipped silently.
+        let p = flat.get_pixel(29, 3).0;
+        assert!(p[0] > 0 && p[0] < 255, "expected blended cell, got {p:?}");
+        assert_eq!(flat.get_pixel(3, 3).0, [0, 0, 0, 255]);
     }
 
     #[test]
