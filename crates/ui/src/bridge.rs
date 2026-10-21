@@ -1003,8 +1003,18 @@ fn preview_target(display: Size, canvas: Size) -> Size {
     )
 }
 
-fn file_url(path: &Path) -> String {
-    format!("file:///{}", path.to_string_lossy().replace('\\', "/"))
+/// Selection that replaces a just-deleted layer: prefer the neighbour above
+/// (`ix-1`), clamped to the remaining list. Deleting layer 0 selects the new
+/// layer 0 (usize underflow guard — this crashed debug builds via the cxx FFI
+/// abort); no layers left = -1.
+fn selection_after_removal(ix: usize, new_count: usize) -> i32 {
+    if new_count == 0 {
+        return -1;
+    }
+    ix.saturating_sub(1).min(new_count - 1) as i32
+}
+
+fn file_url(path: &Path) -> String {    format!("file:///{}", path.to_string_lossy().replace('\\', "/"))
 }
 
 fn extension_for(format: Format) -> &'static str {
@@ -2738,11 +2748,7 @@ session
                 Some(session) => match session.doc.remove_layer(ix) {
                         Ok(()) => {
                             let new_count = session.doc.layers.len();
-                            Ok(if new_count == 0 {
-                                -1
-                            } else {
-                                (ix - 1).min(new_count - 1) as i32
-                            })
+                            Ok(selection_after_removal(ix, new_count))
                         }
                         Err(e) => Err(e.to_string()),
                     },
@@ -4813,5 +4819,30 @@ mod preview_target_tests {
         let canvas = Size::new(1, 1);
         let display = Size::new(4000, 4000); // zoom 4000x
         assert_eq!(preview_target(display, canvas), canvas);
+    }
+}
+
+#[cfg(test)]
+mod selection_after_removal_tests {
+    use super::selection_after_removal;
+
+    #[test]
+    fn deleting_layer_zero_selects_new_first_layer() {
+        // Regression: `ix - 1` underflowed usize for ix == 0 and aborted the
+        // process through the cxx FFI boundary (0xc0000409).
+        assert_eq!(selection_after_removal(0, 2), 0);
+        assert_eq!(selection_after_removal(0, 1), 0);
+    }
+
+    #[test]
+    fn mid_and_last_layer_removal() {
+        assert_eq!(selection_after_removal(3, 4), 2);
+        assert_eq!(selection_after_removal(2, 2), 1); // deleted the last of 3
+    }
+
+    #[test]
+    fn no_layers_left() {
+        assert_eq!(selection_after_removal(0, 0), -1);
+        assert_eq!(selection_after_removal(5, 0), -1);
     }
 }
