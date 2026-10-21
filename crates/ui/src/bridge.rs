@@ -871,6 +871,10 @@ struct Session {
     /// otherwise re-render (and re-encode the BMP) for a preview identical to
     /// the one already on screen.
     last_display: Size,
+    /// Result of the last non-special render (see [`CachedRender`]). Pure
+    /// zoom ticks above 100% clamp to the same preview target, so the whole
+    /// composite + BMP encode + disk write collapses into a URL reuse.
+    last_render: Option<CachedRender>,
     /// Open "调整颜色" panel: the scope captured when it opened plus the live
     /// parameters. Document pixels are NOT touched until `adjust_commit`.
     adjust: Option<AdjustLive>,
@@ -912,6 +916,18 @@ struct Rendered {
     preview: Size,
     /// JSON of the preview histogram (only while the adjust panel is open).
     histogram: Option<String>,
+}
+
+/// What the preview file on disk currently shows, for the zoom-only skip in
+/// [`Session::render`]. `special` marks frames produced under a transient
+/// visual state (live color adjust, hidden editing mark, live layer resize):
+/// reusing their file would freeze or corrupt the next normal frame, so a
+/// special render only becomes reusable after a fresh normal one replaced it.
+struct CachedRender {
+    target: Size,
+    epoch: u64,
+    url: String,
+    special: bool,
 }
 
 enum Refresh {
@@ -963,7 +979,19 @@ fn size_close(a: Size, b: Size) -> bool {
     dw <= TOL && dh <= TOL
 }
 
-fn preview_target(display: Size) -> Size {
+/// Preview bitmap size for a display size.
+///
+/// Zooming past 100% cannot create detail — the pixels just get bigger — so
+/// the composite is capped at the document's own resolution first (then at
+/// [`MAX_PREVIEW_EDGE`] for giant canvases). Two wins: every tick above 100%
+/// shares ONE target (the zoom-only render skip can reuse the frame), and the
+/// blur stays constant instead of degrading past the 4096 cap. The QML Image
+/// does the upscale on the GPU for free.
+fn preview_target(display: Size, canvas: Size) -> Size {
+    let display = Size::new(
+        display.width.min(canvas.width).max(1),
+        display.height.min(canvas.height).max(1),
+    );
     let longest = display.width.max(display.height);
     if longest <= MAX_PREVIEW_EDGE {
         return display;
@@ -1019,6 +1047,7 @@ impl Session {
                 live_scale: None,
                 composer: render::PreviewComposer::new(),
                 last_display: Size::new(0, 0),
+                last_render: None,
                 adjust: None,
                 downsampled_from: decoded.downsampled_from,
                 note: decoded.note,
@@ -1058,15 +1087,44 @@ impl Session {
         self.fit = false;
     }
 
-    fn render(&mut self) -> Result<Rendered, String> {
+    /// Rebuild the preview bitmap. `zoom_only` marks a refresh triggered by a
+    /// pure zoom change (wheel / slider / presets): when that zoom lands in
+    /// the >100% regime the preview target is pinned to the canvas resolution,
+    /// so if the previous frame already used that target and the document has
+    /// not changed, the existing BMP is still exactly right — reuse its URL
+    /// and let the QML Image stretch (sub-millisecond instead of seconds).
+    /// Non-zoom refreshes (mark drags, layer ops, live gestures) never skip:
+    /// some of them mutate the document without bumping `edit_epoch`.
+    fn render(&mut self, zoom_only: bool) -> Result<Rendered, String> {
         let prof_t0 = Instant::now();
         let canvas = self.doc.canvas;
         let display = display_size(canvas, self.zoom);
-        let target = preview_target(display);
+        let target = preview_target(display, canvas);
         if target.pixels() == 0 {
             return Err("empty canvas".into());
         }
         self.last_display = display;
+        let special = self.adjust.is_some()
+            || self.preview_hidden_mark >= 0
+            || self.live_scale.is_some();
+        if zoom_only && !special {
+            let reusable = self.last_render.as_ref().is_some_and(|c| {
+                !c.special && size_close(c.target, target) && c.epoch == self.doc.edit_epoch
+            });
+            if reusable {
+                let url = self.last_render.as_ref().expect("checked").url.clone();
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"render-skip\",\"target\":\"{}x{}\"}}",
+                    target.width, target.height
+                );
+                return Ok(Rendered {
+                    url,
+                    display,
+                    preview: target,
+                    histogram: None,
+                });
+            }
+        }
         // Inline text editing: the mark being edited is hidden from the
         // preview only (restored right after the composite; never undoable).
         // An in-flight layer resize routes the composite through the
@@ -1119,8 +1177,15 @@ impl Session {
         } else {
             None
         };
+        let url = file_url(&path);
+        self.last_render = Some(CachedRender {
+            target,
+            epoch: self.doc.edit_epoch,
+            url: url.clone(),
+            special,
+        });
         Ok(Rendered {
-            url: file_url(&path),
+            url,
             display,
             preview: Size::new(image.width(), image.height()),
             histogram,
@@ -1316,8 +1381,8 @@ impl Session {
         format!("[{}]", parts.join(","))
     }
 
-    fn refresh(&mut self) -> Refresh {
-        match self.render() {
+    fn refresh(&mut self, zoom_only: bool) -> Refresh {
+        match self.render(zoom_only) {
             Ok(rendered) => {
                 let adjust = self.adjust;
                 let adjust_target_name = match adjust {
@@ -2133,14 +2198,14 @@ println!(
         if let Some(session) = self.session.borrow_mut().as_mut() {
             session.zoom_by(ZOOM_STEP);
         }
-        self.as_mut().refresh_preview();
+        self.as_mut().refresh_preview_zoom();
     }
 
     pub fn zoom_out(mut self: Pin<&mut Self>) {
         if let Some(session) = self.session.borrow_mut().as_mut() {
             session.zoom_by(1.0 / ZOOM_STEP);
         }
-        self.as_mut().refresh_preview();
+        self.as_mut().refresh_preview_zoom();
     }
 
     pub fn zoom_step(mut self: Pin<&mut Self>, factor: f64) {
@@ -2150,7 +2215,7 @@ println!(
         if let Some(session) = self.session.borrow_mut().as_mut() {
             session.zoom_by(factor);
         }
-        self.as_mut().refresh_preview();
+        self.as_mut().refresh_preview_zoom();
     }
 
     pub fn zoom_fit(mut self: Pin<&mut Self>) {
@@ -2158,7 +2223,7 @@ println!(
         if let Some(session) = self.session.borrow_mut().as_mut() {
             session.refit(viewport);
         }
-        self.as_mut().refresh_preview();
+        self.as_mut().refresh_preview_zoom();
     }
 
     pub fn zoom_actual(mut self: Pin<&mut Self>) {
@@ -2166,7 +2231,7 @@ println!(
             session.zoom = 1.0;
             session.fit = false;
         }
-        self.as_mut().refresh_preview();
+        self.as_mut().refresh_preview_zoom();
     }
 
     pub fn rotate_cw(mut self: Pin<&mut Self>) {
@@ -4548,12 +4613,23 @@ session
         self.as_mut().refresh_preview();
     }
 
-    fn refresh_preview(mut self: Pin<&mut Self>) {
+    fn refresh_preview(self: Pin<&mut Self>) {
+        self.refresh_preview_inner(false);
+    }
+
+    /// Zoom-entry refresh (wheel ticks, slider, presets, zoom buttons). Only
+    /// these may reuse the previous frame when the preview target is unchanged
+    /// (the >100% regime); every other refresh path renders for real.
+    fn refresh_preview_zoom(self: Pin<&mut Self>) {
+        self.refresh_preview_inner(true);
+    }
+
+    fn refresh_preview_inner(mut self: Pin<&mut Self>, zoom_only: bool) {
         let render_t0 = Instant::now();
         let outcome = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
-                Some(session) => session.refresh(),
+                Some(session) => session.refresh(zoom_only),
                 None => return,
             }
         };
@@ -4685,5 +4761,42 @@ session
                 self.as_mut().set_status(QString::from(status.as_str()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod preview_target_tests {
+    use super::*;
+
+    #[test]
+    fn below_100pct_uses_display_as_is() {
+        let canvas = Size::new(1926, 1109);
+        let display = Size::new(880, 507);
+        assert_eq!(preview_target(display, canvas), display);
+    }
+
+    #[test]
+    fn above_100pct_caps_at_native_canvas() {
+        // Zooming in cannot create detail: the composite never grows past the
+        // document resolution, and every tick above 100% shares one target so
+        // the zoom-only render skip can reuse the frame.
+        let canvas = Size::new(1926, 1109);
+        let display = Size::new(4196, 2416); // zoom 218%
+        assert_eq!(preview_target(display, canvas), canvas);
+    }
+
+    #[test]
+    fn giant_canvas_still_respects_max_preview_edge() {
+        let canvas = Size::new(6000, 4000);
+        let display = Size::new(9000, 6000); // zoom 150%
+        let target = preview_target(display, canvas);
+        assert_eq!(target, Size::new(4096, 2731));
+    }
+
+    #[test]
+    fn never_returns_zero() {
+        let canvas = Size::new(1, 1);
+        let display = Size::new(4000, 4000); // zoom 4000x
+        assert_eq!(preview_target(display, canvas), canvas);
     }
 }

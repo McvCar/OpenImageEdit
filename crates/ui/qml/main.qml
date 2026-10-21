@@ -2602,12 +2602,11 @@ Window {
         }
 
         // ---- 缩放节流 ------------------------------------------------------
-        // Ctrl+滚轮每一格原来都同步跑一遍全量重合成 + BMP 编码（预览目标
-        // 最长边可到 4096px，大图下每步数百 ms），连滚直接卡死。对策与窗口
-        // 缩放相同：手势期间只累积倍率，用「当前 zoom × 累积倍率」预测显示
-        // 尺寸把现有预览拉伸（视觉跟手），停手 120ms 后渲染一次真图。预测
-        // 公式与 Rust 的 zoom_by / display_size 一致（ZOOM_STEP=1.25，clamp
-        // 0.02..16），渲染落地时不跳变。
+        // Ctrl+滚轮每一格原来都同步跑一遍全量重合成 + BMP 编码，连滚直接卡
+        // 死。对策与窗口缩放相同：手势期间只累积倍率，用「当前 zoom × 累积
+        // 倍率」预测显示尺寸把现有预览拉伸（视觉跟手），停手 120ms 后渲染一
+        // 次真图。100% 以上预览目标钳制在画布原生分辨率且不再变化，落地渲染
+        // 大多直接复用上一帧（Rust 端 render-skip），滚轮全程无重绘。
         readonly property bool zoomPending: zoomTimer.running
         property real pendingZoom: 1.0
         readonly property real predictedZoom: {
