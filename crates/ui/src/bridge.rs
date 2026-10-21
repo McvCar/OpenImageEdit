@@ -1460,6 +1460,21 @@ impl qobject::Bridge {
                 "zoom-out" => self.as_mut().zoom_out(),
                 "zoom-fit" => self.as_mut().zoom_fit(),
                 "zoom-actual" => self.as_mut().zoom_actual(),
+                // `zoom:31` — jump to an exact zoom percentage (headless
+                // preview-sharpness checks: no wheel stepping involved).
+                other if other.starts_with("zoom:") => {
+                    if let Some(pct) = other
+                        .strip_prefix("zoom:")
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                    {
+                        if let Some(session) = self.session.borrow_mut().as_mut() {
+                            session.zoom =
+                                (pct / 100.0).clamp(MIN_ZOOM, MAX_ZOOM);
+                            session.fit = false;
+                        }
+                        self.as_mut().refresh_preview_zoom();
+                    }
+                }
                 "save" => self.as_mut().save_edited(),
                 "reset-crop" => self.as_mut().reset_crop(),
                 "toggle-visible-selected" => self.as_mut().toggle_selected_visible(),

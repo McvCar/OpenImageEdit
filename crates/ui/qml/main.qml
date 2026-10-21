@@ -2534,8 +2534,10 @@ Window {
         function centerContent() {
             if (!bridge.fit_mode)
                 return
-            contentX = Math.max(0, (contentWidth - width) / 2)
-            contentY = Math.max(0, (contentHeight - height) / 2)
+            // 取整：contentX/Y 若带 .5，整块内容（含 1:1 的预览位图）都会被
+            // 半像素采样糊掉，与 previewImage.x/y 取整是同一件事的两半。
+            contentX = Math.round(Math.max(0, (contentWidth - width) / 2))
+            contentY = Math.round(Math.max(0, (contentHeight - height) / 2))
         }
         onContentWidthChanged: centerContent()
         onContentHeightChanged: centerContent()
@@ -2648,8 +2650,10 @@ Window {
         function panBy(dx, dy) {
             const maxX = Math.max(0, contentWidth - width)
             const maxY = Math.max(0, contentHeight - height)
-            contentX = Math.min(maxX, Math.max(0, contentX + dx))
-            contentY = Math.min(maxY, Math.max(0, contentY + dy))
+            // 取整：触摸板/滚轮的增量常带小数，contentX 一旦是 .5，1:1 的预览
+            // 位图就会按半像素中心采样（整幅变糊）。
+            contentX = Math.round(Math.min(maxX, Math.max(0, contentX + dx)))
+            contentY = Math.round(Math.min(maxY, Math.max(0, contentY + dy)))
         }
 
         // PS-style checkerboard behind the image: transparent pixels show
@@ -2680,8 +2684,12 @@ Window {
 
             width: view.shownWidth
             height: view.shownHeight
-            x: (view.contentWidth - width) / 2
-            y: (view.contentHeight - height) / 2
+            // 必须落在整数像素上：预览位图与显示尺寸是 1:1 的，一旦 x/y 出现
+            // .5（奇数宽高居中时很常见，例如 31% 的 497×311），GPU 就会按
+            // 半像素中心做双线性采样，整张画面被均匀糊掉——这正是"某些缩放
+            // 比例看着模糊"的根因。居中偏移一律取整。
+            x: Math.round((view.contentWidth - width) / 2)
+            y: Math.round((view.contentHeight - height) / 2)
             cache: false
             fillMode: Image.Stretch
             source: bridge.preview_url
