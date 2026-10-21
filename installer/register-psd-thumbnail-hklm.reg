@@ -1,0 +1,19 @@
+Windows Registry Editor Version 5.00
+
+; ImageEdit PSD thumbnail handler - machine-wide registration.
+; Per-user (HKCU) registration is not honored by Explorer's isolated
+; thumbnail pipeline on some systems; this HKLM copy makes it work.
+; DLL path must match the ImageEdit install directory.
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID\{43B34785-3F16-49F5-BAB6-069B487ED407}]
+@="ImageEdit PSD Thumbnail Provider"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID\{43B34785-3F16-49F5-BAB6-069B487ED407}\InprocServer32]
+@="C:\\Users\\Admin\\AppData\\Local\\Programs\\ImageEdit\\imageedit_thumb.dll"
+"ThreadingModel"="Apartment"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Classes\.psd\ShellEx\{e357fccd-a995-4576-b01f-234630154e96}]
+@="{43B34785-3F16-49F5-BAB6-069B487ED407}"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved]
+"{43B34785-3F16-49F5-BAB6-069B487ED407}"="ImageEdit PSD Thumbnail Provider"

@@ -24,9 +24,10 @@ use windows::Win32::Foundation::{CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATIO
 use windows::Win32::Graphics::Gdi::{
     CreateDIBSection, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP,
 };
-use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
+use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl, IStream};
 use windows::Win32::UI::Shell::PropertiesSystem::{
-    IInitializeWithFile, IInitializeWithFile_Impl,
+    IInitializeWithFile, IInitializeWithFile_Impl, IInitializeWithStream,
+    IInitializeWithStream_Impl,
 };
 use windows::Win32::UI::Shell::{
     IThumbnailProvider, IThumbnailProvider_Impl, WTS_ALPHATYPE, WTSAT_ARGB,
@@ -38,7 +39,12 @@ pub const CLSID_THUMB_PROVIDER: GUID =
     GUID::from_u128(0x43b34785_3f16_49f5_bab6_069b487ed407);
 
 /// Shell extension category for `IThumbnailProvider` (fixed by the system).
-const THUMB_SHELLEX_CATEGORY: &str = "{e357fccd-a995-4577-b039-fa759f30b17e}";
+/// NOTE: this is the *catalog* GUID from the Shell handler table (see
+/// "Implementing Shell Extension Handlers", cc144067). It is NOT the
+/// IThumbnailProvider interface IID {e357fccd-a995-4577-b039-fa759f30b17e} —
+/// registering the IID under `ShellEx` makes Explorer silently skip the
+/// handler entirely.
+const THUMB_SHELLEX_CATEGORY: &str = "{e357fccd-a995-4576-b01f-234630154e96}";
 
 /// Decode ceiling: PSDs whose canvas exceeds this many pixels are rejected
 /// instead of allocating. `explorer.exe` must stay responsive.
@@ -50,20 +56,80 @@ const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DECODE_EDGE: u32 = 1024;
 
 // ---------------------------------------------------------------------------
+// Debug logging (temporary diagnostics; appends to %TEMP%\imageedit_thumb.log)
+// ---------------------------------------------------------------------------
+
+fn log_line(msg: &str) {
+    use std::io::Write;
+    let Ok(temp) = std::env::var("TEMP") else { return };
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::Path::new(&temp).join("imageedit_thumb.log"))
+    else {
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let _ = writeln!(f, "[{ts}] {msg}");
+}
+
+// ---------------------------------------------------------------------------
 // COM object
 // ---------------------------------------------------------------------------
 
-#[implement(IInitializeWithFile, IThumbnailProvider)]
+#[implement(IInitializeWithStream, IInitializeWithFile, IThumbnailProvider)]
 struct Provider {
     path: RefCell<Option<PathBuf>>,
+    stream: RefCell<Option<IStream>>,
 }
 
 impl Provider {
     fn new() -> Self {
         Self {
             path: RefCell::new(None),
+            stream: RefCell::new(None),
         }
     }
+}
+
+impl IInitializeWithStream_Impl for Provider_Impl {
+    fn Initialize(&self, pstm: windows::core::Ref<'_, IStream>, grfstmode: u32) -> Result<()> {
+        let stream = Option::<IStream>::clone(&pstm).ok_or_else(|| Error::from_hresult(E_FAIL))?;
+        log_line("Initialize(Stream)");
+        *self.stream.borrow_mut() = Some(stream.clone());
+        // Remember nothing path-wise; the stream is the content source.
+        let _ = grfstmode;
+        Ok(())
+    }
+}
+
+/// Read the whole initialized stream into memory (files are capped at
+/// MAX_FILE_BYTES before we bother).
+fn read_stream(stream: &IStream) -> std::result::Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    // Heap-allocated: a fixed-size array here would be folded into the caller
+    // frame, and dllhost's 1 MB thread stack cannot fit 1 MB of buffer —
+    // the stack probe in the prologue overflows before GetThumbnail even
+    // runs (0xc00000fd crash loop).
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let mut got: u32 = 0;
+        let hr = unsafe { stream.Read(buf.as_mut_ptr() as *mut _, buf.len() as u32, Some(&mut got)) };
+        if hr.is_err() {
+            return Err(format!("IStream::Read failed: {hr:?}"));
+        }
+        if got == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..got as usize]);
+        if out.len() as u64 > MAX_FILE_BYTES {
+            return Err("file too large".into());
+        }
+    }
+    Ok(out)
 }
 
 impl IInitializeWithFile_Impl for Provider_Impl {
@@ -72,6 +138,7 @@ impl IInitializeWithFile_Impl for Provider_Impl {
             return Err(Error::from_hresult(HRESULT(0x8000_4005u32 as i32))); // E_POINTER
         }
         let s = unsafe { pszfilepath.to_string() }.map_err(|_| Error::from_hresult(E_FAIL))?;
+        log_line(&format!("Initialize: {s}"));
         *self.path.borrow_mut() = Some(PathBuf::from(s));
         Ok(())
     }
@@ -90,28 +157,39 @@ impl IThumbnailProvider_Impl for Provider_Impl {
             .path
             .borrow()
             .clone()
-            .ok_or_else(|| Error::from_hresult(E_FAIL))?;
-
+            .unwrap_or_else(|| PathBuf::from("<stream>"));
+        let stream = self.stream.borrow().clone();
+        log_line(&format!(
+            "GetThumbnail cx={cx} path={} stream={}",
+            path.display(),
+            stream.is_some()
+        ));
         // Decode + GDI work inside catch_unwind: any residual panic in the
         // dependency chain must not abort explorer.exe (requires the `thumb`
         // profile; `validate_psd_sections` is the first line of defence).
-        let result = catch_unwind(AssertUnwindSafe(|| render_thumbnail(&path, cx)));
+        let result = catch_unwind(AssertUnwindSafe(|| match &stream {
+            // Surrogate hosts (Explorer's dllhost) hand us the content as an
+            // IStream; prefer it — the path may not be readable from there.
+            Some(s) => render_thumbnail_stream(s, cx),
+            None => render_thumbnail(&path, cx),
+        }));
         match result {
             Ok(Ok(hbmp)) => unsafe {
                 if phbmp.is_null() || pdwalpha.is_null() {
-                    eprintln!("[thumb] out ptrs null");
+                    log_line("GetThumbnail: out ptrs null");
                     return Err(Error::from_hresult(E_FAIL));
                 }
                 *phbmp = hbmp;
                 *pdwalpha = WTSAT_ARGB;
+                log_line("GetThumbnail: OK");
                 Ok(())
             },
             Ok(Err(e)) => {
-                eprintln!("[thumb] render error: {e}");
+                log_line(&format!("GetThumbnail render error: {e}"));
                 Err(Error::from_hresult(E_FAIL))
             }
             Err(_) => {
-                eprintln!("[thumb] render panicked");
+                log_line("GetThumbnail render panicked");
                 Err(Error::from_hresult(E_FAIL))
             }
         }
@@ -138,7 +216,9 @@ impl IClassFactory_Impl for Factory_Impl {
             return Err(Error::from_hresult(CLASS_E_NOAGGREGATION));
         }
         let unknown: IUnknown = Provider::new().into();
-        unsafe { unknown.query(riid, ppvobject) }.ok()
+        let hr = unsafe { unknown.query(riid, ppvobject) };
+        log_line(&format!("Factory CreateInstance QI -> {hr:?}"));
+        hr.ok()
     }
 
     fn LockServer(&self, _flock: BOOL) -> Result<()> {
@@ -161,8 +241,10 @@ extern "system" fn DllGetClassObject(
             return HRESULT(0x8000_4003u32 as i32); // E_INVALIDARG
         }
         if (*rclsid) != CLSID_THUMB_PROVIDER {
+            log_line("DllGetClassObject: unknown CLSID requested");
             return CLASS_E_CLASSNOTAVAILABLE;
         }
+        log_line("DllGetClassObject: our CLSID");
         let factory: IClassFactory = Factory.into();
         factory.query(riid, ppv)
     }
@@ -275,12 +357,20 @@ fn render_thumbnail(path: &PathBuf, cx: u32) -> std::result::Result<HBITMAP, Str
         return Err("file too large".into());
     }
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    render_thumbnail_bytes(&bytes, cx)
+}
 
+fn render_thumbnail_stream(stream: &IStream, cx: u32) -> std::result::Result<HBITMAP, String> {
+    let bytes = read_stream(stream)?;
+    render_thumbnail_bytes(&bytes, cx)
+}
+
+fn render_thumbnail_bytes(bytes: &[u8], cx: u32) -> std::result::Result<HBITMAP, String> {
     let options = DecodeOptions {
         max_pixels: Some(MAX_PIXELS),
         max_dimension: Some(MAX_DECODE_EDGE),
     };
-    let decoded: Decoded = decode_psd_bytes(&bytes, options).map_err(|e| e.to_string())?;
+    let decoded: Decoded = decode_psd_bytes(bytes, options).map_err(|e| e.to_string())?;
     let img = decoded.image;
 
     // Fit inside the requested square (cx = max edge); never upscale.

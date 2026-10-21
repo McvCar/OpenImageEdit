@@ -14,7 +14,7 @@ Unicode True
 ; Explorer PSD thumbnail handler (crates/thumbnail). Must match
 ; CLSID_THUMB_PROVIDER_STR in crates/thumbnail/src/lib.rs.
 !define THUMB_CLSID "{43B34785-3F16-49F5-BAB6-069B487ED407}"
-!define THUMB_SHELLEX "{e357fccd-a995-4577-b039-fa759f30b17e}"
+!define THUMB_SHELLEX "{e357fccd-a995-4576-b01f-234630154e96}"
 
 !define MUI_ABORTWARNING
 

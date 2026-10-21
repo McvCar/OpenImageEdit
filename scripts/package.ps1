@@ -41,7 +41,12 @@ Copy-Item (Join-Path $repoRoot 'target\release\imageedit.exe') $distDir
 # dedicated `thumb` profile: same optimizations as release but panic=unwind
 # so the provider's catch_unwind can stop PSD parse panics from taking down
 # explorer.exe (the workspace release profile uses panic=abort).
+# PS 5.1 turns cargo's stderr progress lines into ErrorRecords; under
+# $ErrorActionPreference='Stop' the first one aborts the script.
+$oldEA = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 $thumbOut = & cargo build -p imageedit-thumbnail --profile thumb 2>&1 | Out-String
+$ErrorActionPreference = $oldEA
 if ($LASTEXITCODE -ne 0) { throw "thumbnail DLL build failed`n$thumbOut" }
 Copy-Item (Join-Path $repoRoot 'target\thumb\imageedit_thumb.dll') $distDir
 # Per-user registration helpers for zip users (the NSIS installer writes
@@ -56,6 +61,10 @@ Set-Content -LiteralPath (Join-Path $distDir 'unregister-psd-thumbnail.cmd') -Va
 rem Removes the ImageEdit PSD thumbnail handler registration.
 regsvr32 /s /u "%~dp0imageedit_thumb.dll"
 '@ -Encoding Ascii
+
+# Machine-wide fallback registration for setups where the per-user (HKCU)
+# handler is not honored; path matches the NSIS default InstallDir.
+Copy-Item (Join-Path $repoRoot 'installer\register-psd-thumbnail-hklm.reg') $distDir
 
 $oldEA = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
