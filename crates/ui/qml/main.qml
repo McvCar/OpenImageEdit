@@ -717,7 +717,16 @@ Window {
                : "ImageEdit"
 
         onAfterRendering: content.afterFrame()
-        onVisibleChanged: content.b.mark("window-visible")
+        onVisibleChanged: {
+            content.b.mark("window-visible")
+            // Frameless windows created via createObject don't take focus on
+            // their own — without an explicit raise+activate the new window
+            // stayed BEHIND the shell window and looked like "nothing opened".
+            if (visible) {
+                raise()
+                requestActivate()
+            }
+        }
         onClosing: (close) => content.requestClose(close)
 
         WindowEdges {}
@@ -5736,6 +5745,12 @@ Window {
             bridge.resize_canvas(w, h)
         else
             bridge.resize_to(w, h)
+        // The selection lives in display coordinates and the fit zoom may
+        // re-fit after the canvas changed size — remapping it reliably would
+        // need image-space state, so drop it instead of leaving it misplaced.
+        root.selW = 0
+        root.selH = 0
+        cancelLayerScale()
         resizeOverlay.visible = false
     }
 
@@ -6551,7 +6566,7 @@ Window {
                 }
                 Text {
                     width: parent.width
-                    text: "控制「另存副本 / 另存为 / 导出」的质量：\n· JPG：数值越低文件越小（有损压缩）\n· PNG 无损：质量 < 50 时改用最大压缩，文件最小、保存稍慢"
+                    text: "控制「另存副本 / 另存为 / 导出」的质量：\n· JPG：数值越低文件越小（有损压缩）\n· WebP：本版本仅无损编码，质量不影响体积\n· PNG / TIFF 等无损：质量 < 50 时改用最大压缩，文件最小、保存稍慢"
                     color: "#8f96a3"
                     font.pixelSize: 11
                 }

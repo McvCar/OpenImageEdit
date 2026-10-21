@@ -1259,8 +1259,24 @@ impl History {
 }
 
 fn apply_view(doc: &mut Document, view: Rect) {
+    // Layer offsets and marks are CANVAS-relative. Cropping moves the canvas
+    // origin, so their positions must ride along with the content: the whole
+    // composition shifts by (old origin - new origin) inside the new canvas.
+    // Without this, cropping after adding layers / marks made them jump back
+    // to their pre-crop canvas position while the base content moved.
+    let dx = doc.view.x - view.x;
+    let dy = doc.view.y - view.y;
     doc.view = view;
     doc.canvas = Size::new(view.width, view.height);
+    if dx != 0 || dy != 0 {
+        for layer in &mut doc.layers {
+            layer.offset.0 += dx;
+            layer.offset.1 += dy;
+        }
+        for mark in &mut doc.marks {
+            *mark = mark.translated(dx as f32, dy as f32);
+        }
+    }
 }
 
 /// Make every base pixel under `selection` fully transparent. Selection
@@ -1281,7 +1297,11 @@ fn apply_base_to_layer(doc: &mut Document) {
         return;
     }
     let mut layer = Layer::new("背景", doc.base.clone());
-    layer.offset = (doc.view.x, doc.view.y);
+    // Layer offsets are canvas-relative: the converted base must show
+    // base[view.x + x] at canvas x, i.e. its top-left sits at
+    // (-view.x, -view.y). (view.x, view.y) was only correct for an
+    // uncropped document and silently shifted the composition otherwise.
+    layer.offset = (-doc.view.x, -doc.view.y);
     let empty = RgbaImage::new(doc.base.width(), doc.base.height());
     doc.base = empty;
     doc.layers.insert(0, layer);
@@ -2075,6 +2095,55 @@ mod tests {
     }
 
     #[test]
+    fn crop_shifts_layers_and_marks_with_the_content() {
+        let mut doc = Document::from_image(checker(100, 100));
+        let mut layer = Layer::new("dot", checker(10, 10));
+        layer.offset = (30, 30);
+        doc.add_layer(layer).unwrap();
+        let mut mark = Mark::new(MarkKind::Rect);
+        mark.rect = (40.0, 40.0, 60.0, 50.0);
+        doc.add_mark(mark).unwrap();
+
+        doc.crop(Rect::new(20, 20, 50, 50)).unwrap();
+        // The layer kept its place relative to the image content: its canvas
+        // offset moved by -(crop origin).
+        assert_eq!(doc.layers[0].offset, (10, 10));
+        // mark.rect is (x1, y1, x2, y2) corner coordinates.
+        assert_eq!(doc.marks[0].rect, (20.0, 20.0, 40.0, 30.0));
+        // Flatten now equals the pre-crop composite cropped to the rect.
+        let cropped_view = {
+            let mut d = Document::from_image(checker(100, 100));
+            let mut l = Layer::new("dot", checker(10, 10));
+            l.offset = (30, 30);
+            d.add_layer(l).unwrap();
+            let mut m = Mark::new(MarkKind::Rect);
+            m.rect = (40.0, 40.0, 60.0, 50.0);
+            d.add_mark(m).unwrap();
+            image::imageops::crop_imm(&d.flatten(), 20, 20, 50, 50).to_image()
+        };
+        assert_eq!(doc.flatten(), cropped_view);
+
+        // Undo puts everything back at the original canvas position.
+        doc.undo().unwrap();
+        assert_eq!(doc.layers[0].offset, (30, 30));
+        assert_eq!(doc.marks[0].rect, (40.0, 40.0, 60.0, 50.0));
+    }
+
+    #[test]
+    fn convert_base_to_layer_composites_identically_after_crop() {
+        let mut doc = Document::from_image(checker(64, 64));
+        doc.crop(Rect::new(12, 8, 40, 30)).unwrap();
+        let cropped = doc.flatten();
+
+        doc.convert_base_to_layer().unwrap();
+        // Uncropped documents keep offset (0,0); after a crop the layer's
+        // top-left sits at (-view.x, -view.y) so base[view.x + x] shows at
+        // canvas x and the composite stays pixel-identical.
+        assert_eq!(doc.layers[0].offset, (-12, -8));
+        assert_eq!(doc.flatten(), cropped);
+    }
+
+    #[test]
     fn convert_base_to_layer_roundtrips_and_composites_identically() {
         let mut doc = Document::from_image(checker(16, 16));
         let before = doc.flatten();
@@ -2319,11 +2388,14 @@ mod tests {
 
         doc.crop(Rect::new(5, 5, 20, 20)).unwrap();
         assert_eq!(doc.canvas, Size::new(20, 20));
-        // 图层坐标未改动，但视口左上角移到了 (5,5)，所以它落在画布外左侧/上方。
-        assert_eq!(doc.layers[0].offset, (2, 3));
-        assert_eq!(doc.composite_pixel(0, 0).0, [0, 0, 0, 255]);
+        // 图层跟着内容走：画布原点移到 (5,5)，图层的画布偏移同步平移
+        // -(5,5)，所以它相对图像内容的位置不变（画布 (0,0) 露出的是
+        // 原图像 (5,5) 的像素，白点正好压在这个角上）。
+        assert_eq!(doc.layers[0].offset, (-3, -2));
+        assert_eq!(doc.composite_pixel(0, 0).0, [255, 255, 255, 255]);
 
         doc.reset_crop().unwrap();
+        assert_eq!(doc.layers[0].offset, (2, 3));
         assert_eq!(doc.composite_pixel(2, 3).0, [255, 255, 255, 255]);
     }
 

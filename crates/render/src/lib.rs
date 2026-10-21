@@ -62,14 +62,72 @@ pub fn display_size(source: Size, viewport: Size, zoom: Zoom) -> Size {
 ///
 /// Upscaling keeps the filtered path (a box filter would turn zoomed-in pixels
 /// into blocky mush).
+///
+/// RGBA here is straight (non-premultiplied) alpha. Averaging straight-alpha
+/// pixels lets the RGB of fully transparent pixels (RGB=0 after erase) bleed
+/// into neighbours — erased holes grew a dark rim on all four sides. When the
+/// bitmap carries any transparency we resample premultiplied instead; fully
+/// opaque bitmaps (the common photo case) skip the extra passes entirely.
 pub fn resize_to(image: &RgbaImage, target: Size) -> RgbaImage {
     if image.width() == target.width && image.height() == target.height {
         return image.clone();
     }
-    if target.width < image.width() || target.height < image.height() {
-        return image::imageops::thumbnail(image, target.width, target.height);
+    if has_transparent_pixel(image) {
+        let pma = premultiply(image);
+        let scaled = if target.width < image.width() || target.height < image.height() {
+            image::imageops::thumbnail(&pma, target.width, target.height)
+        } else {
+            image::imageops::resize(&pma, target.width, target.height, FilterType::Triangle)
+        };
+        return unpremultiply(&scaled);
     }
-    image::imageops::resize(image, target.width, target.height, FilterType::Triangle)
+    if target.width < image.width() || target.height < image.height() {
+        image::imageops::thumbnail(image, target.width, target.height)
+    } else {
+        image::imageops::resize(image, target.width, target.height, FilterType::Triangle)
+    }
+}
+
+/// True when at least one pixel is not fully opaque (cheapest possible scan;
+/// a fully opaque bitmap never needs the premultiplied round trip).
+fn has_transparent_pixel(image: &RgbaImage) -> bool {
+    image.as_raw().chunks_exact(4).any(|px| px[3] != 255)
+}
+
+/// Straight alpha -> premultiplied alpha (in a fresh buffer).
+fn premultiply(image: &RgbaImage) -> RgbaImage {
+    let mut out = image.clone();
+    for px in out.pixels_mut() {
+        let [r, g, b, a] = px.0;
+        if a != 255 && a != 0 {
+            *px = image::Rgba([
+                ((r as u32 * a as u32 + 127) / 255) as u8,
+                ((g as u32 * a as u32 + 127) / 255) as u8,
+                ((b as u32 * a as u32 + 127) / 255) as u8,
+                a,
+            ]);
+        } else if a == 0 {
+            *px = image::Rgba([0, 0, 0, 0]);
+        }
+    }
+    out
+}
+
+/// Premultiplied alpha -> straight alpha.
+fn unpremultiply(image: &RgbaImage) -> RgbaImage {
+    let mut out = image.clone();
+    for px in out.pixels_mut() {
+        let [r, g, b, a] = px.0;
+        if a == 255 || a == 0 {
+            if a == 0 {
+                *px = image::Rgba([0, 0, 0, 0]);
+            }
+            continue;
+        }
+        let f = |c: u8| ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8;
+        *px = image::Rgba([f(r), f(g), f(b), a]);
+    }
+    out
 }
 
 pub fn crop_region(image: &RgbaImage, region: Rect) -> RgbaImage {
@@ -494,6 +552,38 @@ mod tests {
         let image = solid(100, 50, [255, 0, 0, 255]);
         let cropped = crop_region(&image, Rect::new(90, 40, 30, 30));
         assert_eq!(cropped.dimensions(), (10, 10));
+    }
+
+    #[test]
+    fn downscale_near_transparent_hole_stays_straight_white() {
+        // [white, white, white, hole]: the last output pixel covers one white
+        // and one transparent pixel. Straight-alpha averaging would darken it
+        // to gray (the hole's RGB=0 bleeds in); premultiplied resampling must
+        // keep it white at ~50% alpha — no dark rim around erased regions.
+        let mut img = solid(4, 1, [255, 255, 255, 255]);
+        img.put_pixel(3, 0, image::Rgba([0, 0, 0, 0]));
+        let out = resize_to(&img, Size::new(2, 1));
+        let edge = out.get_pixel(1, 0).0;
+        assert!(
+            (127..=128).contains(&edge[3]),
+            "half coverage expected, got {:?}",
+            edge
+        );
+        assert!(
+            edge[0] >= 250 && edge[1] >= 250 && edge[2] >= 250,
+            "edge must stay white (premultiplied resample), got {:?}",
+            edge
+        );
+    }
+
+    #[test]
+    fn fully_opaque_image_skips_premultiply_roundtrip() {
+        // Opaque bitmaps must produce byte-identical results to the plain
+        // box filter (no rounding drift from premultiply/unpremultiply).
+        let img = solid(64, 48, [30, 144, 255, 255]);
+        let a = resize_to(&img, Size::new(16, 12));
+        let b = image::imageops::thumbnail(&img, 16, 12);
+        assert_eq!(a.as_raw(), b.as_raw());
     }
 
     #[test]
