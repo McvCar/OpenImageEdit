@@ -77,6 +77,9 @@ pub mod qobject {
         #[qproperty(QString, file_size_str, cxx_name = "fileSizeStr")]
         #[qproperty(QString, checker_light, cxx_name = "checkerLight")]
         #[qproperty(QString, checker_dark, cxx_name = "checkerDark")]
+        /// file:/// URL of the generated 16×16 checker tile BMP; QML tiles it
+        /// with `Image.fillMode Tile` (zero repaint on zoom/resize).
+        #[qproperty(QString, checker_tile_url, cxx_name = "checkerTileUrl")]
         #[qproperty(bool, open_in_new_window, cxx_name = "openInNewWindow")]
         #[qproperty(i32, save_quality, cxx_name = "saveQuality")]
         #[qproperty(QString, source_path, cxx_name = "sourcePath")]
@@ -656,6 +659,12 @@ pub struct BridgeRust {
     /// User preferences (checkerboard colors, open-in-new-window behavior).
     checker_light: QString,
     checker_dark: QString,
+    /// file:/// URL of the generated 16×16 checker tile BMP ("" on failure).
+    checker_tile_url: QString,
+    /// Alternates 0/1 per regeneration: the QML Image only reloads when the
+    /// source URL string changes, so the filename toggles a/b on color edits.
+    /// `Cell` because interior mutability is required behind `Pin<&mut Self>`.
+    checker_tile_slot: std::cell::Cell<u8>,
     open_in_new_window: bool,
     /// Save quality 1-100 (mirrors the settings.ini value for QML).
     save_quality: i32,
@@ -732,6 +741,14 @@ impl Default for BridgeRust {
             file_size_str: QString::default(),
             checker_light: QString::from(cfg.checker_light.as_str()),
             checker_dark: QString::from(cfg.checker_dark.as_str()),
+            // Generate the tile eagerly so the first paint already has it;
+            // a failed write just leaves the URL empty (checker hidden).
+            checker_tile_url: QString::from(
+                write_checker_tile_bmp(&cfg.checker_light, &cfg.checker_dark, 0)
+                    .unwrap_or_default()
+                    .as_str(),
+            ),
+            checker_tile_slot: std::cell::Cell::new(0),
             open_in_new_window: cfg.open_in_new_window,
             save_quality: cfg.save_quality as i32,
             source_path: QString::default(),
@@ -764,6 +781,65 @@ fn clipboard() -> &'static std::sync::Mutex<Option<Layer>> {
     static CLIPBOARD: std::sync::OnceLock<std::sync::Mutex<Option<Layer>>> =
         std::sync::OnceLock::new();
     CLIPBOARD.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Render the 16×16 checkerboard tile (8 px cells) as a 32bpp bottom-up BMP
+/// and return a `file:///` URL, or `None` on any failure (QML then just hides
+/// the checkerboard).
+///
+/// Written next to settings.ini. `slot` alternates the filename (a/b) so the
+/// QML `Image` sees a changed URL on color edits — same-path rewrites would
+/// not reload the texture. Generated here instead of painted in QML because
+/// the Canvas + `toDataURL` route re-enters the synchronous Immediate paint
+/// path from `onPainted` and crashes (even with a JS re-entrancy guard).
+fn write_checker_tile_bmp(light: &str, dark: &str, slot: u8) -> Option<String> {
+    fn parse_hex(s: &str) -> Option<[u8; 3]> {
+        let s = s.strip_prefix('#')?;
+        if s.len() != 6 {
+            return None;
+        }
+        let mut out = [0u8; 3];
+        for (i, c) in out.iter_mut().enumerate() {
+            *c = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+        }
+        Some(out)
+    }
+    let (light, dark) = (parse_hex(light)?, parse_hex(dark)?);
+    let (w, h) = (16u32, 16u32);
+    let row = (w * 4) as usize;
+    let pixels = row * h as usize;
+    let mut buf = Vec::with_capacity(54 + pixels);
+    // BITMAPFILEHEADER
+    buf.extend_from_slice(b"BM");
+    buf.extend_from_slice(&((54 + pixels) as u32).to_le_bytes());
+    buf.extend_from_slice(&[0; 4]);
+    buf.extend_from_slice(&54u32.to_le_bytes());
+    // BITMAPINFOHEADER (BI_RGB, bottom-up)
+    buf.extend_from_slice(&40u32.to_le_bytes());
+    buf.extend_from_slice(&(w as i32).to_le_bytes());
+    buf.extend_from_slice(&(h as i32).to_le_bytes());
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.extend_from_slice(&32u16.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&(pixels as u32).to_le_bytes());
+    buf.extend_from_slice(&2835u32.to_le_bytes());
+    buf.extend_from_slice(&2835u32.to_le_bytes());
+    buf.extend_from_slice(&[0; 8]);
+    for gy in (0..h).rev() {
+        for gx in 0..w {
+            let c = if (gx / 8) % 2 == (gy / 8) % 2 { light } else { dark };
+            buf.extend_from_slice(&[c[2], c[1], c[0], 255]);
+        }
+    }
+    let dir = AppConfig::path()?.parent()?.to_path_buf();
+    std::fs::create_dir_all(&dir).ok()?;
+    let name = format!("checker-tile-{}.bmp", if slot == 0 { "a" } else { "b" });
+    std::fs::write(dir.join(&name), &buf).ok()?;
+    Some(format!(
+        "file:///{}/{}",
+        dir.to_string_lossy().replace('\\', "/"),
+        name
+    ))
 }
 
 struct Session {
@@ -1876,6 +1952,7 @@ println!(
             return;
         }
         self.as_mut().set_checker_light(value.clone());
+        self.as_mut().regenerate_checker_tile();
         self.persist_config();
     }
 
@@ -1884,7 +1961,20 @@ println!(
             return;
         }
         self.as_mut().set_checker_dark(value.clone());
+        self.as_mut().regenerate_checker_tile();
         self.persist_config();
+    }
+
+    /// Re-render the checker tile after a color change and publish the new
+    /// (filename-alternated) URL so the QML `Image` reloads it.
+    fn regenerate_checker_tile(mut self: Pin<&mut Self>) {
+        let slot = (self.checker_tile_slot.get() + 1) % 2;
+        self.checker_tile_slot.set(slot);
+        let light = self.checker_light().to_string();
+        let dark = self.checker_dark().to_string();
+        if let Some(url) = write_checker_tile_bmp(&light, &dark, slot) {
+            self.as_mut().set_checker_tile_url(QString::from(url.as_str()));
+        }
     }
 
     pub fn update_open_in_new_window(mut self: Pin<&mut Self>, value: bool) {

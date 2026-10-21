@@ -720,12 +720,24 @@ Window {
         onVisibleChanged: {
             content.b.mark("window-visible")
             // Frameless windows created via createObject don't take focus on
-            // their own — without an explicit raise+activate the new window
-            // stayed BEHIND the shell window and looked like "nothing opened".
+            // their own. raise()+requestActivate() alone only works while our
+            // process already owns the foreground (menu-triggered opens);
+            // Windows denies focus stealing from a background process, so a
+            // file-manager double-click opened the window BEHIND other apps.
+            // Temporarily pinning above-all re-creates the native window with
+            // topmost z-order — no foreground permission needed. The pin is
+            // dropped again right after so the window is not always-on-top.
             if (visible) {
+                flags = Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
                 raise()
                 requestActivate()
+                frontTimer.restart()
             }
+        }
+        Timer {
+            id: frontTimer
+            interval: 300
+            onTriggered: docWin.flags = Qt.Window | Qt.FramelessWindowHint
         }
         onClosing: (close) => content.requestClose(close)
 
@@ -2323,18 +2335,122 @@ Window {
         }
     }
 
+    // 缩放预设菜单（状态栏百分比胶囊弹出，向上弹避免越出窗口底）。
+    Rectangle {
+        id: zoomMenu
+        visible: false
+        z: 220
+        width: 200
+        height: zoomMenuCol.height + 12
+        color: "#2a2d31"
+        border.color: "#3c4043"
+        radius: 6
+        y: statusBar.y - height - 4
+        onVisibleChanged: if (visible) placePopover(zoomMenu, zoomPctBtn)
+
+        Column {
+            id: zoomMenuCol
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.topMargin: 6
+            spacing: 0
+
+            Repeater {
+                model: [25, 50, 100, 200, 400, 800]
+
+                delegate: Item {
+                    required property int modelData
+                    width: parent.width
+                    height: 30
+
+                    Rectangle {
+                        anchors.fill: parent
+                        anchors.margins: 2
+                        radius: 4
+                        color: Math.abs(bridge.zoom_percent - modelData) < 1
+                               ? "#3d5a80"
+                               : zoomItemMa.containsMouse ? "#3a3d42" : "transparent"
+                    }
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.left: parent.left
+                        anchors.leftMargin: 14
+                        text: modelData + "%"
+                        color: "#d5d8dd"
+                        font.pixelSize: 12
+                    }
+                    MouseArea {
+                        id: zoomItemMa
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            view.queueZoomTo(modelData)
+                            zoomMenu.visible = false
+                        }
+                    }
+                }
+            }
+
+            Item { width: parent.width; height: 7
+                Rectangle { anchors.centerIn: parent; width: parent.width - 16; height: 1; color: "#3c4043" }
+            }
+
+            Repeater {
+                model: [
+                    { l: "适应窗口 (Ctrl+9)", run: function () { bridge.zoom_fit() } },
+                    { l: "100% 实际大小 (Ctrl+0)", run: function () { bridge.zoom_actual() } }
+                ]
+
+                delegate: Item {
+                    required property var modelData
+                    width: parent.width
+                    height: 30
+
+                    Rectangle {
+                        anchors.fill: parent
+                        anchors.margins: 2
+                        radius: 4
+                        color: zoomItemMa2.containsMouse ? "#3a3d42" : "transparent"
+                    }
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.left: parent.left
+                        anchors.leftMargin: 14
+                        text: modelData.l
+                        color: "#d5d8dd"
+                        font.pixelSize: 12
+                    }
+                    MouseArea {
+                        id: zoomItemMa2
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            modelData.run()
+                            zoomMenu.visible = false
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 弹窗打开时的点击捕获层。
     MouseArea {
         z: 215
         anchors.fill: parent
         visible: widthPopover.visible || colorPopover.visible
                  || mosaicPopover.visible || fontPopover.visible
+                 || zoomMenu.visible
         enabled: visible
         onPressed: (mouse) => {
             widthPopover.visible = false
             colorPopover.visible = false
             mosaicPopover.visible = false
             fontPopover.visible = false
+            zoomMenu.visible = false
             mouse.accepted = true
         }
     }
@@ -2507,6 +2623,18 @@ Window {
             pendingZoom = Math.min(16.0, Math.max(0.02, pendingZoom * factor))
             zoomTimer.restart()
         }
+        // 绝对值入口（滑杆/预设菜单用）：换算成相对倍率走同一条节流管线。
+        function queueZoomTo(pct) {
+            if (bridge.zoom_percent <= 0)
+                return
+            const target = Math.min(1600, Math.max(2, pct))
+            const base = Math.min(16.0, Math.max(0.02,
+                bridge.zoom_percent / 100.0))
+            const f = target / 100.0 / base
+            if (f > 0.999 && f < 1.001)
+                return
+            queueZoom(f)
+        }
         Timer {
             id: zoomTimer
             interval: 120
@@ -2526,34 +2654,26 @@ Window {
         }
 
         // PS-style checkerboard behind the image: transparent pixels show
-        // the grid configured in the settings panel.
-        Canvas {
+        // the grid configured in the settings panel. The 16×16 pattern tile
+        // is generated by the bridge (checkerTileUrl, a BMP next to
+        // settings.ini) and tiled by the GPU via `Image.fillMode Tile` —
+        // zero repaint on zoom/resize, which a full-size Canvas could not
+        // avoid (canvas resizes force synchronous repaints; that was the
+        // main wheel-zoom jank on large previews). A Canvas + toDataURL
+        // route was tried first and crashed: toDataURL re-enters the
+        // synchronous Immediate paint path from onPainted.
+        Image {
             id: checkerboard
             visible: bridge.preview_url.length > 0
+                     && bridge.checkerTileUrl.length > 0
             x: previewImage.x
             y: previewImage.y
             width: previewImage.width
             height: previewImage.height
-            readonly property color cLight: bridge.checkerLight
-            readonly property color cDark: bridge.checkerDark
-            onCLightChanged: requestPaint()
-            onCDarkChanged: requestPaint()
-            onWidthChanged: requestPaint()
-            onHeightChanged: requestPaint()
-            onPaint: {
-                var ctx = getContext("2d")
-                ctx.clearRect(0, 0, width, height)
-                const cell = 8
-                ctx.fillStyle = cDark
-                ctx.fillRect(0, 0, width, height)
-                ctx.fillStyle = cLight
-                for (var gy = 0; gy < height; gy += cell) {
-                    for (var gx = 0; gx < width; gx += cell) {
-                        if (((gx / cell) | 0) % 2 === ((gy / cell) | 0) % 2)
-                            ctx.fillRect(gx, gy, cell, cell)
-                    }
-                }
-            }
+            fillMode: Image.Tile
+            smooth: false
+            cache: false
+            source: bridge.checkerTileUrl
         }
 
         Image {
@@ -2566,6 +2686,9 @@ Window {
             cache: false
             fillMode: Image.Stretch
             source: bridge.preview_url
+
+            // 显示比例一变（缩放手势的预测拉伸也算）就重映射选区。
+            onWidthChanged: root.remapSelectionToScale()
 
             onStatusChanged: {
                 if (status === Image.Ready) {
@@ -3644,7 +3767,7 @@ Window {
         Text {
             id: modeHint
             anchors.verticalCenter: parent.verticalCenter
-            anchors.right: zoomLabel.left
+            anchors.right: zoomCtl.left
             anchors.rightMargin: 10
             visible: root.modeActive || root.selExists || bridge.selected_layer >= 0
             text: root.pasteFloating
@@ -3755,7 +3878,7 @@ Window {
             anchors.verticalCenter: parent.verticalCenter
             anchors.left: fileInfo.visible ? fileInfo.right : parent.left
             anchors.leftMargin: fileInfo.visible ? 12 : 10
-            anchors.right: (root.modeActive || root.selExists) ? modeHint.left : zoomLabel.left
+            anchors.right: (root.modeActive || root.selExists) ? modeHint.left : zoomCtl.left
             anchors.rightMargin: 10
             elide: Text.ElideMiddle
             text: bridge.status
@@ -3763,16 +3886,178 @@ Window {
             font.pixelSize: 12
         }
 
-        Text {
-            id: zoomLabel
+        // 可操作缩放控件：百分比下拉（预设/适应窗口/实际大小）+ 滑杆 + 加减。
+        Row {
+            id: zoomCtl
             anchors.verticalCenter: parent.verticalCenter
             anchors.right: parent.right
             anchors.rightMargin: 10
-            text: bridge.image_width > 0
-                  ? bridge.zoom_percent + "%"
-                  : ""
-            color: "#b8bcc0"
-            font.pixelSize: 12
+            spacing: 6
+            visible: bridge.image_width > 0
+
+            // 百分比胶囊按钮 → 弹预设菜单。
+            Rectangle {
+                id: zoomPctBtn
+                width: zoomPctRow.implicitWidth + 18
+                height: 20
+                anchors.verticalCenter: parent.verticalCenter
+                radius: 4
+                color: zoomPctMa.containsMouse || zoomMenu.visible
+                       ? "#3a3d42" : "#2f3236"
+                border.color: "#4a4e54"
+                border.width: 1
+
+                Row {
+                    id: zoomPctRow
+                    anchors.centerIn: parent
+                    spacing: 4
+                    Text {
+                        text: bridge.zoom_percent + "%"
+                        color: "#d5d8dd"
+                        font.pixelSize: 11
+                    }
+                    Text {
+                        text: "▾"
+                        color: "#9aa0a6"
+                        font.pixelSize: 9
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                }
+
+                MouseArea {
+                    id: zoomPctMa
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        if (zoomMenu.visible)
+                            zoomMenu.visible = false
+                        else {
+                            placePopover(zoomMenu, zoomPctBtn)
+                            zoomMenu.visible = true
+                        }
+                    }
+                }
+            }
+
+            // 滑杆：对数刻度 2%..1600%，拖动与滚轮共用同一条节流管线。
+            Item {
+                id: zoomSlider
+                width: 96
+                height: 20
+                anchors.verticalCenter: parent.verticalCenter
+
+                property real value: 0.5
+                property bool dragging: false
+
+                function zoomToValue(pct) {
+                    const z = Math.min(1600, Math.max(2, pct))
+                    return Math.log(z / 2) / Math.log(800)
+                }
+                function valueToZoom(v) {
+                    return Math.round(2 * Math.pow(800, v))
+                }
+                function setValue(x) {
+                    value = Math.min(1, Math.max(0, x / width))
+                    view.queueZoomTo(valueToZoom(value))
+                }
+
+                Binding {
+                    target: zoomSlider
+                    property: "value"
+                    value: zoomSlider.zoomToValue(bridge.zoom_percent)
+                    // 等节流定时器把 zoom 落到 bridge 后再恢复跟随，否则
+                    // 松手瞬间会先弹回旧值、120ms 后又跳到新值。
+                    when: !zoomSlider.dragging && !view.zoomPending
+                }
+
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: parent.width
+                    height: 4
+                    radius: 2
+                    color: "#3c4043"
+                }
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: zoomSlider.value * zoomSlider.width
+                    height: 4
+                    radius: 2
+                    color: "#5b9dff"
+                }
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    x: zoomSlider.value * (zoomSlider.width - 10)
+                    width: 10
+                    height: 10
+                    radius: 5
+                    color: zoomMa.containsMouse || zoomSlider.dragging
+                           ? "#7fc3ff" : "#e9eaec"
+                }
+
+                MouseArea {
+                    id: zoomMa
+                    anchors.fill: parent
+                    anchors.margins: -6
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onPressed: (mouse) => {
+                        zoomSlider.dragging = true
+                        zoomSlider.setValue(mouse.x + 6)
+                    }
+                    onPositionChanged: (mouse) => {
+                        if (zoomSlider.dragging)
+                            zoomSlider.setValue(mouse.x + 6)
+                    }
+                    onReleased: zoomSlider.dragging = false
+                }
+            }
+
+            // − / + 按钮：与 Ctrl+滚轮同步长（×1.25）。
+            Rectangle {
+                width: 18
+                height: 18
+                anchors.verticalCenter: parent.verticalCenter
+                radius: 9
+                color: zoomMinusMa.containsMouse ? "#3a3d42" : "transparent"
+                border.color: "#4a4e54"
+                border.width: 1
+                Text {
+                    anchors.centerIn: parent
+                    text: "−"
+                    color: "#d5d8dd"
+                    font.pixelSize: 12
+                }
+                MouseArea {
+                    id: zoomMinusMa
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: view.queueZoom(1 / 1.25)
+                }
+            }
+            Rectangle {
+                width: 18
+                height: 18
+                anchors.verticalCenter: parent.verticalCenter
+                radius: 9
+                color: zoomPlusMa.containsMouse ? "#3a3d42" : "transparent"
+                border.color: "#4a4e54"
+                border.width: 1
+                Text {
+                    anchors.centerIn: parent
+                    text: "+"
+                    color: "#d5d8dd"
+                    font.pixelSize: 12
+                }
+                MouseArea {
+                    id: zoomPlusMa
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: view.queueZoom(1.25)
+                }
+            }
         }
     }
 
@@ -5390,6 +5675,35 @@ Window {
                ? previewImage.width / bridge.image_width : 0
     }
 
+    // 选区存的是显示坐标：缩放（滚轮 / 适应窗口 / 拖窗口）改变显示比例后
+    // 它会漂离原画面位置。按新旧比例把选区重映射，让包围盒始终钉住同一块
+    // 内容。图层框走图像坐标 × toDispScale() 实时换算，天生跟随，无需处理。
+    property real selTrackScale: 0
+    property int selTrackImgW: 0
+    function remapSelectionToScale() {
+        const iw = bridge.image_width
+        if (iw <= 0 || previewImage.width <= 0) {
+            selTrackScale = 0
+            selTrackImgW = 0
+            return
+        }
+        const s = previewImage.width / iw
+        // 图像尺寸没变且之前记过基准 → 纯比例变化，重映射。
+        // 图像尺寸变了（裁剪/调整大小/新文档）→ 语义已变，只重置基准。
+        if (selTrackImgW === iw && selTrackScale > 0 && root.selExists
+                && !root.selRubberBanding) {
+            const k = s / selTrackScale
+            if (k !== 1) {
+                root.selX *= k
+                root.selY *= k
+                root.selW *= k
+                root.selH *= k
+            }
+        }
+        selTrackScale = s
+        selTrackImgW = iw
+    }
+
     // Snap a display coordinate to the nearest image-pixel boundary so every
     // crop / selection edge maps to an exact integer image coordinate.
     function snapDisplay(v) {
@@ -5761,11 +6075,12 @@ Window {
         // 拾色器：Esc = 关面板（已取的色保留）。
         if (bridge.pickerOpen) { bridge.picker_close(); return }
         if (widthPopover.visible || colorPopover.visible
-            || mosaicPopover.visible || fontPopover.visible) {
+            || mosaicPopover.visible || fontPopover.visible || zoomMenu.visible) {
             widthPopover.visible = false
             colorPopover.visible = false
             mosaicPopover.visible = false
             fontPopover.visible = false
+            zoomMenu.visible = false
             return
         }
         if (layerContext.visible) { layerContext.visible = false; return }
