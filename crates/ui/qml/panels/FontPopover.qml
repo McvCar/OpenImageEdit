@@ -1,5 +1,6 @@
 import QtQuick
 import com.imageedit
+import "../js/marks.js" as Marks
 
 // 文本样式面板（macOS 风格）：字体下拉 + 颜色 / 字号步进 + B I U / 对齐。
 Rectangle {
@@ -51,7 +52,7 @@ Rectangle {
                     text: host.markFontName(host.markFont)
                     color: "#e9eaec"
                     font.pixelSize: 13
-                    font.family: host.qmlFontFamily(host.markFont)
+                    font.family: Marks.qmlFontFamily(host.markFont)
                 }
                 Text {
                     anchors.verticalCenter: parent.verticalCenter

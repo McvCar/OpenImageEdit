@@ -43,6 +43,16 @@ fn main() {
     )
         .qt_module("Quick")
         .qt_module("Qml")
+        // 纯 JS 模块（阶段 4）：不是 QML 组件，走 qrc 资源。EditorContent 用
+        // 相对路径 import "../js/*.js"，自动前缀 /qt/qml/com/imageedit 后解析到
+        // qml/js/ 下。
+        .qrc_resources([
+            "qml/js/geometry.js",
+            "qml/js/layers.js",
+            "qml/js/marks.js",
+            "qml/js/adjust.js",
+            "qml/js/picker.js",
+        ])
         .files(["src/bridge.rs"])
         .build();
 

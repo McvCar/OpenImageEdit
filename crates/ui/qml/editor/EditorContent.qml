@@ -2,6 +2,11 @@ import QtQuick
 import QtQuick.Window
 import QtQuick.Dialogs
 import com.imageedit
+import "../js/geometry.js" as Geometry
+import "../js/layers.js" as Layers
+import "../js/marks.js" as Marks
+import "../js/adjust.js" as Adjust
+import "../js/picker.js" as Picker
 
 Item {
     id: root
@@ -50,7 +55,7 @@ Item {
     property real scaleW: 0
     property real scaleH: 0
     property int renamingIndex: -1
-    readonly property var layerList: parseLayers(bridge.layers_json)
+    readonly property var layerList: Layers.parseLayers(bridge.layers_json)
     // The layer PANEL rebuilds its Repeater whenever the model array is
     // replaced. Bounds (x/y/w/h) change on every live-drag tick, which
     // would rebuild the whole list ~30x/s; the panel only shows
@@ -88,10 +93,10 @@ Item {
     property bool markItalic: false
     property bool markUnderline: false
     property int markAlign: 0 // 0 left / 1 center / 2 right
-    readonly property var markList: parseMarks(bridge.marks_json)
+    readonly property var markList: Marks.parseMarks(bridge.marks_json)
     // ---- 调整颜色（macOS 预览风格）----
     // Mirrored parameters (slider positions) and the throttled live push.
-    readonly property var adjustVals: parseAdjust(bridge.adjustValues)
+    readonly property var adjustVals: Adjust.parseAdjust(bridge.adjustValues)
     property string adjustKey: ""
     property real adjustValue: 0
     property bool adjustDirty: false
@@ -115,8 +120,8 @@ Item {
     property real hoverFy: 0
     property bool hoverValid: false
     // ---- 拾色器 ----
-    readonly property var pickerVals: parsePicker(bridge.pickerColor)
-    readonly property var pickerHist: parsePickerHistory(bridge.pickerHistory)
+    readonly property var pickerVals: Picker.parsePicker(bridge.pickerColor)
+    readonly property var pickerHist: Picker.parsePickerHistory(bridge.pickerHistory)
     // 刚复制的那一行（按钮短暂显示「已复制」）。
     property string pickerCopied: ""
     // 四种色值表示（拾色器弹窗逐行复制）。
@@ -335,8 +340,8 @@ Shortcut { sequences: ["Delete", "Backspace"]
                     && (root.selExists || bridge.selected_mark >= 0
                     || bridge.selected_layer >= 0
                     || (function () {
-                        const b = findBase()
-                        return b !== null && b.bd !== true && !isLocked(b)
+                        const b = Layers.findBase(layerList)
+                        return b !== null && b.bd !== true && !Layers.isLocked(b)
                             && bridge.layer_count > 0
                     })())
            onActivated: onDeleteKey() }
@@ -1276,7 +1281,7 @@ Flickable {
             property var editMark: null
             property int editIndex: -1
 
-            font.family: editMark ? qmlFontFamily(editMark.fn) : "Microsoft YaHei"
+            font.family: editMark ? Marks.qmlFontFamily(editMark.fn) : "Microsoft YaHei"
             font.pixelSize: editMark ? Math.max(8, editMark.fs * toDispScale()) : 20
             font.bold: editMark ? !!editMark.b : false
             font.italic: editMark ? !!editMark.it : false
@@ -1846,20 +1851,20 @@ function canvasCursor(x, y) {
     const ix = x - view.pad
     const iy = y - view.pad
     if (root.selExists) {
-        const c = boxCursor(ix, iy, root.selX, root.selY,
+        const c = Geometry.boxCursor(ix, iy, root.selX, root.selY,
                             root.selW, root.selH)
         if (c >= 0)
             return c
     }
     if (layerHandles.visible) {
-        const c = boxCursor(ix, iy, layerHandles.bx, layerHandles.by,
+        const c = Geometry.boxCursor(ix, iy, layerHandles.bx, layerHandles.by,
                             layerHandles.bw, layerHandles.bh)
         if (c >= 0)
             return c
     }
     if (!root.selExists && bridge.image_width > 0) {
         const hit = topLayerAt(x, y)
-        if (hit !== null && !isLocked(hit))
+        if (hit !== null && !Layers.isLocked(hit))
             return Qt.SizeAllCursor
     }
     return Qt.CrossCursor
@@ -1868,27 +1873,6 @@ function canvasCursor(x, y) {
 // Cursor for hovering a box's border / interior (display px).
 // Returns the matching Qt cursor, or -1 when the point is outside the
 // grab zone. Border tolerance: corners beat edges, edges beat interior.
-function boxCursor(x, y, bx, by, bw, bh) {
-    const tol = 7
-    if (x < bx - tol || x > bx + bw + tol
-            || y < by - tol || y > by + bh + tol)
-        return -1
-    const nearL = Math.abs(x - bx) <= tol
-    const nearR = Math.abs(x - (bx + bw)) <= tol
-    const nearT = Math.abs(y - by) <= tol
-    const nearB = Math.abs(y - (by + bh)) <= tol
-    if ((nearL || nearR) && (nearT || nearB))
-        return (nearL === nearT) ? Qt.SizeFDiagCursor
-                                 : Qt.SizeBDiagCursor
-    if (nearL || nearR)
-        return Qt.SizeHorCursor
-    if (nearT || nearB)
-        return Qt.SizeVerCursor
-    if (x > bx && x < bx + bw && y > by && y < by + bh)
-        return Qt.SizeAllCursor
-    return -1
-}
-
 function boxSet(x, y, w, h) {
     root.selX = x; root.selY = y; root.selW = w; root.selH = h
 }
@@ -2030,14 +2014,14 @@ function onDeleteKey() {
         return
     }
     if (bridge.selected_layer >= 0) {
-        if (!isLocked(root.selLayer))
+        if (!Layers.isLocked(root.selLayer))
             bridge.delete_selected_layer()
         return
     }
-    const base = findBase()
+    const base = Layers.findBase(layerList)
     // bd !== true: the base still exists (not "deleted"); visibility is
     // irrelevant for the delete flow.
-    if (base !== null && base.bd !== true && !isLocked(base)
+    if (base !== null && base.bd !== true && !Layers.isLocked(base)
         && bridge.layer_count > 0)
         bridge.delete_base_layer()
 }
@@ -2242,28 +2226,6 @@ function clearHover() {
     root.hoverValid = false
 }
 
-function parsePicker(s) {
-    if (!s)
-        return null
-    try {
-        const v = JSON.parse(s)
-        return v && v.hex !== undefined ? v : null
-    } catch (e) {
-        return null
-    }
-}
-
-function parsePickerHistory(s) {
-    if (!s)
-        return []
-    try {
-        const v = JSON.parse(s)
-        return Array.isArray(v) ? v : []
-    } catch (e) {
-        return []
-    }
-}
-
 // Copy one color notation and flash "已复制" on its row.
 function copyPickerValue(key, value) {
     if (!value)
@@ -2274,47 +2236,11 @@ function copyPickerValue(key, value) {
 }
 
 
-function parseLayers(s) {
-    if (!s)
-        return []
-    try {
-        return JSON.parse(s)
-    } catch (e) {
-        return []
-    }
-}
-
-function parseMarks(s) {
-    if (!s)
-        return []
-    try {
-        return JSON.parse(s)
-    } catch (e) {
-        return []
-    }
-}
-
 function findMark(index) {
     return root.markList.find(mk => mk.i === index) || null
 }
 
 // ---- 调整颜色：参数镜像 / 节流下发 ----
-function parseAdjust(s) {
-    const empty = { e: 0, c: 0, hi: 0, sh: 0, sa: 0, te: 0, ti: 0,
-                    se: 0, sp: 0, bl: 0, ga: 1, wh: 1, mh: 0.5 }
-    if (!s)
-        return empty
-    try {
-        const v = JSON.parse(s)
-        for (const k in empty)
-            if (v[k] === undefined)
-                v[k] = empty[k]
-        return v
-    } catch (e) {
-        return empty
-    }
-}
-
 // Live slider updates are throttled: a 33ms repeat timer (NOT restart())
 // flushes the latest pending value, so a fast drag cannot starve it
 // (see MEMORY: restart()-based throttling never fires on fast input).
@@ -2355,17 +2281,6 @@ function flushLevels() {
     if (bridge.adjustOpen)
         bridge.adjust_set_levels(root.pendingBlack, root.pendingGamma,
                                  root.pendingWhite)
-}
-
-function parseHistogram(s) {
-    if (!s)
-        return null
-    try {
-        const v = JSON.parse(s)
-        return (v && v.r && v.g && v.b) ? v : null
-    } catch (e) {
-        return null
-    }
 }
 
 function commitAdjust() {
@@ -2434,14 +2349,6 @@ function applyTextFont() {
 }
 
 // 字体 id → QML font.family（用于输入框/面板预览）。
-function qmlFontFamily(id) {
-    return id === "simsun" ? "SimSun"
-         : id === "simhei" ? "SimHei"
-         : id === "simkai" ? "KaiTi"
-         : id === "arial" ? "Arial"
-         : "Microsoft YaHei"
-}
-
 // 可选字体族（与 core::font::FONTS 一一对应），面板与下拉共用。
 readonly property var fontChoices: [
     { id: "msyh",   name: "微软雅黑", qml: "Microsoft YaHei" },
@@ -2481,17 +2388,6 @@ function findSelLayer() {
 function findLayerBox() {
     for (var i = 0; i < layerList.length; i++)
         if (!layerList[i].base && layerList[i].i === bridge.selected_layer)
-            return layerList[i]
-    return null
-}
-
-function isLocked(item) {
-    return item !== null && item !== undefined && item.l === true
-}
-
-function findBase() {
-    for (var i = 0; i < layerList.length; i++)
-        if (layerList[i].base === true)
             return layerList[i]
     return null
 }

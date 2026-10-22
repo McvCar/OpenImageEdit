@@ -1,5 +1,6 @@
 import QtQuick
 import com.imageedit
+import "../js/adjust.js" as Adjust
 
 Item {
     id: adjustPanel
@@ -147,7 +148,7 @@ Item {
                         anchors.fill: parent
                         renderStrategy: Canvas.Immediate
                         renderTarget: Canvas.Image
-                        property var hist: host.parseHistogram(bridge.adjustHistogram)
+                        property var hist: Adjust.parseHistogram(bridge.adjustHistogram)
                         onHistChanged: requestPaint()
                         // 裁剪区随色阶手柄变化重绘。
                         property real blk: host.adjustVals.bl
