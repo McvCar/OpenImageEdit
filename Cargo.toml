@@ -41,10 +41,20 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
+# Vendored fork of psd 0.3.5 (unmaintained upstream): defensive fixes for
+# files the upstream parser panics on (RLE channel shorter than the scanline
+# table, Zip-compressed layers). A panic here aborts the app (release
+# panic=abort) and breaks Explorer thumbnails.
+[patch.crates-io]
+psd = { path = "vendor/psd" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# unwind (not abort): decode_psd_bytes wraps the vendored psd parser in
+# catch_unwind so a malformed file surfaces as an error dialog instead of
+# taking the app down. The thumbnail DLL profile below requires unwind too.
+panic = "unwind"
 strip = true
 
 [profile.bench]

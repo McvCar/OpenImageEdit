@@ -309,8 +309,18 @@ pub fn decode_psd_bytes(bytes: &[u8], options: DecodeOptions) -> Result<Decoded,
         }
     }
     validate_psd_sections(bytes, width, height, channels)?;
-    let psd = psd::Psd::from_bytes(bytes).map_err(|e| DecodeError::Psd(e.to_string()))?;
-    let rgba = psd.rgba();
+    // The vendored psd fork fixes the known panics, but the crate is riddled
+    // with unchecked slices — treat any residual panic as a decode error.
+    // (Release builds with panic="unwind" for exactly this.)
+    let psd = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        psd::Psd::from_bytes(bytes)
+    }))
+    .ok()
+    .and_then(|r| r.ok())
+    .ok_or_else(|| DecodeError::Psd("无法解析此 PSD（文件数据异常或使用了不支持的压缩）".into()))?;
+    let rgba = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| psd.rgba()))
+        .ok()
+        .ok_or_else(|| DecodeError::Psd("无法解析此 PSD（图像数据异常）".into()))?;
     let image = RgbaImage::from_raw(width, height, rgba)
         .ok_or_else(|| DecodeError::Psd("合成图数据与画布尺寸不符".into()))?;
     let (image, downsampled_from) = apply_max_dimension(image, options.max_dimension);
