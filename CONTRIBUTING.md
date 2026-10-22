@@ -32,8 +32,16 @@ cargo test --workspace                                  # 提交前跑一遍
 - `crates/ui/src/bridge.rs` — cxx-qt 桥。QML 只通过 Bridge 的
   `#[qinvokable]` 与 qproperty 访问文档；注意 qproperty 的 QML 名是
   snake_case。
-- `crates/ui/qml/main.qml` — 全部界面。该文件较大且缩进层级复杂，
-  插入 QML 块前务必确认目标容器。
+- `crates/ui/qml/main.qml` — 主窗口 `DocWindow`（`qml/editor/DocWindow.qml`
+  经 qmldir 注册）与 `EditorContent` 容器。界面已按组件拆分到
+  `qml/widgets/`（叶子控件）、`qml/panels/`（面板）、`qml/canvas/`（画布层）、
+  `qml/js/`（纯函数库）。新增 QML 文件后必须在 `crates/ui/build.rs` 的
+  `qml_files(...)` 里登记（组件名 = 文件名，注册后全模块可见）。
+- **拆分/搬移 QML 块的工具**（`scripts/`）：`qml_depth.py` 按括号深度给出
+  容器直接子节点的真实首尾行（`main.qml` 缩进不可信，定位边界一律用它）；
+  `qml_deps.py <file> <start> <end>` 列出区块引用的外部 id 与宿主组件的
+  裸函数调用（搬移前必须把两者变成显式依赖）；`qml_extract.py` 做括号平衡
+  校验后把区块抽到新文件。
 
 ## 问题报告
 

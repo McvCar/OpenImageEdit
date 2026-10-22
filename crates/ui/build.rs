@@ -6,7 +6,25 @@ fn main() {
     // embedding the stale main.qml (the "界面与最新源码不一致" trap). Watch
     // the QML tree explicitly.
     println!("cargo:rerun-if-changed=qml");
-    CxxQtBuilder::new_qml_module(QmlModule::new("com.imageedit").qml_file("qml/main.qml"))
+    CxxQtBuilder::new_qml_module(
+        QmlModule::new("com.imageedit")
+            .qml_file("qml/main.qml")
+            // Extracted components (type name = file name); main.qml sees
+            // them through its `import com.imageedit`.
+            .qml_files([
+                "qml/editor/DocWindow.qml",
+                "qml/editor/EditorContent.qml",
+                "qml/widgets/AdjustRow.qml",
+                "qml/widgets/CheckRow.qml",
+                "qml/widgets/DashedRect.qml",
+                "qml/widgets/EdgeGrab.qml",
+                "qml/widgets/EdgeHandles.qml",
+                "qml/widgets/IconButton.qml",
+                "qml/widgets/MenuRow.qml",
+                "qml/widgets/ToolButton.qml",
+                "qml/widgets/WindowEdges.qml",
+            ]),
+    )
         .qt_module("Quick")
         .qt_module("Qml")
         .files(["src/bridge.rs"])
