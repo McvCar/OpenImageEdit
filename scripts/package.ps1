@@ -92,6 +92,9 @@ echo [1] DLL file:
 if exist "%~dp0imageedit_thumb.dll" (echo     OK  %~dp0imageedit_thumb.dll) else (echo     MISSING %~dp0imageedit_thumb.dll)
 echo [2] CLSID (HKCU):
 reg query "HKCU\Software\Classes\CLSID\%CLSID%\InprocServer32" /ve
+echo [2b] CLSID redirected to 32-bit view (WOW6432Node)? If ONLY this one
+echo      shows a value, your installer predates the 64-bit registry fix:
+reg query "HKCU\Software\Classes\WOW6432Node\CLSID\%CLSID%\InprocServer32" /ve 2>nul
 echo [3] ShellEx key (HKCR merged view):
 reg query "HKCR\.psd\ShellEx\%SHELLEX%" /ve
 echo [4] VC++ runtime (app-local next to exe, else System32):

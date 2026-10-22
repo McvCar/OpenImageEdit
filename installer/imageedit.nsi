@@ -6,6 +6,7 @@
 Unicode True
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
+!include "x64.nsh"
 
 !define APP_NAME "ImageEdit"
 !define APP_VERSION "0.1.0"
@@ -49,6 +50,22 @@ VIAddVersionKey "ProductVersion" "${APP_VERSION}"
 !insertmacro MUI_UNPAGE_INSTFILES
 
 !insertmacro MUI_LANGUAGE "SimpChinese"
+
+; The makensis-produced installer is a 32-bit process. Without SetRegView 64
+; its HKCU\Software\Classes\CLSID writes land in WOW6432Node on Windows
+; versions where that key is redirected, and the 64-bit Explorer never sees
+; the thumbnail handler CLSID. Force the 64-bit registry view everywhere.
+Function .onInit
+    ${If} ${RunningX64}
+        SetRegView 64
+    ${EndIf}
+FunctionEnd
+
+Function un.onInit
+    ${If} ${RunningX64}
+        SetRegView 64
+    ${EndIf}
+FunctionEnd
 
 ; ---------------------------------------------------------------------------
 ; Sections. The main section is mandatory; format associations are optional
@@ -258,6 +275,12 @@ Section "Uninstall"
     DeleteRegKey HKLM "Software\Classes\.psd\ShellEx\${THUMB_SHELLEX}"
     DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" "${THUMB_CLSID}"
     DeleteRegValue HKCU "${REG_CLASSES}\.psd\ShellEx" "${THUMB_SHELLEX}"
+    ; Old installers ran as 32-bit processes: on systems where HKCU Classes
+    ; CLSID is redirected their keys live in WOW6432Node. Clean those too.
+    SetRegView 32
+    DeleteRegKey HKCU "${REG_CLASSES}\CLSID\${THUMB_CLSID}"
+    DeleteRegKey HKCU "${REG_CLASSES}\.psd\ShellEx\${THUMB_SHELLEX}"
+    SetRegView 64
     System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
 
     DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"
