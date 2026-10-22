@@ -34,14 +34,29 @@ fn main() {
     // completely, so automation can run beside the user's session.
     let automation = args.iter().any(|a| a.starts_with("--"));
     if !automation {
-        if let Some(path) = args.iter().find(|a| !a.starts_with("--")) {
-            if instance::try_handoff(std::path::Path::new(path)) {
+        // Explorer multi-select passes every file to ONE process launch; hand
+        // each of them off independently (a partial handoff still lets the
+        // leftovers open here). Files that survive beyond the first are
+        // queued for the primary window's external-open timer.
+        let mut leftovers: Vec<std::path::PathBuf> = Vec::new();
+        for file in args.iter().filter(|a| !a.starts_with("--")) {
+            if instance::try_handoff(std::path::Path::new(file)) {
                 println!(
                     "{{\"phase\":\"ui\",\"event\":\"handoff-ok\",\"file\":\"{}\"}}",
-                    path.replace('\\', "/")
+                    file.replace('\\', "/")
                 );
-                return;
+            } else {
+                leftovers.push(std::path::PathBuf::from(file));
             }
+        }
+        // At least one non-`--` arg is guaranteed here, so an empty leftover
+        // list means every file was handed off — exit. A plain no-arg launch
+        // (empty window) still becomes the primary.
+        if leftovers.is_empty() && !args.is_empty() {
+            return;
+        }
+        for extra in leftovers.iter().skip(1) {
+            instance::queue_pending(extra.clone());
         }
         instance::acquire();
     }

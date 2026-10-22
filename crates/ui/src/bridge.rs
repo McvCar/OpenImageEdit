@@ -1014,7 +1014,26 @@ fn selection_after_removal(ix: usize, new_count: usize) -> i32 {
     ix.saturating_sub(1).min(new_count - 1) as i32
 }
 
-fn file_url(path: &Path) -> String {    format!("file:///{}", path.to_string_lossy().replace('\\', "/"))
+/// `file:///…` URL for a local path, percent-encoded per RFC 3986.
+///
+/// This used to be a raw concat, so a `#` in a filename (game assets love
+/// `颜色#236652.png`) leaked into the URL: QML's `url` type treats `#` as the
+/// fragment separator, the path was silently truncated at it, and the file
+/// "failed to open" while decode itself was never even reached. Encoding every
+/// byte outside the unreserved set (plus `/` and `:`) round-trips through
+/// QUrl → toLocalFile unchanged.
+fn file_url(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let mut out = String::with_capacity(text.len() + 8);
+    out.push_str("file:///");
+    for b in text.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => out.push(*b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 fn extension_for(format: Format) -> &'static str {
@@ -4884,6 +4903,30 @@ mod selection_after_removal_tests {
     fn no_layers_left() {
         assert_eq!(selection_after_removal(0, 0), -1);
         assert_eq!(selection_after_removal(5, 0), -1);
+    }
+
+    #[test]
+    fn file_url_round_trips_fragment_and_special_chars() {
+        use std::path::Path;
+        use super::file_url;
+        // The regression: a `#` in a directory/file name must not terminate
+        // the URL path (QML url treats `#` as the fragment separator).
+        assert_eq!(
+            file_url(Path::new(r"D:\Users\Downloads\按键#236652\a#b.png")),
+            "file:///D:/Users/Downloads/%E6%8C%89%E9%94%AE%23236652/a%23b.png"
+        );
+        // Percent signs in names must not look like pre-existing escapes.
+        assert_eq!(
+            file_url(Path::new("D:/art/100%.png")),
+            "file:///D:/art/100%25.png"
+        );
+        // Spaces come back through QUrl::toLocalFile as literal spaces.
+        assert_eq!(
+            file_url(Path::new("D:/my art/ui 1.png")),
+            "file:///D:/my%20art/ui%201.png"
+        );
+        // Plain ASCII stays readable.
+        assert_eq!(file_url(Path::new("D:/art/ui.png")), "file:///D:/art/ui.png");
     }
 }
 

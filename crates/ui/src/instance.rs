@@ -165,6 +165,16 @@ pub fn take_pending() -> Option<PathBuf> {
     }
 }
 
+/// Queue a path for the primary window to open, same drain path as a
+/// single-instance hand-off. Used when a fresh process was launched with
+/// several files (Explorer multi-select): the first opens via the CLI scan,
+/// the rest land here.
+pub fn queue_pending(path: PathBuf) {
+    if let Ok(mut queue) = pending().lock() {
+        queue.push(path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
