@@ -1029,6 +1029,31 @@ fn extension_for(format: Format) -> &'static str {
     }
 }
 
+/// True when the path points at a Photoshop document. PSD is preview-only
+/// (the decoder flattens layers) and image 0.25 has no PSD encoder — its
+/// extension map returns None for `.psd`, so every `unwrap_or(Format::Png)`
+/// save path would silently write PNG bytes into the .psd file.
+fn is_psd_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("psd"))
+        .unwrap_or(false)
+}
+
+const PSD_SAVE_HINT: &str = "PSD 是预览专用格式（打开时图层已合并），不能直接保存原文件，请用「另存为」导出 PNG / JPEG 等格式";
+
+/// Encode format for saving a document loaded from `path`. PSD sources fall
+/// back to PNG: image 0.25 has no PSD encoder and its extension map returns
+/// None for `.psd`, so the historical `unwrap_or(Format::Png)` here is what
+/// silently wrote PNG bytes into .psd files.
+fn save_format_for_source(path: &Path) -> Format {
+    if is_psd_path(path) {
+        Format::Png
+    } else {
+        format_from_path(path).unwrap_or(Format::Png)
+    }
+}
+
 impl Session {
     /// Build a session from already-decoded pixels (the decode itself runs
     /// either inline for automation or on the worker thread for the UI).
@@ -1256,7 +1281,9 @@ impl Session {
                     .file_stem()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "image".to_string());
-                let format = format_from_path(src).unwrap_or(Format::Png);
+                // A PSD source can't be re-encoded (no PSD writer); default
+                // the target to PNG instead of a corrupt "<stem>-edited.psd".
+                let format = save_format_for_source(src);
                 (
                     src.with_file_name(format!("{stem}-edited.{}", extension_for(format))),
                     format,
@@ -1273,9 +1300,16 @@ impl Session {
     /// keeping its original format. Without a source (e.g. a pasted image)
     /// there is nothing to overwrite — QML routes those to the Save-As
     /// dialog instead.
+    ///
+    /// PSD is preview-only (the decoder flattens layers and image 0.25 has
+    /// no PSD encoder): saving back would `unwrap_or(Png)` into PNG bytes
+    /// written to the .psd path. Block it with an actionable hint.
     fn save(&self) -> Result<PathBuf, String> {
         let src = self.source.clone().ok_or_else(|| "没有可保存的文件".to_string())?;
-        let format = format_from_path(&src).unwrap_or(Format::Png);
+        if is_psd_path(&src) {
+            return Err(PSD_SAVE_HINT.to_string());
+        }
+        let format = save_format_for_source(&src);
         self.write_to(&src, format)?;
         Ok(src)
     }
@@ -2348,8 +2382,14 @@ println!(
             match guard.as_ref() {
                 None => Err("nothing to save".to_string()),
                 Some(session) => {
-                    let format = format_from_path(&path).unwrap_or(Format::Png);
-                    session.write_to(&path, format).map(|()| path.clone())
+                    // Refuse a hand-typed .psd target the same way Ctrl+S
+                    // refuses the source file — there is no PSD encoder.
+                    if is_psd_path(&path) {
+                        Err(PSD_SAVE_HINT.to_string())
+                    } else {
+                        let format = format_from_path(&path).unwrap_or(Format::Png);
+                        session.write_to(&path, format).map(|()| path.clone())
+                    }
                 }
             }
         };
@@ -4844,5 +4884,29 @@ mod selection_after_removal_tests {
     fn no_layers_left() {
         assert_eq!(selection_after_removal(0, 0), -1);
         assert_eq!(selection_after_removal(5, 0), -1);
+    }
+}
+
+#[cfg(test)]
+mod psd_save_guard_tests {
+    use super::*;
+
+    #[test]
+    fn psd_paths_detected_case_insensitive() {
+        assert!(is_psd_path(Path::new("D:/art/ui.psd")));
+        assert!(is_psd_path(Path::new("D:/art/UI.PSD")));
+        assert!(!is_psd_path(Path::new("D:/art/ui.png")));
+        assert!(!is_psd_path(Path::new("D:/art/psd"))); // no extension
+        assert!(!is_psd_path(Path::new("")));
+    }
+
+    #[test]
+    fn psd_source_save_format_falls_back_to_png() {
+        // The corruption bug: .psd + unwrap_or(Png) wrote PNG bytes into the
+        // .psd file. Explicit fallback + no .psd target anywhere.
+        assert_eq!(save_format_for_source(Path::new("D:/art/ui.psd")), Format::Png);
+        assert_eq!(save_format_for_source(Path::new("D:/art/ui.PNG")), Format::Png);
+        assert_eq!(save_format_for_source(Path::new("D:/art/a.jpg")), Format::Jpeg);
+        assert_eq!(save_format_for_source(Path::new("D:/art/unknown.xyz")), Format::Png);
     }
 }
