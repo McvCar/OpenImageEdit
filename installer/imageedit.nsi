@@ -154,12 +154,22 @@ SectionEnd
 ; user has Photoshop installed (Photoshop ships no thumbnail handler).
 
 Section "资源管理器 PSD 缩略图预览" SecThumb
-    IfSilent skip_thumb
+    ; Registered even in silent installs - deployments want thumbnails too.
     WriteRegStr HKCU "${REG_CLASSES}\CLSID\${THUMB_CLSID}\InprocServer32" "" "$INSTDIR\imageedit_thumb.dll"
     WriteRegStr HKCU "${REG_CLASSES}\CLSID\${THUMB_CLSID}\InprocServer32" "ThreadingModel" "Apartment"
     WriteRegStr HKCU "${REG_CLASSES}\.psd\ShellEx\${THUMB_SHELLEX}" "" "${THUMB_CLSID}"
+    WriteRegStr HKCU "${REG_CLASSES}\SystemFileAssociations\.psd\ShellEx\${THUMB_SHELLEX}" "" "${THUMB_CLSID}"
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" "${THUMB_CLSID}" "ImageEdit PSD Thumbnail Provider"
+    ; Machine-wide mirror when the installer happens to run elevated: HKLM is
+    ; the most universally honored location for shell extension handlers.
+    ClearErrors
+    WriteRegStr HKLM "Software\Classes\CLSID\${THUMB_CLSID}\InprocServer32" "" "$INSTDIR\imageedit_thumb.dll"
+    WriteRegStr HKLM "Software\Classes\CLSID\${THUMB_CLSID}\InprocServer32" "ThreadingModel" "Apartment"
+    WriteRegStr HKLM "Software\Classes\.psd\ShellEx\${THUMB_SHELLEX}" "" "${THUMB_CLSID}"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" "${THUMB_CLSID}" "ImageEdit PSD Thumbnail Provider"
+    IfErrors 0 +2
+        DetailPrint "未写入机器级缩略图注册（无管理员权限），使用当前用户注册"
     Call NotifyShell
-    skip_thumb:
 SectionEnd
 
 ; --- Helpers --------------------------------------------------------------
@@ -236,9 +246,18 @@ Section "Uninstall"
     DeleteRegKey /ifempty HKCU "${REG_CLASSES}\.tiff\OpenWithProgids"
     DeleteRegKey /ifempty HKCU "${REG_CLASSES}\.webp\OpenWithProgids"
     DeleteRegKey HKCU "${REG_CLASSES}\${PROG_ID}"
-    ; Thumbnail handler registration.
+    ; Thumbnail handler registration: remove everything the installer wrote,
+    ; plus per-machine keys when we can, plus the value-style key old
+    ; installers left under .psd\ShellEx.
     DeleteRegKey HKCU "${REG_CLASSES}\CLSID\${THUMB_CLSID}"
     DeleteRegKey HKCU "${REG_CLASSES}\.psd\ShellEx\${THUMB_SHELLEX}"
+    DeleteRegKey HKCU "${REG_CLASSES}\SystemFileAssociations\.psd\ShellEx\${THUMB_SHELLEX}"
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" "${THUMB_CLSID}"
+    DeleteRegKey /ifempty HKCU "Software\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved"
+    DeleteRegKey HKLM "Software\Classes\CLSID\${THUMB_CLSID}"
+    DeleteRegKey HKLM "Software\Classes\.psd\ShellEx\${THUMB_SHELLEX}"
+    DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" "${THUMB_CLSID}"
+    DeleteRegValue HKCU "${REG_CLASSES}\.psd\ShellEx" "${THUMB_SHELLEX}"
     System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
 
     DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"

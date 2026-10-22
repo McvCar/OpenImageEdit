@@ -45,10 +45,25 @@ Copy-Item (Join-Path $repoRoot 'target\release\imageedit.exe') $distDir
 # $ErrorActionPreference='Stop' the first one aborts the script.
 $oldEA = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
+# Static CRT: the DLL must load on machines without the VC++ redistributable
+# (Explorer silently drops the handler when LoadLibrary fails). Pure Rust,
+# no C++ objects, so /MT is conflict-free here.
+$env:RUSTFLAGS = '-C target-feature=+crt-static'
 $thumbOut = & cargo build -p imageedit-thumbnail --profile thumb 2>&1 | Out-String
+Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
 $ErrorActionPreference = $oldEA
 if ($LASTEXITCODE -ne 0) { throw "thumbnail DLL build failed`n$thumbOut" }
 Copy-Item (Join-Path $repoRoot 'target\thumb\imageedit_thumb.dll') $distDir
+
+# App-local VC++ runtime: imageedit.exe (cxx-qt) and the Qt6 DLLs import
+# MSVCP140/VCRUNTIME140, which clean machines without the VC++ redist lack.
+# Windows resolves app-local DLLs before the system copy, so shipping them
+# beside the exe keeps per-user installs self-contained (no admin needed).
+foreach ($rt in 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll') {
+    $src = Join-Path $env:WINDIR "System32\$rt"
+    if (-not (Test-Path -LiteralPath $src)) { throw "runtime DLL missing: $src" }
+    Copy-Item $src $distDir -Force
+}
 # Per-user registration helpers for zip users (the NSIS installer writes
 # the same HKCU keys itself, no regsvr32 needed there).
 Set-Content -LiteralPath (Join-Path $distDir 'register-psd-thumbnail.cmd') -Value @'
@@ -65,6 +80,28 @@ regsvr32 /s /u "%~dp0imageedit_thumb.dll"
 # Machine-wide fallback registration for setups where the per-user (HKCU)
 # handler is not honored; path matches the NSIS default InstallDir.
 Copy-Item (Join-Path $repoRoot 'installer\register-psd-thumbnail-hklm.reg') $distDir
+
+# Diagnostic for remote debugging (e.g. "no PSD preview on another PC").
+# English-only output: cmd files are read in the OEM code page.
+Set-Content -LiteralPath (Join-Path $distDir 'check-psd-thumbnail.cmd') -Value @'
+@echo off
+rem Diagnoses the ImageEdit PSD thumbnail handler registration.
+set CLSID={43B34785-3F16-49F5-BAB6-069B487ED407}
+set SHELLEX={e357fccd-a995-4576-b01f-234630154e96}
+echo [1] DLL file:
+if exist "%~dp0imageedit_thumb.dll" (echo     OK  %~dp0imageedit_thumb.dll) else (echo     MISSING %~dp0imageedit_thumb.dll)
+echo [2] CLSID (HKCU):
+reg query "HKCU\Software\Classes\CLSID\%CLSID%\InprocServer32" /ve
+echo [3] ShellEx key (HKCR merged view):
+reg query "HKCR\.psd\ShellEx\%SHELLEX%" /ve
+echo [4] VC++ runtime (app-local next to exe, else System32):
+if exist "%~dp0vcruntime140.dll" (echo     OK  app-local vcruntime140.dll) else if exist "%WINDIR%\System32\vcruntime140.dll" (echo     OK  System32\vcruntime140.dll) else (echo     MISSING - install VC++ x64 redistributable)
+echo [5] Test extraction via Explorer API requires a reboot of explorer.exe
+echo     after registration: taskkill /f /im explorer.exe ^&^& start explorer.exe
+echo.
+echo If [2] or [3] is missing, run register-psd-thumbnail.cmd as this user.
+pause
+'@ -Encoding Ascii
 
 $oldEA = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'

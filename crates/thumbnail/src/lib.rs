@@ -300,6 +300,20 @@ fn register() -> HRESULT {
     if key.set_value("", &CLSID_THUMB_PROVIDER_STR).is_err() {
         return E_FAIL;
     }
+    // Same registration under SystemFileAssociations, for systems where the
+    // .psd extension is re-associated by another app and ProgID lookup masks
+    // the .psd\ShellEx key.
+    let sfa_path = format!(r"Software\Classes\SystemFileAssociations\.psd\ShellEx\{THUMB_SHELLEX_CATEGORY}");
+    if let Ok((key, _)) = hkcu.create_subkey(&sfa_path) {
+        let _ = key.set_value("", &CLSID_THUMB_PROVIDER_STR);
+    }
+    // Approve the extension for the current user (some shells log a warning
+    // and skip unapproved handlers).
+    if let Ok((key, _)) =
+        hkcu.create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved")
+    {
+        let _ = key.set_value(CLSID_THUMB_PROVIDER_STR, &"ImageEdit PSD Thumbnail Provider");
+    }
     S_OK
 }
 
@@ -315,6 +329,13 @@ fn unregister() -> HRESULT {
     ));
     let _ = hkcu.delete_subkey(format!(r"Software\Classes\CLSID\{CLSID_THUMB_PROVIDER_STR}"));
     let _ = hkcu.delete_subkey(format!(r"Software\Classes\.psd\ShellEx\{THUMB_SHELLEX_CATEGORY}"));
+    let _ = hkcu.delete_subkey(format!(
+        r"Software\Classes\SystemFileAssociations\.psd\ShellEx\{THUMB_SHELLEX_CATEGORY}"
+    ));
+    if let Ok(key) = hkcu.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved")
+    {
+        let _ = key.delete_value(CLSID_THUMB_PROVIDER_STR);
+    }
     S_OK
 }
 
