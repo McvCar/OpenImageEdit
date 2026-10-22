@@ -127,3 +127,27 @@ pub(in crate::bridge) fn save_format_for_source(path: &Path) -> Format {
         format_from_path(path).unwrap_or(Format::Png)
     }
 }
+
+#[cfg(test)]
+mod psd_save_guard_tests {
+    use crate::bridge::*;
+
+    #[test]
+    fn psd_paths_detected_case_insensitive() {
+        assert!(is_psd_path(Path::new("D:/art/ui.psd")));
+        assert!(is_psd_path(Path::new("D:/art/UI.PSD")));
+        assert!(!is_psd_path(Path::new("D:/art/ui.png")));
+        assert!(!is_psd_path(Path::new("D:/art/psd"))); // no extension
+        assert!(!is_psd_path(Path::new("")));
+    }
+
+    #[test]
+    fn psd_source_save_format_falls_back_to_png() {
+        // The corruption bug: .psd + unwrap_or(Png) wrote PNG bytes into the
+        // .psd file. Explicit fallback + no .psd target anywhere.
+        assert_eq!(save_format_for_source(Path::new("D:/art/ui.psd")), Format::Png);
+        assert_eq!(save_format_for_source(Path::new("D:/art/ui.PNG")), Format::Png);
+        assert_eq!(save_format_for_source(Path::new("D:/art/a.jpg")), Format::Jpeg);
+        assert_eq!(save_format_for_source(Path::new("D:/art/unknown.xyz")), Format::Png);
+    }
+}
