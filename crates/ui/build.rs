@@ -14,6 +14,7 @@ fn main() {
             .qml_files([
                 "qml/editor/DocWindow.qml",
                 "qml/editor/EditorContent.qml",
+                "qml/panels/SettingsOverlay.qml",
                 "qml/widgets/AdjustRow.qml",
                 "qml/widgets/CheckRow.qml",
                 "qml/widgets/DashedRect.qml",
