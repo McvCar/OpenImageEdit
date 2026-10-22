@@ -7,6 +7,8 @@ Rectangle {
     required property var bridge
     required property var view
     required property var zoomMenu
+    // 供缩放菜单（ZoomMenu）重新锚定到百分比胶囊按钮。
+    property var pctBtnRef: zoomPctBtn
     anchors.bottom: parent.bottom
     anchors.left: parent.left
     anchors.right: parent.right
