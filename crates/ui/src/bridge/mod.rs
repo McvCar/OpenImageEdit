@@ -15,6 +15,12 @@ use editcore::{
 use image::RgbaImage;
 
 mod ops;
+mod geom;
+mod config;
+mod paths;
+pub(in crate::bridge) use geom::*;
+pub(in crate::bridge) use config::*;
+pub(in crate::bridge) use paths::*;
 
 pub static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
@@ -526,24 +532,6 @@ pub mod qobject {
     }
 }
 
-/// User preferences persisted across runs (plain key=value file under
-/// %APPDATA%/ImageEdit so no extra dependency is needed).
-struct AppConfig {
-    checker_light: String,
-    checker_dark: String,
-    open_in_new_window: bool,
-    /// Save quality (1-100). Lossy formats (JPEG/WebP) use it directly;
-    /// lossless PNG maps it to the compression effort (< 50 = max
-    /// compression / smallest file).
-    save_quality: u8,
-    /// Ruler Y direction: `false` = origin top-left (screen order),
-    /// `true` = origin bottom-left (Y grows upward).
-    ruler_bottom_up: bool,
-    /// Downsampling-first open cap for the longest edge. `0` disables it and
-    /// keeps the original resolution (files above 300 MP are still rejected).
-    max_dimension: i32,
-}
-
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -554,80 +542,6 @@ impl Default for AppConfig {
             ruler_bottom_up: false,
             max_dimension: 8192,
         }
-    }
-}
-
-impl AppConfig {
-    fn path() -> Option<PathBuf> {
-        std::env::var_os("APPDATA")
-            .map(|root| PathBuf::from(root).join("ImageEdit").join("settings.ini"))
-    }
-
-    fn load() -> Self {
-        let mut cfg = Self::default();
-        if let Some(path) = Self::path() {
-            if let Ok(text) = std::fs::read_to_string(path) {
-                for line in text.lines() {
-                    let (key, value) = match line.split_once('=') {
-                        Some((k, v)) => (k.trim(), v.trim()),
-                        None => continue,
-                    };
-                    match key {
-                        "checker_light" if !value.is_empty() => {
-                            cfg.checker_light = value.to_string()
-                        }
-                        "checker_dark" if !value.is_empty() => cfg.checker_dark = value.to_string(),
-                        "open_in_new_window" => cfg.open_in_new_window = value == "true",
-                        "ruler_bottom_up" => cfg.ruler_bottom_up = value == "true",
-                        "save_quality" => {
-                            if let Ok(q) = value.parse::<u8>() {
-                                cfg.save_quality = q.clamp(1, 100);
-                            }
-                        }
-                        "max_dimension" => {
-                            if let Ok(d) = value.parse::<i32>() {
-                                cfg.max_dimension = d.max(0);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        cfg
-    }
-
-    fn save(&self) {
-        if let Some(path) = Self::path() {
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let text = format!(
-                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\nruler_bottom_up={}\nmax_dimension={}\n",
-                self.checker_light,
-                self.checker_dark,
-                self.open_in_new_window,
-                self.save_quality,
-                self.ruler_bottom_up,
-                self.max_dimension
-            );
-            let _ = std::fs::write(path, text);
-        }
-    }
-}
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0usize;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -776,74 +690,6 @@ impl Default for BridgeRust {
     }
 }
 
-/// Process-global clipboard (per-window `RefCell` fields cannot share state
-/// across the multi-window Bridges). Holds a full `Layer`, so pixels survive
-/// opening a different document (cross-image copy/paste).
-fn clipboard() -> &'static std::sync::Mutex<Option<Layer>> {
-    static CLIPBOARD: std::sync::OnceLock<std::sync::Mutex<Option<Layer>>> =
-        std::sync::OnceLock::new();
-    CLIPBOARD.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-/// Render the 16×16 checkerboard tile (8 px cells) as a 32bpp bottom-up BMP
-/// and return a `file:///` URL, or `None` on any failure (QML then just hides
-/// the checkerboard).
-///
-/// Written next to settings.ini. `slot` alternates the filename (a/b) so the
-/// QML `Image` sees a changed URL on color edits — same-path rewrites would
-/// not reload the texture. Generated here instead of painted in QML because
-/// the Canvas + `toDataURL` route re-enters the synchronous Immediate paint
-/// path from `onPainted` and crashes (even with a JS re-entrancy guard).
-fn write_checker_tile_bmp(light: &str, dark: &str, slot: u8) -> Option<String> {
-    fn parse_hex(s: &str) -> Option<[u8; 3]> {
-        let s = s.strip_prefix('#')?;
-        if s.len() != 6 {
-            return None;
-        }
-        let mut out = [0u8; 3];
-        for (i, c) in out.iter_mut().enumerate() {
-            *c = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
-        }
-        Some(out)
-    }
-    let (light, dark) = (parse_hex(light)?, parse_hex(dark)?);
-    let (w, h) = (16u32, 16u32);
-    let row = (w * 4) as usize;
-    let pixels = row * h as usize;
-    let mut buf = Vec::with_capacity(54 + pixels);
-    // BITMAPFILEHEADER
-    buf.extend_from_slice(b"BM");
-    buf.extend_from_slice(&((54 + pixels) as u32).to_le_bytes());
-    buf.extend_from_slice(&[0; 4]);
-    buf.extend_from_slice(&54u32.to_le_bytes());
-    // BITMAPINFOHEADER (BI_RGB, bottom-up)
-    buf.extend_from_slice(&40u32.to_le_bytes());
-    buf.extend_from_slice(&(w as i32).to_le_bytes());
-    buf.extend_from_slice(&(h as i32).to_le_bytes());
-    buf.extend_from_slice(&1u16.to_le_bytes());
-    buf.extend_from_slice(&32u16.to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes());
-    buf.extend_from_slice(&(pixels as u32).to_le_bytes());
-    buf.extend_from_slice(&2835u32.to_le_bytes());
-    buf.extend_from_slice(&2835u32.to_le_bytes());
-    buf.extend_from_slice(&[0; 8]);
-    for gy in (0..h).rev() {
-        for gx in 0..w {
-            let c = if (gx / 8) % 2 == (gy / 8) % 2 { light } else { dark };
-            buf.extend_from_slice(&[c[2], c[1], c[0], 255]);
-        }
-    }
-    let dir = AppConfig::path()?.parent()?.to_path_buf();
-    std::fs::create_dir_all(&dir).ok()?;
-    let name = format!("checker-tile-{}.bmp", if slot == 0 { "a" } else { "b" });
-    std::fs::write(dir.join(&name), &buf).ok()?;
-    Some(format!(
-        "file:///{}/{}",
-        dir.to_string_lossy().replace('\\', "/"),
-        name
-    ))
-}
-
 struct Session {
     id: u32,
     doc: Document,
@@ -953,126 +799,6 @@ enum Refresh {
         adjust_histogram: String,
     },
     Err(String),
-}
-
-fn fit_zoom(canvas: Size, viewport: Size) -> f64 {
-    if canvas.pixels() == 0 || viewport.pixels() == 0 {
-        return 1.0;
-    }
-    let sx = viewport.width as f64 / canvas.width as f64;
-    let sy = viewport.height as f64 / canvas.height as f64;
-    sx.min(sy).min(1.0)
-}
-
-fn display_size(canvas: Size, zoom: f64) -> Size {
-    Size::new(
-        ((canvas.width as f64 * zoom).round() as u64).clamp(1, MAX_DISPLAY_EDGE as u64) as u32,
-        ((canvas.height as f64 * zoom).round() as u64).clamp(1, MAX_DISPLAY_EDGE as u64) as u32,
-    )
-}
-
-/// Two display sizes that differ by at most 2px on each axis are treated as
-/// "the preview already on screen": re-rendering for them costs a full preview
-/// composite (hundreds of ms in debug) and changes nothing visible.
-fn size_close(a: Size, b: Size) -> bool {
-    const TOL: u32 = 2;
-    let dw = a.width.abs_diff(b.width);
-    let dh = a.height.abs_diff(b.height);
-    dw <= TOL && dh <= TOL
-}
-
-/// Preview bitmap size for a display size.
-///
-/// Zooming past 100% cannot create detail — the pixels just get bigger — so
-/// the composite is capped at the document's own resolution first (then at
-/// [`MAX_PREVIEW_EDGE`] for giant canvases). Two wins: every tick above 100%
-/// shares ONE target (the zoom-only render skip can reuse the frame), and the
-/// blur stays constant instead of degrading past the 4096 cap. The QML Image
-/// does the upscale on the GPU for free.
-fn preview_target(display: Size, canvas: Size) -> Size {
-    let display = Size::new(
-        display.width.min(canvas.width).max(1),
-        display.height.min(canvas.height).max(1),
-    );
-    let longest = display.width.max(display.height);
-    if longest <= MAX_PREVIEW_EDGE {
-        return display;
-    }
-    let scale = MAX_PREVIEW_EDGE as f64 / longest as f64;
-    Size::new(
-        ((display.width as f64 * scale).round() as u32).max(1),
-        ((display.height as f64 * scale).round() as u32).max(1),
-    )
-}
-
-/// Selection that replaces a just-deleted layer: prefer the neighbour above
-/// (`ix-1`), clamped to the remaining list. Deleting layer 0 selects the new
-/// layer 0 (usize underflow guard — this crashed debug builds via the cxx FFI
-/// abort); no layers left = -1.
-fn selection_after_removal(ix: usize, new_count: usize) -> i32 {
-    if new_count == 0 {
-        return -1;
-    }
-    ix.saturating_sub(1).min(new_count - 1) as i32
-}
-
-/// `file:///…` URL for a local path, percent-encoded per RFC 3986.
-///
-/// This used to be a raw concat, so a `#` in a filename (game assets love
-/// `颜色#236652.png`) leaked into the URL: QML's `url` type treats `#` as the
-/// fragment separator, the path was silently truncated at it, and the file
-/// "failed to open" while decode itself was never even reached. Encoding every
-/// byte outside the unreserved set (plus `/` and `:`) round-trips through
-/// QUrl → toLocalFile unchanged.
-fn file_url(path: &Path) -> String {
-    let text = path.to_string_lossy().replace('\\', "/");
-    let mut out = String::with_capacity(text.len() + 8);
-    out.push_str("file:///");
-    for b in text.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => out.push(*b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-fn extension_for(format: Format) -> &'static str {
-    match format {
-        Format::Jpeg => "jpg",
-        Format::Png => "png",
-        Format::WebP => "webp",
-        Format::Bmp => "bmp",
-        Format::Tiff => "tiff",
-        Format::Gif => "gif",
-        _ => "png",
-    }
-}
-
-/// True when the path points at a Photoshop document. PSD is preview-only
-/// (the decoder flattens layers) and image 0.25 has no PSD encoder — its
-/// extension map returns None for `.psd`, so every `unwrap_or(Format::Png)`
-/// save path would silently write PNG bytes into the .psd file.
-fn is_psd_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("psd"))
-        .unwrap_or(false)
-}
-
-const PSD_SAVE_HINT: &str = "PSD 是预览专用格式（打开时图层已合并），不能直接保存原文件，请用「另存为」导出 PNG / JPEG 等格式";
-
-/// Encode format for saving a document loaded from `path`. PSD sources fall
-/// back to PNG: image 0.25 has no PSD encoder and its extension map returns
-/// None for `.psd`, so the historical `unwrap_or(Format::Png)` here is what
-/// silently wrote PNG bytes into .psd files.
-fn save_format_for_source(path: &Path) -> Format {
-    if is_psd_path(path) {
-        Format::Png
-    } else {
-        format_from_path(path).unwrap_or(Format::Png)
-    }
 }
 
 impl Session {
