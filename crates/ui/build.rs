@@ -23,6 +23,7 @@ fn main() {
                 "qml/panels/ResizeOverlay.qml",
                 "qml/panels/SettingsOverlay.qml",
                 "qml/panels/StatusBar.qml",
+                "qml/panels/TitleBar.qml",
                 "qml/panels/ZoomMenu.qml",
                 "qml/widgets/AdjustRow.qml",
                 "qml/widgets/CheckRow.qml",
