@@ -1398,135 +1398,13 @@ Flickable {
         }
     }
 
-    // Selection outline: dashed frame + W×H pixel readout + blue dots.
-    DashedRect {
-        id: selRectViz
-        visible: root.selExists
-        z: 7
-        x: previewImage.x
-        y: previewImage.y
-        width: previewImage.width
-        height: previewImage.height
-        rx: root.selX
-        ry: root.selY
-        rw: root.selW
-        rh: root.selH
-        dashColor: "#000000"
-    }
+SelectionViz {
+    id: selectionViz
+    host: root
+    bridge: bridge
+    previewImage: previewImage
+}
 
-    // Selection size badge: W×H only, in a small gray rounded chip so it
-    // stays readable over any image content.
-    Rectangle {
-        id: selBadge
-        visible: root.selExists && !root.rulerOn
-        z: 8
-        x: previewImage.x
-           + Math.max(0, Math.min(root.selX,
-               previewImage.width - selBadge.width))
-        y: previewImage.y
-           + Math.min(previewImage.height - selBadge.height,
-                      root.selY + root.selH + 4)
-        width: selBadgeLabel.implicitWidth + 12
-        height: selBadgeLabel.implicitHeight + 6
-        radius: 3
-        color: "#43474d"
-        border.color: "#6b7076"
-        border.width: 1
-
-        Text {
-            id: selBadgeLabel
-            anchors.centerIn: parent
-            text: Math.round(root.selW / toDispScale()) + " × "
-                  + Math.round(root.selH / toDispScale())
-            color: "#d5d8dd"
-            font.pixelSize: 11
-        }
-    }
-
-    EdgeHandles {
-        id: selHandles
-        // 拾色器打开时隐藏：画布点击必须优先给取色，不能被选区手柄吞掉。
-        visible: root.selExists && !root.selRubberBanding && bridge.image_width > 0
-                 && !bridge.pickerOpen
-        z: 8
-        x: previewImage.x
-        y: previewImage.y
-        width: previewImage.width
-        height: previewImage.height
-        bx: root.selX
-        by: root.selY
-        bw: root.selW
-        bh: root.selH
-        pxScale: toDispScale()
-        resizeFn: function(startRect, role, dx, dy, free) {
-            resizeBoxFrom(startRect, role, dx, dy)
-        }
-        moveFn: function(startRect, dx, dy) {
-            moveSelFrom(startRect, dx, dy)
-        }
-    }
-
-    // Selected layer outline (dashed) + blue-dot handles for scaling.
-    DashedRect {
-        id: layerBoxViz
-        visible: root.selLayer !== null && root.scaleW === 0
-        z: 6
-        x: previewImage.x
-        y: previewImage.y
-        width: previewImage.width
-        height: previewImage.height
-        rx: root.selLayerBox !== null ? root.selLayerBox.x * toDispScale() : 0
-        ry: root.selLayerBox !== null ? root.selLayerBox.y * toDispScale() : 0
-        rw: root.selLayerBox !== null ? root.selLayerBox.w * toDispScale() : 0
-        rh: root.selLayerBox !== null ? root.selLayerBox.h * toDispScale() : 0
-        dashColor: "#5b9dff99"
-    }
-
-    EdgeHandles {
-        id: layerHandles
-        // 拾色器打开时隐藏（同 selHandles：取色优先于缩放/移动）。
-        visible: root.selLayer !== null && root.selLayer.base !== true
-                 && !root.selExists && bridge.image_width > 0
-                 && !bridge.pickerOpen
-        z: 8
-        x: previewImage.x
-        y: previewImage.y
-        width: previewImage.width
-        height: previewImage.height
-        bx: root.scaleW > 0 ? root.scaleX
-                            : (root.selLayerBox !== null ? root.selLayerBox.x * toDispScale() : 0)
-        by: root.scaleW > 0 ? root.scaleY
-                            : (root.selLayerBox !== null ? root.selLayerBox.y * toDispScale() : 0)
-        bw: root.scaleW > 0 ? root.scaleW
-                            : (root.selLayerBox !== null ? root.selLayerBox.w * toDispScale() : 0)
-        bh: root.scaleW > 0 ? root.scaleH
-                            : (root.selLayerBox !== null ? root.selLayerBox.h * toDispScale() : 0)
-        moveEnabled: false
-        pxScale: toDispScale()
-        resizeFn: function(startRect, role, dx, dy, free) {
-            resizeLayerFrom(startRect, role, dx, dy, free)
-        }
-        onEngagedChanged: {
-            if (layerHandles.engaged) {
-                if (root.scaleW === 0)
-                    bridge.scale_layer_begin()
-            } else if (root.scaleW > 0) {
-                commitLayerScale()
-            }
-        }
-    }
-
-    Text {
-        visible: root.scaleW > 0
-        z: 8
-        x: previewImage.x + root.scaleX
-        y: Math.min(previewImage.y + previewImage.height - 16,
-                    previewImage.y + root.scaleY + root.scaleH + 4)
-        text: Math.round(root.scaleW / toDispScale()) + " × "
-              + Math.round(root.scaleH / toDispScale()) + "　松手应用缩放 · Esc 取消"
-        color: "#7fc3ff"
-        font.pixelSize: 11
-    }
 
 RulerOverlay {
     id: rulerOverlay
@@ -1738,9 +1616,9 @@ function canvasCursor(x, y) {
         if (c >= 0)
             return c
     }
-    if (layerHandles.visible) {
-        const c = Geometry.boxCursor(ix, iy, layerHandles.bx, layerHandles.by,
-                            layerHandles.bw, layerHandles.bh)
+    if (selectionViz.layerHandles.visible) {
+        const c = Geometry.boxCursor(ix, iy, selectionViz.layerHandles.bx, selectionViz.layerHandles.by,
+                            selectionViz.layerHandles.bw, selectionViz.layerHandles.bh)
         if (c >= 0)
             return c
     }

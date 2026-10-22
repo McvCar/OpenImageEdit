@@ -26,6 +26,7 @@ fn main() {
                 "qml/panels/PsdHintOverlay.qml",
                 "qml/panels/ResizeOverlay.qml",
                 "qml/panels/RulerOverlay.qml",
+                "qml/panels/SelectionViz.qml",
                 "qml/panels/SettingsOverlay.qml",
                 "qml/panels/StatusBar.qml",
                 "qml/panels/TitleBar.qml",
