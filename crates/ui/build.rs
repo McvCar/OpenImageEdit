@@ -16,6 +16,7 @@ fn main() {
                 "qml/editor/EditorContent.qml",
                 "qml/panels/AdjustPanel.qml",
                 "qml/panels/ConfirmOverlay.qml",
+                "qml/panels/LayerPanel.qml",
                 "qml/panels/PickerPanel.qml",
                 "qml/panels/PsdHintOverlay.qml",
                 "qml/panels/ResizeOverlay.qml",
