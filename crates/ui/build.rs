@@ -16,6 +16,7 @@ fn main() {
                 "qml/editor/EditorContent.qml",
                 "qml/panels/AdjustPanel.qml",
                 "qml/panels/CanvasSurface.qml",
+                "qml/panels/CanvasView.qml",
                 "qml/panels/ColorPopover.qml",
                 "qml/panels/ConfirmOverlay.qml",
                 "qml/panels/FontPopover.qml",

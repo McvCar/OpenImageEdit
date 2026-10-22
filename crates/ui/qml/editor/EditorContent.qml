@@ -47,7 +47,7 @@ Item {
     readonly property bool selExists: selW >= 3 && selH >= 3
     // Transient "rubber band in use" state; hides the handle dots and
     // disables the wheel zoom while dragging a new selection.
-    readonly property bool selRubberBanding: canvasSurface.selDragMouse.dragging
+    readonly property bool selRubberBanding: view.canvasSurface.selDragMouse.dragging
     readonly property bool modeActive: selRubberBanding || pasteFloating
     // Scale target for the selected layer (display coords); empty when idle.
     property real scaleX: 0
@@ -335,7 +335,7 @@ Shortcut { sequence: "Ctrl+Shift+R"; onActivated: bridge.rotate_cw() }
 // 重命名）获得焦点时必须禁用：QML Shortcut 先于焦点项拦截按键，
 // 不禁用会吞掉输入框的退格键，还会误删选中的标记/图层。
 Shortcut { sequences: ["Delete", "Backspace"]
-           enabled: !canvasSurface.textPopup.visible && !fontPopover.sizeInput.activeFocus
+           enabled: !view.canvasSurface.textPopup.visible && !fontPopover.sizeInput.activeFocus
                     && root.renamingIndex < 0
                     && (root.selExists || bridge.selected_mark >= 0
                     || bridge.selected_layer >= 0
@@ -366,7 +366,7 @@ TitleBar {
     settingsOverlay: settingsOverlay
     resizeOverlay: resizeOverlay
     overflowMenu: overflowMenu
-    textPopup: canvasSurface.textPopup
+    textPopup: view.canvasSurface.textPopup
     widthPopover: widthPopover
     colorPopover: colorPopover
     mosaicPopover: mosaicPopover
@@ -466,248 +466,14 @@ MouseArea {
     }
 }
 
-Flickable {
+CanvasView {
     id: view
-
-    anchors.top: markBar.visible ? markBar.bottom : toolbar.bottom
-    anchors.bottom: statusBar.top
-    anchors.left: parent.left
-    // 图层面板悬浮在右侧：fit/居中必须按扣掉面板后的可见区域算，
-    // 否则适应窗口时图片右边会被面板盖住。
-    anchors.right: layerPanel.visible ? layerPanel.left : parent.right
-    clip: true
-    boundsBehavior: Flickable.StopAtBounds
-    // Panning happens ONLY via wheel/touchpad and middle-drag (panMa);
-    // left-drag belongs to selection/layer gestures.
-    interactive: false
-    // PAD display px of slack around the image so layers pushed partially
-    // off-canvas stay visible and clickable (canvasSurface matches).
-    readonly property int pad: 64
-    contentWidth: Math.max(width, previewImage.width + 2 * pad)
-    contentHeight: Math.max(height, previewImage.height + 2 * pad)
-
-    // In fit mode the content includes the 64px work-area pad on every
-    // side, so it is slightly larger than the viewport — without recentring
-    // the image would sit 64px down (blank top, cut bottom). Center the
-    // image in the viewport whenever fit sizing changes.
-    function centerContent() {
-        if (!bridge.fit_mode)
-            return
-        // 取整：contentX/Y 若带 .5，整块内容（含 1:1 的预览位图）都会被
-        // 半像素采样糊掉，与 previewImage.x/y 取整是同一件事的两半。
-        contentX = Math.round(Math.max(0, (contentWidth - width) / 2))
-        contentY = Math.round(Math.max(0, (contentHeight - height) / 2))
-    }
-    onContentWidthChanged: centerContent()
-    onContentHeightChanged: centerContent()
-    onWidthChanged: {
-        centerContent()
-        requestViewport()
-    }
-    onHeightChanged: {
-        centerContent()
-        requestViewport()
-    }
-    // Startup safety net: when the first layout lands directly on the
-    // final size, onWidthChanged/onHeightChanged never fire (no "change")
-    // and the bridge would keep a 0x0 viewport — fit zoom then opens at
-    // 100%. Reporting once at completion closes that race.
-    Component.onCompleted: requestViewport()
-
-    // ---- 窗口缩放节流 ------------------------------------------------
-    // 适应窗口模式下每次 viewport 变化都要重跑一遍全预览重合成 + BMP
-    // 编码写盘；拖动窗口边框时这类事件每秒几十次，debug 构建下界面直接
-    // 卡死（实测每步 ~500ms）。对策：拖动期间一个像素都不渲染，只用
-    // 「预测显示尺寸」把现有预览拉伸（视觉上跟手），停手 120ms 后再渲染
-    // 一次真图。预测公式与 Rust 的 fit_zoom / display_size 一致，因此
-    // 渲染落地时不会跳变。
-    readonly property bool viewportPending: viewportTimer.running
-    readonly property real fitScalePreview: {
-        if (!bridge.fit_mode || bridge.image_width <= 0 || bridge.image_height <= 0)
-            return 0
-        return Math.min(width / bridge.image_width,
-                        height / bridge.image_height, 1.0)
-    }
-    // 画布当前应当显示的尺寸：待渲染期间用预测值，其余用 bridge 的真值。
-    // 缩放手势的预测优先（fit 已被 zoom_by 置 false）。
-    readonly property real shownWidth: {
-        if (zoomPending && predictedZoom > 0)
-            return Math.max(1, Math.round(bridge.image_width * predictedZoom))
-        if (viewportPending && fitScalePreview > 0)
-            return Math.max(1, Math.round(bridge.image_width * fitScalePreview))
-        return Math.max(1, bridge.display_width)
-    }
-    readonly property real shownHeight: {
-        if (zoomPending && predictedZoom > 0)
-            return Math.max(1, Math.round(bridge.image_height * predictedZoom))
-        if (viewportPending && fitScalePreview > 0)
-            return Math.max(1, Math.round(bridge.image_height * fitScalePreview))
-        return Math.max(1, bridge.display_height)
-    }
-
-    function requestViewport() {
-        if (!bridge.fit_mode) {
-            // 非适应窗口：显示尺寸与 viewport 无关，同步告知即可（不渲染）。
-            bridge.set_viewport(width, height)
-            return
-        }
-        viewportTimer.restart()
-    }
-
-    // 拖动结束后才真正重渲染（Qt 在系统的缩放循环里通常不派发定时器，
-    // 所以拖动全程零渲染）。
-    Timer {
-        id: viewportTimer
-        interval: 120
-        onTriggered: bridge.set_viewport(view.width, view.height)
-    }
-
-    // ---- 缩放节流 ------------------------------------------------------
-    // Ctrl+滚轮每一格原来都同步跑一遍全量重合成 + BMP 编码，连滚直接卡
-    // 死。对策与窗口缩放相同：手势期间只累积倍率，用「当前 zoom × 累积
-    // 倍率」预测显示尺寸把现有预览拉伸（视觉跟手），停手 120ms 后渲染一
-    // 次真图。100% 以上预览目标钳制在画布原生分辨率且不再变化，落地渲染
-    // 大多直接复用上一帧（Rust 端 render-skip），滚轮全程无重绘。
-    readonly property bool zoomPending: zoomTimer.running
-    property real pendingZoom: 1.0
-    readonly property real predictedZoom: {
-        if (!zoomPending || bridge.zoom_percent <= 0)
-            return 0
-        const z = Math.min(16.0, Math.max(0.02,
-            (bridge.zoom_percent / 100.0) * pendingZoom))
-        // 与 Rust display_size 一致：显示最长边 clamp 32767。
-        const longest = Math.max(bridge.image_width, bridge.image_height)
-        return Math.min(z, 32767.0 / longest)
-    }
-    function queueZoom(factor) {
-        pendingZoom = Math.min(16.0, Math.max(0.02, pendingZoom * factor))
-        zoomTimer.restart()
-    }
-    // 绝对值入口（滑杆/预设菜单用）：换算成相对倍率走同一条节流管线。
-    function queueZoomTo(pct) {
-        if (bridge.zoom_percent <= 0)
-            return
-        const target = Math.min(1600, Math.max(2, pct))
-        const base = Math.min(16.0, Math.max(0.02,
-            bridge.zoom_percent / 100.0))
-        const f = target / 100.0 / base
-        if (f > 0.999 && f < 1.001)
-            return
-        queueZoom(f)
-    }
-    Timer {
-        id: zoomTimer
-        interval: 120
-        onTriggered: {
-            const f = view.pendingZoom
-            view.pendingZoom = 1.0
-            bridge.zoom_step(f)
-        }
-    }
-
-    // Clamp-and-shift the visible region by (dx, dy) viewport px.
-    function panBy(dx, dy) {
-        const maxX = Math.max(0, contentWidth - width)
-        const maxY = Math.max(0, contentHeight - height)
-        // 取整：触摸板/滚轮的增量常带小数，contentX 一旦是 .5，1:1 的预览
-        // 位图就会按半像素中心采样（整幅变糊）。
-        contentX = Math.round(Math.min(maxX, Math.max(0, contentX + dx)))
-        contentY = Math.round(Math.min(maxY, Math.max(0, contentY + dy)))
-    }
-
-    // PS-style checkerboard behind the image: transparent pixels show
-    // the grid configured in the settings panel. The 16×16 pattern tile
-    // is generated by the bridge (checkerTileUrl, a BMP next to
-    // settings.ini) and tiled by the GPU via `Image.fillMode Tile` —
-    // zero repaint on zoom/resize, which a full-size Canvas could not
-    // avoid (canvas resizes force synchronous repaints; that was the
-    // main wheel-zoom jank on large previews). A Canvas + toDataURL
-    // route was tried first and crashed: toDataURL re-enters the
-    // synchronous Immediate paint path from onPainted.
-    Image {
-        id: checkerboard
-        visible: bridge.preview_url.length > 0
-                 && bridge.checkerTileUrl.length > 0
-        x: previewImage.x
-        y: previewImage.y
-        width: previewImage.width
-        height: previewImage.height
-        fillMode: Image.Tile
-        smooth: false
-        cache: false
-        source: bridge.checkerTileUrl
-    }
-
-    Image {
-        id: previewImage
-
-        width: view.shownWidth
-        height: view.shownHeight
-        // 必须落在整数像素上：预览位图与显示尺寸是 1:1 的，一旦 x/y 出现
-        // .5（奇数宽高居中时很常见，例如 31% 的 497×311），GPU 就会按
-        // 半像素中心做双线性采样，整张画面被均匀糊掉——这正是"某些缩放
-        // 比例看着模糊"的根因。居中偏移一律取整。
-        x: Math.round((view.contentWidth - width) / 2)
-        y: Math.round((view.contentHeight - height) / 2)
-        cache: false
-        fillMode: Image.Stretch
-        source: bridge.preview_url
-
-        // 显示比例一变（缩放手势的预测拉伸也算）就重映射选区。
-        onWidthChanged: root.remapSelectionToScale()
-
-        onStatusChanged: {
-            if (status === Image.Ready) {
-                imageRendered = true;
-                bridge.image_shown();
-            } else if (status === Image.Error) {
-                console.log("ImageEdit: preview load error");
-                if (bridge.auto_quit)
-                    Qt.quit();
-            }
-        }
-    }
-
-    // ---- Persistent-selection interaction stack ----------------------
-    // Hit priority: selected layer content drag (no active selection) →
-    // selection move (center of the selection) → new selection rubber
-    // band. Crop is applied to the live selection (Enter / Ctrl+K).
-    //
-    // The surface extends PAD display px beyond the image on every side
-    // (and the Flickable content grows to match), so layers pushed
-    // partially off-canvas remain reachable.
-
-    CanvasSurface {
-        id: canvasSurface
-        host: root
-        bridge: bridge
-        view: view
-        previewImage: previewImage
-    }
-
-SelectionViz {
-    id: selectionViz
     host: root
     bridge: bridge
-    previewImage: previewImage
-}
-
-
-RulerOverlay {
-    id: rulerOverlay
-    host: root
-    bridge: bridge
-    previewImage: previewImage
-}
-
-
-    Text {
-        anchors.centerIn: parent
-        visible: bridge.preview_url.length === 0
-        text: "把图片拖到这里，或在命令行传入文件路径"
-        color: "#6b7076"
-        font.pixelSize: 14
-    }
+    markBar: markBar
+    toolbar: toolbar
+    statusBar: statusBar
+    layerPanel: layerPanel
 }
 
 // Viewport-fixed pan/zoom input (sits above the Flickable so it never
@@ -824,12 +590,12 @@ ResizeOverlay {
 }
 
 function toImageScale() {
-    return previewImage.width > 0 ? bridge.image_width / previewImage.width : 1
+    return view.previewImage.width > 0 ? bridge.image_width / view.previewImage.width : 1
 }
 
 function toDispScale() {
-    return bridge.image_width > 0 && previewImage.width > 0
-           ? previewImage.width / bridge.image_width : 0
+    return bridge.image_width > 0 && view.previewImage.width > 0
+           ? view.previewImage.width / bridge.image_width : 0
 }
 
 // 选区存的是显示坐标：缩放（滚轮 / 适应窗口 / 拖窗口）改变显示比例后
@@ -839,12 +605,12 @@ property real selTrackScale: 0
 property int selTrackImgW: 0
 function remapSelectionToScale() {
     const iw = bridge.image_width
-    if (iw <= 0 || previewImage.width <= 0) {
+    if (iw <= 0 || view.previewImage.width <= 0) {
         selTrackScale = 0
         selTrackImgW = 0
         return
     }
-    const s = previewImage.width / iw
+    const s = view.previewImage.width / iw
     // 图像尺寸没变且之前记过基准 → 纯比例变化，重映射。
     // 图像尺寸变了（裁剪/调整大小/新文档）→ 语义已变，只重置基准。
     if (selTrackImgW === iw && selTrackScale > 0 && root.selExists
@@ -877,7 +643,7 @@ function snapDisplay(v) {
 // authoritative cursor decision.
 function canvasCursor(x, y) {
     // 文本输入中：普通箭头。
-    if (canvasSurface.textPopup.visible)
+    if (view.canvasSurface.textPopup.visible)
         return Qt.ArrowCursor
     // 拾色器打开：整块画布都是取色十字。
     if (bridge.pickerOpen)
@@ -885,15 +651,15 @@ function canvasCursor(x, y) {
     // 标记工具激活：手柄 → 缩放光标；标记上 → 移动；文本工具 → 工字；
     // 其余 → 十字。
     if (root.markTool !== "none") {
-        const h = canvasSurface.markMa.handleAt(x, y)
+        const h = view.canvasSurface.markMa.handleAt(x, y)
         if (h !== "")
-            return canvasSurface.markMa.handleCursor(h)
-        if (canvasSurface.markMa.markAt(x, y) >= 0)
+            return view.canvasSurface.markMa.handleCursor(h)
+        if (view.canvasSurface.markMa.markAt(x, y) >= 0)
             return Qt.SizeAllCursor
         return Qt.CrossCursor
     }
     // 未选绘制工具时：悬停标记仍可移动/编辑（标记不依赖工具栏）。
-    if (canvasSurface.markMa.markAt(x, y) >= 0)
+    if (view.canvasSurface.markMa.markAt(x, y) >= 0)
         return Qt.SizeAllCursor
     const ix = x - view.pad
     const iy = y - view.pad
@@ -903,9 +669,9 @@ function canvasCursor(x, y) {
         if (c >= 0)
             return c
     }
-    if (selectionViz.layerHandles.visible) {
-        const c = Geometry.boxCursor(ix, iy, selectionViz.layerHandles.bx, selectionViz.layerHandles.by,
-                            selectionViz.layerHandles.bw, selectionViz.layerHandles.bh)
+    if (view.selectionViz.layerHandles.visible) {
+        const c = Geometry.boxCursor(ix, iy, view.selectionViz.layerHandles.bx, view.selectionViz.layerHandles.by,
+                            view.selectionViz.layerHandles.bw, view.selectionViz.layerHandles.bh)
         if (c >= 0)
             return c
     }
@@ -935,7 +701,7 @@ function resizeBoxFrom(startRect, role, dx, dy) {
     }
     if (role.indexOf("e") >= 0) {
         w = Math.min(Math.max(s, snapDisplay(startRect.width + dx)),
-                     previewImage.width - x)
+                     view.previewImage.width - x)
     }
     if (role.indexOf("n") >= 0) {
         let ny = snapDisplay(startRect.y + dy)
@@ -945,7 +711,7 @@ function resizeBoxFrom(startRect, role, dx, dy) {
     }
     if (role.indexOf("s") >= 0) {
         h = Math.min(Math.max(s, snapDisplay(startRect.height + dy)),
-                     previewImage.height - y)
+                     view.previewImage.height - y)
     }
     boxSet(x, y, w, h)
 }
@@ -953,8 +719,8 @@ function resizeBoxFrom(startRect, role, dx, dy) {
 function moveSelFrom(startRect, dx, dy) {
     let x = snapDisplay(startRect.x + dx)
     let y = snapDisplay(startRect.y + dy)
-    x = Math.max(0, Math.min(x, previewImage.width - startRect.width))
-    y = Math.max(0, Math.min(y, previewImage.height - startRect.height))
+    x = Math.max(0, Math.min(x, view.previewImage.width - startRect.width))
+    y = Math.max(0, Math.min(y, view.previewImage.height - startRect.height))
     boxSet(x, y, startRect.width, startRect.height)
 }
 
@@ -970,7 +736,7 @@ function resizeLayerFrom(startRect, role, dx, dy, free) {
     }
     if (role.indexOf("e") >= 0) {
         w = Math.min(Math.max(s, snapDisplay(startRect.width + dx)),
-                     previewImage.width - x)
+                     view.previewImage.width - x)
     }
     if (role.indexOf("n") >= 0) {
         let ny = snapDisplay(startRect.y + dy)
@@ -980,7 +746,7 @@ function resizeLayerFrom(startRect, role, dx, dy, free) {
     }
     if (role.indexOf("s") >= 0) {
         h = Math.min(Math.max(s, snapDisplay(startRect.height + dy)),
-                     previewImage.height - y)
+                     view.previewImage.height - y)
     }
     if (role.length === 2 && !free) {
         // Corner handles keep the layer's aspect ratio by default
@@ -997,15 +763,15 @@ function resizeLayerFrom(startRect, role, dx, dy, free) {
     }
     root.scaleX = x; root.scaleY = y
     root.scaleW = Math.max(1, w); root.scaleH = Math.max(1, h)
-    if (!canvasSurface.scaleTimer.running) {
-        canvasSurface.scaleTimer.lastW = -1; canvasSurface.scaleTimer.lastH = -1
-        canvasSurface.scaleTimer.lastX = 0; canvasSurface.scaleTimer.lastY = 0
-        canvasSurface.scaleTimer.start()
+    if (!view.canvasSurface.scaleTimer.running) {
+        view.canvasSurface.scaleTimer.lastW = -1; view.canvasSurface.scaleTimer.lastH = -1
+        view.canvasSurface.scaleTimer.lastX = 0; view.canvasSurface.scaleTimer.lastY = 0
+        view.canvasSurface.scaleTimer.start()
     }
 }
 
 function commitLayerScale() {
-    canvasSurface.scaleTimer.stop()
+    view.canvasSurface.scaleTimer.stop()
     const s = toDispScale()
     if (root.scaleW >= 1 && root.scaleH >= 1 && s > 0) {
         bridge.scale_layer_end(
@@ -1018,7 +784,7 @@ function commitLayerScale() {
 }
 
 function cancelLayerScale() {
-    canvasSurface.scaleTimer.stop()
+    view.canvasSurface.scaleTimer.stop()
     if (root.scaleW > 0)
         bridge.scale_layer_end(false, 0, 0, 0, 0)
     root.scaleX = 0; root.scaleY = 0; root.scaleW = 0; root.scaleH = 0
@@ -1052,7 +818,7 @@ function deleteSelectionPixels() {
 // 与 Esc 的取消层级一致）；然后是选区像素 → 选中图层 → 可删的背景。
 function onDeleteKey() {
     // 就地编辑文本时 Delete 属于输入框，不删标记。
-    if (bridge.selected_mark >= 0 && !canvasSurface.textPopup.visible) {
+    if (bridge.selected_mark >= 0 && !view.canvasSurface.textPopup.visible) {
         bridge.delete_selected_mark()
         return
     }
@@ -1075,12 +841,12 @@ function onDeleteKey() {
 
 // Ctrl+A: selection covering the whole canvas (Preview ⌘A).
 function selectAllCanvas() {
-    if (previewImage.width < 1 || previewImage.height < 1)
+    if (view.previewImage.width < 1 || view.previewImage.height < 1)
         return
     root.selX = 0
     root.selY = 0
-    root.selW = previewImage.width
-    root.selH = previewImage.height
+    root.selW = view.previewImage.width
+    root.selH = view.previewImage.height
     settlePaste()
 }
 
@@ -1145,7 +911,7 @@ function settlePaste() {
 }
 
 function onEscape() {
-    if (canvasSurface.textPopup.visible) { canvasSurface.textPopup.close(false); return }
+    if (view.canvasSurface.textPopup.visible) { view.canvasSurface.textPopup.close(false); return }
     // 调色面板：Esc = 放弃（像素从未被改动）。
     if (bridge.adjustOpen) { root.cancelAdjust(); return }
     // 拾色器：Esc = 关面板（已取的色保留）。
@@ -1166,7 +932,7 @@ function onEscape() {
     if (resizeOverlay.visible) { resizeOverlay.visible = false; return }
     if (settingsOverlay.visible) { settingsOverlay.visible = false; return }
     if (root.scaleW > 0) { cancelLayerScale(); return }
-    if (canvasSurface.selDragMouse.dragging) { canvasSurface.selDragMouse.dragging = false; return }
+    if (view.canvasSurface.selDragMouse.dragging) { view.canvasSurface.selDragMouse.dragging = false; return }
     if (bridge.selected_mark >= 0) { bridge.select_mark(-1); return }
     if (root.pasteFloating) {
         // D3-A: roll back everything committed since the paste.
@@ -1739,13 +1505,13 @@ Timer {
     onTriggered: {
         root.markBarVisible = true
         root.markTool = "ellipse"
-        canvasSurface.markMa.startX = view.pad
-        canvasSurface.markMa.startY = view.pad
-        canvasSurface.markMa.curX = view.pad + previewImage.width * 0.3
-        canvasSurface.markMa.curY = view.pad + previewImage.height * 0.3
-        canvasSurface.markMa.mode = 1
+        view.canvasSurface.markMa.startX = view.pad
+        view.canvasSurface.markMa.startY = view.pad
+        view.canvasSurface.markMa.curX = view.pad + view.previewImage.width * 0.3
+        view.canvasSurface.markMa.curY = view.pad + view.previewImage.height * 0.3
+        view.canvasSurface.markMa.mode = 1
         bridge.mark("probe phase1 requestPaint")
-        canvasSurface.markPreview.requestPaint()
+        view.canvasSurface.markPreview.requestPaint()
         phase2Timer.start()
     }
 }
@@ -1753,10 +1519,10 @@ Timer {
     id: phase2Timer
     interval: 2000
     onTriggered: {
-        canvasSurface.markMa.curX = view.pad + previewImage.width * 0.9
-        canvasSurface.markMa.curY = view.pad + previewImage.height * 0.9
+        view.canvasSurface.markMa.curX = view.pad + view.previewImage.width * 0.9
+        view.canvasSurface.markMa.curY = view.pad + view.previewImage.height * 0.9
         bridge.mark("probe phase2 requestPaint")
-        canvasSurface.markPreview.requestPaint()
+        view.canvasSurface.markPreview.requestPaint()
     }
 }
 
@@ -1781,10 +1547,10 @@ Timer {
         root.markBarVisible = true
         root.rulerOn = true
         if (!root.selExists && bridge.image_width > 0) {
-            root.selX = previewImage.width * 0.18
-            root.selY = previewImage.height * 0.22
-            root.selW = previewImage.width * 0.38
-            root.selH = previewImage.height * 0.34
+            root.selX = view.previewImage.width * 0.18
+            root.selY = view.previewImage.height * 0.22
+            root.selW = view.previewImage.width * 0.38
+            root.selH = view.previewImage.height * 0.34
         }
         if (bridge.image_width > 0) {
             root.hoverFx = bridge.image_width * 0.72
