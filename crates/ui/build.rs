@@ -18,6 +18,7 @@ fn main() {
                 "qml/panels/PsdHintOverlay.qml",
                 "qml/panels/ResizeOverlay.qml",
                 "qml/panels/SettingsOverlay.qml",
+                "qml/panels/StatusBar.qml",
                 "qml/widgets/AdjustRow.qml",
                 "qml/widgets/CheckRow.qml",
                 "qml/widgets/DashedRect.qml",
