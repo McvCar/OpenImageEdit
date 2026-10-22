@@ -57,7 +57,7 @@ fn main() {
             "qml/js/adjust.js",
             "qml/js/picker.js",
         ])
-        .files(["src/bridge.rs"])
+        .files(["src/bridge/mod.rs"])
         .build();
 
     // Embed the application icon (and version info) into the Windows exe so
