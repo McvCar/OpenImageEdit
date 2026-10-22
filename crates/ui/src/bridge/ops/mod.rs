@@ -5,6 +5,7 @@
 //! 助手方法无需改可见性。`#[qproperty]/#[qinvokable]` 声明全在 mod.rs 的
 //! `qobject` 块里，这里只是实现体。
 
+pub(super) mod script;
 pub(super) mod shell;
 pub(super) mod settings;
 pub(super) mod document;
