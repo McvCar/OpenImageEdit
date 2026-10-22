@@ -5,6 +5,8 @@ Rectangle {
     id: statusBar
     required property var host
     required property var bridge
+    required property var view
+    required property var zoomMenu
     anchors.bottom: parent.bottom
     anchors.left: parent.left
     anchors.right: parent.right
@@ -149,7 +151,7 @@ Rectangle {
             height: 20
             anchors.verticalCenter: parent.verticalCenter
             radius: 4
-            color: zoomPctMa.containsMouse || host.zoomMenu.visible
+            color: zoomPctMa.containsMouse || zoomMenu.visible
                    ? "#3a3d42" : "#2f3236"
             border.color: "#4a4e54"
             border.width: 1
@@ -177,11 +179,11 @@ Rectangle {
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onClicked: {
-                    if (host.zoomMenu.visible)
-                        host.zoomMenu.visible = false
+                    if (zoomMenu.visible)
+                        zoomMenu.visible = false
                     else {
-                        host.placePopover(host.zoomMenu, zoomPctBtn)
-                        host.zoomMenu.visible = true
+                        host.placePopover(zoomMenu, zoomPctBtn)
+                        zoomMenu.visible = true
                     }
                 }
             }
@@ -206,7 +208,7 @@ Rectangle {
             }
             function setValue(x) {
                 value = Math.min(1, Math.max(0, x / width))
-                host.view.queueZoomTo(valueToZoom(value))
+                view.queueZoomTo(valueToZoom(value))
             }
 
             Binding {
@@ -215,7 +217,7 @@ Rectangle {
                 value: zoomSlider.zoomToValue(bridge.zoom_percent)
                 // 等节流定时器把 zoom 落到 bridge 后再恢复跟随，否则
                 // 松手瞬间会先弹回旧值、120ms 后又跳到新值。
-                when: !zoomSlider.dragging && !host.view.zoomPending
+                when: !zoomSlider.dragging && !view.zoomPending
             }
 
             Rectangle {
@@ -280,7 +282,7 @@ Rectangle {
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                onClicked: host.view.queueZoom(1 / 1.25)
+                onClicked: view.queueZoom(1 / 1.25)
             }
         }
         Rectangle {
@@ -302,7 +304,7 @@ Rectangle {
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                onClicked: host.view.queueZoom(1.25)
+                onClicked: view.queueZoom(1.25)
             }
         }
     }

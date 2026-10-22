@@ -5,28 +5,31 @@ Item {
     id: pickerPanel
     required property var host
     required property var bridge
+    required property var toolbar
+    required property var markBar
+    required property var pickerBtn
     visible: bridge.pickerOpen
     width: 316
-    readonly property real maxHeight: Math.max(220, host.height - host.toolbar.height - 24)
-    readonly property real anchorX: host.pickerBtn.x + host.pickerBtn.parent.x
+    readonly property real maxHeight: Math.max(220, host.height - toolbar.height - 24)
+    readonly property real anchorX: pickerBtn.x + pickerBtn.parent.x
     height: Math.min(pickerCol.implicitHeight + 24, maxHeight)
     x: 8
-    y: host.toolbar.height + (host.markBar.visible ? host.markBar.height : 0) + 2
+    y: toolbar.height + (markBar.visible ? markBar.height : 0) + 2
     z: 221
     property bool userMoved: false
     onVisibleChanged: {
         if (visible) {
             userMoved = false
-            host.placePopover(pickerPanel, host.pickerBtn)
+            host.placePopover(pickerPanel, pickerBtn)
         }
     }
-    onAnchorXChanged: if (visible && !userMoved) host.placePopover(pickerPanel, host.pickerBtn)
+    onAnchorXChanged: if (visible && !userMoved) host.placePopover(pickerPanel, pickerBtn)
     onHeightChanged: if (visible && userMoved) moveTo(x, y)
 
     function moveTo(nx, ny) {
         userMoved = true
         x = Math.max(4, Math.min(Math.max(4, host.width - width - 4), nx))
-        const minY = host.toolbar.height + 2
+        const minY = toolbar.height + 2
         const maxY = Math.max(minY, host.height - height - 8)
         y = Math.max(minY, Math.min(maxY, ny))
     }

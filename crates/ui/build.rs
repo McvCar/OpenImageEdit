@@ -14,6 +14,7 @@ fn main() {
             .qml_files([
                 "qml/editor/DocWindow.qml",
                 "qml/editor/EditorContent.qml",
+                "qml/panels/AdjustPanel.qml",
                 "qml/panels/ConfirmOverlay.qml",
                 "qml/panels/PickerPanel.qml",
                 "qml/panels/PsdHintOverlay.qml",
