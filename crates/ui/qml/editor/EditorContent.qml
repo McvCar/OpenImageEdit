@@ -209,6 +209,17 @@ Item {
         }
     }
 
+    // Report the screen's device-pixel-ratio to the bridge so the preview
+    // bitmap is rendered at the physical resolution (logical × dpr). Without
+    // this a window at >100% Windows scaling gets a logically-sized bitmap
+    // stretched by the GPU → the whole image is uniformly blurred. `window`
+    // is this Item's top-level window (main Window or a DocWindow); its
+    // screen's devicePixelRatio is the Windows scaling factor. The binding is
+    // fully reactive: it fires on start, on scaling changes, and when the
+    // window moves to a different-density monitor.
+    property real dpr: window ? window.screen.devicePixelRatio : 1.0
+    onDprChanged: bridge.set_dpr(dpr)
+
     // ---- 单实例：接收另一个进程交过来的图片 -------------------------
     // 资源管理器里双击图片会新起一个进程；main() 发现已有实例时把路径通过
     // 本地回环 socket 交给它并退出，于是所有文档窗口都在同一个进程里（图层
@@ -1650,6 +1661,10 @@ Timer {
 
 Component.onCompleted: {
     bridge.mark("qml-completed");
+    // Push the screen's device-pixel-ratio so the first preview frame is
+    // rendered at the physical resolution (onDprChanged alone may not fire
+    // for the initial value).
+    bridge.set_dpr(dpr);
     if (root.primary) {
         bridge.start();
         if (root.probeDialog)

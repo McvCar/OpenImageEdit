@@ -188,11 +188,11 @@ impl Session {
     /// and let the QML Image stretch (sub-millisecond instead of seconds).
     /// Non-zoom refreshes (mark drags, layer ops, live gestures) never skip:
     /// some of them mutate the document without bumping `edit_epoch`.
-    pub(in crate::bridge) fn render(&mut self, zoom_only: bool) -> Result<Rendered, String> {
+    pub(in crate::bridge) fn render(&mut self, zoom_only: bool, dpr: f64) -> Result<Rendered, String> {
         let prof_t0 = Instant::now();
         let canvas = self.doc.canvas;
         let display = display_size(canvas, self.zoom);
-        let target = preview_target(display, canvas);
+        let target = preview_target(display, canvas, dpr);
         if target.pixels() == 0 {
             return Err("empty canvas".into());
         }
@@ -483,8 +483,8 @@ impl Session {
         format!("[{}]", parts.join(","))
     }
 
-    pub(in crate::bridge) fn refresh(&mut self, zoom_only: bool) -> Refresh {
-        match self.render(zoom_only) {
+    pub(in crate::bridge) fn refresh(&mut self, zoom_only: bool, dpr: f64) -> Refresh {
+        match self.render(zoom_only, dpr) {
             Ok(rendered) => {
                 let adjust = self.adjust;
                 let adjust_target_name = match adjust {

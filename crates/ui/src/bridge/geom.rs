@@ -29,26 +29,36 @@ pub(in crate::bridge) fn size_close(a: Size, b: Size) -> bool {
 
 /// Preview bitmap size for a display size.
 ///
-/// Zooming past 100% cannot create detail — the pixels just get bigger — so
-/// the composite is capped at the document's own resolution first (then at
-/// [`MAX_PREVIEW_EDGE`] for giant canvases). Two wins: every tick above 100%
-/// shares ONE target (the zoom-only render skip can reuse the frame), and the
-/// blur stays constant instead of degrading past the 4096 cap. The QML Image
-/// does the upscale on the GPU for free.
-pub(in crate::bridge) fn preview_target(display: Size, canvas: Size) -> Size {
-    let display = Size::new(
-        display.width.min(canvas.width).max(1),
-        display.height.min(canvas.height).max(1),
+/// The bitmap is rendered in PHYSICAL pixels: the QML `Image` item is sized in
+/// logical pixels but the GPU draws it at `logical × devicePixelRatio` physical
+/// pixels, so the source texture must match that to stay crisp. At dpr = 1 this
+/// is exactly the display size (no behaviour change); at dpr > 1 the preview is
+/// upscaled accordingly so a fit-mode image is no longer blurred by the GPU.
+///
+/// Two caps still apply, in order:
+///  1. The document's own resolution — zooming past 100% cannot create detail,
+///     so the composite never exceeds the canvas pixel count (every tick above
+///     100% shares one target, letting the zoom-only render skip reuse a frame).
+///  2. [`MAX_PREVIEW_EDGE`] (physical) bounds memory/composite cost for giant
+///     canvases and high-DPI displays.
+pub(in crate::bridge) fn preview_target(display: Size, canvas: Size, dpr: f64) -> Size {
+    let dpr = if dpr.is_finite() && dpr > 0.0 { dpr } else { 1.0 };
+    // Physical pixels the Image will be drawn at.
+    let physical = Size::new(
+        ((display.width as f64 * dpr).round() as u64).max(1) as u32,
+        ((display.height as f64 * dpr).round() as u64).max(1) as u32,
     );
-    let longest = display.width.max(display.height);
-    if longest <= MAX_PREVIEW_EDGE {
-        return display;
+    // Cap at the document's native resolution (the real detail limit).
+    let mut w = physical.width.min(canvas.width).max(1);
+    let mut h = physical.height.min(canvas.height).max(1);
+    // Cap at the physical memory limit for giant canvases / high DPI.
+    let longest = w.max(h);
+    if longest > MAX_PREVIEW_EDGE {
+        let scale = MAX_PREVIEW_EDGE as f64 / longest as f64;
+        w = ((w as f64 * scale).round() as u32).max(1);
+        h = ((h as f64 * scale).round() as u32).max(1);
     }
-    let scale = MAX_PREVIEW_EDGE as f64 / longest as f64;
-    Size::new(
-        ((display.width as f64 * scale).round() as u32).max(1),
-        ((display.height as f64 * scale).round() as u32).max(1),
-    )
+    Size::new(w, h)
 }
 
 /// Selection that replaces a just-deleted layer: prefer the neighbour above
@@ -70,7 +80,7 @@ mod preview_target_tests {
     fn below_100pct_uses_display_as_is() {
         let canvas = Size::new(1926, 1109);
         let display = Size::new(880, 507);
-        assert_eq!(preview_target(display, canvas), display);
+        assert_eq!(preview_target(display, canvas, 1.0), display);
     }
 
     #[test]
@@ -80,22 +90,41 @@ mod preview_target_tests {
         // the zoom-only render skip can reuse the frame.
         let canvas = Size::new(1926, 1109);
         let display = Size::new(4196, 2416); // zoom 218%
-        assert_eq!(preview_target(display, canvas), canvas);
+        assert_eq!(preview_target(display, canvas, 1.0), canvas);
     }
 
     #[test]
     fn giant_canvas_still_respects_max_preview_edge() {
-        let canvas = Size::new(6000, 4000);
-        let display = Size::new(9000, 6000); // zoom 150%
-        let target = preview_target(display, canvas);
-        assert_eq!(target, Size::new(4096, 2731));
+        // Longest physical edge 12000 > 8192 cap → scaled down to 8192.
+        let canvas = Size::new(12000, 8000);
+        let display = Size::new(15000, 10000); // zoom 125%
+        let target = preview_target(display, canvas, 1.0);
+        assert_eq!(target, Size::new(8192, 5461));
     }
 
     #[test]
     fn never_returns_zero() {
         let canvas = Size::new(1, 1);
         let display = Size::new(4000, 4000); // zoom 4000x
-        assert_eq!(preview_target(display, canvas), canvas);
+        assert_eq!(preview_target(display, canvas, 1.0), canvas);
+    }
+
+    #[test]
+    fn high_dpi_renders_at_physical_pixels() {
+        // At 150% scaling a 880-logical-px display occupies 1320 physical px;
+        // the bitmap must match that or the GPU upscales (blurs) it.
+        let canvas = Size::new(1926, 1109);
+        let display = Size::new(880, 507);
+        assert_eq!(preview_target(display, canvas, 1.5), Size::new(1320, 761));
+    }
+
+    #[test]
+    fn high_dpi_still_capped_by_canvas() {
+        // Zoomed past the document resolution at high DPI: still capped at the
+        // native canvas, never grows past the real detail.
+        let canvas = Size::new(1926, 1109);
+        let display = Size::new(2000, 1158); // zoom 104%
+        assert_eq!(preview_target(display, canvas, 2.0), canvas);
     }
 }
 

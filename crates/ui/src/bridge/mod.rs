@@ -41,7 +41,10 @@ fn elapsed_ms() -> i32 {
         .unwrap_or(-1)
 }
 
-const MAX_PREVIEW_EDGE: u32 = 4096;
+/// Longest-edge cap for the preview bitmap, in PHYSICAL pixels. The preview
+/// is rendered at the display size × device-pixel-ratio, so the cap must be
+/// sized for physical resolution (8192 ≈ a 4096-logical-px preview at 2× DPI).
+const MAX_PREVIEW_EDGE: u32 = 8192;
 const MAX_DISPLAY_EDGE: u32 = 32767;
 const MIN_ZOOM: f64 = 0.02;
 const MAX_ZOOM: f64 = 16.0;
@@ -172,6 +175,12 @@ pub mod qobject {
 
         #[qinvokable]
         fn set_viewport(self: Pin<&mut Self>, width: i32, height: i32);
+
+        /// Screen device-pixel-ratio changed (Windows scaling adjusted, or the
+        /// window moved to a different-density monitor). The preview must be
+        /// re-rendered at the new physical resolution.
+        #[qinvokable]
+        fn set_dpr(self: Pin<&mut Self>, ratio: f64);
 
         #[qinvokable]
         fn zoom_in(self: Pin<&mut Self>);
@@ -628,6 +637,11 @@ pub struct BridgeRust {
     mark_drag: RefCell<Option<(usize, Mark)>>,
     session: RefCell<Option<Session>>,
     viewport: RefCell<Size>,
+    /// Screen device-pixel-ratio pushed by QML (1.0 at 100% scaling). The
+    /// preview bitmap is rendered at display size × dpr so it stays crisp on
+    /// high-DPI displays. `Cell` because `set_dpr` mutates it behind
+    /// `Pin<&mut Self>`; the render path reads it.
+    dpr: std::cell::Cell<f64>,
 }
 
 impl Default for BridgeRust {
@@ -688,6 +702,7 @@ impl Default for BridgeRust {
             mark_drag: RefCell::new(None),
             session: RefCell::new(None),
             viewport: RefCell::new(Size::new(0, 0)),
+            dpr: std::cell::Cell::new(1.0),
         }
     }
 }
@@ -1044,7 +1059,7 @@ impl qobject::Bridge {
         let outcome = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
-                Some(session) => session.refresh(zoom_only),
+                Some(session) => session.refresh(zoom_only, self.dpr.get()),
                 None => return,
             }
         };
@@ -1071,16 +1086,24 @@ impl qobject::Bridge {
             } => {
                 // The status bar's left side already shows the file name and
                 // size; a second resolution readout here was redundant, so
-                // only keep the preview-degraded hint when it matters.
-                let mut status = if preview == display {
-                    String::new()
-                } else {
+                // only keep the preview-degraded hint when it matters. The
+                // preview is rendered in PHYSICAL pixels (display × dpr), so
+                // "degraded" means it is smaller than the physical display
+                // size (zoomed past the native resolution or past the memory
+                // cap) — not merely different from the logical display size.
+                let dpr = self.dpr.get();
+                let phys_w = ((display.width as f64 * dpr).round() as u32).max(1);
+                let phys_h = ((display.height as f64 * dpr).round() as u32).max(1);
+                let degraded = preview.width < phys_w || preview.height < phys_h;
+                let mut status = if degraded {
                     format!(
                         "{}  (预览 {}x{})",
                         if fit { "适应窗口" } else { "缩放" },
                         preview.width,
                         preview.height
                     )
+                } else {
+                    String::new()
                 };
                 // Persistent downsampling hint: refreshes rebuild the status
                 // text, so the "save resolution differs" notice must live here

@@ -2,6 +2,19 @@
 use super::super::*;
 
 impl qobject::Bridge {
+    pub fn set_dpr(mut self: Pin<&mut Self>, ratio: f64) {
+        let ratio = if ratio.is_finite() && ratio > 0.0 { ratio } else { 1.0 };
+        if (self.dpr.get() - ratio).abs() < 0.001 {
+            return;
+        }
+        self.dpr.set(ratio);
+        // The on-screen preview was rendered at the old physical resolution;
+        // re-render so it matches the new DPI. Only when a document is open.
+        if self.session.borrow().is_some() {
+            self.as_mut().refresh_preview();
+        }
+    }
+
     pub fn set_viewport(mut self: Pin<&mut Self>, width: i32, height: i32) {
         let size = Size::new(width.max(0) as u32, height.max(0) as u32);
         if *self.viewport.borrow() == size {
