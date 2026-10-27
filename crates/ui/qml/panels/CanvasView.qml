@@ -68,26 +68,31 @@ Flickable {
     // 一次真图。预测公式与 Rust 的 fit_zoom / display_size 一致，因此
     // 渲染落地时不会跳变。
     readonly property bool viewportPending: viewportTimer.running
+    // host.dpr = 屏幕 devicePixelRatio（OS 缩放，如 125% = 1.25）。Rust 端
+    // zoom 定义为「物理像素/图像像素」，逻辑显示尺寸 = 画布 × zoom / dpr；
+    // 这里的预测公式必须与 fit_zoom / display_size 严格一致，否则滚轮/拖窗
+    // 停手瞬间落地渲染会与预测值跳变。dpr = 1 时这些除/乘都是恒等。
+    readonly property real dpr: host ? host.dpr : 1.0
     readonly property real fitScalePreview: {
         if (!bridge.fit_mode || bridge.image_width <= 0 || bridge.image_height <= 0)
             return 0
-        return Math.min(width / bridge.image_width,
-                        height / bridge.image_height, 1.0)
+        return Math.min(width * dpr / bridge.image_width,
+                        height * dpr / bridge.image_height, 1.0)
     }
     // 画布当前应当显示的尺寸：待渲染期间用预测值，其余用 bridge 的真值。
     // 缩放手势的预测优先（fit 已被 zoom_by 置 false）。
     readonly property real shownWidth: {
         if (zoomPending && predictedZoom > 0)
-            return Math.max(1, Math.round(bridge.image_width * predictedZoom))
+            return Math.max(1, Math.round(bridge.image_width * predictedZoom / dpr))
         if (viewportPending && fitScalePreview > 0)
-            return Math.max(1, Math.round(bridge.image_width * fitScalePreview))
+            return Math.max(1, Math.round(bridge.image_width * fitScalePreview / dpr))
         return Math.max(1, bridge.display_width)
     }
     readonly property real shownHeight: {
         if (zoomPending && predictedZoom > 0)
-            return Math.max(1, Math.round(bridge.image_height * predictedZoom))
+            return Math.max(1, Math.round(bridge.image_height * predictedZoom / dpr))
         if (viewportPending && fitScalePreview > 0)
-            return Math.max(1, Math.round(bridge.image_height * fitScalePreview))
+            return Math.max(1, Math.round(bridge.image_height * fitScalePreview / dpr))
         return Math.max(1, bridge.display_height)
     }
 

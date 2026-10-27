@@ -10,6 +10,17 @@ impl qobject::Bridge {
         self.dpr.set(ratio);
         // The on-screen preview was rendered at the old physical resolution;
         // re-render so it matches the new DPI. Only when a document is open.
+        let viewport = *self.viewport.borrow();
+        if let Some(session) = self.session.borrow_mut().as_mut() {
+            session.dpr = ratio;
+            // A fit-mode session was fitted at the old scaling; recompute the
+            // fit zoom so "fit" stays correct and 100% keeps meaning 1 image
+            // px = 1 physical px under the new dpr. Manual zooms are left
+            // alone (zoom is physical px per image px, so it is dpr-independent).
+            if session.fit {
+                session.refit(viewport);
+            }
+        }
         if self.session.borrow().is_some() {
             self.as_mut().refresh_preview();
         }
@@ -26,7 +37,7 @@ impl qobject::Bridge {
             match guard.as_mut() {
                 Some(session) if session.fit => {
                     session.refit(size);
-                    let display = display_size(session.doc.canvas, session.zoom);
+                    let display = display_size(session.doc.canvas, session.zoom, session.dpr);
                     (true, size_close(display, session.last_display))
                 }
                 _ => (false, false),

@@ -17,8 +17,40 @@ fn elapsed_ms() -> i64 {
         .unwrap_or(-1)
 }
 
+#[cfg(windows)]
+fn dpi_diagnostic() {
+    // Ground-truth DPI state straight from the OS, independent of Qt/QML
+    // binding timing. GetDpiForSystem = the real system scaling (96=100%,
+    // 120=125%, 144=150%). GetProcessDpiAwareness = whether THIS process is
+    // DPI-aware (0=unaware, 1=system, 2=per-monitor, 4=per-monitor-v2).
+    // If awareness==0 while the system is >96, Windows bitmap-stretches the
+    // whole window (blur + oversized) and Qt reports devicePixelRatio==1.0.
+    extern "system" {
+        fn GetDpiForSystem() -> u32;
+        fn GetProcessDpiAwareness(level: *mut i32) -> i32;
+    }
+    let sys_dpi = unsafe { GetDpiForSystem() };
+    let mut awareness: i32 = 0;
+    let hr = unsafe { GetProcessDpiAwareness(&mut awareness) };
+    let name = match awareness {
+        0 => "unaware",
+        1 => "system",
+        2 => "per-monitor",
+        4 => "per-monitor-v2",
+        _ => "unknown",
+    };
+    let scale = sys_dpi * 100 / 96;
+    println!(
+        "{{\"phase\":\"ui\",\"event\":\"dpi-probe\",\"sys-dpi\":{sys_dpi},\"scale\":{scale},\"awareness\":\"{name}\",\"awareness-raw\":{awareness},\"hr\":{hr}}}"
+    );
+}
+
+#[cfg(not(windows))]
+fn dpi_diagnostic() {}
+
 fn main() {
     bridge::mark_process_start();
+    dpi_diagnostic();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let selftest = args.iter().any(|a| a == "--selftest");

@@ -957,7 +957,7 @@ impl qobject::Bridge {
         );
         let viewport = *self.viewport.borrow();
         let opts = self.decode_opts();
-        match Session::open(path, viewport, (*self.save_quality()).clamp(1, 100) as u8, opts) {
+        match Session::open(path, viewport, (*self.save_quality()).clamp(1, 100) as u8, opts, self.dpr.get()) {
             Ok((session, ms)) => {
                 if let Some((w, h)) = session.downsampled_from {
                     println!(

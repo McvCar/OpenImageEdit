@@ -1,19 +1,38 @@
 // geom 相关项。所有项标 pub(in crate::bridge)，mod.rs 再导出。
 use super::*;
 
-pub(in crate::bridge) fn fit_zoom(canvas: Size, viewport: Size) -> f64 {
+/// Zoom-to-fit: the largest zoom that fits the (logical) viewport.
+///
+/// `zoom` is defined as *physical* pixels per image pixel (the convention
+/// used by Photos and Photoshop for "actual size"): at zoom 1.0 one image
+/// pixel occupies one physical pixel on screen, whatever the OS scaling. The
+/// on-screen item is sized in logical pixels, so the physical viewport is
+/// `viewport × dpr` and the fitting zoom is `viewport × dpr / canvas`, capped
+/// at 1.0 (fit never zooms past 100%). At dpr = 1 this is exactly the old
+/// `viewport / canvas`, so 100%-scaling displays are unchanged.
+pub(in crate::bridge) fn fit_zoom(canvas: Size, viewport: Size, dpr: f64) -> f64 {
+    let dpr = if dpr.is_finite() && dpr > 0.0 { dpr } else { 1.0 };
     if canvas.pixels() == 0 || viewport.pixels() == 0 {
         return 1.0;
     }
-    let sx = viewport.width as f64 / canvas.width as f64;
-    let sy = viewport.height as f64 / canvas.height as f64;
+    let sx = (viewport.width as f64 * dpr) / canvas.width as f64;
+    let sy = (viewport.height as f64 * dpr) / canvas.height as f64;
     sx.min(sy).min(1.0)
 }
 
-pub(in crate::bridge) fn display_size(canvas: Size, zoom: f64) -> Size {
+/// On-screen (logical) size of the image at a given zoom.
+///
+/// `zoom` is physical pixels per image pixel, and the QML `Image` item is
+/// sized in logical pixels, so the logical size is `canvas × zoom / dpr`. At
+/// zoom 1.0 (100%) the image is 1 image px = 1 physical px independent of OS
+/// scaling — matching Photos/PS "actual size". Dividing by dpr (rather than
+/// the old bare `canvas × zoom`) is what keeps 100% from being 25% larger than
+/// Photos on a 125%-scaled display. At dpr = 1 this is unchanged.
+pub(in crate::bridge) fn display_size(canvas: Size, zoom: f64, dpr: f64) -> Size {
+    let dpr = if dpr.is_finite() && dpr > 0.0 { dpr } else { 1.0 };
     Size::new(
-        ((canvas.width as f64 * zoom).round() as u64).clamp(1, MAX_DISPLAY_EDGE as u64) as u32,
-        ((canvas.height as f64 * zoom).round() as u64).clamp(1, MAX_DISPLAY_EDGE as u64) as u32,
+        ((canvas.width as f64 * zoom / dpr).round() as u64).clamp(1, MAX_DISPLAY_EDGE as u64) as u32,
+        ((canvas.height as f64 * zoom / dpr).round() as u64).clamp(1, MAX_DISPLAY_EDGE as u64) as u32,
     )
 }
 
@@ -30,10 +49,12 @@ pub(in crate::bridge) fn size_close(a: Size, b: Size) -> bool {
 /// Preview bitmap size for a display size.
 ///
 /// The bitmap is rendered in PHYSICAL pixels: the QML `Image` item is sized in
-/// logical pixels but the GPU draws it at `logical × devicePixelRatio` physical
-/// pixels, so the source texture must match that to stay crisp. At dpr = 1 this
-/// is exactly the display size (no behaviour change); at dpr > 1 the preview is
-/// upscaled accordingly so a fit-mode image is no longer blurred by the GPU.
+/// logical pixels (`display`) but the GPU draws it at `logical × devicePixelRatio`
+/// physical pixels, so the source texture must match that to stay crisp. Since
+/// `display` is already `canvas × zoom / dpr`, the physical size is `canvas ×
+/// zoom` — independent of OS scaling. At dpr = 1 this is exactly the display
+/// size (no behaviour change); at dpr > 1 the preview is upscaled accordingly
+/// so a fit-mode image is no longer blurred by the GPU.
 ///
 /// Two caps still apply, in order:
 ///  1. The document's own resolution — zooming past 100% cannot create detail,
@@ -125,6 +146,77 @@ mod preview_target_tests {
         let canvas = Size::new(1926, 1109);
         let display = Size::new(2000, 1158); // zoom 104%
         assert_eq!(preview_target(display, canvas, 2.0), canvas);
+    }
+}
+
+#[cfg(test)]
+mod fit_zoom_tests {
+    use crate::bridge::*;
+
+    #[test]
+    fn dpr_one_matches_legacy_fit() {
+        // Regression: at 100% OS scaling the fit zoom is exactly the old
+        // viewport/canvas value — nothing about 100%-scaling displays changes.
+        let canvas = Size::new(1926, 1109);
+        let viewport = Size::new(880, 507);
+        let z = fit_zoom(canvas, viewport, 1.0);
+        assert!((z - (880f64 / 1926.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fit_never_exceeds_100pct() {
+        // A viewport larger than the canvas still caps at 1.0 (fit is
+        // never a zoom-in), at any dpr.
+        let canvas = Size::new(100, 100);
+        let viewport = Size::new(4000, 4000);
+        assert_eq!(fit_zoom(canvas, viewport, 1.25), 1.0);
+    }
+
+    #[test]
+    fn fit_scales_with_dpr() {
+        // At 125% the same window holds 1.25× more physical pixels, so the
+        // fitting (physical-px-per-image-px) zoom is 1.25× the dpr-1 value.
+        let canvas = Size::new(1926, 1109);
+        let viewport = Size::new(880, 507);
+        let z1 = fit_zoom(canvas, viewport, 1.0);
+        let z125 = fit_zoom(canvas, viewport, 1.25);
+        assert!((z125 - z1 * 1.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn degenerate_canvas_falls_back_to_100pct() {
+        assert_eq!(fit_zoom(Size::new(0, 100), Size::new(500, 500), 1.25), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod display_size_tests {
+    use crate::bridge::*;
+
+    #[test]
+    fn hundred_pct_is_one_physical_px_at_any_dpr() {
+        // The core fix: at zoom 1.0 the image is 1 image px = 1 physical px,
+        // so the *logical* size is canvas/dpr. On a 125%-scaled display a
+        // 1000-px image shows at 800 logical px (×1.25 = 1000 physical) —
+        // the same physical size as Photos, not 25% larger.
+        let canvas = Size::new(1000, 800);
+        assert_eq!(display_size(canvas, 1.0, 1.0), Size::new(1000, 800));
+        assert_eq!(display_size(canvas, 1.0, 1.25), Size::new(800, 640));
+        assert_eq!(display_size(canvas, 1.0, 1.5), Size::new(667, 533));
+    }
+
+    #[test]
+    fn dpr_one_is_unchanged() {
+        // Regression: 100%-scaling displays see the identical logical size as
+        // before the fix (canvas × zoom).
+        let canvas = Size::new(1926, 1109);
+        assert_eq!(display_size(canvas, 0.5, 1.0), Size::new(963, 555));
+    }
+
+    #[test]
+    fn clamps_to_one_min_pixel() {
+        // A sub-pixel display size never rounds to zero.
+        assert_eq!(display_size(Size::new(1, 1), 0.01, 16.0), Size::new(1, 1));
     }
 }
 

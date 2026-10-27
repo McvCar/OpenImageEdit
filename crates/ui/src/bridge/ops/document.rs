@@ -235,6 +235,7 @@ impl qobject::Bridge {
                     decoded,
                     viewport,
                     (*self.save_quality()).clamp(1, 100) as u8,
+                    self.dpr.get(),
                 );
                 self.as_mut().set_load_failed(false);
                 self.as_mut().set_decode_ms(decode_ms);

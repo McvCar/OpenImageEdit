@@ -43,6 +43,12 @@ pub(in crate::bridge) struct Session {
     pub(in crate::bridge) downsampled_from: Option<(u32, u32)>,
     /// Decoder hint shown in the status bar (e.g. PSD flattened preview).
     pub(in crate::bridge) note: Option<String>,
+    /// Screen device-pixel-ratio (OS scaling, e.g. 1.25 at 125%). Kept on the
+    /// session so `refit`/`from_decoded` can compute a correct fit zoom even
+    /// before the first `render`. Mirrors the bridge's `dpr` (synced by
+    /// `set_dpr`); used by `fit_zoom`/`display_size` to make 100% mean
+    /// 1 image px = 1 *physical* px (Photos/PS convention).
+    pub(in crate::bridge) dpr: f64,
 }
 
 /// Live "调整颜色" state (history-free until the panel commits).
@@ -115,10 +121,17 @@ pub(in crate::bridge) enum Refresh {
 impl Session {
     /// Build a session from already-decoded pixels (the decode itself runs
     /// either inline for automation or on the worker thread for the UI).
-    pub(in crate::bridge) fn from_decoded(path: &Path, decoded: Decoded, viewport: Size, save_quality: u8) -> (Self, i32) {
+    pub(in crate::bridge) fn from_decoded(
+        path: &Path,
+        decoded: Decoded,
+        viewport: Size,
+        save_quality: u8,
+        dpr: f64,
+    ) -> (Self, i32) {
         let t0 = Instant::now();
         let doc = Document::from_image(decoded.image);
-        let zoom = fit_zoom(doc.canvas, viewport);
+        let dpr = if dpr.is_finite() && dpr > 0.0 { dpr } else { 1.0 };
+        let zoom = fit_zoom(doc.canvas, viewport, dpr);
         let ms = t0.elapsed().as_millis().min(i32::MAX as u128) as i32;
         // A relative CLI path ("photo.jpg") must not leak into the session: the
         // status-bar path, the "save a copy" target and the "open the same file
@@ -144,6 +157,7 @@ impl Session {
                 adjust: None,
                 downsampled_from: decoded.downsampled_from,
                 note: decoded.note,
+                dpr,
             },
             ms,
         )
@@ -156,16 +170,17 @@ impl Session {
         viewport: Size,
         save_quality: u8,
         opts: DecodeOptions,
+        dpr: f64,
     ) -> Result<(Self, i32), String> {
         let t0 = Instant::now();
         let decoded = decode_path(path, opts).map_err(|e| e.to_string())?;
         let decode_ms = t0.elapsed().as_millis().min(i32::MAX as u128) as i32;
-        let (session, _) = Self::from_decoded(path, decoded, viewport, save_quality);
+        let (session, _) = Self::from_decoded(path, decoded, viewport, save_quality, dpr);
         Ok((session, decode_ms))
     }
 
     pub(in crate::bridge) fn refit(&mut self, viewport: Size) {
-        self.zoom = fit_zoom(self.doc.canvas, viewport);
+        self.zoom = fit_zoom(self.doc.canvas, viewport, self.dpr);
         self.fit = true;
     }
 
@@ -191,7 +206,7 @@ impl Session {
     pub(in crate::bridge) fn render(&mut self, zoom_only: bool, dpr: f64) -> Result<Rendered, String> {
         let prof_t0 = Instant::now();
         let canvas = self.doc.canvas;
-        let display = display_size(canvas, self.zoom);
+        let display = display_size(canvas, self.zoom, dpr);
         let target = preview_target(display, canvas, dpr);
         if target.pixels() == 0 {
             return Err("empty canvas".into());
