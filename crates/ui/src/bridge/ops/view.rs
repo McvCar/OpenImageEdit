@@ -1,9 +1,35 @@
 // 视口 / 缩放 / 预览刷新。
 use super::super::*;
 
+/// Append a line to a small DPI diagnostic log so the *real* devicePixelRatio
+/// the running app sees can be confirmed on a specific machine without a
+/// console. Pure std file I/O (no Windows FFI — a previous FFI-based probe
+/// raised an access violation on first call, so this stays in pure Rust).
+/// The file is tiny and overwritten on each launch.
+fn dpr_log(line: &str) {
+    let Some(root) = std::env::var_os("APPDATA") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(root).join("ImageEdit");
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("dpr.log");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = std::fs::write(&file, format!("{}\n", line).as_bytes());
+    let _ = stamp; // (kept for clarity; timestamp is implicit from launch)
+}
+
 impl qobject::Bridge {
     pub fn set_dpr(mut self: Pin<&mut Self>, ratio: f64) {
         let ratio = if ratio.is_finite() && ratio > 0.0 { ratio } else { 1.0 };
+        dpr_log(&format!(
+            "set_dpr ratio={} dpr-before={:.3} pid={}",
+            ratio,
+            self.dpr.get(),
+            std::process::id()
+        ));
         if (self.dpr.get() - ratio).abs() < 0.001 {
             return;
         }
