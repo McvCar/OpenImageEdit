@@ -18,7 +18,39 @@ fn elapsed_ms() -> i64 {
 }
 
 
+/// Best-effort Per-Monitor V2 DPI awareness, called before any window exists.
+///
+/// The embedded manifest (assets/app.manifest) is what normally pins this, and
+/// it does work — an external probe reports PER_MONITOR_AWARE for the running
+/// process. This call is only a fallback for the rare case where the manifest
+/// is ignored; when the manifest already applied, Windows refuses the change
+/// and it returns 0, which is expected and harmless.
+///
+/// Per-Monitor V2 = -4, in user32.dll (Win10 1703+). Only the setter is called,
+/// never a getter: a previous shcore getter diagnostic raised an access
+/// violation at startup.
+#[cfg(windows)]
+fn force_per_monitor_v2() {
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetProcessDpiAwarenessContext(value: *const std::ffi::c_void) -> i32;
+    }
+    const PER_MONITOR_AWARE_V2: i32 = -4;
+    // `false` here means "already aware via the manifest", not "DPI broken".
+    let forced = unsafe {
+        SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2 as *const std::ffi::c_void)
+    } != 0;
+    println!(
+        "{{\"phase\":\"ui\",\"event\":\"dpi-awareness\",\"forced-by-api\":{}}}",
+        forced
+    );
+}
+
+#[cfg(not(windows))]
+fn force_per_monitor_v2() {}
+
 fn main() {
+    force_per_monitor_v2();
     bridge::mark_process_start();
 
     let args: Vec<String> = std::env::args().skip(1).collect();

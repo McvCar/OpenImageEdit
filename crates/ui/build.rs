@@ -4,8 +4,10 @@ fn main() {
     // cxx-qt-build's own rerun-if-changed directives do not cover the QML
     // source, so a QML-only edit rebuilt nothing and the qrc silently kept
     // embedding the stale main.qml (the "界面与最新源码不一致" trap). Watch
-    // the QML tree explicitly.
-    println!("cargo:rerun-if-changed=qml");
+    // the QML tree explicitly — per FILE, not just the directory: Cargo only
+    // tracks the directory's own mtime, so editing a file inside it would not
+    // rerun this script.
+    watch_dir_recursive("qml");
     // Rebuild when the embedded DPI manifest changes.
     println!("cargo:rerun-if-changed=assets/app.manifest");
     CxxQtBuilder::new_qml_module(
@@ -81,6 +83,26 @@ fn main() {
         // to the MSVC toolkit (rc.exe) already.
         res.set_toolkit_path(&find_windows_sdk_bin().to_string_lossy());
         res.compile().expect("failed to embed Windows resources");
+    }
+}
+
+/// Emit `rerun-if-changed` for every file under `dir` (recursively). Cargo
+/// only watches a directory's own mtime, so a directory-level directive misses
+/// edits to files inside it — which silently kept stale QML in the qrc.
+fn watch_dir_recursive(dir: &str) {
+    let mut stack = vec![std::path::PathBuf::from(dir)];
+    while let Some(path) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                println!("cargo:rerun-if-changed={}", p.display());
+            }
+        }
     }
 }
 

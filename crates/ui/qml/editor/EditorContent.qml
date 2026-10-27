@@ -212,12 +212,15 @@ Item {
     // Report the screen's device-pixel-ratio to the bridge so the preview
     // bitmap is rendered at the physical resolution (logical × dpr). Without
     // this a window at >100% Windows scaling gets a logically-sized bitmap
-    // stretched by the GPU → the whole image is uniformly blurred. `window`
-    // is this Item's top-level window (main Window or a DocWindow); its
-    // screen's devicePixelRatio is the Windows scaling factor. The binding is
-    // fully reactive: it fires on start, on scaling changes, and when the
-    // window moves to a different-density monitor.
-    property real dpr: window ? window.screen.devicePixelRatio : 1.0
+    // stretched by the GPU → the whole image is uniformly blurred.
+    //
+    // MUST use the attached `Screen` type, not `window.screen`: the attached
+    // `window` property evaluates to null/throws here (EditorContent is
+    // instantiated inside a Window owned by another file), so the old
+    // `window ? window.screen.devicePixelRatio : 1.0` binding silently fell
+    // back to 1.0 forever — the app then drew at logical size (25% too large
+    // on a 125% display) with the bitmap upscaled (blurred).
+    property real dpr: Screen.devicePixelRatio > 0 ? Screen.devicePixelRatio : 1.0
     onDprChanged: bridge.set_dpr(dpr)
 
     // ---- 单实例：接收另一个进程交过来的图片 -------------------------
