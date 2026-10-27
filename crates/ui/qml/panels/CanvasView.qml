@@ -203,6 +203,12 @@ Flickable {
         cache: false
         fillMode: Image.Stretch
         source: bridge.preview_url
+        // 平滑只在"真的在缩放"时开：位图是 1:1 物理像素渲染的，此时贴图尺寸
+        // 与设备像素尺寸完全相等（如 360×318 位图 → 360×318 设备像素）。但
+        // 逻辑坐标取整后乘 dpr（如 1.25）不一定是整数，x/y 常落半像素；开
+        // 着 smooth 就会双线性插值，整幅均匀发糊。1:1 时关掉平滑即精确取样。
+        smooth: Math.abs(implicitWidth - width * dpr) > 0.5
+                || Math.abs(implicitHeight - height * dpr) > 0.5
 
         // 显示比例一变（缩放手势的预测拉伸也算）就重映射选区。
         onWidthChanged: host.remapSelectionToScale()
