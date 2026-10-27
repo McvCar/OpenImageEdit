@@ -6,6 +6,8 @@ fn main() {
     // embedding the stale main.qml (the "界面与最新源码不一致" trap). Watch
     // the QML tree explicitly.
     println!("cargo:rerun-if-changed=qml");
+    // Rebuild when the embedded DPI manifest changes.
+    println!("cargo:rerun-if-changed=assets/app.manifest");
     CxxQtBuilder::new_qml_module(
         QmlModule::new("com.imageedit")
             .qml_file("qml/main.qml")
@@ -68,6 +70,12 @@ fn main() {
         res.set_icon("assets/app.ico");
         res.set("FileDescription", "ImageEdit");
         res.set("ProductName", "ImageEdit");
+        // Embed the PerMonitorV2 DPI-awareness manifest. Without it the process
+        // is DPI-unaware: at >100% Windows scaling the OS bitmap-stretches the
+        // whole window (UI + image) and Qt reports devicePixelRatio == 1.0, so
+        // the preview stays blurred and 100% zoom looks larger than other apps.
+        // With it, Qt sees the real per-monitor DPI and renders crisp.
+        res.set_manifest_file("assets/app.manifest");
         // Pin the toolkit path so winresource never probes the registry
         // (reg.exe is blocked in sandboxed builds). The MSVC target defaults
         // to the MSVC toolkit (rc.exe) already.
