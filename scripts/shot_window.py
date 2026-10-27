@@ -41,6 +41,14 @@ def find_main_window(pid):
 
 def main():
     import PIL.ImageGrab  # noqa: F401  (ensure pillow present)
+    # This script runs inside an ordinary DPI-unaware Python, so GetWindowRect
+    # and the DC would come back in *virtualized* (scaled-down) coordinates and
+    # PrintWindow would render into a too-small bitmap. Switch this thread to
+    # Per-Monitor-V2 so every measurement is in real device pixels.
+    try:
+        user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception:
+        pass
     target_pid = int(sys.argv[1])
     out_path = sys.argv[2]
     hwnd = find_main_window(target_pid)
