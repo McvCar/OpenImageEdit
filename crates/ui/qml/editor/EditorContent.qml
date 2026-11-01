@@ -52,8 +52,8 @@ Item {
     signal windowFitRequested()
 
     // 把 win 调成"刚好装下这张图"：宽高 = 图片 100% 显示尺寸（逻辑像素）
-    // + 画布以外的 chrome；超过屏幕可用区域就按屏幕封顶（图片随后由
-    // 适应窗口缩放到可见范围），不小于窗口最小尺寸；最大化/全屏不动。
+    // + 画布以外的 chrome；装不下时图片按同一比例缩到屏幕内（保宽高比），
+    // 不小于窗口最小尺寸；最大化/全屏不动。
     function fitWindowToImage(win) {
         if (!win || root.automationRun)
             return
@@ -63,18 +63,14 @@ Item {
         if (win.visibility !== Window.Windowed)
             return
         const dpr = root.dpr > 0 ? root.dpr : 1
-        let w = Math.round(bridge.image_width / dpr)
-        let h = Math.round(bridge.image_height / dpr)
+        // 图片本身 100% 显示要的画布尺寸，和画布以外的界面开销分开记，
+        // 后面按比例缩图时只缩图片那部分，chrome 是固定的。
+        const imgW = Math.max(1, bridge.image_width / dpr)
+        const imgH = Math.max(1, bridge.image_height / dpr)
         // 图层面板浮在画布右侧，扣掉它之后才是图片可用的宽度。
-        if (root.panelVisible)
-            w += layerPanel.width
-        h += root.toolbarHeight + root.statusHeight
-        if (root.markBarVisible)
-            h += root.toolbarHeight
-        const minW = win.minimumWidth > 0 ? win.minimumWidth : 320
-        const minH = win.minimumHeight > 0 ? win.minimumHeight : 240
-        let targetW = Math.max(minW, w)
-        let targetH = Math.max(minH, h)
+        const chromeW = root.panelVisible ? layerPanel.width : 0
+        const chromeH = root.toolbarHeight + root.statusHeight
+                        + (root.markBarVisible ? root.toolbarHeight : 0)
         // 屏幕可用区域：**不能**用 Screen.availableWidth/availableHeight ——
         // 那是 Qt 5 的名字，Qt 6 上取到的是 undefined（实测 aw=undefined
         // ah=undefined），旧代码于是静默 fallback 成整屏 3440×1440，而真实
@@ -90,10 +86,25 @@ Item {
         const availH = Math.min(root.Screen.desktopAvailableHeight || sh, sh)
         // 留 48px 边距，别把窗口贴死在屏幕边缘/任务栏上。
         const margin = 48
-        if (availW > 0)
-            targetW = Math.min(targetW, Math.max(minW, availW - margin))
-        if (availH > 0)
-            targetH = Math.min(targetH, Math.max(minH, availH - margin))
+        const maxW = availW > 0 ? availW - margin : 0
+        const maxH = availH > 0 ? availH - margin : 0
+        // 装不下时按**同一比例**缩图片，而不是把宽、高分别砍到屏幕上限：
+        // 8160×6120（4:3）分别砍会得到 3392×1344（2.5:1），图只有 1704 宽，
+        // 左右各空 844px —— 就是"窗口宽度没有收缩到图片大小"。
+        let scale = 1
+        if (maxW > 0)
+            scale = Math.min(scale, Math.max(0.02, (maxW - chromeW) / imgW))
+        if (maxH > 0)
+            scale = Math.min(scale, Math.max(0.02, (maxH - chromeH) / imgH))
+        const minW = win.minimumWidth > 0 ? win.minimumWidth : 320
+        const minH = win.minimumHeight > 0 ? win.minimumHeight : 240
+        let targetW = Math.max(minW, Math.round(imgW * scale) + chromeW)
+        let targetH = Math.max(minH, Math.round(imgH * scale) + chromeH)
+        // 最小尺寸可能反倒把窗口撑出可用区域，最后再钳一次。
+        if (maxW > 0)
+            targetW = Math.min(targetW, Math.max(minW, maxW))
+        if (maxH > 0)
+            targetH = Math.min(targetH, Math.max(minH, maxH))
         win.width = Math.round(targetW)
         win.height = Math.round(targetH)
         // 位置也要一起收：只改尺寸不动位置时，窗口若原本开在屏幕中间或
