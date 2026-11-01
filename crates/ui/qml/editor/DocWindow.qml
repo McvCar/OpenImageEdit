@@ -63,6 +63,8 @@ Window {
         anchors.fill: parent
         primary: false
         fileUrl: docWin.fileUrl
+        // 新窗口按图片大小定位（内容自己做尺寸钳制/屏幕内收边）。
+        onWindowFitRequested: content.fitWindowToImage(docWin)
         onRequestNewWindow: (fileUrl) => {
             if (docWin.newWindowFn)
                 docWin.newWindowFn(fileUrl)

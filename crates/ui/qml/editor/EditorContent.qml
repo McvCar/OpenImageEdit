@@ -30,6 +30,66 @@ Item {
     readonly property int toolbarHeight: 40
     readonly property int statusHeight: 26
 
+    // ---- 打开图片后把窗口贴合到图片大小 --------------------------------
+    // automationRun：任何 -- 开关（--selftest / --script / 各种 --probe-*）
+    // 都跑同步解码 + 固定窗口尺寸做几何断言，自动改窗口会打乱既有基线，
+    // 所以自动化运行里一律不触发（与 shell.rs 的 automation 判定一致）。
+    readonly property bool automationRun: {
+        const args = Qt.application.arguments
+        for (let i = 0; i < args.length; i++)
+            if (args[i].indexOf("--") === 0)
+                return true
+        return false
+    }
+    // 新文档装载计数（Rust 装好 session 后自增并放在刷新之后，此时尺寸已
+    // 发布）。用它而不是 image_width/h：裁剪、旋转、改画布尺寸同样会改宽高，
+    // 那些操作不该动窗口。
+    property int loadSerialSeen: bridge.loadSerial
+    onLoadSerialSeenChanged: {
+        if (root.loadSerialSeen > 0)
+            root.windowFitRequested()
+    }
+    signal windowFitRequested()
+
+    // 把 win 调成"刚好装下这张图"：宽高 = 图片 100% 显示尺寸（逻辑像素）
+    // + 画布以外的 chrome；超过屏幕可用区域就按屏幕封顶（图片随后由
+    // 适应窗口缩放到可见范围），不小于窗口最小尺寸；最大化/全屏不动。
+    function fitWindowToImage(win) {
+        if (!win || root.automationRun)
+            return
+        if (bridge.image_width <= 0 || bridge.image_height <= 0)
+            return
+        // 只在普通窗口下改：最大化/最小化/全屏时用户已经表达过尺寸意愿。
+        if (win.visibility !== Window.Windowed)
+            return
+        const dpr = root.dpr > 0 ? root.dpr : 1
+        let w = Math.round(bridge.image_width / dpr)
+        let h = Math.round(bridge.image_height / dpr)
+        // 图层面板浮在画布右侧，扣掉它之后才是图片可用的宽度。
+        if (root.panelVisible)
+            w += layerPanel.width
+        h += root.toolbarHeight + root.statusHeight
+        if (root.markBarVisible)
+            h += root.toolbarHeight
+        const minW = win.minimumWidth > 0 ? win.minimumWidth : 320
+        const minH = win.minimumHeight > 0 ? win.minimumHeight : 240
+        let targetW = Math.max(minW, w)
+        let targetH = Math.max(minH, h)
+        // 屏幕可用区域用 Screen 附加属性取（root 所在窗口的屏幕，D8 实测
+        // 可靠）；窗口对象的 win.screen 在这里拿不到，不能用来封顶。
+        // 留 48px 边距，别把窗口贴死在屏幕边缘/任务栏上。
+        const availW = root.Screen.availableWidth > 0
+                       ? root.Screen.availableWidth : root.Screen.width
+        const availH = root.Screen.availableHeight > 0
+                       ? root.Screen.availableHeight : root.Screen.height
+        if (availW > 0)
+            targetW = Math.min(targetW, Math.max(minW, availW - 48))
+        if (availH > 0)
+            targetH = Math.min(targetH, Math.max(minH, availH - 48))
+        win.width = Math.round(targetW)
+        win.height = Math.round(targetH)
+    }
+
     property bool fullscreen: false
     // Persistent-selection interaction model (no crop/selection/move mode
     // toggles): one selection lives on the canvas, crop is applied to it,

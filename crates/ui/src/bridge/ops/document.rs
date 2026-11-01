@@ -242,6 +242,9 @@ impl qobject::Bridge {
                 *self.session.borrow_mut() = Some(session);
                 self.as_mut().update_file_info();
                 self.as_mut().refresh_preview();
+                // LAST: the QML window-fit handler reads `image_width` /
+                // `display_*`, which refresh_preview just published.
+                self.as_mut().bump_load_serial();
                 if let Some((w, h)) = downsampled_from {
                     println!(
                         "{{\"phase\":\"ui\",\"event\":\"downsampled\",\"from\":\"{}x{}\",\"to\":\"{}x{}\"}}",

@@ -96,6 +96,11 @@ pub mod qobject {
         #[qproperty(bool, open_in_new_window, cxx_name = "openInNewWindow")]
         #[qproperty(i32, save_quality, cxx_name = "saveQuality")]
         #[qproperty(QString, source_path, cxx_name = "sourcePath")]
+        /// Bumped every time a NEW document is installed (open / navigate).
+        /// QML uses it to resize the window to the image once per load —
+        /// `image_width` alone cannot be used because crop/rotate/canvas
+        /// resize also change it.
+        #[qproperty(i32, load_serial, cxx_name = "loadSerial")]
         // ---- 后台解码 ----
         /// True while an image is being decoded off the UI thread; the QML
         /// poll timer calls `poll_decode()` until it flips back to false.
@@ -598,6 +603,8 @@ pub struct BridgeRust {
     /// Full path of the loaded file ("" when no file), for the clickable
     /// status-bar path button.
     source_path: QString,
+    /// Counts installed documents (see [`qobject::Bridge::load_serial`]).
+    load_serial: i32,
     /// "调整颜色" panel state published to QML.
     adjust_open: bool,
     /// Scope label shown in the panel title ("背景" / layer name).
@@ -684,6 +691,7 @@ impl Default for BridgeRust {
             open_in_new_window: cfg.open_in_new_window,
             save_quality: cfg.save_quality as i32,
             source_path: QString::default(),
+            load_serial: 0,
             adjust_open: false,
             adjust_target_name: QString::default(),
             adjust_values: QString::default(),
@@ -737,6 +745,15 @@ impl qobject::Bridge {
         if let Some(url) = write_checker_tile_bmp(&light, &dark, slot) {
             self.as_mut().set_checker_tile_url(QString::from(url.as_str()));
         }
+    }
+
+    /// Announce that a new document was installed (open / navigate / the
+    /// single-instance hand-off). QML watches the counter to size the window
+    /// to the image it just opened, so it must NOT fire for canvas edits
+    /// (crop / rotate / resize), which change `image_width` too.
+    fn bump_load_serial(mut self: Pin<&mut Self>) {
+        let next = self.load_serial().wrapping_add(1).max(1);
+        self.as_mut().set_load_serial(next);
     }
 
     /// Export a single layer's pixels as `layout_<编号>.png` next to the
@@ -970,6 +987,9 @@ impl qobject::Bridge {
                 *self.session.borrow_mut() = Some(session);
                 self.as_mut().update_file_info();
                 self.as_mut().refresh_preview();
+                // LAST: the QML window-fit handler reads `image_width` /
+                // `display_*`, which refresh_preview just published.
+                self.as_mut().bump_load_serial();
             }
             Err(err) => {
                 *self.session.borrow_mut() = None;

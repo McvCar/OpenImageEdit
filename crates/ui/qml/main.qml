@@ -31,6 +31,8 @@ Window {
         id: content
         anchors.fill: parent
         primary: true
+        // 每次装上新的图片，把窗口调成刚好装下它（内容自己判断尺寸/钳制）。
+        onWindowFitRequested: content.fitWindowToImage(shell)
         onRequestNewWindow: (fileUrl) => openNewWindow(fileUrl)
     }
 
