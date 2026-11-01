@@ -50,6 +50,15 @@ Rectangle {
         host.selFieldEditing = false
     }
 
+    // 菜单自身吃掉点击。原来菜单背景只是个 Rectangle、没有 MouseArea，
+    // 点在菜单内的空白处（行与行之间、右侧 px 单位附近）会穿透到下面那层
+    // 「点空白处关菜单」的全屏 MouseArea，于是看起来像误触关闭。
+    MouseArea {
+        anchors.fill: parent
+        acceptedButtons: Qt.AllButtons
+        z: -1
+    }
+
     Column {
         id: body
         anchors.left: parent.left

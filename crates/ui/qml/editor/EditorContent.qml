@@ -71,7 +71,6 @@ Item {
         const chromeW = root.panelVisible ? layerPanel.width : 0
         const chromeH = root.toolbarHeight + root.statusHeight
                         + (root.markBarVisible ? root.toolbarHeight : 0)
-                        + (selBar.visible ? root.toolbarHeight : 0)
         // 屏幕可用区域：**不能**用 Screen.availableWidth/availableHeight ——
         // 那是 Qt 5 的名字，Qt 6 上取到的是 undefined（实测 aw=undefined
         // ah=undefined），旧代码于是静默 fallback 成整屏 3440×1440，而真实
@@ -151,8 +150,8 @@ Item {
     readonly property real selOffY: view.canvasSurface ? view.canvasSurface.selOffY : 0
     // 当前选区工具："rect" | "ellipse" | "lasso" | "polygon" | "none"
     property string selTool: "rect"
-    // 选区工具条（第二行；激活任一种选区工具时显示）。
-    property bool selBarVisible: false
+    // 选区工具浮动面板（标记栏的「选区」按钮点开；原来那行固定工具条已取消）。
+    property bool selPopoverOpen: false
     // 加选/减选/相交的粘滞模式（拖动时按住的 Shift/Alt 会临时覆盖它）：
     // 0 替换 / 1 加选 / 2 减选 / 3 相交。
     property int selMode: 0
@@ -303,6 +302,9 @@ Item {
     readonly property bool probeSelMenu: Qt.application.arguments.indexOf("--probe-selmenu") !== -1
     // 多边形套索的进行中预览（截图核对橡皮筋 + 顶点方块）。
     readonly property bool probeSelPoly: Qt.application.arguments.indexOf("--probe-selpoly") !== -1
+    // 选区浮动面板（标记栏里的那个按钮弹出来的）：核对面板排版 + 画布是否
+    // 正确让位。选区工具条改成浮层后没有常驻行，只能靠它截图。
+    readonly property bool probeSelPop: Qt.application.arguments.indexOf("--probe-selpop") !== -1
     // Ids inside an inline component are invisible from outside, so the
     // shell / DocWindow wrappers reach the Bridge through this alias.
     readonly property alias b: bridge
@@ -547,9 +549,9 @@ MarkBar {
     toolbar: toolbar
 }
 
-// ---- 选区工具条（PS 式 options bar）--------------------------------
-SelectionBar {
-    id: selBar
+// ---- 选区浮动面板（标记栏「选区」按钮点开）--------------------------
+SelectionPopover {
+    id: selPopover
     host: root
     bridge: bridge
     toolbar: toolbar
@@ -670,7 +672,6 @@ CanvasView {
     host: root
     bridge: bridge
     markBar: markBar
-    selBar: selBar
     toolbar: toolbar
     statusBar: statusBar
     layerPanel: layerPanel
@@ -943,13 +944,29 @@ function canUseToolKeys() {
 // 两边同时激活时框选手势永远起不来。
 function setSelTool(tool) {
     root.selTool = tool
-    root.selBarVisible = tool !== "none"
+    // 选区入口现在在标记栏里：用快捷键（M / L）激活工具时把标记栏带出来，
+    // 否则按钮被藏起来，用户找不到选区面板。
     if (tool !== "none") {
+        root.markBarVisible = true
         root.markTool = "none"
         widthPopover.visible = false
         mosaicPopover.visible = false
     }
     view.canvasSurface.cancelPolygon()
+}
+
+// 标记栏「选区」按钮：开/关浮动面板。首次打开时顺手激活矩形选框，
+// 关掉面板时不动已经选好的工具（用户还在画选区）。
+function toggleSelPopover() {
+    if (!root.selPopoverOpen && root.selTool === "none")
+        root.selTool = "rect"
+    root.selPopoverOpen = !root.selPopoverOpen
+}
+
+// 面板里选中某种选区形状：切工具并收起面板，把画布让出来。
+function pickSelTool(tool) {
+    setSelTool(tool)
+    root.selPopoverOpen = false
 }
 
 function applyCrop() {
@@ -1063,6 +1080,7 @@ function onEscape() {
     if (bridge.adjustOpen) { root.cancelAdjust(); return }
     // 拾色器：Esc = 关面板（已取的色保留）。
     if (bridge.pickerOpen) { bridge.picker_close(); return }
+    if (root.selPopoverOpen) { root.selPopoverOpen = false; return }
     if (widthPopover.visible || colorPopover.visible
         || mosaicPopover.visible || fontPopover.visible || zoomMenu.visible) {
         widthPopover.visible = false
@@ -1704,6 +1722,26 @@ Timer {
             cs.selPolyActive = true
             cs.selPreview.requestPaint()
         }
+    }
+}
+
+// Probe: --probe-selpop 打开标记栏 + 选区浮动面板，并落一个矩形选区，
+// 用来核对面板排版、标记栏按钮选中态，以及画布有没有被浮层挤走。
+Timer {
+    id: selPopProbeTimer
+    interval: 800
+    running: root.probeSelPop
+    onTriggered: {
+        root.markBarVisible = true
+        if (bridge.image_width > 0 && !root.selExists)
+            // 参数是「角坐标 + 布尔模式」，漏掉最后的 mode 会让 QML 直接抛
+            // TypeError，把本 handler 后面的语句一起跳过（面板就打不开了）。
+            bridge.sel_set_rect(bridge.image_width * 0.18,
+                                bridge.image_height * 0.18,
+                                bridge.image_width * 0.76,
+                                bridge.image_height * 0.70, 0)
+        root.selTool = "rect"
+        root.selPopoverOpen = true
     }
 }
 

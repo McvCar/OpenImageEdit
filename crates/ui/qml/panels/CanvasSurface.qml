@@ -144,6 +144,9 @@ Item {
         }
 
         onPressed: (mouse) => {
+            // 在画布上按下 = 选区面板收起（不吞掉这次点击）。
+            if (host.selPopoverOpen)
+                host.selPopoverOpen = false
             // 右键：落在选区内 → 弹选区菜单（PS 的右键菜单）。
             if (mouse.button === Qt.RightButton) {
                 const p = toImage(mouse.x, mouse.y)

@@ -41,7 +41,9 @@ Rectangle {
         if (isNaN(v))
             v = sb.value
         v = Math.max(sb.from, Math.min(sb.to, v))
-        input.text = String(v)
+        // 只在需要时改写文本：每敲一个字都重设 text 会把光标顶到末尾。
+        if (input.text !== String(v))
+            input.text = String(v)
         if (v !== sb.value)
             sb.edited(v)
     }
@@ -55,11 +57,30 @@ Rectangle {
             input.focus = false
     }
 
-    // Esc / 外部关菜单：丢弃未提交的输入，把键盘还给文档。
+    // 外部关菜单 / Esc：把框里的值提交掉再交焦点。
+    // 这里绝不能「丢弃输入」—— 用户点一下菜单外面菜单就关了，丢掉等于
+    // 白敲（这正是"输入数值没效果、只有箭头有效"的来源）。
     function endEdit() {
-        input.text = String(sb.value)
+        sb.commit(input.text)
         if (input.activeFocus)
             input.focus = false
+    }
+
+    // 当前值：编辑中优先用框里已经敲的内容，箭头微调才不会把它顶掉。
+    function currentValue() {
+        let v = parseInt(input.text, 10)
+        if (isNaN(v))
+            v = sb.value
+        return Math.max(sb.from, Math.min(sb.to, v))
+    }
+
+    // 边打边生效（防抖 260ms）：数值框是即时预览的，等回车才应用的话，
+    // 用户点一下别处就白输了；连续敲三位数也只会重算一次。
+    Timer {
+        id: typeDebounce
+        interval: 260
+        repeat: false
+        onTriggered: sb.commit(input.text)
     }
 
     TextInput {
@@ -82,8 +103,10 @@ Rectangle {
                 sb.commit(text)
         }
         onAccepted: sb.finish(text)
-        Keys.onUpPressed: { sb.commit(String(sb.value + sb.step)); event.accepted = true }
-        Keys.onDownPressed: { sb.commit(String(sb.value - sb.step)); event.accepted = true }
+        // 用户每敲一个字都重新计时，停下来 260ms 才真正算一次。
+        onTextEdited: typeDebounce.restart()
+        Keys.onUpPressed: { sb.commit(String(sb.currentValue() + sb.step)); event.accepted = true }
+        Keys.onDownPressed: { sb.commit(String(sb.currentValue() - sb.step)); event.accepted = true }
         Keys.onPressed: (event) => {
             if ((event.modifiers & Qt.ControlModifier) === 0)
                 return
@@ -124,7 +147,7 @@ Rectangle {
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                onClicked: sb.finish(String(sb.value + sb.step))
+                onClicked: sb.finish(String(sb.currentValue() + sb.step))
             }
         }
         Rectangle {
@@ -143,7 +166,7 @@ Rectangle {
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                onClicked: sb.finish(String(sb.value - sb.step))
+                onClicked: sb.finish(String(sb.currentValue() - sb.step))
             }
         }
     }

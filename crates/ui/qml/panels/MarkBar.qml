@@ -15,6 +15,8 @@ Rectangle {
     readonly property alias mosaicBtn: mosaicBtn
     readonly property alias widthBtn: widthBtn
     readonly property alias colorBtn: colorBtn
+    // 选区面板的锚点（选区工具已从独立工具条搬到这里）。
+    readonly property alias selBtn: selBtn
     visible: host.markBarVisible
     anchors.top: toolbar.bottom
     anchors.left: parent.left
@@ -29,6 +31,38 @@ Rectangle {
         anchors.leftMargin: 10
         anchors.verticalCenter: parent.verticalCenter
         spacing: 2
+
+        // 选区（PS 的选框工具）：点开浮动面板选矩形 / 椭圆 / 套索 /
+        // 多边形。以前的整行固定选区工具条已经取消。
+        IconButton {
+            id: selBtn
+            tip: "选区（矩形 / 椭圆 / 套索 / 多边形，M · L）"
+            active: bridge.image_width > 0
+            selected: host.selPopoverOpen
+            onClicked: host.toggleSelPopover()
+            // 虚线方框 = 蚂蚁线选框（和实线矩形标记区分开）。
+            Canvas {
+                width: 22
+                height: 22
+                anchors.centerIn: parent
+                property color ink: selBtn.selected ? "#ffffff" : "#e9eaec"
+                onInkChanged: requestPaint()
+                onPaint: {
+                    const c = getContext("2d")
+                    c.clearRect(0, 0, width, height)
+                    c.strokeStyle = ink
+                    c.lineWidth = 1.4
+                    c.setLineDash([3, 2.5])
+                    c.beginPath()
+                    c.rect(3.5, 4.5, 15.0, 13.0)
+                    c.stroke()
+                    c.setLineDash([])
+                }
+            }
+        }
+
+        Rectangle { width: 9; height: 18; color: "transparent"
+            Rectangle { anchors.centerIn: parent; width: 1; height: 18; color: "#3c4043" } }
 
         IconButton {
             glyph: "▭"

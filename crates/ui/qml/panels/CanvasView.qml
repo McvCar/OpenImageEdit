@@ -6,7 +6,6 @@ Flickable {
     required property var host
     required property var bridge
     required property var markBar
-    required property var selBar
     required property var toolbar
     required property var statusBar
     required property var layerPanel
@@ -16,9 +15,9 @@ Flickable {
     readonly property alias canvasSurface: canvasSurface
     readonly property alias selectionViz: selectionViz
 
-    // 三行工具栏可能同时出现（标题栏 / 标记栏 / 选区栏），取最下面那行的底。
-    anchors.top: selBar.visible ? selBar.bottom
-                : (markBar.visible ? markBar.bottom : toolbar.bottom)
+    // 两行工具栏可能同时出现（标题栏 / 标记栏），取最下面那行的底。
+    // 选区工具已经是标记栏里的浮层，不再占一行。
+    anchors.top: markBar.visible ? markBar.bottom : toolbar.bottom
     anchors.bottom: statusBar.top
     anchors.left: parent.left
     // 图层面板悬浮在右侧：fit/居中必须按扣掉面板后的可见区域算，
