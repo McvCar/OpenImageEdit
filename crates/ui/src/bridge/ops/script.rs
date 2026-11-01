@@ -114,6 +114,14 @@ impl qobject::Bridge {
                         println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}")
                     }
                 }
+                other if other.starts_with("sel-resize:") => {
+                    let nums = parse_nums(other);
+                    if nums.len() == 4 {
+                        self.as_mut().sel_resize(nums[0], nums[1], nums[2], nums[3]);
+                    } else {
+                        println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}")
+                    }
+                }
                 other if other.starts_with("sel-border:")
                     || other.starts_with("sel-smooth:")
                     || other.starts_with("sel-feather:") =>

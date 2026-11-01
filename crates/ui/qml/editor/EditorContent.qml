@@ -848,12 +848,14 @@ function canvasCursor(x, y) {
         if (hit !== null && !Layers.isLocked(hit))
             return Qt.SizeAllCursor
     }
-    // 选区工具下，指到选区里 = 可拖动移动（PS 的 SizeAll）。这里用包围盒
-    // 粗判：hover 是高频路径，不值得每次都跨语言做 alpha 命中。
-    if (root.selExists && root.selTool !== "none" && root.selTool !== "polygon"
-            && ix >= root.selX && ix <= root.selX + root.selW
-            && iy >= root.selY && iy <= root.selY + root.selH)
-        return Qt.SizeAllCursor
+    // 选区工具下：边/角 → 方向光标（可拖手柄改大小），框内 → 移动光标。
+    // 用包围盒估算（hover 是高频路径，不做跨语言 alpha 命中）。
+    if (root.selExists && root.selTool !== "none") {
+        const c = Geometry.boxCursor(ix, iy, root.selX, root.selY,
+                                     root.selW, root.selH)
+        if (c >= 0)
+            return c
+    }
     return Qt.CrossCursor
 }
 

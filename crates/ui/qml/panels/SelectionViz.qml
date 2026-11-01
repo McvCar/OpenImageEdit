@@ -9,17 +9,47 @@ Item {
     z: 8
     // 暴露给 EditorContent：canvasCursor 读手柄几何算光标。
     readonly property alias layerHandles: layerHandles
+    readonly property alias selHandles: selHandles
+
+    // ---- 选区手柄（拖四边/四角改选区大小）----
+    // 拖动期间只画本地预览框，松手才让 Rust 按新包围盒重采样 mask：
+    // 每帧重采样整块选区在大图上会明显掉帧。
+    property bool resizingSel: false
+    property rect liveSelBox: Qt.rect(0, 0, 0, 0)
+
+    // 角色（nw/n/ne/e/se/s/sw/w）→ 新包围盒（显示坐标，钳在画布内）。
+    function resizedSelBox(r, role, dx, dy) {
+        const s = Math.max(host.toDispScale(), 0.0001)
+        let x = r.x, y = r.y, w = r.width, h = r.height
+        if (role.indexOf("w") >= 0) {
+            const nx = Math.max(0, Math.min(Math.round(x + dx), x + w - s))
+            w = x + w - nx
+            x = nx
+        } else if (role.indexOf("e") >= 0) {
+            w = Math.min(Math.max(s, Math.round(w + dx)), previewImage.width - x)
+        }
+        if (role.indexOf("n") >= 0) {
+            const ny = Math.max(0, Math.min(Math.round(y + dy), y + h - s))
+            h = y + h - ny
+            y = ny
+        } else if (role.indexOf("s") >= 0) {
+            h = Math.min(Math.max(s, Math.round(h + dy)), previewImage.height - y)
+        }
+        return Qt.rect(x, y, Math.max(w, s), Math.max(h, s))
+    }
 
     // ---- 选区轮廓（蚂蚁线）--------------------------------------------
     // 轮廓真值在 Rust（mask 的 marching squares 轮廓，图像坐标），QML 只在
     // selVersion 变化时拉一次，避免每次缩放/重绘都跨语言跑几十万像素。
     Canvas {
         id: ants
-        visible: host.selExists
-        x: previewImage.x
-        y: previewImage.y
-        width: previewImage.width
-        height: previewImage.height
+        visible: host.selExists && !selectionViz.resizingSel
+        // 画布比预览图大 1px：轮廓正好落在图像边缘时（全选 / 贴边选区），
+        // 1px 描边有一半在 x=0 外被裁掉，左边那一条会"看不见"。
+        x: previewImage.x - 1
+        y: previewImage.y - 1
+        width: previewImage.width + 2
+        height: previewImage.height + 2
         // 蚂蚁线要在静止场景里持续流动，必须用 Immediate + Image
         //（Cooperative 策略会把单次 requestPaint 丢掉）。
         renderStrategy: Canvas.Immediate
@@ -86,8 +116,9 @@ Item {
                 if (s <= 0)
                     return
                 // 拖动选区时的临时偏移（松手后由 Rust 平移 mask 接管）。
-                const ox = host.selOffX || 0
-                const oy = host.selOffY || 0
+                // +1.5 = 画布相对预览图的 1px 外扩 + 0.5px 像素中心对齐。
+                const ox = (host.selOffX || 0) + 1.5
+                const oy = (host.selOffY || 0) + 1.5
                 // PS 的蚂蚁线 = 白底 + 黑虚线：白段在黑底照片上可见，黑段
                 // 在白底照片上可见。**先**铺白实线，再叠黑虚线（顺序反了
                 // 就只剩黑虚线，浅色照片上整圈看不见）。
@@ -102,6 +133,9 @@ Item {
                     ctx.moveTo(ring[0][0] * s + ox, ring[0][1] * s + oy)
                     for (var j = 1; j < ring.length; j++)
                         ctx.lineTo(ring[j][0] * s + ox, ring[j][1] * s + oy)
+                    // 轮廓点是「左上 → 顺时针」一圈，最后一点到起点那一段
+                    // 得自己闭合 —— 少了它，矩形左边整条蚂蚁线不见。
+                    ctx.closePath()
                 }
                 ctx.stroke()
                 // 上面再走一条黑色虚线，相位滚动 = 流动。
@@ -116,11 +150,65 @@ Item {
         }
     }
 
+    // 拖动选区手柄时的预览框（虚线 + 手柄跟随），松手后由蚂蚁线接管。
+    DashedRect {
+        id: selResizeViz
+        visible: selectionViz.resizingSel
+        z: 7
+        x: previewImage.x
+        y: previewImage.y
+        width: previewImage.width
+        height: previewImage.height
+        rx: selectionViz.liveSelBox.x
+        ry: selectionViz.liveSelBox.y
+        rw: selectionViz.liveSelBox.width
+        rh: selectionViz.liveSelBox.height
+        dashColor: "#ffffff"
+    }
+
+    // 选区手柄：8 个蓝点 + 四边可拖。moveEnabled 关掉 —— 拖内部移动由
+    // 下层 CanvasSurface 的鼠标区处理（那里能一次性提交并走抖动优化）。
+    EdgeHandles {
+        id: selHandles
+        visible: host.selExists && !host.selRubberBanding && !host.rulerOn
+                 && host.selTool !== "none" && bridge.image_width > 0
+                 && !bridge.pickerOpen && !host.selMenuOpen
+        z: 9
+        x: previewImage.x
+        y: previewImage.y
+        width: previewImage.width
+        height: previewImage.height
+        bx: selectionViz.resizingSel ? selectionViz.liveSelBox.x : host.selX
+        by: selectionViz.resizingSel ? selectionViz.liveSelBox.y : host.selY
+        bw: selectionViz.resizingSel ? selectionViz.liveSelBox.width : host.selW
+        bh: selectionViz.resizingSel ? selectionViz.liveSelBox.height : host.selH
+        moveEnabled: false
+        pxScale: host.toDispScale()
+        resizeFn: function(startRect, role, dx, dy, free) {
+            selectionViz.liveSelBox = selectionViz.resizedSelBox(
+                        startRect, role, dx, dy)
+            if (!selectionViz.resizingSel)
+                selectionViz.resizingSel = true
+        }
+        onEngagedChanged: {
+            if (selHandles.engaged)
+                return
+            if (!selectionViz.resizingSel)
+                return
+            selectionViz.resizingSel = false
+            const s = Math.max(host.toDispScale(), 0.0001)
+            const b = selectionViz.liveSelBox
+            if (b.width >= 1 && b.height >= 1)
+                bridge.sel_resize(b.x / s, b.y / s, b.width / s, b.height / s)
+        }
+    }
+
     // Selection size badge: W×H only, in a small gray rounded chip so it
     // stays readable over any image content.
     Rectangle {
         id: selBadge
         visible: host.selExists && !host.rulerOn && !host.selRubberBanding
+                 && !selectionViz.resizingSel
         z: 8
         // host.selX/selY/selW/selH 已经是「显示坐标」（EditorContent 里
         // 由 selImg* × toDispScale() 算好），这里不要再乘一次比例。

@@ -297,6 +297,44 @@ impl qobject::Bridge {
         self.as_mut().refresh_for_selection();
     }
 
+    /// 拖手柄改选区大小（图像坐标，浮点）。Rust 侧按新包围盒重采样
+    /// mask，QML 拖动期间只画本地预览框 —— 每帧重采样大选区会卡。
+    pub fn sel_resize(mut self: Pin<&mut Self>, x: f64, y: f64, w: f64, h: f64) {
+        let canvas = match self.session.borrow().as_ref().map(|s| s.doc.canvas) {
+            Some(c) => c,
+            None => return,
+        };
+        if w < 1.0 || h < 1.0 {
+            return;
+        }
+        let bounds = Rect::new(
+            x.round() as i32,
+            y.round() as i32,
+            w.round().max(1.0) as u32,
+            h.round().max(1.0) as u32,
+        );
+        let empty = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut().and_then(|s| s.selection.as_mut()) {
+                Some(st) => {
+                    st.resize_to(bounds, canvas);
+                    st.is_empty()
+                }
+                None => return,
+            }
+        };
+        if empty {
+            // 拖到没有面积了 = 取消选区（PS 里手柄拖过对边也是这个结果）。
+            let mut guard = self.session.borrow_mut();
+            if let Some(session) = guard.as_mut() {
+                session.clear_selection();
+            }
+        }
+        self.touch_selection();
+        self.as_mut().publish_selection();
+        self.as_mut().refresh_for_selection();
+    }
+
     pub fn sel_toggle_quick_mask(mut self: Pin<&mut Self>) {
         let next = !*self.quick_mask();
         {

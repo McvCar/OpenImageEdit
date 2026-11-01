@@ -267,6 +267,64 @@ impl SelectionMask {
         }
     }
 
+    /// 缩放到新包围盒（拖手柄改选区大小）。alpha 双线性重采样，所以
+    /// 软边（羽化 / 平滑过的）拉大拉小都还是软的，不会退化成锯齿。
+    pub fn resampled_to(&self, new_bounds: Rect) -> Self {
+        if self.is_empty() || new_bounds.is_empty() {
+            return Self::empty();
+        }
+        let (sw, sh) = (self.bounds.width as usize, self.bounds.height as usize);
+        let (w, h) = (new_bounds.width as usize, new_bounds.height as usize);
+        if sw == 0 || sh == 0 {
+            return Self::empty();
+        }
+        let mut alpha = vec![0u8; w * h];
+        // 二值选区（矩形/椭圆/平滑过的）缩放后必须还是硬边：否则每拉一次
+        // 手柄，边界都会多一圈半透明像素，几次之后就糊了。羽化过的不碰。
+        let binary = self.alpha.iter().all(|&a| a == 0 || a == 255);
+        for y in 0..h {
+            // 目标像素中心 → 源像素坐标（-0.5 是像素中心约定）。
+            let sy = ((y as f32 + 0.5) / h as f32) * sh as f32 - 0.5;
+            for x in 0..w {
+                let sx = ((x as f32 + 0.5) / w as f32) * sw as f32 - 0.5;
+                let v = self.sample_bilinear(sx, sy);
+                alpha[y * w + x] = if binary {
+                    if v >= 128 { 255 } else { 0 }
+                } else {
+                    v
+                };
+            }
+        }
+        Self {
+            bounds: new_bounds,
+            alpha,
+        }
+        .crop_to_content()
+    }
+
+    /// 越界按「选区外」(=0) 处理，与 coverage_at 一致。插值中心 clamp 到
+    /// 边缘像素 —— 否则放大会把最外圈像素当成半覆盖，硬边选区缩一次就
+    /// 多一圈毛边。
+    fn sample_bilinear(&self, x: f32, y: f32) -> u8 {
+        let (w, h) = (self.bounds.width as i32, self.bounds.height as i32);
+        let x0 = (x.floor() as i32).clamp(0, w - 1);
+        let y0 = (y.floor() as i32).clamp(0, h - 1);
+        let fx = (x - x0 as f32).clamp(0.0, 1.0);
+        let fy = (y - y0 as f32).clamp(0.0, 1.0);
+        // 越界复制边缘像素（与 blur3 的边界策略一致）：若按 0 处理，
+        // 缩放后最外一圈像素会被"选区外"拉低，硬边选区就缺角了。
+        let at = |px: i32, py: i32| -> f32 {
+            let cx = px.clamp(0, w - 1);
+            let cy = py.clamp(0, h - 1);
+            self.alpha[(cy * w + cx) as usize] as f32
+        };
+        let v = at(x0, y0) * (1.0 - fx) * (1.0 - fy)
+            + at(x0 + 1, y0) * fx * (1.0 - fy)
+            + at(x0, y0 + 1) * (1.0 - fx) * fy
+            + at(x0 + 1, y0 + 1) * fx * fy;
+        v.round().clamp(0.0, 255.0) as u8
+    }
+
     // ---- 算子 ------------------------------------------------------------
 
     /// 边界：沿原边缘生成总宽 `k` 的环（内外各 k/2），PS 的「边界」语义。
@@ -580,6 +638,19 @@ impl SelectionState {
             m = m.smooth(self.ops.smooth);
         }
         self.mask = m;
+    }
+
+    /// 拖手柄改选区大小：把 base 重采样到新包围盒，边界/平滑/羽化
+    /// 参数保持不变后重算（算子本来就按新尺寸跑）。
+    pub fn resize_to(&mut self, new_bounds: Rect, canvas: Size) {
+        let full = Rect::new(0, 0, canvas.width, canvas.height);
+        let Some(r) = new_bounds.intersect(full) else {
+            self.base = SelectionMask::empty();
+            self.recompute();
+            return;
+        };
+        self.base = self.base.resampled_to(r);
+        self.recompute();
     }
 
     /// 轮廓 / 手柄 / 命中判定用的 mask（不含羽化 —— 羽化后蚂蚁线不动）。
@@ -957,6 +1028,43 @@ mod tests {
         // 也不该改动轮廓（bounds 决定蚂蚁线位置）。
         assert_eq!(f.bounds, mask.bounds);
         assert!(f.alpha.iter().all(|&a| a < 128));
+    }
+
+    #[test]
+    fn resample_scales_rect_and_stays_solid() {
+        let m = SelectionMask::rect(Rect::new(0, 0, 10, 10));
+        let big = m.resampled_to(Rect::new(20, 20, 40, 40));
+        assert_eq!(big.bounds, Rect::new(20, 20, 40, 40));
+        assert_eq!(big.coverage_at(40, 40), 255);
+        // 四角像素的插值中心被 clamp 到边缘像素，所以放大后仍然是完整
+        // 的 40×40，不会缺角。
+        assert_eq!(big.area(), 40 * 40, "area {}", big.area());
+        // 缩回去也不该出现空洞。
+        let small = big.resampled_to(Rect::new(0, 0, 5, 5));
+        assert_eq!(small.area(), 25, "area {}", small.area());
+    }
+
+    #[test]
+    fn resample_keeps_feathered_edge_soft() {
+        let m = SelectionMask::rect(Rect::new(0, 0, 40, 40)).feathered(10);
+        let small = m.resampled_to(Rect::new(0, 0, 20, 20));
+        let mids = (0..20)
+            .flat_map(|y| (0..20).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let c = small.coverage_at(x, y);
+                c > 10 && c < 245
+            })
+            .count();
+        assert!(mids > 0, "羽化软边在重采样后变成了硬边");
+    }
+
+    #[test]
+    fn resize_to_clips_to_canvas() {
+        let mut st = SelectionState::new(SelectionMask::rect(Rect::new(10, 10, 20, 20)));
+        st.resize_to(Rect::new(-10, -10, 40, 40), canvas(30, 30));
+        let b = st.mask().bounds;
+        assert!(b.x >= 0 && b.y >= 0, "{b:?}");
+        assert!(b.right() <= 30 && b.bottom() <= 30, "{b:?}");
     }
 
     #[test]

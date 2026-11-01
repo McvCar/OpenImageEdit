@@ -326,6 +326,10 @@ pub mod qobject {
         #[qinvokable]
         fn sel_translate(self: Pin<&mut Self>, dx: i32, dy: i32);
 
+        /// Resize the selection to a new bounding box (dragging a handle).
+        #[qinvokable]
+        fn sel_resize(self: Pin<&mut Self>, x: f64, y: f64, w: f64, h: f64);
+
         /// Quick mask (Q): dim outside the selection in the preview.
         #[qinvokable]
         fn sel_toggle_quick_mask(self: Pin<&mut Self>);
