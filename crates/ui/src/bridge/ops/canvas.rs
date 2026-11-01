@@ -38,7 +38,12 @@ impl qobject::Bridge {
             }
         };
         match outcome {
-            Ok(true) => self.as_mut().refresh_preview(),
+            Ok(true) => {
+                // 撤销可能把选区整个换掉（SetSelection 也在历史里）：蚂蚁线、
+                // 尺寸徽标、八个蓝点全靠这次发布刷新。
+                self.as_mut().sync_selection_after_history();
+                self.as_mut().refresh_preview();
+            }
             Ok(false) => {}
             Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
         }
@@ -61,7 +66,10 @@ impl qobject::Bridge {
             }
         };
         match outcome {
-            Ok(true) => self.as_mut().refresh_preview(),
+            Ok(true) => {
+                self.as_mut().sync_selection_after_history();
+                self.as_mut().refresh_preview();
+            }
             Ok(false) => {}
             Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
         }

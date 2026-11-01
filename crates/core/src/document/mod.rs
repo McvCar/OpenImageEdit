@@ -25,6 +25,10 @@ pub struct Document {
     /// Vector markup annotations (rect / ellipse / arrow / brush / …) drawn
     /// on top of the composite at render time. Canvas-space coordinates.
     pub marks: Vec<Mark>,
+    /// Active selection (PS-style alpha coverage map, canvas coordinates).
+    /// Lives here instead of on the UI session so Ctrl+Z walks it back in the
+    /// same history as pixel edits. `None` = nothing selected.
+    pub selection: Option<SelectionState>,
     /// Monotonic counter bumped by every committed / structural change
     /// (execute, undo, redo). Preview caches key on it: any real edit
     /// invalidates them, while history-free live mutations (layer offset
@@ -96,6 +100,7 @@ impl Document {
             view: Rect::new(0, 0, canvas.width, canvas.height),
             layers: Vec::new(),
             marks: Vec::new(),
+            selection: None,
             base_deleted: false,
             base_hidden: false,
             base_converted: false,
@@ -109,6 +114,38 @@ impl Document {
         op.apply(self)?;
         self.history.push(op);
         self.edit_epoch = self.edit_epoch.wrapping_add(1);
+        Ok(())
+    }
+
+    // ---- 选区（可撤销的文档状态，见 `EditOp::SetSelection`）-------------
+
+    /// 换一个选区（新建 / 反选 / 取消 / 平移 / 缩放）。与当前完全相同则
+    /// 不产生历史条目。
+    pub fn set_selection(&mut self, next: Option<SelectionState>) -> Result<(), EditError> {
+        if self.selection == next {
+            return Ok(());
+        }
+        let from = self.selection.clone();
+        self.execute_selection(EditOp::SetSelection { from, to: next })
+    }
+
+    /// 改边界 / 平滑 / 羽化参数（从 base 重算，不叠加）。
+    pub fn set_selection_ops(&mut self, ops: SelOps) -> Result<(), EditError> {
+        let Some(state) = self.selection.as_ref() else {
+            return Ok(());
+        };
+        let from = state.ops;
+        if from == ops {
+            return Ok(());
+        }
+        self.execute_selection(EditOp::SelectionOptions { from, to: ops })
+    }
+
+    /// 选区不碰任何一个像素，所以**不 bump `edit_epoch`**：预览合成器的
+    /// 分层缓存按 epoch 失效，不该因为拖了一下选区就整块重新重采样。
+    fn execute_selection(&mut self, op: EditOp) -> Result<(), EditError> {
+        op.apply(self)?;
+        self.history.push(op);
         Ok(())
     }
 

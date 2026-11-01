@@ -1,5 +1,8 @@
 // 选区（PS 式）命令。几何真值在 core::SelectionState，这里只做
 // 「QML 坐标 → 画布坐标 → 更新状态 → 发布」的搬运，外加视图刷新。
+//
+// 选区存在 `Document` 里（不是 session），所以每次改动都进文档历史 ——
+// Ctrl+Z 撤掉选区、Ctrl+Y 再拿回来，和像素编辑走同一条时间线。
 use super::super::*;
 
 /// Two opposite corners (possibly dragged right-to-left / bottom-to-top) →
@@ -17,11 +20,11 @@ impl qobject::Bridge {
     /// mirror the session's revision into `sel_version` so QML re-pulls the
     /// outline when — and only when — the selection really changed.
     pub(crate) fn publish_selection(mut self: Pin<&mut Self>) {
-        let (active, rect, ops, rev, quick) = {
+        let (active, rect, ops, rev, quick, can_undo, can_redo) = {
             let guard = self.session.borrow();
             match guard.as_ref() {
                 Some(session) => {
-                    let (active, rect, ops) = match session.selection.as_ref() {
+                    let (active, rect, ops) = match session.doc.selection.as_ref() {
                         Some(st) if !st.is_empty() => (
                             true,
                             st.mask().bounds,
@@ -33,11 +36,27 @@ impl qobject::Bridge {
                         ),
                         _ => (false, Rect::default(), (0, 0, 0)),
                     };
-                    (active, rect, ops, session.sel_rev as i32, session.quick_mask)
+                    (
+                        active,
+                        rect,
+                        ops,
+                        session.sel_rev as i32,
+                        session.quick_mask,
+                        session.doc.can_undo(),
+                        session.doc.can_redo(),
+                    )
                 }
-                None => (false, Rect::default(), (0, 0, 0), 0, false),
+                None => (false, Rect::default(), (0, 0, 0), 0, false, false, false),
             }
         };
+        // 选区现在是文档历史的一部分：只动选区也会让"撤销"变成可用。
+        // 之前这几步不刷新 preview，工具栏的撤销图标就会一直是灰的。
+        if *self.can_undo() != can_undo {
+            self.as_mut().set_can_undo(can_undo);
+        }
+        if *self.can_redo() != can_redo {
+            self.as_mut().set_can_redo(can_redo);
+        }
         if *self.sel_active() != active {
             self.as_mut().set_sel_active(active);
         }
@@ -71,10 +90,20 @@ impl qobject::Bridge {
     }
 
     /// Bump the session's selection revision (call after every mutation).
-    fn touch_selection(&self) {
+    pub(crate) fn touch_selection(&self) {
         if let Some(session) = self.session.borrow_mut().as_mut() {
             session.sel_rev = session.sel_rev.wrapping_add(1);
         }
+    }
+
+    /// 撤销 / 重做之后必须把选区重新发布一遍：`SetSelection` 会把文档里的
+    /// 选区整体换掉（或者换回来），QML 的蚂蚁线、尺寸徽标、手柄全靠这次
+    /// 发布刷新。放在这里是因为 undo/redo 在 canvas.rs。
+    pub(crate) fn sync_selection_after_history(mut self: Pin<&mut Self>) {
+        self.touch_selection();
+        self.as_mut().publish_selection();
+        // 快速蒙版是画进预览位图的，选区变了就得重出一帧。
+        self.as_mut().refresh_for_selection();
     }
 
     /// The quick mask is drawn INTO the preview bitmap, so every selection
@@ -85,6 +114,20 @@ impl qobject::Bridge {
         }
     }
 
+    /// 改选区参数（边界 / 平滑 / 羽化）。`SelectionOptions` 会被文档历史
+    /// 自动合并，所以数字框连点十几下也只算一步。
+    fn mutate_selection_ops(self: Pin<&mut Self>, f: impl FnOnce(&mut SelOps)) -> bool {
+        let mut guard = self.session.borrow_mut();
+        let Some(session) = guard.as_mut() else {
+            return false;
+        };
+        let Some(mut ops) = session.doc.selection.as_ref().map(|st| st.ops) else {
+            return false;
+        };
+        f(&mut ops);
+        session.doc.set_selection_ops(ops).is_ok()
+    }
+
     /// Replace / add / subtract / intersect the current selection with `mask`.
     /// mode: 0 replace, 1 add, 2 subtract, 3 intersect.
     fn combine_selection(mut self: Pin<&mut Self>, mask: SelectionMask, mode: i32) {
@@ -93,12 +136,16 @@ impl qobject::Bridge {
             None => return,
         };
         let mask = mask.clipped(canvas);
-        if !mask.is_empty() || mode != 0 {
+        // 单击（没拖出面积）不该把已有选区清掉。
+        if mask.is_empty() && mode == 0 {
+            return;
+        }
+        {
             let mut guard = self.session.borrow_mut();
             let Some(session) = guard.as_mut() else {
                 return;
             };
-            let current = session.selection.as_ref().map(|s| s.mask().clone());
+            let current = session.doc.selection.as_ref().map(|s| s.mask().clone());
             let combined = match current {
                 _ if mode == 0 => mask,
                 Some(c) if mode == 1 => c.union(&mask),
@@ -107,11 +154,12 @@ impl qobject::Bridge {
                 // 加/减/交但当前没有选区：行为同替换（与 PS 一致）。
                 _ => mask,
             };
-            session.selection = if combined.is_empty() {
+            let next = if combined.is_empty() {
                 None
             } else {
                 Some(SelectionState::new(combined))
             };
+            let _ = session.doc.set_selection(next);
         }
         self.touch_selection();
         self.as_mut().publish_selection();
@@ -184,11 +232,19 @@ impl qobject::Bridge {
     }
 
     pub fn sel_clear(mut self: Pin<&mut Self>) {
-        {
+        let changed = {
             let mut guard = self.session.borrow_mut();
-            if let Some(session) = guard.as_mut() {
-                session.clear_selection();
+            match guard.as_mut() {
+                Some(session) => {
+                    let had = session.doc.selection.is_some();
+                    session.clear_selection();
+                    had
+                }
+                None => false,
             }
+        };
+        if !changed {
+            return;
         }
         self.touch_selection();
         self.as_mut().publish_selection();
@@ -201,18 +257,16 @@ impl qobject::Bridge {
             Some(c) => c,
             None => return,
         };
-        let inverted = {
+        {
             let mut guard = self.session.borrow_mut();
             let Some(session) = guard.as_mut() else {
                 return;
             };
-            match session.selection.as_ref() {
+            let inverted = match session.doc.selection.as_ref() {
                 Some(st) => st.mask().invert(canvas),
                 None => SelectionMask::rect(Rect::new(0, 0, canvas.width, canvas.height)),
-            }
-        };
-        if let Some(session) = self.session.borrow_mut().as_mut() {
-            session.selection = Some(SelectionState::new(inverted));
+            };
+            let _ = session.doc.set_selection(Some(SelectionState::new(inverted)));
         }
         self.touch_selection();
         self.as_mut().publish_selection();
@@ -222,11 +276,8 @@ impl qobject::Bridge {
 
     pub fn sel_set_border(mut self: Pin<&mut Self>, k: i32) {
         let k = k.clamp(0, 400) as u32;
-        {
-            let mut guard = self.session.borrow_mut();
-            if let Some(st) = guard.as_mut().and_then(|s| s.selection.as_mut()) {
-                st.set_border(k);
-            }
+        if !self.as_mut().mutate_selection_ops(|ops| ops.border = k) {
+            return;
         }
         self.touch_selection();
         self.as_mut().publish_selection();
@@ -235,11 +286,8 @@ impl qobject::Bridge {
 
     pub fn sel_set_smooth(mut self: Pin<&mut Self>, k: i32) {
         let k = k.clamp(0, 400) as u32;
-        {
-            let mut guard = self.session.borrow_mut();
-            if let Some(st) = guard.as_mut().and_then(|s| s.selection.as_mut()) {
-                st.set_smooth(k);
-            }
+        if !self.as_mut().mutate_selection_ops(|ops| ops.smooth = k) {
+            return;
         }
         self.touch_selection();
         self.as_mut().publish_selection();
@@ -248,11 +296,8 @@ impl qobject::Bridge {
 
     pub fn sel_set_feather(mut self: Pin<&mut Self>, r: i32) {
         let r = r.clamp(0, 250) as u32;
-        {
-            let mut guard = self.session.borrow_mut();
-            if let Some(st) = guard.as_mut().and_then(|s| s.selection.as_mut()) {
-                st.set_feather(r);
-            }
+        if !self.as_mut().mutate_selection_ops(|ops| ops.feather = r) {
+            return;
         }
         self.touch_selection();
         self.as_mut().publish_selection();
@@ -273,7 +318,7 @@ impl qobject::Bridge {
         self.session
             .borrow()
             .as_ref()
-            .and_then(|s| s.selection.as_ref())
+            .and_then(|s| s.doc.selection.as_ref())
             .map(|st| st.mask().contains(x as f32 + 0.5, y as f32 + 0.5))
             .unwrap_or(false)
     }
@@ -288,9 +333,15 @@ impl qobject::Bridge {
         }
         {
             let mut guard = self.session.borrow_mut();
-            if let Some(st) = guard.as_mut().and_then(|s| s.selection.as_mut()) {
-                st.translate(dx, dy, canvas);
-            }
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            let Some(mut st) = session.doc.selection.clone() else {
+                return;
+            };
+            st.translate(dx, dy, canvas);
+            let next = if st.is_empty() { None } else { Some(st) };
+            let _ = session.doc.set_selection(next);
         }
         self.touch_selection();
         self.as_mut().publish_selection();
@@ -313,22 +364,18 @@ impl qobject::Bridge {
             w.round().max(1.0) as u32,
             h.round().max(1.0) as u32,
         );
-        let empty = {
+        {
             let mut guard = self.session.borrow_mut();
-            match guard.as_mut().and_then(|s| s.selection.as_mut()) {
-                Some(st) => {
-                    st.resize_to(bounds, canvas);
-                    st.is_empty()
-                }
-                None => return,
-            }
-        };
-        if empty {
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            let Some(mut st) = session.doc.selection.clone() else {
+                return;
+            };
+            st.resize_to(bounds, canvas);
             // 拖到没有面积了 = 取消选区（PS 里手柄拖过对边也是这个结果）。
-            let mut guard = self.session.borrow_mut();
-            if let Some(session) = guard.as_mut() {
-                session.clear_selection();
-            }
+            let next = if st.is_empty() { None } else { Some(st) };
+            let _ = session.doc.set_selection(next);
         }
         self.touch_selection();
         self.as_mut().publish_selection();
@@ -341,7 +388,7 @@ impl qobject::Bridge {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
                 // 没有选区时快速蒙版没有意义（PS 里也是灰的）。
-                Some(session) if session.selection.is_some() => {
+                Some(session) if session.doc.selection.is_some() => {
                     session.quick_mask = next;
                 }
                 _ => return,
@@ -357,7 +404,7 @@ impl qobject::Bridge {
             let guard = self.session.borrow();
             guard
                 .as_ref()
-                .and_then(|s| s.selection.as_ref())
+                .and_then(|s| s.doc.selection.as_ref())
                 .map(|st| st.mask().bounds)
         };
         let Some(rect) = rect else {
@@ -365,7 +412,15 @@ impl qobject::Bridge {
         };
         self.as_mut().crop_to(rect.x, rect.y, rect.width as i32, rect.height as i32);
         // Cropping moves the canvas origin: canvas coordinates (and therefore
-        // the selection) are no longer meaningful.
-        self.as_mut().sel_clear();
+        // the selection) are no longer meaningful. 裁剪 op 自己已经把选区清
+        // 掉了，这里只是顺手关掉快速蒙版并把状态同步回 QML。
+        {
+            let mut guard = self.session.borrow_mut();
+            if let Some(session) = guard.as_mut() {
+                session.clear_selection();
+            }
+        }
+        self.touch_selection();
+        self.as_mut().publish_selection();
     }
 }

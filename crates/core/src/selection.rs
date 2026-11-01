@@ -380,7 +380,16 @@ impl SelectionMask {
         Self { bounds, alpha }.crop_to_content()
     }
 
-    /// 平滑：抹掉边缘锯齿。模糊后阈值化（保留硬边，只圆角化）。
+    /// 平滑：抹掉边缘锯齿、把尖角磨圆。模糊后按 50% 阈值二值化。
+    ///
+    /// **模糊必须按"选区外 = 0"填充**（`replicate: false`）。之前用复制边
+    /// 缘填充，矩形选区内每一点（连同补出来的一圈）都是 255，模糊后仍
+    /// 然是 255，阈值化等于恒等变换 —— 于是"平滑"对矩形/椭圆完全没效果，
+    /// 四角永远不圆。
+    ///
+    /// 直边不会因此缩水：对称核在边缘像素中心的值恒 > 0.5（例如 r=1 时
+    /// 是 2/3），阈值 128 正好卡在原位置上；只有凸角的覆盖度掉到 ~0.25，
+    /// 被阈值削掉 —— 这就是"圆角"。
     pub fn smooth(&self, k: u32) -> Self {
         if k == 0 || self.is_empty() {
             return self.clone();
@@ -390,17 +399,22 @@ impl SelectionMask {
             return self.clone();
         }
         let r = k.max(1) as usize;
-        // 复制边缘：贴住包围盒的边不被"啃掉"（平滑只该圆角，不该缩边）。
-        let v = blur3_padded(&self.alpha, w, h, r, r, true);
-        let alpha = v
+        let v = blur3_padded(&self.alpha, w, h, r, r, false);
+        let alpha: Vec<u8> = v
             .iter()
             .map(|&x| if x >= 128.0 { 255u8 } else { 0u8 })
             .collect();
-        Self {
+        let out = Self {
             bounds: self.bounds,
             alpha,
         }
-        .crop_to_content()
+        .crop_to_content();
+        // 半径比选区本身还粗时（细线 / 小方块）阈值会把整块削空。PS 的平滑
+        // 不会让选区消失，这里退回原样 —— 宁可没效果，也别让蚂蚁线凭空没了。
+        if out.is_empty() {
+            return self.clone();
+        }
+        out
     }
 
     /// 羽化：软边。**不阈值化**，只把 alpha 抹成渐变；轮廓（bounds）不变，
@@ -586,7 +600,7 @@ impl SelectionMask {
 ///
 /// 关键点：`mask` 永远从 `base` 重新算，所以内联数字框反复改同一个参数
 /// 不会叠加；换一个参数（比如先改边界再改平滑）也是从同一个基准重算。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SelectionState {
     pub base: SelectionMask,
     pub ops: SelOps,
@@ -620,6 +634,12 @@ impl SelectionState {
 
     pub fn set_feather(&mut self, r: u32) {
         self.ops.feather = r;
+    }
+
+    /// 一次性换掉全部参数（撤销 / 重做用：`SelOps` 是整体快照）。
+    pub fn set_ops(&mut self, ops: SelOps) {
+        self.ops = ops;
+        self.recompute();
     }
 
     /// 平移整块选区（拖动选区内部）。平移 base 再重算，边界/平滑/羽化
@@ -1001,11 +1021,13 @@ mod tests {
         let before = mask.area();
         let smooth = mask.smooth(6);
         let after = smooth.area();
-        // 平滑不改变量级，只削掉锯齿角。
+        // 半径 6（≈ 一圈 12px 的圆角）对 3px 宽的锯齿是"重手"：锯齿尖被
+        // 削掉，面积必然缩小，但不该整块消失或碎成几片。
         let ratio = after as f64 / before as f64;
-        assert!(ratio > 0.85 && ratio < 1.15, "ratio {ratio}");
+        assert!(ratio > 0.45 && ratio < 1.0, "ratio {ratio}");
         // 仍然是一个整块（没有被阈值化啃出洞）。
         assert!(smooth.contains(10.5, 20.5));
+        assert_eq!(smooth.outline(1).len(), 1, "平滑后不该碎成多块");
     }
 
     #[test]
@@ -1132,6 +1154,43 @@ mod tests {
         let clipped = mask.clipped(canvas(10, 10));
         assert_eq!(clipped.bounds, Rect::new(0, 0, 10, 10));
         assert_eq!(clipped.area(), 100);
+    }
+
+    #[test]
+    fn smooth_rounds_rect_corners_but_keeps_edges() {
+        let mask = SelectionMask::rect(Rect::new(20, 20, 200, 200));
+        let s = mask.smooth(20);
+        // 四角磨圆：角上的像素不再是选中态（复制边缘填充时这里恒为 255，
+        // 也就是"平滑完全没效果"的老 bug）。
+        assert_eq!(s.coverage_at(20, 20), 0, "左上角没变圆");
+        assert_eq!(s.coverage_at(219, 219), 0, "右下角没变圆");
+        // 直边不缩：边中点的像素中心仍在 50% 线内侧。
+        assert_eq!(s.coverage_at(20, 120), 255, "左边被啃掉了");
+        assert_eq!(s.coverage_at(120, 20), 255, "上边被啃掉了");
+        assert_eq!(s.coverage_at(120, 120), 255, "内部不该有洞");
+        // 面积略减（四角），但不该塌掉。
+        let ratio = s.area() as f64 / mask.area() as f64;
+        assert!(ratio > 0.90 && ratio < 1.0, "ratio {ratio}");
+    }
+
+    #[test]
+    fn smooth_turns_four_corner_outline_into_a_rounded_ring() {
+        let mask = SelectionMask::rect(Rect::new(0, 0, 60, 60));
+        assert_eq!(mask.outline(1)[0].len(), 4, "矩形本该只有 4 个角");
+        let after = mask.smooth(10).outline(1);
+        assert_eq!(after.len(), 1);
+        // 圆角后每一级台阶都是一个点，肯定远多于 4 个。
+        assert!(after[0].len() > 8, "平滑后轮廓点数 {}", after[0].len());
+    }
+
+    #[test]
+    fn smooth_never_erases_a_thin_selection() {
+        // 1px 高的长条：半径 30 的模糊后整条都会低于阈值，但对用户来说
+        // "平滑把选区弄没了"是不可接受的，必须退回原样。
+        let mask = SelectionMask::rect(Rect::new(0, 10, 40, 1));
+        let s = mask.smooth(30);
+        assert!(!s.is_empty());
+        assert_eq!(s.area(), mask.area());
     }
 
     #[test]

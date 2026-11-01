@@ -81,6 +81,16 @@ pub enum EditOp {
         from: RgbaImage,
         params: Adjust,
     },
+    /// Replace the whole selection (new marquee / invert / clear / move /
+    /// resize). Selection is document state in PS and here too, so Ctrl+Z
+    /// walks it back together with the pixel edits in one unified history.
+    SetSelection {
+        from: Option<SelectionState>,
+        to: Option<SelectionState>,
+    },
+    /// 边界 / 平滑 / 羽化 参数调整。单独一种 op 是为了合并：数字框连点几
+    /// 下箭头不该塞进五条历史（见 `History::push`）。
+    SelectionOptions { from: SelOps, to: SelOps },
 }
 
 impl EditOp {
@@ -88,14 +98,19 @@ impl EditOp {
         match self {
             EditOp::TransformDocument { transform } => {
                 transform_document(doc, *transform);
+                // 坐标空间翻了/转了，旧的 alpha 覆盖图立刻就是错的：宁可
+                // 让选区消失，也别让它指向错位的一块区域。
+                doc.selection = None;
                 Ok(())
             }
             EditOp::CropDocument { to, .. } => {
                 apply_view(doc, *to);
+                doc.selection = None;
                 Ok(())
             }
             EditOp::ResizeDocument { to, .. } => {
                 apply_resize(doc, *to);
+                doc.selection = None;
                 Ok(())
             }
             EditOp::AddLayer { layer, index } => {
@@ -183,6 +198,7 @@ impl EditOp {
             }
             EditOp::CanvasResize { to, .. } => {
                 apply_canvas_resize(doc, *to);
+                doc.selection = None;
                 Ok(())
             }
             EditOp::BaseToLayer { .. } => {
@@ -230,6 +246,16 @@ impl EditOp {
                     }
                 }
             }
+            EditOp::SetSelection { to, .. } => {
+                doc.selection = to.clone();
+                Ok(())
+            }
+            EditOp::SelectionOptions { to, .. } => {
+                if let Some(st) = doc.selection.as_mut() {
+                    st.set_ops(*to);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -237,14 +263,17 @@ impl EditOp {
         match self {
             EditOp::TransformDocument { transform } => {
                 transform_document(doc, transform.inverted());
+                doc.selection = None;
                 Ok(())
             }
             EditOp::CropDocument { from, .. } => {
                 apply_view(doc, *from);
+                doc.selection = None;
                 Ok(())
             }
             EditOp::ResizeDocument { from, .. } => {
                 doc.restore(from.clone());
+                doc.selection = None;
                 Ok(())
             }
             EditOp::AddLayer { index, .. } => {
@@ -319,6 +348,7 @@ impl EditOp {
             }
             EditOp::CanvasResize { from, .. } => {
                 doc.restore(from.clone());
+                doc.selection = None;
                 Ok(())
             }
             EditOp::BaseToLayer { from } => {
@@ -363,6 +393,16 @@ impl EditOp {
                     }
                 }
             }
+            EditOp::SetSelection { from, .. } => {
+                doc.selection = from.clone();
+                Ok(())
+            }
+            EditOp::SelectionOptions { from, .. } => {
+                if let Some(st) = doc.selection.as_mut() {
+                    st.set_ops(*from);
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -384,6 +424,16 @@ impl History {
     }
 
     pub(crate) fn push(&mut self, op: EditOp) {
+        // 边界/平滑/羽化 的内联数字框每点一下就是一个新值：连着点十下不该
+        // 留十条历史。连续两次参数调整合并成一条（保留最早的 from、最新的
+        // to），Ctrl+Z 一次退回调整前的状态 —— 和 PS 的数字框手感一致。
+        if let EditOp::SelectionOptions { to, .. } = &op {
+            if let Some(EditOp::SelectionOptions { to: prev, .. }) = self.undo.last_mut() {
+                *prev = *to;
+                self.redo.clear();
+                return;
+            }
+        }
         self.undo.push(op);
         if self.limit > 0 && self.undo.len() > self.limit {
             self.undo.remove(0);

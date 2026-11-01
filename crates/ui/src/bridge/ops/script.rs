@@ -43,11 +43,11 @@ impl qobject::Bridge {
                         let session = guard.as_ref();
                         (
                             session
-                                .and_then(|s| s.selection.as_ref())
+                                .and_then(|s| s.doc.selection.as_ref())
                                 .map(|st| st.mask().bounds)
                                 .unwrap_or_default(),
                             session
-                                .and_then(|s| s.selection.as_ref())
+                                .and_then(|s| s.doc.selection.as_ref())
                                 .map(|st| (st.ops.border, st.ops.smooth, st.ops.feather))
                                 .unwrap_or((0, 0, 0)),
                             session.map(|s| s.sel_rev).unwrap_or(0),
@@ -57,7 +57,7 @@ impl qobject::Bridge {
                         let guard = self.session.borrow();
                         guard
                             .as_ref()
-                            .and_then(|s| s.selection.as_ref())
+                            .and_then(|s| s.doc.selection.as_ref())
                             .map(|st| !st.is_empty())
                             .unwrap_or(false)
                     };

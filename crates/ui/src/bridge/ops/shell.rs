@@ -3,8 +3,11 @@ use super::super::*;
 
 impl qobject::Bridge {
     pub fn start(mut self: Pin<&mut Self>) {
+        // `--selftest` 自带退出；`--script` 默认留窗口（有些探针要截图/看效果），
+        // 不想留下窗口时再加 `--auto-quit`。
         let selftest = std::env::args().any(|a| a == "--selftest");
-        self.as_mut().set_auto_quit(selftest);
+        let auto_quit = selftest || std::env::args().any(|a| a == "--auto-quit");
+        self.as_mut().set_auto_quit(auto_quit);
 
         let script = std::env::args().find_map(|a| {
             a.strip_prefix("--script=")

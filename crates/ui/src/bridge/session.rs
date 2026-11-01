@@ -49,9 +49,6 @@ pub(in crate::bridge) struct Session {
     /// `set_dpr`); used by `fit_zoom`/`display_size` to make 100% mean
     /// 1 image px = 1 *physical* px (Photos/PS convention).
     pub(in crate::bridge) dpr: f64,
-    /// Active selection (PS-style, canvas coordinates). `None` = nothing
-    /// selected. Everything that touches "selected pixels" goes through it.
-    pub(in crate::bridge) selection: Option<SelectionState>,
     /// Quick mask (PS's Q): dim everything OUTSIDE the selection in the
     /// PREVIEW only, so the feathered soft edge becomes visible.
     pub(in crate::bridge) quick_mask: bool,
@@ -63,7 +60,8 @@ pub(in crate::bridge) struct Session {
 
 impl Session {
     pub(in crate::bridge) fn clear_selection(&mut self) {
-        self.selection = None;
+        // 走文档的历史（选区是可撤销的文档状态）：Ctrl+Z 能把选区拿回来。
+        let _ = self.doc.set_selection(None);
         // 快速蒙版是"看选区软边"的视图态：选区没了就自动关，否则下次
         // 新建选区时会莫名其妙处于蒙版态。
         self.quick_mask = false;
@@ -71,7 +69,11 @@ impl Session {
 
     /// The mask every pixel-consuming command should use (feathered).
     pub(in crate::bridge) fn effective_selection(&self) -> Option<SelectionMask> {
-        self.selection.as_ref().map(|s| s.effective())
+        self.selection().map(|s| s.effective())
+    }
+
+    pub(in crate::bridge) fn selection(&self) -> Option<&SelectionState> {
+        self.doc.selection.as_ref()
     }
 }
 
@@ -182,7 +184,6 @@ impl Session {
                 downsampled_from: decoded.downsampled_from,
                 note: decoded.note,
                 dpr,
-                selection: None,
                 quick_mask: false,
                 sel_rev: 0,
             },
@@ -295,7 +296,7 @@ impl Session {
         // Quick mask (Q): dim everything outside the selection, preview only.
         let mut image = image;
         if self.quick_mask {
-            apply_quick_mask(&mut image, self.selection.as_ref(), canvas);
+            apply_quick_mask(&mut image, self.doc.selection.as_ref(), canvas);
         }
         // BMP on purpose: uncompressed means both the encode here and Qt's
         // decode are near memcpy speed. PNG compression dominated each live
@@ -575,7 +576,7 @@ impl Session {
     /// ants are one pixel wide, so tracing 60 MP at full resolution would
     /// cost hundreds of ms for no visible gain.
     pub(in crate::bridge) fn selection_outline_json(&self) -> String {
-        let Some(state) = self.selection.as_ref() else {
+        let Some(state) = self.doc.selection.as_ref() else {
             return "[]".to_string();
         };
         let m = state.mask();

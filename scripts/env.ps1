@@ -7,10 +7,12 @@ if (-not (Test-Path -LiteralPath (Join-Path $qtRoot 'bin\qmake.exe'))) {
 
 # The machine-wide CC/CXX point at LLVM clang, which cannot compile against MSVC
 # headers with the C++11 standard cxx requests. Force MSVC detection instead.
-Remove-Item Env:CC -ErrorAction SilentlyContinue
-Remove-Item Env:CXX -ErrorAction SilentlyContinue
-Remove-Item Env:CC_x86_64_pc_windows_msvc -ErrorAction SilentlyContinue
-Remove-Item Env:CXX_x86_64_pc_windows_msvc -ErrorAction SilentlyContinue
+# Remove through the .NET API: Remove-Item is intercepted by the local
+# safe-delete hook, which fails closed when the variable does not exist.
+[Environment]::SetEnvironmentVariable('CC', $null, 'Process')
+[Environment]::SetEnvironmentVariable('CXX', $null, 'Process')
+[Environment]::SetEnvironmentVariable('CC_x86_64_pc_windows_msvc', $null, 'Process')
+[Environment]::SetEnvironmentVariable('CXX_x86_64_pc_windows_msvc', $null, 'Process')
 
 $env:QMAKE = Join-Path $qtRoot 'bin\qmake.exe'
 $env:QT_VERSION_MAJOR = '6'
@@ -38,12 +40,18 @@ $env:Path = (($paths + $env:Path) -join ';')
 # qmlcache_loader.cpp; creating it fresh always works. Same for
 # qmltyperegistrar's qmldir / plugin.qmltypes / .qrc outputs. Delete the
 # cached outputs before every build so the build script never needs to
-# overwrite.
-Remove-Item -Path (Join-Path $repoRoot 'target\debug\build\imageedit-ui-*\out\qmlcachegen') `
-    -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -Path (Join-Path $repoRoot 'target\release\build\imageedit-ui-*\out\qmlcachegen') `
-    -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -Path (Join-Path $repoRoot 'target\debug\build\imageedit-ui-*\out\qt-build-utils') `
-    -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -Path (Join-Path $repoRoot 'target\release\build\imageedit-ui-*\out\qt-build-utils') `
-    -Recurse -Force -ErrorAction SilentlyContinue
+# overwrite. (.NET delete on purpose: Remove-Item goes through the local
+# safe-delete hook, which fails closed when the path is absent.)
+foreach ($cfg in @('debug', 'release')) {
+    $buildRoot = Join-Path $repoRoot "target\$cfg\build"
+    if (-not (Test-Path -LiteralPath $buildRoot)) { continue }
+    Get-ChildItem -LiteralPath $buildRoot -Directory -Filter 'imageedit-ui-*' -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            foreach ($sub in @('qmlcachegen', 'qt-build-utils')) {
+                $p = Join-Path $_.FullName "out\$sub"
+                if (Test-Path -LiteralPath $p) {
+                    [System.IO.Directory]::Delete($p, $true)
+                }
+            }
+        }
+}

@@ -10,7 +10,7 @@ use cxx_qt_lib::{QString, QUrl};
 use decode::{decode_path, encode, format_from_path, DecodeOptions, Decoded, Format};
 use editcore::{
     adjust_json, Adjust, AdjustTarget, Document, Histogram, Layer, Mark, MarkKind, PickedColor, Rect,
-    SelShape, Selection, SelectionMask, SelectionState, Size, Transform,
+    SelOps, SelectionMask, SelectionState, Size, Transform,
 };
 use image::RgbaImage;
 

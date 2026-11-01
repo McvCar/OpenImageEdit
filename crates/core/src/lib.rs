@@ -170,6 +170,69 @@ mod tests {
     }
 
     #[test]
+    fn selection_is_undoable_document_state() {
+        let mut doc = Document::from_image(checker(32, 32));
+        assert!(doc.selection.is_none());
+        // Ctrl+Z 一开始什么都不该有。
+        assert_eq!(doc.undo(), Err(EditError::NothingToUndo));
+
+        doc.set_selection(Some(SelectionState::new(SelectionMask::rect(Rect::new(
+            4, 4, 10, 10,
+        )))))
+        .unwrap();
+        assert_eq!(doc.selection.as_ref().unwrap().mask().bounds, Rect::new(4, 4, 10, 10));
+
+        // 取消选择也是一步历史，撤销后选区要回来。
+        doc.set_selection(None).unwrap();
+        assert!(doc.selection.is_none());
+        doc.undo().unwrap();
+        assert_eq!(doc.selection.as_ref().unwrap().mask().bounds, Rect::new(4, 4, 10, 10));
+        doc.redo().unwrap();
+        assert!(doc.selection.is_none());
+
+        // 撤回最初那一步：选区彻底消失。
+        doc.undo().unwrap();
+        doc.undo().unwrap();
+        assert!(doc.selection.is_none());
+        doc.redo().unwrap();
+        assert!(doc.selection.is_some());
+    }
+
+    #[test]
+    fn selection_ops_coalesce_into_one_history_step() {
+        let mut doc = Document::from_image(checker(32, 32));
+        doc.set_selection(Some(SelectionState::new(SelectionMask::rect(Rect::new(
+            0, 0, 20, 20,
+        )))))
+        .unwrap();
+        // 数字框连点三下：只留一条历史。
+        for k in [4u32, 8, 12] {
+            doc.set_selection_ops(SelOps {
+                smooth: k,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        assert_eq!(doc.selection.as_ref().unwrap().ops.smooth, 12);
+        doc.undo().unwrap();
+        // 一次撤销退回到"还没调过"的状态，而不是 8。
+        assert_eq!(doc.selection.as_ref().unwrap().ops.smooth, 0);
+        assert!(doc.selection.is_some(), "选区本身不该被参数撤销带走");
+    }
+
+    #[test]
+    fn crop_and_rotate_drop_the_stale_selection() {
+        let mut doc = Document::from_image(checker(32, 32));
+        doc.set_selection(Some(SelectionState::new(SelectionMask::rect(Rect::new(
+            4, 4, 10, 10,
+        )))))
+        .unwrap();
+        doc.crop(Rect::new(2, 2, 16, 16)).unwrap();
+        // 画布原点动了，旧坐标的 alpha 图立刻是错的。
+        assert!(doc.selection.is_none());
+    }
+
+    #[test]
     fn erase_selection_rejects_empty_and_outside_selections() {
         let mut doc = Document::from_image(checker(16, 16));
         assert_eq!(
