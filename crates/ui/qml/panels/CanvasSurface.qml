@@ -26,6 +26,16 @@ Item {
     // 加选/减选模式在「第一个点」时锁定：中途松掉 Shift 不该改变意图。
     property int polyMode: 0
 
+    // ---- 拖动已有选区（PS 默认：按住选区内部拖 = 移动蚂蚁线）----
+    // 拖动期间只在 QML 里给轮廓加偏移，松手才让 Rust 一次性平移 mask：
+    // 每帧跨语言重算 mask + 重抽轮廓，大选区会明显掉帧。
+    property bool moveSelActive: false
+    property real moveFromX: 0
+    property real moveFromY: 0
+    // 显示坐标下的临时偏移（SelectionViz 绘制时叠加）。
+    property real selOffX: 0
+    property real selOffY: 0
+
     // 把画布坐标换算成图像坐标（可能越界，交给 Rust 裁剪）。
     function toImage(mx, my) {
         const s = host.toDispScale()
@@ -159,6 +169,20 @@ Item {
             }
             host.settlePaste()
             selMode = modeFrom(mouse.modifiers)
+            // 已有选区时按在选区内部 = 移动选区（不动像素）。带 Shift/Alt
+            // 说明想加选/减选，那就照常新建，不进移动手势。
+            if (host.selExists && selMode === 0
+                    && host.selTool !== "polygon" && host.selTool !== "none") {
+                const pi = toImage(mouse.x, mouse.y)
+                if (bridge.sel_contains(Math.floor(pi[0]), Math.floor(pi[1]))) {
+                    moveSelActive = true
+                    moveFromX = mouse.x
+                    moveFromY = mouse.y
+                    selOffX = 0
+                    selOffY = 0
+                    return
+                }
+            }
             // 多边形套索：一次点击加一个顶点，双击 / 点回起点 / 回车闭合。
             if (host.selTool === "polygon") {
                 addPolygonPoint(mouse.x, mouse.y)
@@ -200,6 +224,11 @@ Item {
                 selPreview.requestPaint()
                 return
             }
+            if (moveSelActive) {
+                selOffX = mouse.x - moveFromX
+                selOffY = mouse.y - moveFromY
+                return
+            }
             if (pickDrag) {
                 curX = mouse.x
                 curY = mouse.y
@@ -237,6 +266,19 @@ Item {
         onReleased: (mouse) => {
             if (mouse.button !== Qt.LeftButton)
                 return
+            if (moveSelActive) {
+                moveSelActive = false
+                const sc = Math.max(host.toImageScale(), 0.0001)
+                const mdx = Math.round(selOffX * sc)
+                const mdy = Math.round(selOffY * sc)
+                // 先归零再提交：同一个事件里两次重绘会被合并成一帧，
+                // 不会出现「新位置 + 旧偏移」的双倍位移闪烁。
+                selOffX = 0
+                selOffY = 0
+                if (mdx !== 0 || mdy !== 0)
+                    bridge.sel_translate(mdx, mdy)
+                return
+            }
             if (pickDrag) {
                 pickDrag = false
                 if (pickMoved) {

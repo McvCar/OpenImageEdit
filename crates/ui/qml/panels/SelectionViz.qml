@@ -45,6 +45,9 @@ Item {
         Connections {
             target: host
             function onSelExistsChanged() { ants.reload() }
+            // 拖动选区期间只有本地偏移在变，重绘一次就够（不必拉轮廓）。
+            function onSelOffXChanged() { ants.requestPaint() }
+            function onSelOffYChanged() { ants.requestPaint() }
         }
 
         function reload() {
@@ -82,6 +85,9 @@ Item {
                 const s = host.toDispScale()
                 if (s <= 0)
                     return
+                // 拖动选区时的临时偏移（松手后由 Rust 平移 mask 接管）。
+                const ox = host.selOffX || 0
+                const oy = host.selOffY || 0
                 // PS 的蚂蚁线 = 白底 + 黑虚线：白段在黑底照片上可见，黑段
                 // 在白底照片上可见。**先**铺白实线，再叠黑虚线（顺序反了
                 // 就只剩黑虚线，浅色照片上整圈看不见）。
@@ -93,9 +99,9 @@ Item {
                     const ring = rings[i]
                     if (!ring || ring.length < 2)
                         continue
-                    ctx.moveTo(ring[0][0] * s, ring[0][1] * s)
+                    ctx.moveTo(ring[0][0] * s + ox, ring[0][1] * s + oy)
                     for (var j = 1; j < ring.length; j++)
-                        ctx.lineTo(ring[j][0] * s, ring[j][1] * s)
+                        ctx.lineTo(ring[j][0] * s + ox, ring[j][1] * s + oy)
                 }
                 ctx.stroke()
                 // 上面再走一条黑色虚线，相位滚动 = 流动。
@@ -119,9 +125,11 @@ Item {
         // host.selX/selY/selW/selH 已经是「显示坐标」（EditorContent 里
         // 由 selImg* × toDispScale() 算好），这里不要再乘一次比例。
         x: previewImage.x
+           + (host.selOffX || 0)
            + Math.max(0, Math.min(host.selX,
                previewImage.width - selBadge.width))
         y: previewImage.y
+           + (host.selOffY || 0)
            + Math.min(previewImage.height - selBadge.height,
                       host.selY + host.selH + 4)
         width: selBadgeLabel.implicitWidth + 12

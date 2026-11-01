@@ -146,6 +146,9 @@ Item {
     readonly property real selW: selImgW * toDispScale()
     readonly property real selH: selImgH * toDispScale()
     readonly property bool selExists: bridge.selActive
+    // 拖动选区时的临时显示偏移（真值仍由 Rust 在松手时平移）。
+    readonly property real selOffX: view.canvasSurface ? view.canvasSurface.selOffX : 0
+    readonly property real selOffY: view.canvasSurface ? view.canvasSurface.selOffY : 0
     // 当前选区工具："rect" | "ellipse" | "lasso" | "polygon" | "none"
     property string selTool: "rect"
     // 选区工具条（第二行；激活任一种选区工具时显示）。
@@ -845,6 +848,12 @@ function canvasCursor(x, y) {
         if (hit !== null && !Layers.isLocked(hit))
             return Qt.SizeAllCursor
     }
+    // 选区工具下，指到选区里 = 可拖动移动（PS 的 SizeAll）。这里用包围盒
+    // 粗判：hover 是高频路径，不值得每次都跨语言做 alpha 命中。
+    if (root.selExists && root.selTool !== "none" && root.selTool !== "polygon"
+            && ix >= root.selX && ix <= root.selX + root.selW
+            && iy >= root.selY && iy <= root.selY + root.selH)
+        return Qt.SizeAllCursor
     return Qt.CrossCursor
 }
 

@@ -28,7 +28,7 @@ Rectangle {
               : host.scaleW > 0
               ? "拖角/边调整图层大小（角点等比，Shift 自由）；松手应用，Esc 取消"
               : host.selExists
-              ? "已选区：右键弹出边界/平滑/羽化；Enter 或 Ctrl+K 应用裁剪，Ctrl+D 取消"
+              ? "已选区：拖选区内可移动，右键出边界/平滑/羽化；Enter 裁剪，Ctrl+D 取消"
               : "已选图层：点住拖动移动，拖手柄缩放；点击空白处或 Esc 取消选择"
         color: "#9fb6d8"
         font.pixelSize: 12
