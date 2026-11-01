@@ -16,12 +16,14 @@ $sample = Join-Path $benchDir 'small-1600x1200.jpg'
 if (-not $SkipBuild) {
     $oldEA = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    $buildOut = & cargo build --release --workspace 2>&1 | Out-String
+    $buildOut = & cargo build --release --workspace --exclude imageedit-ui 2>&1 | Out-String
     $buildExit = $LASTEXITCODE
     if ($buildExit -eq 0) {
         # End-user binary: drop the console feature so main.rs compiles as
-        # windows_subsystem = "windows" (no console window for users). Only
-        # the ui crate relinks; icon resources and Qt deps are unchanged.
+        # windows_subsystem = "windows" (no console window for users).
+        # imageedit-ui is excluded from the loop above on purpose: the console
+        # variant is never packaged, and building it just to throw it away adds
+        # a whole second ui compile + link to every package run.
         $buildOut += & cargo build --release -p imageedit-ui --no-default-features 2>&1 | Out-String
         $buildExit = $LASTEXITCODE
     }

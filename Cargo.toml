@@ -49,13 +49,28 @@ tracing-subscriber = "0.3"
 psd = { path = "vendor/psd" }
 
 [profile.release]
+# Thin LTO keeps cross-crate inlining (the cxx-qt bridge benefits from it) but
+# is far cheaper than fat LTO.
 lto = "thin"
-codegen-units = 1
+# 16 codegen units instead of 1: codegen for each crate is split and run in
+# parallel. `1` forced the whole program through one serial codegen pass and
+# made every release build take >10 minutes — the single worst knob here.
+# Thin LTO still merges the units, so the runtime cost is ~1-3%.
+codegen-units = 16
 # unwind (not abort): decode_psd_bytes wraps the vendored psd parser in
 # catch_unwind so a malformed file surfaces as an error dialog instead of
 # taking the app down. The thumbnail DLL profile below requires unwind too.
 panic = "unwind"
 strip = true
+
+# Fast release-ish profile for iteration: no LTO, parallel codegen. Roughly a
+# third of the release build time with ~5% slower code. Use it while testing a
+# packaging change; ship with `--release`.
+#   cargo build --profile quick -p imageedit-ui --no-default-features
+[profile.quick]
+inherits = "release"
+lto = false
+codegen-units = 16
 
 [profile.bench]
 lto = "thin"
