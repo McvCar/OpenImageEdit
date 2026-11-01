@@ -53,15 +53,17 @@ pub(crate) fn apply_base_to_layer(doc: &mut Document) {
     doc.base_converted = true;
 }
 
-pub(crate) fn erase_base_pixels(doc: &mut Document, selection: &Selection) {    let canvas_rect = Rect::new(0, 0, doc.canvas.width, doc.canvas.height);
-    let Some(clipped) = selection.bounds().intersect(canvas_rect) else {
+pub(crate) fn erase_base_pixels(doc: &mut Document, selection: &SelectionMask) {
+    let canvas_rect = Rect::new(0, 0, doc.canvas.width, doc.canvas.height);
+    let Some(clipped) = selection.bounds.intersect(canvas_rect) else {
         return;
     };
     for y in 0..clipped.height {
         for x in 0..clipped.width {
             let cx = clipped.x + x as i32;
             let cy = clipped.y + y as i32;
-            if !selection.contains(cx as f32 + 0.5, cy as f32 + 0.5) {
+            let cov = selection.coverage_at(cx, cy);
+            if cov == 0 {
                 continue;
             }
             let bx = doc.view.x + cx;
@@ -71,7 +73,13 @@ pub(crate) fn erase_base_pixels(doc: &mut Document, selection: &Selection) {    
             }
             let (bx, by) = (bx as u32, by as u32);
             if bx < doc.base.width() && by < doc.base.height() {
-                *doc.base.get_pixel_mut(bx, by) = image::Rgba([0, 0, 0, 0]);
+                // Partial coverage (feather) scales the pixel's alpha instead
+                // of punching a hard hole.
+                let px = doc.base.get_pixel_mut(bx, by);
+                px.0[3] = ((px.0[3] as u32 * (255 - cov as u32) + 127) / 255) as u8;
+                if px.0[3] == 0 {
+                    px.0 = [0, 0, 0, 0];
+                }
             }
         }
     }

@@ -2,18 +2,18 @@
 use super::super::*;
 
 impl qobject::Bridge {
-    pub fn copy_selection_pixels(mut self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32) {
-        let Some(rect) = self.clamp_selection(x, y, w, h) else {
-            return;
-        };
+    pub fn copy_selection_pixels(mut self: Pin<&mut Self>) {
         let result: Result<Layer, String> = {
-            let mut guard = self.session.borrow_mut();
-            match guard.as_mut() {
+            let guard = self.session.borrow();
+            match guard.as_ref() {
                 None => Err("no document".into()),
-                Some(session) => session
-                    .doc
-                    .selection_layer(&Selection::Rect(rect))
-                    .map_err(|e| e.to_string()),
+                Some(session) => match session.effective_selection() {
+                    None => Err("没有选区".into()),
+                    Some(mask) => session
+                        .doc
+                        .selection_layer(&mask)
+                        .map_err(|e| e.to_string()),
+                },
             }
         };
         match result {
@@ -26,39 +26,32 @@ impl qobject::Bridge {
                 *clipboard().lock().unwrap() = Some(layer);
                 *self.paste_counter.borrow_mut() = 0;
                 self.as_mut().set_status(QString::from(text.as_str()));
-                println!(
-                    "{{\"phase\":\"ui\",\"event\":\"copied\",\"rect\":\"{},{},{},{}\"}}",
-                    rect.x, rect.y, rect.width, rect.height
-                );
+                println!("{{\"phase\":\"ui\",\"event\":\"copied\"}}");
             }
             Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
         }
     }
 
-    pub fn cut_selection_pixels(mut self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32) {
-        let Some(rect) = self.clamp_selection(x, y, w, h) else {
-            return;
-        };
+    pub fn cut_selection_pixels(mut self: Pin<&mut Self>) {
         let viewport = *self.viewport.borrow();
         let result: Result<Layer, String> = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
                 None => Err("no document".into()),
-                Some(session) => {
-                    match session.doc.selection_layer(&Selection::Rect(rect)) {
+                Some(session) => match session.effective_selection() {
+                    None => Err("没有选区".into()),
+                    Some(mask) => match session.doc.selection_layer(&mask) {
                         Err(e) => Err(e.to_string()),
-                        Ok(layer) => {
-                            match session.doc.erase_selection(&Selection::Rect(rect)) {
-                                Err(e) => Err(e.to_string()),
-                                Ok(()) => {
-                                    session.refit_if_needed(viewport);
-                                    session.dirty = true;
-                                    Ok(layer)
-                                }
+                        Ok(layer) => match session.doc.erase_selection(&mask) {
+                            Err(e) => Err(e.to_string()),
+                            Ok(()) => {
+                                session.refit_if_needed(viewport);
+                                session.dirty = true;
+                                Ok(layer)
                             }
-                        }
-                    }
-                }
+                        },
+                    },
+                },
             }
         };
         match result {
@@ -72,26 +65,23 @@ impl qobject::Bridge {
                 *self.paste_counter.borrow_mut() = 0;
                 self.as_mut().set_status(QString::from(text.as_str()));
                 self.as_mut().refresh_preview();
-                println!(
-                    "{{\"phase\":\"ui\",\"event\":\"cut\",\"rect\":\"{},{},{},{}\"}}",
-                    rect.x, rect.y, rect.width, rect.height
-                );
+                println!("{{\"phase\":\"ui\",\"event\":\"cut\"}}");
             }
             Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
         }
     }
 
-    pub fn erase_selection_pixels(mut self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32) {
-        let Some(rect) = self.clamp_selection(x, y, w, h) else {
-            return;
-        };
+    pub fn erase_selection_pixels(mut self: Pin<&mut Self>) {
         let viewport = *self.viewport.borrow();
         let result: Result<bool, String> = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
                 None => Ok(false),
                 Some(session) => {
-                    match session.doc.erase_selection(&Selection::Rect(rect)) {
+                    let Some(mask) = session.effective_selection() else {
+                        return;
+                    };
+                    match session.doc.erase_selection(&mask) {
                         Ok(()) => {
                             session.refit_if_needed(viewport);
                             session.dirty = true;
@@ -105,11 +95,9 @@ impl qobject::Bridge {
         match result {
             Ok(true) => {
                 self.as_mut().refresh_preview();
-                self.as_mut().set_status(QString::from("已删除选区像素（非破坏，可撤销）"));
-                println!(
-                    "{{\"phase\":\"ui\",\"event\":\"erased\",\"rect\":\"{},{},{},{}\"}}",
-                    rect.x, rect.y, rect.width, rect.height
-                );
+                self.as_mut()
+                    .set_status(QString::from("已删除选区像素（非破坏，可撤销）"));
+                println!("{{\"phase\":\"ui\",\"event\":\"erased\"}}");
             }
             Ok(false) => {}
             Err(message) => self.as_mut().set_status(QString::from(message.as_str())),

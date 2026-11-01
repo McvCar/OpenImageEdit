@@ -158,8 +158,7 @@ Item {
                             // layer takes over the canvas: drop any
                             // active selection so the layer's handles
                             // and drag become usable at once.
-                            host.selW = 0
-                            host.selH = 0
+                            bridge.sel_clear()
                             bridge.select_layer(layerRow.row.i)
                         }
                         reordering = false

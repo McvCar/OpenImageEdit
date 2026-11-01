@@ -1,0 +1,113 @@
+import QtQuick
+
+// 数值输入 + 右侧上下箭头（PS 弹窗里那种小 steps）。
+// 用于选区的「边界 / 平滑 / 羽化」：拖动/点击箭头即时生效，直接改数值
+// 回车（或失焦）才提交，避免每敲一个数字就整幅重算。
+Rectangle {
+    id: sb
+
+    property int value: 0
+    property int from: 0
+    property int to: 400
+    property int step: 1
+    // 后缀单位（"px"）——只用于宽度估算，输入框里不显示。
+    property string unit: "px"
+    // 正在编辑时把快捷键让路（M/L/Q 不能被吞成工具切换）。
+    // editingChanged 由属性自动生成，不用再声明。
+    property bool editing: input.activeFocus
+    signal edited(int v)
+
+    implicitWidth: 74
+    height: 22
+    radius: 3
+    color: "#1b1d20"
+    border.color: input.activeFocus ? "#5b9dff" : "#45484d"
+    border.width: 1
+
+    onValueChanged: {
+        if (!input.activeFocus)
+            input.text = String(value)
+    }
+    Component.onCompleted: input.text = String(value)
+
+    function commit(raw) {
+        let v = parseInt(raw, 10)
+        if (isNaN(v))
+            v = sb.value
+        v = Math.max(sb.from, Math.min(sb.to, v))
+        input.text = String(v)
+        if (v !== sb.value)
+            sb.edited(v)
+    }
+
+    TextInput {
+        id: input
+        anchors.left: parent.left
+        anchors.leftMargin: 6
+        anchors.verticalCenter: parent.verticalCenter
+        width: parent.width - 24
+        text: String(sb.value)
+        color: "#e9eaec"
+        font.pixelSize: 12
+        selectByMouse: true
+        horizontalAlignment: TextInput.AlignLeft
+        validator: IntValidator { bottom: sb.from; top: sb.to }
+        // 输入框抢焦点时禁用单字母快捷键（父级把 editing 汇总到
+        // EditorContent.selFieldEditing）。editing 是 activeFocus 的绑定，
+        // editingChanged 会自动发。
+        onActiveFocusChanged: {
+            if (!activeFocus)
+                sb.commit(text)
+        }
+        onAccepted: sb.commit(text)
+        Keys.onUpPressed: { sb.commit(String(sb.value + sb.step)); event.accepted = true }
+        Keys.onDownPressed: { sb.commit(String(sb.value - sb.step)); event.accepted = true }
+    }
+
+    // 上下箭头（右边一列，各占一半高）。
+    Column {
+        anchors.right: parent.right
+        anchors.rightMargin: 2
+        anchors.verticalCenter: parent.verticalCenter
+        spacing: 1
+
+        Rectangle {
+            width: 16
+            height: 9
+            radius: 2
+            color: up.containsMouse ? "#4a4e54" : "transparent"
+            Text {
+                anchors.centerIn: parent
+                text: "▲"
+                color: "#c9cdd2"
+                font.pixelSize: 6
+            }
+            MouseArea {
+                id: up
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: sb.commit(String(sb.value + sb.step))
+            }
+        }
+        Rectangle {
+            width: 16
+            height: 9
+            radius: 2
+            color: dn.containsMouse ? "#4a4e54" : "transparent"
+            Text {
+                anchors.centerIn: parent
+                text: "▼"
+                color: "#c9cdd2"
+                font.pixelSize: 6
+            }
+            MouseArea {
+                id: dn
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: sb.commit(String(sb.value - sb.step))
+            }
+        }
+    }
+}

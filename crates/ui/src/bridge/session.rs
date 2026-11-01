@@ -49,6 +49,30 @@ pub(in crate::bridge) struct Session {
     /// `set_dpr`); used by `fit_zoom`/`display_size` to make 100% mean
     /// 1 image px = 1 *physical* px (Photos/PS convention).
     pub(in crate::bridge) dpr: f64,
+    /// Active selection (PS-style, canvas coordinates). `None` = nothing
+    /// selected. Everything that touches "selected pixels" goes through it.
+    pub(in crate::bridge) selection: Option<SelectionState>,
+    /// Quick mask (PS's Q): dim everything OUTSIDE the selection in the
+    /// PREVIEW only, so the feathered soft edge becomes visible.
+    pub(in crate::bridge) quick_mask: bool,
+    /// Bumped by every selection mutation; QML re-pulls the outline when the
+    /// published copy of it changes. Kept on the session so a plain refresh
+    /// never looks like a selection change.
+    pub(in crate::bridge) sel_rev: u32,
+}
+
+impl Session {
+    pub(in crate::bridge) fn clear_selection(&mut self) {
+        self.selection = None;
+        // 快速蒙版是"看选区软边"的视图态：选区没了就自动关，否则下次
+        // 新建选区时会莫名其妙处于蒙版态。
+        self.quick_mask = false;
+    }
+
+    /// The mask every pixel-consuming command should use (feathered).
+    pub(in crate::bridge) fn effective_selection(&self) -> Option<SelectionMask> {
+        self.selection.as_ref().map(|s| s.effective())
+    }
 }
 
 /// Live "调整颜色" state (history-free until the panel commits).
@@ -158,6 +182,9 @@ impl Session {
                 downsampled_from: decoded.downsampled_from,
                 note: decoded.note,
                 dpr,
+                selection: None,
+                quick_mask: false,
+                sel_rev: 0,
             },
             ms,
         )
@@ -256,6 +283,20 @@ impl Session {
             self.composite_for_preview(target, adjust)
         };
         let composite_ms = prof_t0.elapsed().as_millis();
+        // The panel graph reflects the ADJUSTED preview (like Preview), so it
+        // is computed from the composited pixels and only while it is open.
+        // It must be sampled BEFORE the quick-mask overlay, which would skew
+        // the histogram with the dimming.
+        let histogram = if self.adjust.is_some() {
+            Some(Histogram::of(&image).to_json())
+        } else {
+            None
+        };
+        // Quick mask (Q): dim everything outside the selection, preview only.
+        let mut image = image;
+        if self.quick_mask {
+            apply_quick_mask(&mut image, self.selection.as_ref(), canvas);
+        }
         // BMP on purpose: uncompressed means both the encode here and Qt's
         // decode are near memcpy speed. PNG compression dominated each live
         // drag tick (tens of ms); BMP keeps the preview path real-time. The
@@ -280,11 +321,6 @@ impl Session {
         );
         // The panel graph reflects the adjusted preview (like Preview), so it
         // is computed from the composited pixels and only while it is open.
-        let histogram = if self.adjust.is_some() {
-            Some(Histogram::of(&image).to_json())
-        } else {
-            None
-        };
         let url = file_url(&path);
         self.last_render = Some(CachedRender {
             target,
@@ -529,6 +565,69 @@ impl Session {
                 }
             }
             Err(err) => Refresh::Err(err),
+        }
+    }
+}
+
+impl Session {
+    /// Outline of the current selection as QML reads it: `[[[x,y],...],...]`
+    /// in IMAGE coordinates. Downsampled by `step` for big canvases — the
+    /// ants are one pixel wide, so tracing 60 MP at full resolution would
+    /// cost hundreds of ms for no visible gain.
+    pub(in crate::bridge) fn selection_outline_json(&self) -> String {
+        let Some(state) = self.selection.as_ref() else {
+            return "[]".to_string();
+        };
+        let m = state.mask();
+        if m.is_empty() {
+            return "[]".to_string();
+        }
+        let c = self.doc.canvas;
+        let step = ((c.width.max(c.height) as f64 / 1400.0).ceil() as u32).max(1);
+        let parts: Vec<String> = m
+            .outline(step)
+            .iter()
+            .map(|ring| {
+                let pts: Vec<String> = ring
+                    .iter()
+                    .map(|(x, y)| format!("[{},{}]", x.round() as i32, y.round() as i32))
+                    .collect();
+                format!("[{}]", pts.join(","))
+            })
+            .collect();
+        format!("[{}]", parts.join(","))
+    }
+}
+
+/// Quick-mask overlay (PS's Q): multiply the pixels OUTSIDE the selection
+/// toward black so the feathered edge becomes visible. Preview only — the
+/// document pixels and the saved file are untouched.
+fn apply_quick_mask(image: &mut RgbaImage, sel: Option<&SelectionState>, canvas: Size) {
+    let Some(state) = sel else {
+        return;
+    };
+    let mask = state.mask();
+    if mask.is_empty() || canvas.width == 0 || canvas.height == 0 {
+        return;
+    }
+    let sw = image.width() as f64 / canvas.width as f64;
+    let sh = image.height() as f64 / canvas.height as f64;
+    if sw <= 0.0 || sh <= 0.0 {
+        return;
+    }
+    for y in 0..image.height() {
+        let cy = (y as f64 / sh) as i32;
+        for x in 0..image.width() {
+            let cx = (x as f64 / sw) as i32;
+            let cov = mask.coverage_at(cx, cy);
+            if cov >= 255 {
+                continue;
+            }
+            let dim = 1.0 - 0.55 * (1.0 - cov as f64 / 255.0);
+            let p = image.get_pixel_mut(x, y);
+            for i in 0..3 {
+                p.0[i] = (p.0[i] as f64 * dim).round().clamp(0.0, 255.0) as u8;
+            }
         }
     }
 }

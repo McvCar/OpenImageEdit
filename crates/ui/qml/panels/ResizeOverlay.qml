@@ -343,11 +343,9 @@ function commitResize() {
         bridge.resize_canvas(w, h)
     else
         bridge.resize_to(w, h)
-    // The selection lives in display coordinates and the fit zoom may
-    // re-fit after the canvas changed size — remapping it reliably would
-    // need image-space state, so drop it instead of leaving it misplaced.
-    host.selW = 0
-    host.selH = 0
+    // 画布尺寸变了，选区（画布坐标）就不再指向原来的内容：直接丢掉。
+    // Rust 侧的 crop/resize 也会清，这里补一刀覆盖 QML 直接改尺寸的路径。
+    bridge.sel_clear()
     host.cancelLayerScale()
     resizeOverlay.visible = false
 }

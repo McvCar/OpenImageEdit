@@ -10,7 +10,7 @@ use cxx_qt_lib::{QString, QUrl};
 use decode::{decode_path, encode, format_from_path, DecodeOptions, Decoded, Format};
 use editcore::{
     adjust_json, Adjust, AdjustTarget, Document, Histogram, Layer, Mark, MarkKind, PickedColor, Rect,
-    Selection, Size, Transform,
+    SelShape, Selection, SelectionMask, SelectionState, Size, Transform,
 };
 use image::RgbaImage;
 
@@ -123,6 +123,22 @@ pub mod qobject {
         #[qproperty(QString, picker_color, cxx_name = "pickerColor")]
         /// JSON array of recent picks, newest first.
         #[qproperty(QString, picker_history, cxx_name = "pickerHistory")]
+        // ---- 选区（PS 式：矩形 / 椭圆 / 套索 / 多边形套索）----
+        /// A selection exists and covers at least one pixel.
+        #[qproperty(bool, sel_active, cxx_name = "selActive")]
+        /// Bumped on every selection change; QML re-pulls the outline on it.
+        #[qproperty(i32, sel_version, cxx_name = "selVersion")]
+        /// Bounds of the selection in IMAGE coordinates (drives the handles).
+        #[qproperty(i32, sel_x, cxx_name = "selX")]
+        #[qproperty(i32, sel_y, cxx_name = "selY")]
+        #[qproperty(i32, sel_w, cxx_name = "selW")]
+        #[qproperty(i32, sel_h, cxx_name = "selH")]
+        /// Current 边界 / 平滑 / 羽化 parameters (shown in the right-click menu).
+        #[qproperty(i32, sel_border, cxx_name = "selBorder")]
+        #[qproperty(i32, sel_smooth, cxx_name = "selSmooth")]
+        #[qproperty(i32, sel_feather, cxx_name = "selFeather")]
+        /// Quick mask (Q): dim everything outside the selection in the preview.
+        #[qproperty(bool, quick_mask, cxx_name = "quickMask")]
         #[namespace = "imageedit"]
         type Bridge = super::BridgeRust;
 
@@ -245,10 +261,82 @@ pub mod qobject {
         #[qinvokable]
         fn reset_crop(self: Pin<&mut Self>);
 
-        // ---- 选区图层 ----
+        // ---- 选区（PS 式，画布坐标）----
+
+        /// Replace / combine the selection with a rectangle given by two
+        /// opposite corners (image coords). `mode`: 0 replace, 1 add,
+        /// 2 subtract, 3 intersect.
+        #[qinvokable]
+        fn sel_set_rect(
+            self: Pin<&mut Self>,
+            x0: f64,
+            y0: f64,
+            x1: f64,
+            y1: f64,
+            mode: i32,
+        );
+
+        /// Same as `sel_set_rect` for an ellipse inscribed in the drag box.
+        #[qinvokable]
+        fn sel_set_ellipse(
+            self: Pin<&mut Self>,
+            x0: f64,
+            y0: f64,
+            x1: f64,
+            y1: f64,
+            mode: i32,
+        );
+
+        /// Freehand lasso / polygonal lasso: `"x,y x,y …"` image coords.
+        #[qinvokable]
+        fn sel_set_polygon(self: Pin<&mut Self>, points: &QString, mode: i32);
 
         #[qinvokable]
-        fn extract_selection(self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32);
+        fn sel_select_all(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn sel_clear(self: Pin<&mut Self>);
+
+        /// 选择反选 (Ctrl+Shift+I).
+        #[qinvokable]
+        fn sel_invert(self: Pin<&mut Self>);
+
+        /// 边界: ring of total width `k` centered on the current edge.
+        #[qinvokable]
+        fn sel_set_border(self: Pin<&mut Self>, k: i32);
+
+        /// 平滑: round off the staircase edge, radius `k`.
+        #[qinvokable]
+        fn sel_set_smooth(self: Pin<&mut Self>, k: i32);
+
+        /// 羽化: soft edge of radius `r` for subsequent edits.
+        #[qinvokable]
+        fn sel_set_feather(self: Pin<&mut Self>, r: i32);
+
+        /// Closed rings of the selection in image coords, `[[[x,y],…],…]`.
+        #[qinvokable]
+        fn sel_outline(self: Pin<&mut Self>) -> QString;
+
+        /// Whether the image-space point is inside the selection (right-click
+        /// hit test for the context menu).
+        #[qinvokable]
+        fn sel_contains(self: Pin<&mut Self>, x: i32, y: i32) -> bool;
+
+        /// Move the selection itself (dragging inside it, PS default).
+        #[qinvokable]
+        fn sel_translate(self: Pin<&mut Self>, dx: i32, dy: i32);
+
+        /// Quick mask (Q): dim outside the selection in the preview.
+        #[qinvokable]
+        fn sel_toggle_quick_mask(self: Pin<&mut Self>);
+
+        /// Crop to the selection's bounding box, then drop the selection
+        /// (the canvas coordinate frame changed).
+        #[qinvokable]
+        fn crop_to_selection(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn extract_selection(self: Pin<&mut Self>);
 
         #[qinvokable]
         fn layer_name(self: Pin<&mut Self>, index: i32) -> QString;
@@ -478,13 +566,13 @@ pub mod qobject {
         // ---- 剪贴板（跨文档） ----
 
         #[qinvokable]
-        fn copy_selection_pixels(self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32);
+        fn copy_selection_pixels(self: Pin<&mut Self>);
 
         #[qinvokable]
-        fn cut_selection_pixels(self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32);
+        fn cut_selection_pixels(self: Pin<&mut Self>);
 
         #[qinvokable]
-        fn erase_selection_pixels(self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32);
+        fn erase_selection_pixels(self: Pin<&mut Self>);
 
         #[qinvokable]
         fn copy_selected_layer(self: Pin<&mut Self>);
@@ -631,6 +719,20 @@ pub struct BridgeRust {
     picker_history: QString,
     /// Recent picks in decoded form (the JSON is rebuilt from this).
     picker_recent: RefCell<Vec<PickedColor>>,
+    // ---- 选区（PS 式）----
+    sel_active: bool,
+    /// Bumped by every selection mutation so QML can re-pull the outline.
+    sel_version: i32,
+    /// Selection bounds in image coords (published for the handle overlay).
+    sel_x: i32,
+    sel_y: i32,
+    sel_w: i32,
+    sel_h: i32,
+    /// Live 边界 / 平滑 / 羽化 values, mirrored into the right-click menu.
+    sel_border: i32,
+    sel_smooth: i32,
+    sel_feather: i32,
+    quick_mask: bool,
     paste_counter: RefCell<u32>,
     /// Opacity of the selected layer before the current live slider drag, so
     /// the committed history op can record the true pre-drag value.
@@ -704,6 +806,16 @@ impl Default for BridgeRust {
             picker_color: QString::default(),
             picker_history: QString::from("[]"),
             picker_recent: RefCell::new(Vec::new()),
+            sel_active: false,
+            sel_version: 0,
+            sel_x: 0,
+            sel_y: 0,
+            sel_w: 0,
+            sel_h: 0,
+            sel_border: 0,
+            sel_smooth: 0,
+            sel_feather: 0,
+            quick_mask: false,
             paste_counter: RefCell::new(0),
             opacity_live: RefCell::new(None),
             drag_start_offset: RefCell::new(None),
@@ -790,22 +902,6 @@ impl qobject::Bridge {
                 self.as_mut().set_source_path(QString::from(""));
             }
         }
-    }
-
-    fn clamp_selection(&self, x: i32, y: i32, w: i32, h: i32) -> Option<Rect> {
-        let canvas = self
-            .session
-            .borrow()
-            .as_ref()
-            .map(|s| s.doc.canvas)?;
-        if canvas.pixels() == 0 {
-            return None;
-        }
-        let x = x.clamp(0, canvas.width as i32 - 1);
-        let y = y.clamp(0, canvas.height as i32 - 1);
-        let w = w.max(1).min(canvas.width as i32 - x) as u32;
-        let h = h.max(1).min(canvas.height as i32 - y) as u32;
-        Some(Rect::new(x, y, w, h))
     }
 
     fn selected_guard(&self, index: i32) -> Option<usize> {
@@ -1017,6 +1113,8 @@ impl qobject::Bridge {
                         );
                         session.refit_if_needed(viewport);
                         session.dirty = true;
+                        // 旋转/翻转换掉了画布坐标系：选区随之失效。
+                        session.clear_selection();
                         Ok(true)
                     }
                     Err(err) => Err(err.to_string()),
@@ -1210,6 +1308,10 @@ impl qobject::Bridge {
                     "{{\"phase\":\"ui\",\"event\":\"preview-ready\",\"zoom\":{zoom_percent},\"display\":\"{}x{}\",\"preview\":\"{}x{}\",\"undo\":{can_undo},\"redo\":{can_redo},\"ms\":{render_ms}}}",
                     display.width, display.height, preview.width, preview.height
                 );
+                // Selection state (bounds / ops / active) is republished on
+                // every refresh: canvas-changing ops clear it, and the QML
+                // overlay must learn about that without a second round trip.
+                self.as_mut().publish_selection();
                 // Last: updating preview_url triggers Image loading, which may
                 // complete synchronously and re-enter `image_shown`.
                 self.as_mut().set_preview_url(QString::from(url.as_str()));

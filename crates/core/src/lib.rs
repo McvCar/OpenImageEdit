@@ -15,8 +15,10 @@ mod transform;
 mod op;
 mod ops;
 mod document;
+mod selection;
 
 pub use geometry::{Size, Rect, Selection};
+pub use selection::{SelOps, SelShape, SelectionMask, SelectionState};
 pub use mark::{MarkKind, Mark};
 pub use layer::Layer;
 pub use transform::Transform;
@@ -52,7 +54,7 @@ mod tests {
     fn extract_rect_selection_produces_layer_of_selection_bounds() {
         let mut doc = Document::from_image(checker(64, 32));
         let index = doc
-            .extract_selection(&Selection::Rect(Rect::new(8, 4, 16, 12)))
+            .extract_selection(&SelectionMask::rect(Rect::new(8, 4, 16, 12)))
             .unwrap();
         let layer = &doc.layers[index];
         assert_eq!(layer.image.width(), 16);
@@ -66,7 +68,7 @@ mod tests {
     fn ellipse_selection_masks_corners() {
         let doc = Document::from_image(checker(64, 64));
         let layer = doc
-            .selection_layer(&Selection::Ellipse(Rect::new(0, 0, 64, 64)))
+            .selection_layer(&SelectionMask::ellipse(Rect::new(0, 0, 64, 64)))
             .unwrap();
         assert_eq!(layer.image.get_pixel(0, 0).0[3], 0);
         assert_eq!(layer.image.get_pixel(32, 32).0[3], 255);
@@ -119,7 +121,7 @@ mod tests {
     fn cross_document_paste_keeps_pixels_and_offset() {
         let mut src = Document::from_image(checker(32, 32));
         let index = src
-            .extract_selection(&Selection::Rect(Rect::new(4, 6, 8, 8)))
+            .extract_selection(&SelectionMask::rect(Rect::new(4, 6, 8, 8)))
             .unwrap();
         let layer = src.layers[index].clone();
 
@@ -134,10 +136,10 @@ mod tests {
     fn erase_selection_makes_base_pixels_transparent_and_keeps_layers() {
         let mut doc = Document::from_image(checker(32, 16));
         let index = doc
-            .extract_selection(&Selection::Rect(Rect::new(20, 2, 8, 8)))
+            .extract_selection(&SelectionMask::rect(Rect::new(20, 2, 8, 8)))
             .unwrap();
 
-        doc.erase_selection(&Selection::Rect(Rect::new(4, 4, 8, 8)))
+        doc.erase_selection(&SelectionMask::rect(Rect::new(4, 4, 8, 8)))
             .unwrap();
         // Erased base area is transparent (no layer above it there).
         assert_eq!(doc.composite_pixel(4, 4).0, [0, 0, 0, 0]);
@@ -155,7 +157,7 @@ mod tests {
         let original = doc.flatten();
 
         // Selection partially outside the canvas: only the inside part erases.
-        doc.erase_selection(&Selection::Rect(Rect::new(12, 12, 20, 20)))
+        doc.erase_selection(&SelectionMask::rect(Rect::new(12, 12, 20, 20)))
             .unwrap();
         assert_eq!(doc.composite_pixel(12, 12).0, [0, 0, 0, 0]);
         assert_eq!(doc.composite_pixel(15, 15).0, [0, 0, 0, 0]);
@@ -171,11 +173,11 @@ mod tests {
     fn erase_selection_rejects_empty_and_outside_selections() {
         let mut doc = Document::from_image(checker(16, 16));
         assert_eq!(
-            doc.erase_selection(&Selection::Rect(Rect::new(0, 0, 0, 0))),
+            doc.erase_selection(&SelectionMask::rect(Rect::new(0, 0, 0, 0))),
             Err(EditError::EmptySelection)
         );
         assert_eq!(
-            doc.erase_selection(&Selection::Rect(Rect::new(40, 40, 4, 4))),
+            doc.erase_selection(&SelectionMask::rect(Rect::new(40, 40, 4, 4))),
             Err(EditError::EmptySelection)
         );
         assert_eq!(doc.can_undo(), false);
@@ -186,7 +188,7 @@ mod tests {
         // Erase must map canvas coords through `view` after a crop.
         let mut doc = Document::from_image(ramp(32, 32));
         doc.crop(Rect::new(8, 8, 16, 16)).unwrap();
-        doc.erase_selection(&Selection::Rect(Rect::new(0, 0, 4, 4)))
+        doc.erase_selection(&SelectionMask::rect(Rect::new(0, 0, 4, 4)))
             .unwrap();
         assert_eq!(doc.composite_pixel(0, 0).0, [0, 0, 0, 0]);
         // base pixel at (8,8) is what canvas (0,0) maps to.

@@ -35,9 +35,10 @@ pub enum EditOp {
     TranslateLayer { index: usize, from: (i32, i32), to: (i32, i32) },
     RenameLayer { index: usize, from: String, to: String },
     /// Non-destructive "delete selection pixels": the base pixels under the
-    /// selection are made fully transparent while layers stay untouched. The
-    /// pre-op snapshot makes undo exact (same pattern as `ResizeDocument`).
-    EraseBasePixels { from: DocumentSnapshot, selection: Selection },
+    /// selection fade out (scaled by the mask's alpha coverage, so a feathered
+    /// selection gets a soft edge) while layers stay untouched. The pre-op
+    /// snapshot makes undo exact (same pattern as `ResizeDocument`).
+    EraseBasePixels { from: DocumentSnapshot, selection: SelectionMask },
     /// Scale a layer's image to `to` (Lanczos3) and move its top-left corner
     /// to `offset`, so handle-driven resizes anchor at the dragged corner /
     /// edge instead of always growing toward the bottom-right. The pre-op

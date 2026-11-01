@@ -46,6 +46,10 @@ impl Rect {
         self.x + self.width as i32
     }
 
+    pub const fn pixels(self) -> u64 {
+        self.width as u64 * self.height as u64
+    }
+
     pub const fn bottom(self) -> i32 {
         self.y + self.height as i32
     }

@@ -103,6 +103,8 @@ impl qobject::Bridge {
                     if let Some(s) = guard.as_mut() {
                         s.refit_if_needed(viewport);
                         s.dirty = true;
+                        // canvas 坐标变了：选区（画布坐标）失效。
+                        s.clear_selection();
                     }
                 }
                 self.as_mut().refresh_preview();
@@ -152,6 +154,8 @@ session
                     if let Some(s) = guard.as_mut() {
                         s.refit_if_needed(viewport);
                         s.dirty = true;
+                        // canvas 坐标变了：选区（画布坐标）失效。
+                        s.clear_selection();
                     }
                 }
                 self.as_mut().refresh_preview();
@@ -198,6 +202,8 @@ session
                     if let Some(s) = guard.as_mut() {
                         s.refit_if_needed(viewport);
                         s.dirty = true;
+                        // canvas 坐标变了：选区（画布坐标）失效。
+                        s.clear_selection();
                     }
                 }
                 self.as_mut().refresh_preview();
@@ -243,6 +249,8 @@ session
                     if let Some(s) = guard.as_mut() {
                         s.refit_if_needed(viewport);
                         s.dirty = true;
+                        // canvas 坐标变了：选区（画布坐标）失效。
+                        s.clear_selection();
                     }
                 }
                 self.as_mut().refresh_preview();
@@ -254,20 +262,20 @@ session
         }
     }
 
-    pub fn extract_selection(mut self: Pin<&mut Self>, x: i32, y: i32, w: i32, h: i32) {
+    pub fn extract_selection(mut self: Pin<&mut Self>) {
         let viewport = *self.viewport.borrow();
-        let Some(rect) = self.clamp_selection(x, y, w, h) else {
-            return;
-        };
         let result: Result<i32, String> = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
                 None => Err("no document".into()),
-                Some(session) => session
-                    .doc
-                    .extract_selection(&Selection::Rect(rect))
-                    .map(|ix| ix as i32)
-                    .map_err(|e| e.to_string()),
+                Some(session) => match session.effective_selection() {
+                    None => Err("没有选区".into()),
+                    Some(mask) => session
+                        .doc
+                        .extract_selection(&mask)
+                        .map(|ix| ix as i32)
+                        .map_err(|e| e.to_string()),
+                },
             }
         };
         match result {
@@ -282,8 +290,7 @@ session
                 }
                 self.as_mut().refresh_preview();
                 println!(
-                    "{{\"phase\":\"ui\",\"event\":\"layer-extracted\",\"index\":{ix},\"rect\":\"{},{},{},{}\"}}",
-                    rect.x, rect.y, rect.width, rect.height
+                    "{{\"phase\":\"ui\",\"event\":\"layer-extracted\",\"index\":{ix}}}"
                 );
             }
             Err(message) => self

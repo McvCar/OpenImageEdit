@@ -11,10 +11,72 @@ Item {
     // 暴露给 EditorContent：光标/探针/选区/缩放/文字编辑等外部交互逻辑
     // 仍留在 EditorContent，通过 instance.alias 访问这些内部 id。
     readonly property alias selDragMouse: selDragMouse
+    readonly property alias selPreview: selPreview
     readonly property alias markMa: markMa
     readonly property alias markPreview: markPreview
     readonly property alias textPopup: textPopup
     readonly property alias scaleTimer: scaleTimer
+
+    // ---- 多边形套索的进行中状态（跨多次点击，所以放在根上）----
+    // 已提交的顶点（图像坐标），以及跟随光标的橡皮筋位置（画布坐标）。
+    property bool selPolyActive: false
+    property var polyPts: []
+    property real polyCurX: 0
+    property real polyCurY: 0
+    // 加选/减选模式在「第一个点」时锁定：中途松掉 Shift 不该改变意图。
+    property int polyMode: 0
+
+    // 把画布坐标换算成图像坐标（可能越界，交给 Rust 裁剪）。
+    function toImage(mx, my) {
+        const s = host.toDispScale()
+        return s > 0 ? [(mx - view.pad) / s, (my - view.pad) / s] : [0, 0]
+    }
+
+    function cancelPolygon() {
+        if (!selPolyActive && polyPts.length === 0)
+            return
+        selPolyActive = false
+        polyPts = []
+        selPreview.requestPaint()
+    }
+
+    // 闭合多边形 → 提交给 Rust（mode 取决于按下时的 Shift/Alt）。
+    function commitPolygon() {
+        if (polyPts.length >= 3) {
+            const text = polyPts
+                .map(p => p[0].toFixed(1) + "," + p[1].toFixed(1))
+                .join(" ")
+            bridge.sel_set_polygon(text, polyMode)
+        }
+        selPolyActive = false
+        polyPts = []
+        selPreview.requestPaint()
+    }
+
+    function addPolygonPoint(mx, my) {
+        const p = toImage(mx, my)
+        if (!selPolyActive) {
+            selPolyActive = true
+            polyPts = []
+            polyMode = selDragMouse.selMode
+        }
+        // 点回起点（8px 内）= 闭合多边形。
+        if (polyPts.length >= 3) {
+            const s = Math.max(host.toDispScale(), 0.0001)
+            const first = polyPts[0]
+            const dx = (first[0] - p[0]) * s
+            const dy = (first[1] - p[1]) * s
+            if (Math.sqrt(dx * dx + dy * dy) <= 8) {
+                commitPolygon()
+                return
+            }
+        }
+        polyPts = polyPts.concat([[p[0], p[1]]])
+        polyCurX = mx
+        polyCurY = my
+        selPreview.requestPaint()
+    }
+
     visible: bridge.image_width > 0
     z: 5
     x: previewImage.x - view.pad
@@ -36,6 +98,7 @@ Item {
         id: selDragMouse
         anchors.fill: parent
         hoverEnabled: true
+        acceptedButtons: Qt.LeftButton | Qt.RightButton
         // undefined: MouseAreas default to ArrowCursor and shadow
         // every cursor below; the canvas HoverHandler owns cursors.
         cursorShape: undefined
@@ -44,6 +107,11 @@ Item {
         property real curX: 0
         property real curY: 0
         property bool dragging: false
+        // 本次手势的合成模式：0 替换 / 1 加选 / 2 减选 / 3 相交。
+        // 按下时的 Shift/Alt 决定，松开时一起提交给 Rust。
+        property int selMode: 0
+        // 套索的采样点（画布坐标）。
+        property var lassoPts: []
         // Layer pick-and-move gesture (no selection active).
         property bool pickDrag: false
         property bool pickMoved: false
@@ -51,7 +119,31 @@ Item {
         property int lastDx: 0
         property int lastDy: 0
 
+        // PS 惯例：Shift = 加选，Alt = 减选，Shift+Alt = 相交，否则用
+        // 工具条上的粘滞模式。
+        function modeFrom(mods) {
+            const add = (mods & Qt.ShiftModifier) !== 0
+            const sub = (mods & Qt.AltModifier) !== 0
+            if (add && sub)
+                return 3
+            if (add)
+                return 1
+            if (sub)
+                return 2
+            return host.selMode
+        }
+
         onPressed: (mouse) => {
+            // 右键：落在选区内 → 弹选区菜单（PS 的右键菜单）。
+            if (mouse.button === Qt.RightButton) {
+                const p = toImage(mouse.x, mouse.y)
+                if (bridge.sel_contains(Math.floor(p[0]), Math.floor(p[1]))) {
+                    const g = mapToItem(host, mouse.x, mouse.y)
+                    host.openSelMenu(g.x, g.y)
+                    mouse.accepted = true
+                }
+                return
+            }
             const hit = host.selExists ? null : host.topLayerAt(mouse.x, mouse.y)
             if (hit !== null) {
                 if (bridge.selected_mark >= 0)
@@ -65,18 +157,49 @@ Item {
                 curY = mouse.y
                 return
             }
+            host.settlePaste()
+            selMode = modeFrom(mouse.modifiers)
+            // 多边形套索：一次点击加一个顶点，双击 / 点回起点 / 回车闭合。
+            if (host.selTool === "polygon") {
+                addPolygonPoint(mouse.x, mouse.y)
+                return
+            }
+            if (host.selTool === "none") {
+                // 没选任何选区工具：点空白 = 取消选区（旧行为）。
+                if (bridge.selected_layer >= 0)
+                    bridge.select_layer(-1)
+                else if (host.selExists)
+                    bridge.sel_clear()
+                return
+            }
             startX = mouse.x
             startY = mouse.y
             curX = mouse.x
             curY = mouse.y
+            lassoPts = []
+            if (host.selTool === "lasso")
+                lassoPts = [toImage(mouse.x, mouse.y)]
             dragging = true
-            host.selW = 0
-            host.selH = 0
-            host.settlePaste()
+            selPreview.requestPaint()
         }
+
+        onDoubleClicked: (mouse) => {
+            if (mouse.button !== Qt.LeftButton)
+                return
+            if (host.selTool === "polygon" && selPolyActive)
+                commitPolygon()
+        }
+
         onPositionChanged: (mouse) => {
             if (host.rulerOn)
                 host.noteHover(mouse.x, mouse.y)
+            // 多边形套索的橡皮筋跟随光标（不需要按住）。
+            if (selPolyActive) {
+                polyCurX = mouse.x
+                polyCurY = mouse.y
+                selPreview.requestPaint()
+                return
+            }
             if (pickDrag) {
                 curX = mouse.x
                 curY = mouse.y
@@ -99,20 +222,21 @@ Item {
                 return
             curX = mouse.x
             curY = mouse.y
-            // Clamp the rubber band to the canvas: a selection can
-            // never exceed the image bounds. Mouse coords are in
-            // canvasSurface space; the image spans [pad, pad+size].
-            const pad = view.pad
-            const x1 = Math.max(pad, Math.min(startX, curX))
-            const y1 = Math.max(pad, Math.min(startY, curY))
-            const x2 = Math.min(pad + previewImage.width, Math.max(startX, curX))
-            const y2 = Math.min(pad + previewImage.height, Math.max(startY, curY))
-            host.selX = host.snapDisplay(x1 - pad)
-            host.selY = host.snapDisplay(y1 - pad)
-            host.selW = Math.max(host.snapDisplay(x2 - x1), host.toDispScale())
-            host.selH = Math.max(host.snapDisplay(y2 - y1), host.toDispScale())
+            if (host.selTool === "lasso") {
+                const p = toImage(curX, curY)
+                const last = lassoPts.length > 0
+                             ? lassoPts[lassoPts.length - 1] : null
+                // 丢太近的点没用：套索常见几万个采样，送去 Rust 的是
+                // 直线段近似，1px 以内直接合并。
+                if (!last || Math.abs(p[0] - last[0]) + Math.abs(p[1] - last[1]) >= 1)
+                    lassoPts = lassoPts.concat([[p[0], p[1]]])
+            }
+            selPreview.requestPaint()
         }
-        onReleased: {
+
+        onReleased: (mouse) => {
+            if (mouse.button !== Qt.LeftButton)
+                return
             if (pickDrag) {
                 pickDrag = false
                 if (pickMoved) {
@@ -127,16 +251,146 @@ Item {
                 }
                 return
             }
+            if (!dragging)
+                return
             dragging = false
-            if (host.selW < 3 || host.selH < 3) {
-                // Click on empty canvas: clear the selection and any
-                // layer selection with it.
-                host.selW = 0
-                host.selH = 0
-                if (bridge.selected_layer >= 0)
-                    bridge.select_layer(-1)
+            const a = toImage(startX, startY)
+            const b = toImage(curX, curY)
+            const dx = Math.abs(b[0] - a[0])
+            const dy = Math.abs(b[1] - a[1])
+            if (host.selTool === "lasso") {
+                // 判"是否真的拖出了面积"必须用轨迹包围盒：画闭环时起点
+                // ≈ 终点，用端点距离会把套索误判成单击（然后清空选区）。
+                var lx0 = Infinity, ly0 = Infinity, lx1 = -Infinity, ly1 = -Infinity
+                for (var li = 0; li < lassoPts.length; li++) {
+                    lx0 = Math.min(lx0, lassoPts[li][0])
+                    ly0 = Math.min(ly0, lassoPts[li][1])
+                    lx1 = Math.max(lx1, lassoPts[li][0])
+                    ly1 = Math.max(ly1, lassoPts[li][1])
+                }
+                if (lassoPts.length >= 3 && (lx1 - lx0) >= 2 && (ly1 - ly0) >= 2) {
+                    const text = lassoPts
+                        .map(p => p[0].toFixed(1) + "," + p[1].toFixed(1))
+                        .join(" ")
+                    bridge.sel_set_polygon(text, selMode)
+                } else {
+                    // 套索单击（没拖动）= 取消选区。
+                    bridge.sel_clear()
+                }
+            } else if (host.selTool === "rect" || host.selTool === "ellipse") {
+                if (dx < 0.5 || dy < 0.5) {
+                    // 点击（没拖出面积）= 取消选区 + 取消图层选中。
+                    bridge.sel_clear()
+                    if (bridge.selected_layer >= 0)
+                        bridge.select_layer(-1)
+                } else if (host.selTool === "rect") {
+                    bridge.sel_set_rect(a[0], a[1], b[0], b[1], selMode)
+                } else {
+                    bridge.sel_set_ellipse(a[0], a[1], b[0], b[1], selMode)
+                }
+            }
+            lassoPts = []
+            selPreview.requestPaint()
+        }
+    }
+
+    // 框选 / 套索进行中的预览（画布坐标，松手后由 Rust 的选区接管）。
+    // 与 markPreview 同一套打法：Immediate + Image + 16ms 补拍，否则
+    // 场景静止时单次 requestPaint 会被丢掉，预览冻结在早期帧。
+    Canvas {
+        id: selPreview
+        anchors.fill: parent
+        visible: selDragMouse.dragging || selPolyActive
+        z: 6
+        renderStrategy: Canvas.Immediate
+        renderTarget: Canvas.Image
+        onPaint: {
+            try {
+                var ctx = getContext("2d")
+                ctx.clearRect(0, 0, width, height)
+                paintImpl(ctx)
+            } catch (e) {
+                bridge.mark("SELPAINT-ERR " + e)
             }
         }
+        function paintImpl(ctx) {
+            ctx.lineWidth = 1
+            ctx.setLineDash([4, 3])
+            ctx.strokeStyle = "#000000"
+            ctx.fillStyle = "rgba(255,255,255,0.08)"
+            if (selPolyActive) {
+                if (polyPts.length === 0)
+                    return
+                const s = Math.max(host.toDispScale(), 0.0001)
+                const px = v => view.pad + v * s
+                ctx.beginPath()
+                ctx.moveTo(px(polyPts[0][0]), px(polyPts[0][1]))
+                for (var i = 1; i < polyPts.length; i++)
+                    ctx.lineTo(px(polyPts[i][0]), px(polyPts[i][1]))
+                ctx.lineTo(polyCurX, polyCurY)
+                ctx.stroke()
+                // 顶点小方块：方便看清已提交的点在哪。
+                ctx.setLineDash([])
+                ctx.fillStyle = "#ffffff"
+                for (var j = 0; j < polyPts.length; j++) {
+                    const vx = px(polyPts[j][0])
+                    const vy = px(polyPts[j][1])
+                    ctx.fillRect(vx - 2, vy - 2, 4, 4)
+                    ctx.strokeRect(vx - 2, vy - 2, 4, 4)
+                }
+                return
+            }
+            if (!selDragMouse.dragging)
+                return
+            const x0 = selDragMouse.startX
+            const y0 = selDragMouse.startY
+            const x1 = selDragMouse.curX
+            const y1 = selDragMouse.curY
+            if (host.selTool === "lasso") {
+                if (selDragMouse.lassoPts.length < 2)
+                    return
+                const s2 = Math.max(host.toDispScale(), 0.0001)
+                const qx = v => view.pad + v * s2
+                ctx.beginPath()
+                ctx.moveTo(qx(selDragMouse.lassoPts[0][0]),
+                           qx(selDragMouse.lassoPts[0][1]))
+                for (var k = 1; k < selDragMouse.lassoPts.length; k++)
+                    ctx.lineTo(qx(selDragMouse.lassoPts[k][0]),
+                               qx(selDragMouse.lassoPts[k][1]))
+                ctx.stroke()
+                return
+            }
+            if (host.selTool === "ellipse") {
+                const ecx = (x0 + x1) / 2
+                const ecy = (y0 + y1) / 2
+                const erx = Math.abs(x1 - x0) / 2
+                const ery = Math.abs(y1 - y0) / 2
+                if (erx < 0.5 || ery < 0.5)
+                    return
+                // Context2D.ellipse 的 (x,y) 是外接矩形左上角（不是圆心），
+                // 用单位圆 + 缩放构造最稳（见 markPreview 的同类注释）。
+                ctx.save()
+                ctx.translate(ecx, ecy)
+                ctx.scale(erx, ery)
+                ctx.beginPath()
+                ctx.arc(0, 0, 1, 0, Math.PI * 2)
+                ctx.restore()
+                ctx.stroke()
+                return
+            }
+            const rx = Math.min(x0, x1)
+            const ry = Math.min(y0, y1)
+            ctx.fillRect(rx, ry, Math.abs(x1 - x0), Math.abs(y1 - y0))
+            ctx.strokeRect(rx, ry, Math.abs(x1 - x0), Math.abs(y1 - y0))
+        }
+    }
+
+    Timer {
+        id: selPreviewTimer
+        interval: 16
+        repeat: true
+        running: selDragMouse.dragging || selPolyActive
+        onTriggered: selPreview.requestPaint()
     }
 
     // ---- 标记绘制/编辑区：标记工具激活时盖在选择交互之上 -------

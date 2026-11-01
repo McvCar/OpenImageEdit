@@ -69,6 +69,16 @@ Rectangle {
         { l: "重置裁剪", ok: bridge.image_width > 0, run: function () { bridge.reset_crop() } },
         { l: "调整尺寸…", ok: bridge.image_width > 0, run: function () { resizeOverlay.openResizeDialog() } },
         { l: "", ok: true, sep: true },
+        { l: "选区工具条（M / L）", ok: true, run: function () { selBarBtn.clicked() } },
+        { l: "全选 (Ctrl+A)", ok: bridge.image_width > 0,
+          run: function () { bridge.sel_select_all() } },
+        { l: "选择反选 (Ctrl+Shift+I)", ok: bridge.image_width > 0,
+          run: function () { bridge.sel_invert() } },
+        { l: "取消选择 (Ctrl+D)", ok: host.selExists,
+          run: function () { bridge.sel_clear() } },
+        { l: "快速蒙版 (Q)", ok: host.selExists,
+          run: function () { bridge.sel_toggle_quick_mask() } },
+        { l: "", ok: true, sep: true },
         { l: "提取图层", ok: host.selExists, run: function () { host.commitExtract() } },
         { l: "删除选区像素 (Delete)", ok: host.selExists, run: function () { host.deleteSelectionPixels() } },
         { l: "图层面板", ok: true, run: function () { host.panelVisible = !host.panelVisible } },
@@ -100,7 +110,8 @@ Rectangle {
     // 图片尺寸打开、创建时宽度还是 0），capacity 会一直停在 0 —— 整排图标
     // 消失但分隔线还在，正是"窄窗口下工具栏全被收起来"的那个状态。
     // 右侧固定簇：窗口按钮 + ⋯ + 图层面板 + 标记栏（含各自的间距/边距）。
-    readonly property real rightCluster: markBarBtn.width + 2 + layersBtn.width + 2
+    readonly property real rightCluster: selBarBtn.width + 2 + markBarBtn.width + 2
+                                         + layersBtn.width + 2
                                          + menuBtn.width + 6 + winRow.width + 4
     // 一行里能塞下多少个图标槽（30px 按钮 + 2px 间距，按 32 算）。
     function slotsFor(titleWidth) {
@@ -216,6 +227,26 @@ Rectangle {
                           || (toolbar.barActions[index].sel === true)
                 visible: modelData.sep === true || index < toolbar.capacity
                 onClicked: modelData.run()
+            }
+        }
+    }
+
+    IconButton {
+        id: selBarBtn
+        anchors.right: markBarBtn.left
+        anchors.rightMargin: 2
+        anchors.verticalCenter: parent.verticalCenter
+        glyph: "◫"
+        tip: "选区工具（矩形 / 椭圆 / 套索 / 多边形，M · L）"
+        selected: host.selBarVisible
+        onClicked: {
+            if (host.selBarVisible) {
+                host.selBarVisible = false
+                host.selTool = "none"
+                host.selFieldEditing = false
+            } else {
+                // 默认落到矩形选框（PS 的 M）。
+                host.setSelTool("rect")
             }
         }
     }

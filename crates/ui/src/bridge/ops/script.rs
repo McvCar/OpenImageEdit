@@ -30,6 +30,111 @@ impl qobject::Bridge {
                         self.as_mut().refresh_preview_zoom();
                     }
                 }
+                // ---- 选区探针（无头验证用，拖拽手势无法脚本化） ----
+                "sel-all" => self.as_mut().sel_select_all(),
+                "sel-none" => self.as_mut().sel_clear(),
+                "sel-invert" => self.as_mut().sel_invert(),
+                "sel-quickmask" => self.as_mut().sel_toggle_quick_mask(),
+                "crop-sel" => self.as_mut().crop_to_selection(),
+                // `sel-dump` — 断言用：bounds / ops / rev。
+                "sel-dump" => {
+                    let (rect, ops, rev) = {
+                        let guard = self.session.borrow();
+                        let session = guard.as_ref();
+                        (
+                            session
+                                .and_then(|s| s.selection.as_ref())
+                                .map(|st| st.mask().bounds)
+                                .unwrap_or_default(),
+                            session
+                                .and_then(|s| s.selection.as_ref())
+                                .map(|st| (st.ops.border, st.ops.smooth, st.ops.feather))
+                                .unwrap_or((0, 0, 0)),
+                            session.map(|s| s.sel_rev).unwrap_or(0),
+                        )
+                    };
+                    let active = {
+                        let guard = self.session.borrow();
+                        guard
+                            .as_ref()
+                            .and_then(|s| s.selection.as_ref())
+                            .map(|st| !st.is_empty())
+                            .unwrap_or(false)
+                    };
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"sel-dump\",\"active\":{active},\
+                         \"rect\":\"{},{},{},{}\",\"border\":{},\"smooth\":{},\"feather\":{},\"rev\":{rev}}}",
+                        rect.x, rect.y, rect.width, rect.height, ops.0, ops.1, ops.2
+                    );
+                }
+                // `sel-outline` — 打印轮廓 JSON（蚂蚁线数据源）。
+                "sel-outline" => {
+                    let json = self.as_mut().sel_outline().to_string();
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"sel-outline\",\"len\":{},\"rings\":{}}}",
+                        json.len(),
+                        json.matches("],[[").count() + 1
+                    );
+                }
+                other if other.starts_with("sel-rect:") || other.starts_with("sel-ellipse:") => {
+                    let (body, mode) = split_mode(other);
+                    let nums = parse_nums(body);
+                    if nums.len() == 4 {
+                        if other.starts_with("sel-rect:") {
+                            self.as_mut().sel_set_rect(
+                                nums[0], nums[1], nums[2], nums[3], mode,
+                            );
+                        } else {
+                            self.as_mut().sel_set_ellipse(
+                                nums[0], nums[1], nums[2], nums[3], mode,
+                            );
+                        }
+                    } else {
+                        println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}")
+                    }
+                }
+                other if other.starts_with("sel-polygon:") => {
+                    let (body, mode) = split_mode(other);
+                    let pts = body.strip_prefix("sel-polygon:").unwrap_or("");
+                    // "x,y x,y x,y"（空格分隔点，避免吃掉脚本的 `;`）
+                    let norm = pts.trim().replace(' ', ",");
+                    let nums: Vec<f32> = norm
+                        .split(',')
+                        .map(str::trim)
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                    if nums.len() >= 6 && nums.len() % 2 == 0 {
+                        let pair: Vec<String> = nums
+                            .chunks(2)
+                            .map(|c| format!("{},{}", c[0], c[1]))
+                            .collect();
+                        self.as_mut()
+                            .sel_set_polygon(&QString::from(pair.join(" ")), mode);
+                    } else {
+                        println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}")
+                    }
+                }
+                other if other.starts_with("sel-border:")
+                    || other.starts_with("sel-smooth:")
+                    || other.starts_with("sel-feather:") =>
+                {
+                    let v = other
+                        .rsplit(':')
+                        .next()
+                        .and_then(|s| s.trim().parse::<i32>().ok());
+                    match (v, other) {
+                        (Some(k), o) if o.starts_with("sel-border:") => {
+                            self.as_mut().sel_set_border(k)
+                        }
+                        (Some(k), o) if o.starts_with("sel-smooth:") => {
+                            self.as_mut().sel_set_smooth(k)
+                        }
+                        (Some(k), _) => self.as_mut().sel_set_feather(k),
+                        _ => println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        ),
+                    }
+                }
                 "save" => self.as_mut().save_edited(),
                 "reset-crop" => self.as_mut().reset_crop(),
                 "toggle-visible-selected" => self.as_mut().toggle_selected_visible(),
@@ -295,15 +400,22 @@ impl qobject::Bridge {
                             println!(
                                 "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
                             );
-                        } else if other.starts_with("copy:") {
-                            self.as_mut()
-                                .copy_selection_pixels(nums[0], nums[1], nums[2], nums[3]);
-                        } else if other.starts_with("cut:") {
-                            self.as_mut()
-                                .cut_selection_pixels(nums[0], nums[1], nums[2], nums[3]);
                         } else {
-                            self.as_mut()
-                                .erase_selection_pixels(nums[0], nums[1], nums[2], nums[3]);
+                            // 旧脚本形式把矩形当选区：先落一个矩形选区再执行。
+                            self.as_mut().sel_set_rect(
+                                nums[0] as f64,
+                                nums[1] as f64,
+                                (nums[0] + nums[2]) as f64,
+                                (nums[1] + nums[3]) as f64,
+                                0,
+                            );
+                            if other.starts_with("copy:") {
+                                self.as_mut().copy_selection_pixels();
+                            } else if other.starts_with("cut:") {
+                                self.as_mut().cut_selection_pixels();
+                            } else {
+                                self.as_mut().erase_selection_pixels();
+                            }
                         }
                     }
                     None => match other.strip_prefix("extract:") {
@@ -314,8 +426,14 @@ impl qobject::Bridge {
                                 .filter_map(|s| s.parse().ok())
                                 .collect();
                             if nums.len() == 4 {
-                                self.as_mut()
-                                    .extract_selection(nums[0], nums[1], nums[2], nums[3])
+                                self.as_mut().sel_set_rect(
+                                    nums[0] as f64,
+                                    nums[1] as f64,
+                                    (nums[0] + nums[2]) as f64,
+                                    (nums[1] + nums[3]) as f64,
+                                    0,
+                                );
+                                self.as_mut().extract_selection()
                             } else {
                                 println!(
                                     "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
@@ -400,4 +518,26 @@ println!(
                 self.status(),
             );
     }
+}
+
+/// `"sel-rect:1,2,3,4@2"` → `("sel-rect:1,2,3,4", 2)`. The `@mode` suffix
+/// carries the PS-style combine mode (0 replace / 1 add / 2 subtract /
+/// 3 intersect) without colliding with the `,`-separated coordinates.
+fn split_mode(op: &str) -> (&str, i32) {
+    match op.split_once('@') {
+        Some((body, mode)) => (body, mode.trim().parse().unwrap_or(0)),
+        None => (op, 0),
+    }
+}
+
+/// Numbers after the first `:` of a script op.
+fn parse_nums(op: &str) -> Vec<f64> {
+    op.split_once(':')
+        .map(|(_, rest)| {
+            rest.split(',')
+                .map(str::trim)
+                .filter_map(|s| s.parse::<f64>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }

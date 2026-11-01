@@ -71,6 +71,7 @@ Item {
         const chromeW = root.panelVisible ? layerPanel.width : 0
         const chromeH = root.toolbarHeight + root.statusHeight
                         + (root.markBarVisible ? root.toolbarHeight : 0)
+                        + (selBar.visible ? root.toolbarHeight : 0)
         // 屏幕可用区域：**不能**用 Screen.availableWidth/availableHeight ——
         // 那是 Qt 5 的名字，Qt 6 上取到的是 undefined（实测 aw=undefined
         // ah=undefined），旧代码于是静默 fallback 成整屏 3440×1440，而真实
@@ -131,14 +132,36 @@ Item {
     // floating state (the paste itself + any drag/scale commits), so Esc
     // can roll the whole paste back.
     property int floatingOps: 0
-    property real selX: 0
-    property real selY: 0
-    property real selW: 0
-    property real selH: 0
-    readonly property bool selExists: selW >= 3 && selH >= 3
+    // ---- 选区（PS 式）------------------------------------------------
+    // 真值在 Rust（SelectionMask，图像像素坐标）；QML 只读它，并按当前
+    // 显示比例换算成显示坐标，供绘制 / 光标 / 尺子用。
+    // ★这 4 个必须保持只读：任何 `root.selW = …` 的旧写法都是 bug，改选
+    //   区一律走 bridge.sel_*。
+    readonly property int selImgX: bridge.image_width > 0 ? bridge.selX : 0
+    readonly property int selImgY: bridge.image_width > 0 ? bridge.selY : 0
+    readonly property int selImgW: bridge.image_width > 0 ? bridge.selW : 0
+    readonly property int selImgH: bridge.image_width > 0 ? bridge.selH : 0
+    readonly property real selX: selImgX * toDispScale()
+    readonly property real selY: selImgY * toDispScale()
+    readonly property real selW: selImgW * toDispScale()
+    readonly property real selH: selImgH * toDispScale()
+    readonly property bool selExists: bridge.selActive
+    // 当前选区工具："rect" | "ellipse" | "lasso" | "polygon" | "none"
+    property string selTool: "rect"
+    // 选区工具条（第二行；激活任一种选区工具时显示）。
+    property bool selBarVisible: false
+    // 加选/减选/相交的粘滞模式（拖动时按住的 Shift/Alt 会临时覆盖它）：
+    // 0 替换 / 1 加选 / 2 减选 / 3 相交。
+    property int selMode: 0
+    // 右键菜单是否打开（打开时 Esc 先关它）。
+    property bool selMenuOpen: false
+    // 选区数值输入框正在编辑：此时 M/L/Q 快捷键必须让路（否则输入框
+    // 里打的字会切成工具 / 开关快速蒙版）。
+    property bool selFieldEditing: false
     // Transient "rubber band in use" state; hides the handle dots and
     // disables the wheel zoom while dragging a new selection.
     readonly property bool selRubberBanding: view.canvasSurface.selDragMouse.dragging
+                                             || view.canvasSurface.selPolyActive
     readonly property bool modeActive: selRubberBanding || pasteFloating
     // Scale target for the selected layer (display coords); empty when idle.
     property real scaleX: 0
@@ -271,6 +294,12 @@ Item {
     readonly property bool probeResize: Qt.application.arguments.indexOf("--probe-resize") !== -1
     readonly property bool probeLayers: Qt.application.arguments.indexOf("--probe-layers") !== -1
     readonly property bool probeMarks: Qt.application.arguments.indexOf("--probe-marks") !== -1
+    // 选区探针：打开工具条 + 落一个椭圆选区（截图/手工验证用）。
+    readonly property bool probeSelection: Qt.application.arguments.indexOf("--probe-selection") !== -1
+    // 选区探针的附加项：把右键菜单也弹出来（核对数值输入框排版）。
+    readonly property bool probeSelMenu: Qt.application.arguments.indexOf("--probe-selmenu") !== -1
+    // 多边形套索的进行中预览（截图核对橡皮筋 + 顶点方块）。
+    readonly property bool probeSelPoly: Qt.application.arguments.indexOf("--probe-selpoly") !== -1
     // Ids inside an inline component are invisible from outside, so the
     // shell / DocWindow wrappers reach the Bridge through this alias.
     readonly property alias b: bridge
@@ -292,9 +321,8 @@ Item {
         onLoadFailedChanged: if (bridge.loadFailed && bridge.auto_quit)
             Qt.quit()
         onImage_widthChanged: {
-            // New canvas: drop any pending selection / scale preview.
-            root.selW = 0
-            root.selH = 0
+            // New canvas: drop the scale preview. The selection lives in
+            // Rust now and is cleared there when the canvas itself changes.
             root.scaleW = 0
             root.scaleH = 0
         }
@@ -405,7 +433,7 @@ Shortcut { sequence: "Right"; enabled: canNavigate(); onActivated: navigateRel(1
 // 回车：模态确认框 = 默认动作（保存并打开/切换/关闭）；否则裁剪/粘贴。
 Shortcut { sequences: ["Return", "Enter"]
            enabled: confirmOverlay.visible || root.pasteFloating
-                    || root.selExists
+                    || root.selExists || view.canvasSurface.selPolyActive
            onActivated: onEnter() }
 
 Shortcut { sequence: "Left";  enabled: bridge.selected_layer >= 0; onActivated: nudgeLayer(-1, 0) }
@@ -420,6 +448,15 @@ Shortcut { sequence: "Shift+Down";  enabled: bridge.selected_layer >= 0; onActiv
 Shortcut { sequences: [StandardKey.ZoomIn, "Ctrl+="]; onActivated: view.queueZoom(1.25) }
 Shortcut { sequences: [StandardKey.ZoomOut]; onActivated: view.queueZoom(1 / 1.25) }
 // Preview-aligned: ⌘0 actual size, ⌘9 zoom-to-fit (old keys kept as aliases).
+// Ctrl+方向键 = 平移选区（PS 的蚂蚁线平移；图层 nudge 仍归方向键）。
+Shortcut { sequence: "Ctrl+Left";  enabled: root.selExists && root.canUseToolKeys()
+           onActivated: bridge.sel_translate(-1, 0) }
+Shortcut { sequence: "Ctrl+Right"; enabled: root.selExists && root.canUseToolKeys()
+           onActivated: bridge.sel_translate(1, 0) }
+Shortcut { sequence: "Ctrl+Up";    enabled: root.selExists && root.canUseToolKeys()
+           onActivated: bridge.sel_translate(0, -1) }
+Shortcut { sequence: "Ctrl+Down";  enabled: root.selExists && root.canUseToolKeys()
+           onActivated: bridge.sel_translate(0, 1) }
 Shortcut { sequences: ["Ctrl+0", "Ctrl+1"]; onActivated: bridge.zoom_actual() }
 Shortcut { sequences: ["Ctrl+9"]; onActivated: bridge.zoom_fit() }
 Shortcut { sequences: [StandardKey.Undo]; onActivated: bridge.undo() }
@@ -453,6 +490,23 @@ Shortcut { sequences: ["Delete", "Backspace"]
 Shortcut { sequence: "Ctrl+A"
            enabled: bridge.image_width > 0 && root.renamingIndex < 0
            onActivated: selectAllCanvas() }
+// ---- 选区（PS 快捷键）----
+// M / Shift+M = 矩形 / 椭圆选框；L / Shift+L = 套索 / 多边形套索。
+Shortcut { sequence: "M"; enabled: root.canUseToolKeys()
+           onActivated: root.setSelTool("rect") }
+Shortcut { sequence: "Shift+M"; enabled: root.canUseToolKeys()
+           onActivated: root.setSelTool("ellipse") }
+Shortcut { sequence: "L"; enabled: root.canUseToolKeys()
+           onActivated: root.setSelTool("lasso") }
+Shortcut { sequence: "Shift+L"; enabled: root.canUseToolKeys()
+           onActivated: root.setSelTool("polygon") }
+Shortcut { sequence: "Ctrl+D"; enabled: root.selExists
+           onActivated: bridge.sel_clear() }
+Shortcut { sequence: "Ctrl+Shift+I"; enabled: bridge.image_width > 0
+           onActivated: bridge.sel_invert() }
+// Q: 快速蒙版（要看羽化软边在哪就按它）。
+Shortcut { sequence: "Q"; enabled: bridge.image_width > 0 && root.canUseToolKeys()
+           onActivated: bridge.sel_toggle_quick_mask() }
 // ⌘W / ⌘Q: close window / quit, both through the dirty-confirm guard.
 Shortcut { sequence: "Ctrl+W"; onActivated: requestQuit() }
 Shortcut { sequence: "Ctrl+Q"; onActivated: requestQuit() }
@@ -484,6 +538,39 @@ MarkBar {
     host: root
     bridge: bridge
     toolbar: toolbar
+}
+
+// ---- 选区工具条（PS 式 options bar）--------------------------------
+SelectionBar {
+    id: selBar
+    host: root
+    bridge: bridge
+    toolbar: toolbar
+    markBar: markBar
+}
+
+// ---- 选区右键菜单 ---------------------------------------------------
+SelectionMenu {
+    id: selMenu
+    host: root
+    bridge: bridge
+}
+
+// 点空白处关掉选区菜单（菜单本身在更高的 z 上，点击不会穿透到这里）。
+MouseArea {
+    z: 295
+    anchors.fill: parent
+    visible: root.selMenuOpen
+    enabled: root.selMenuOpen
+    onPressed: (mouse) => {
+        selMenu.close()
+        mouse.accepted = true
+    }
+}
+
+// 右键落在选区内 → 弹菜单（画布坐标已换算成 root 坐标）。
+function openSelMenu(x, y) {
+    selMenu.open(x, y)
 }
 
 
@@ -576,6 +663,7 @@ CanvasView {
     host: root
     bridge: bridge
     markBar: markBar
+    selBar: selBar
     toolbar: toolbar
     statusBar: statusBar
     layerPanel: layerPanel
@@ -588,7 +676,9 @@ CanvasView {
 // normal click-drag can never pan the view.
 MouseArea {
     id: panMa
-    anchors.top: toolbar.bottom
+    // 顶部对齐画布视图本身（而不是标题栏），否则中键拖动会压住
+    // 标记栏 / 选区栏上的按钮。
+    anchors.top: view.top
     anchors.bottom: statusBar.top
     anchors.left: parent.left
     anchors.right: parent.right
@@ -703,34 +793,10 @@ function toDispScale() {
            ? view.previewImage.width / bridge.image_width : 0
 }
 
-// 选区存的是显示坐标：缩放（滚轮 / 适应窗口 / 拖窗口）改变显示比例后
-// 它会漂离原画面位置。按新旧比例把选区重映射，让包围盒始终钉住同一块
-// 内容。图层框走图像坐标 × toDispScale() 实时换算，天生跟随，无需处理。
-property real selTrackScale: 0
-property int selTrackImgW: 0
-function remapSelectionToScale() {
-    const iw = bridge.image_width
-    if (iw <= 0 || view.previewImage.width <= 0) {
-        selTrackScale = 0
-        selTrackImgW = 0
-        return
-    }
-    const s = view.previewImage.width / iw
-    // 图像尺寸没变且之前记过基准 → 纯比例变化，重映射。
-    // 图像尺寸变了（裁剪/调整大小/新文档）→ 语义已变，只重置基准。
-    if (selTrackImgW === iw && selTrackScale > 0 && root.selExists
-            && !root.selRubberBanding) {
-        const k = s / selTrackScale
-        if (k !== 1) {
-            root.selX *= k
-            root.selY *= k
-            root.selW *= k
-            root.selH *= k
-        }
-    }
-    selTrackScale = s
-    selTrackImgW = iw
-}
+// 选区真值在 Rust（图像坐标），缩放 / 拖窗口都不会让它漂移——显示框由
+// selX/selW 的绑定按当前比例实时换算。这个钩子保留给 CanvasView 的
+// 宽度变化通知（曾经在这里把选区重映射到新比例）。
+function remapSelectionToScale() {}
 
 // Snap a display coordinate to the nearest image-pixel boundary so every
 // crop / selection edge maps to an exact integer image coordinate.
@@ -768,12 +834,6 @@ function canvasCursor(x, y) {
         return Qt.SizeAllCursor
     const ix = x - view.pad
     const iy = y - view.pad
-    if (root.selExists) {
-        const c = Geometry.boxCursor(ix, iy, root.selX, root.selY,
-                            root.selW, root.selH)
-        if (c >= 0)
-            return c
-    }
     if (view.selectionViz.layerHandles.visible) {
         const c = Geometry.boxCursor(ix, iy, view.selectionViz.layerHandles.bx, view.selectionViz.layerHandles.by,
                             view.selectionViz.layerHandles.bw, view.selectionViz.layerHandles.bh)
@@ -786,47 +846,6 @@ function canvasCursor(x, y) {
             return Qt.SizeAllCursor
     }
     return Qt.CrossCursor
-}
-
-// Cursor for hovering a box's border / interior (display px).
-// Returns the matching Qt cursor, or -1 when the point is outside the
-// grab zone. Border tolerance: corners beat edges, edges beat interior.
-function boxSet(x, y, w, h) {
-    root.selX = x; root.selY = y; root.selW = w; root.selH = h
-}
-
-function resizeBoxFrom(startRect, role, dx, dy) {
-    const s = Math.max(toDispScale(), 0.001)
-    let x = startRect.x, y = startRect.y, w = startRect.width, h = startRect.height
-    if (role.indexOf("w") >= 0) {
-        let nx = snapDisplay(startRect.x + dx)
-        nx = Math.max(0, Math.min(nx, startRect.x + startRect.width - s))
-        w = startRect.x + startRect.width - nx
-        x = nx
-    }
-    if (role.indexOf("e") >= 0) {
-        w = Math.min(Math.max(s, snapDisplay(startRect.width + dx)),
-                     view.previewImage.width - x)
-    }
-    if (role.indexOf("n") >= 0) {
-        let ny = snapDisplay(startRect.y + dy)
-        ny = Math.max(0, Math.min(ny, startRect.y + startRect.height - s))
-        h = startRect.y + startRect.height - ny
-        y = ny
-    }
-    if (role.indexOf("s") >= 0) {
-        h = Math.min(Math.max(s, snapDisplay(startRect.height + dy)),
-                     view.previewImage.height - y)
-    }
-    boxSet(x, y, w, h)
-}
-
-function moveSelFrom(startRect, dx, dy) {
-    let x = snapDisplay(startRect.x + dx)
-    let y = snapDisplay(startRect.y + dy)
-    x = Math.max(0, Math.min(x, view.previewImage.width - startRect.width))
-    y = Math.max(0, Math.min(y, view.previewImage.height - startRect.height))
-    boxSet(x, y, startRect.width, startRect.height)
 }
 
 // Live scale-target box for the selected layer; committed on release.
@@ -895,27 +914,44 @@ function cancelLayerScale() {
     root.scaleX = 0; root.scaleY = 0; root.scaleW = 0; root.scaleH = 0
 }
 
+// ---- 选区工具 -------------------------------------------------------
+// 单字母快捷键（M/L/Q）只有在没有任何文本输入获得焦点时才生效，否则会
+// 把用户正在输入的字符吞成工具切换。
+function canUseToolKeys() {
+    return !view.canvasSurface.textPopup.visible
+        && root.renamingIndex < 0
+        && !root.selFieldEditing
+        && !fontPopover.sizeInput.activeFocus
+}
+
+// 切换选区工具。选区工具与标记工具互斥：markMa 盖在画布按下事件之上，
+// 两边同时激活时框选手势永远起不来。
+function setSelTool(tool) {
+    root.selTool = tool
+    root.selBarVisible = tool !== "none"
+    if (tool !== "none") {
+        root.markTool = "none"
+        widthPopover.visible = false
+        mosaicPopover.visible = false
+    }
+    view.canvasSurface.cancelPolygon()
+}
+
 function applyCrop() {
     if (!root.selExists)
         return
-    const s = toDispScale()
-    bridge.crop_to(Math.round(root.selX / s), Math.round(root.selY / s),
-                   Math.max(1, Math.round(root.selW / s)),
-                   Math.max(1, Math.round(root.selH / s)))
-    root.selW = 0
-    root.selH = 0
+    // PS 语义：裁剪到选区的包围盒（套索/羽化选区也一样）。裁剪会移动画布
+    // 原点，Rust 侧已经顺手清掉选区。
+    bridge.crop_to(root.selImgX, root.selImgY,
+                   Math.max(1, root.selImgW), Math.max(1, root.selImgH))
     cancelLayerScale()
 }
 
 function deleteSelectionPixels() {
     if (!root.selExists)
         return
-    const s = toDispScale()
-    bridge.erase_selection_pixels(
-        Math.floor(root.selX / s), Math.floor(root.selY / s),
-        Math.round(root.selW / s), Math.round(root.selH / s))
-    root.selW = 0
-    root.selH = 0
+    // 羽化/边界都算进"有效覆盖度"里：软边也会按 alpha 擦除。
+    bridge.erase_selection_pixels()
 }
 
 // Delete / Backspace: 显式选中的标记最优先（持久选区 + 选中标记时，
@@ -946,13 +982,10 @@ function onDeleteKey() {
 
 // Ctrl+A: selection covering the whole canvas (Preview ⌘A).
 function selectAllCanvas() {
-    if (view.previewImage.width < 1 || view.previewImage.height < 1)
+    if (bridge.image_width < 1 || bridge.image_height < 1)
         return
-    root.selX = 0
-    root.selY = 0
-    root.selW = view.previewImage.width
-    root.selH = view.previewImage.height
     settlePaste()
+    bridge.sel_select_all()
 }
 
 // Ctrl+W / Ctrl+Q: close the window through the dirty-confirm guard.
@@ -972,10 +1005,7 @@ function requestQuit() {
 // different document (cross-image paste).
 function doCopy() {
     if (root.selExists) {
-        const s = toDispScale()
-        bridge.copy_selection_pixels(
-            Math.floor(root.selX / s), Math.floor(root.selY / s),
-            Math.round(root.selW / s), Math.round(root.selH / s))
+        bridge.copy_selection_pixels()
     } else if (bridge.selected_layer >= 0) {
         bridge.copy_selected_layer()
     }
@@ -983,12 +1013,8 @@ function doCopy() {
 
 function doCut() {
     if (root.selExists) {
-        const s = toDispScale()
-        bridge.cut_selection_pixels(
-            Math.floor(root.selX / s), Math.floor(root.selY / s),
-            Math.round(root.selW / s), Math.round(root.selH / s))
-        root.selW = 0
-        root.selH = 0
+        // 剪切保留选区（PS 行为）：像素走了，蚂蚁线还在原处。
+        bridge.cut_selection_pixels()
     } else if (bridge.selected_layer >= 0) {
         bridge.cut_selected_layer()
     }
@@ -1000,8 +1026,6 @@ function doCut() {
 function doPaste() {
     if (root.pasteFloating)
         settlePaste()
-    root.selW = 0
-    root.selH = 0
     // Only a successful paste enters the floating placement state —
     // otherwise Esc would "roll back" an unrelated edit.
     if (bridge.paste_clipboard()) {
@@ -1037,6 +1061,8 @@ function onEscape() {
     if (resizeOverlay.visible) { resizeOverlay.visible = false; return }
     if (settingsOverlay.visible) { settingsOverlay.visible = false; return }
     if (root.scaleW > 0) { cancelLayerScale(); return }
+    // 多边形套索进行中：Esc = 放弃这一串顶点（不动已有选区）。
+    if (view.canvasSurface.selPolyActive) { view.canvasSurface.cancelPolygon(); return }
     if (view.canvasSurface.selDragMouse.dragging) { view.canvasSurface.selDragMouse.dragging = false; return }
     if (bridge.selected_mark >= 0) { bridge.select_mark(-1); return }
     if (root.pasteFloating) {
@@ -1046,7 +1072,8 @@ function onEscape() {
         settlePaste()
         return
     }
-    if (root.selExists) { root.selW = 0; root.selH = 0; return }
+    if (root.selMenuOpen) { root.selMenuOpen = false; return }
+    if (root.selExists) { bridge.sel_clear(); return }
     if (bridge.selected_layer >= 0) { bridge.select_layer(-1); return }
     if (root.panelVisible) { root.panelVisible = false; return }
     root.fullscreen = false
@@ -1056,6 +1083,11 @@ function onEnter() {
     // 模态确认框：回车 = 默认动作（保存并打开/切换/关闭）。
     if (confirmOverlay.visible) {
         confirmSaveProceed()
+        return
+    }
+    // 多边形套索进行中：回车 = 闭合（不要把已有选区拿去裁剪）。
+    if (view.canvasSurface.selPolyActive) {
+        view.canvasSurface.commitPolygon()
         return
     }
     if (root.pasteFloating) {
@@ -1069,12 +1101,8 @@ function onEnter() {
 function commitExtract() {
     if (!root.selExists)
         return
-    const scale = toImageScale()
-    bridge.extract_selection(
-        Math.floor(root.selX * scale), Math.floor(root.selY * scale),
-        Math.round(root.selW * scale), Math.round(root.selH * scale))
-    root.selW = 0
-    root.selH = 0
+    // 「提取图层」按选区 alpha 抠出来（羽化软边原样带走）。
+    bridge.extract_selection()
 }
 
 // 再点一次已选中的标记工具 = 取消（回到 none，不绘制只选择）。
@@ -1631,6 +1659,34 @@ Timer {
     }
 }
 
+// Probe: --probe-selection 打开选区工具条并落一个椭圆选区，方便截图核对
+// 蚂蚁线 / 尺寸徽标 / 工具条排版。
+Timer {
+    id: selectionProbeTimer
+    interval: 800
+    running: root.probeSelection || root.probeSelPoly
+    onTriggered: {
+        root.setSelTool(root.probeSelPoly ? "polygon" : "ellipse")
+        // 多边形探针只画预览，不要先落一个椭圆选区（会遮住判断）。
+        if (!root.probeSelPoly && bridge.image_width > 0 && !root.selExists)
+            bridge.sel_set_ellipse(bridge.image_width * 0.22,
+                                   bridge.image_height * 0.20,
+                                   bridge.image_width * 0.78,
+                                   bridge.image_height * 0.75, 0)
+        if (root.probeSelMenu)
+            root.openSelMenu(root.width * 0.42, root.height * 0.34)
+        if (root.probeSelPoly) {
+            const cs = view.canvasSurface
+            const s2 = Math.max(root.toDispScale(), 0.0001)
+            cs.polyPts = [[120, 90], [520, 150], [460, 470], [150, 400]]
+            cs.polyCurX = view.pad + 620 * s2
+            cs.polyCurY = view.pad + 300 * s2
+            cs.selPolyActive = true
+            cs.selPreview.requestPaint()
+        }
+    }
+}
+
 // Prepare-only: enable the mark bar + ellipse tool, then let a REAL
 // (posted) mouse drag drive the interaction.
 Timer {
@@ -1652,10 +1708,10 @@ Timer {
         root.markBarVisible = true
         root.rulerOn = true
         if (!root.selExists && bridge.image_width > 0) {
-            root.selX = view.previewImage.width * 0.18
-            root.selY = view.previewImage.height * 0.22
-            root.selW = view.previewImage.width * 0.38
-            root.selH = view.previewImage.height * 0.34
+            bridge.sel_set_rect(bridge.image_width * 0.18,
+                                bridge.image_height * 0.22,
+                                bridge.image_width * 0.56,
+                                bridge.image_height * 0.56, 0)
         }
         if (bridge.image_width > 0) {
             root.hoverFx = bridge.image_width * 0.72

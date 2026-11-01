@@ -358,21 +358,35 @@ impl Document {
         !self.history.redo.is_empty()
     }
 
-    pub fn selection_layer(&self, selection: &Selection) -> Result<Layer, EditError> {
-        let bounds = selection.bounds();
-        if bounds.is_empty() {
+    pub fn selection_layer(&self, selection: &SelectionMask) -> Result<Layer, EditError> {
+        let canvas_rect = Rect::new(0, 0, self.canvas.width, self.canvas.height);
+        let bounds = selection
+            .bounds
+            .intersect(canvas_rect)
+            .ok_or(EditError::EmptySelection)?;
+        if bounds.is_empty() || selection.area() == 0 {
             return Err(EditError::EmptySelection);
         }
         let mut image = RgbaImage::new(bounds.width, bounds.height);
+        let mut any = false;
         for y in 0..bounds.height {
             for x in 0..bounds.width {
                 let sx = bounds.x + x as i32;
                 let sy = bounds.y + y as i32;
-                if !selection.contains(sx as f32 + 0.5, sy as f32 + 0.5) {
+                let cov = selection.coverage_at(sx, sy);
+                if cov == 0 {
                     continue;
                 }
-                image.put_pixel(x, y, self.composite_pixel(sx, sy));
+                any = true;
+                // The selection is an alpha coverage map: feathered edges
+                // come out of the extracted layer already semi-transparent.
+                let mut px = self.composite_pixel(sx, sy);
+                px.0[3] = ((px.0[3] as u32 * cov as u32 + 127) / 255) as u8;
+                image.put_pixel(x, y, px);
             }
+        }
+        if !any {
+            return Err(EditError::EmptySelection);
         }
         let mut layer = Layer::new("Selection", image);
         layer.offset = (bounds.x, bounds.y);
@@ -385,7 +399,7 @@ impl Document {
         self.next_layer_seq.to_string()
     }
 
-    pub fn extract_selection(&mut self, selection: &Selection) -> Result<usize, EditError> {
+    pub fn extract_selection(&mut self, selection: &SelectionMask) -> Result<usize, EditError> {
         let mut layer = self.selection_layer(selection)?;
         layer.name = self.next_layer_name();
         let index = self.layers.len();
@@ -394,15 +408,16 @@ impl Document {
     }
 
     /// Non-destructive "delete selection pixels": base pixels under the
-    /// selection become transparent; layers are untouched; undo restores the
-    /// exact previous state via snapshot.
-    pub fn erase_selection(&mut self, selection: &Selection) -> Result<(), EditError> {
+    /// selection become transparent (scaled by the selection's coverage, so a
+    /// feathered edge fades out instead of being cut); layers are untouched;
+    /// undo restores the exact previous state via snapshot.
+    pub fn erase_selection(&mut self, selection: &SelectionMask) -> Result<(), EditError> {
         let canvas_rect = Rect::new(0, 0, self.canvas.width, self.canvas.height);
         let clipped = selection
-            .bounds()
+            .bounds
             .intersect(canvas_rect)
             .ok_or(EditError::EmptySelection)?;
-        if clipped.is_empty() {
+        if clipped.is_empty() || selection.area() == 0 {
             return Err(EditError::EmptySelection);
         }
         let from = self.snapshot();
