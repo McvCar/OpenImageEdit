@@ -75,19 +75,39 @@ Item {
         const minH = win.minimumHeight > 0 ? win.minimumHeight : 240
         let targetW = Math.max(minW, w)
         let targetH = Math.max(minH, h)
-        // 屏幕可用区域用 Screen 附加属性取（root 所在窗口的屏幕，D8 实测
-        // 可靠）；窗口对象的 win.screen 在这里拿不到，不能用来封顶。
+        // 屏幕可用区域：**不能**用 Screen.availableWidth/availableHeight ——
+        // 那是 Qt 5 的名字，Qt 6 上取到的是 undefined（实测 aw=undefined
+        // ah=undefined），旧代码于是静默 fallback 成整屏 3440×1440，而真实
+        // 工作区只有 3440×1392（底部 48px 任务栏）：大图窗口底边正好压到
+        // 任务栏上。
+        // 用 desktopAvailable*（Qt 6 的名字）再与当前屏尺寸取小，多屏拼接
+        // 时也不会算出跨屏的宽度。
+        const sx = root.Screen.virtualX
+        const sy = root.Screen.virtualY
+        const sw = root.Screen.width
+        const sh = root.Screen.height
+        const availW = Math.min(root.Screen.desktopAvailableWidth || sw, sw)
+        const availH = Math.min(root.Screen.desktopAvailableHeight || sh, sh)
         // 留 48px 边距，别把窗口贴死在屏幕边缘/任务栏上。
-        const availW = root.Screen.availableWidth > 0
-                       ? root.Screen.availableWidth : root.Screen.width
-        const availH = root.Screen.availableHeight > 0
-                       ? root.Screen.availableHeight : root.Screen.height
+        const margin = 48
         if (availW > 0)
-            targetW = Math.min(targetW, Math.max(minW, availW - 48))
+            targetW = Math.min(targetW, Math.max(minW, availW - margin))
         if (availH > 0)
-            targetH = Math.min(targetH, Math.max(minH, availH - 48))
+            targetH = Math.min(targetH, Math.max(minH, availH - margin))
         win.width = Math.round(targetW)
         win.height = Math.round(targetH)
+        // 位置也要一起收：只改尺寸不动位置时，窗口若原本开在屏幕中间或
+        // 偏右下，放大到接近满屏后右/下两条边直接跑到屏幕外（标题栏、
+        // 状态栏都看不见）。越界就居中到可见区域，没越界就保持用户摆的
+        // 位置，别每次开图都把窗口搬走。
+        if (availW > 0 && availH > 0) {
+            const maxX = Math.max(sx, sx + availW - targetW)
+            const maxY = Math.max(sy, sy + availH - targetH)
+            if (win.x < sx || win.y < sy || win.x > maxX || win.y > maxY) {
+                win.x = Math.round(sx + (availW - targetW) / 2)
+                win.y = Math.round(sy + (availH - targetH) / 2)
+            }
+        }
     }
 
     property bool fullscreen: false
