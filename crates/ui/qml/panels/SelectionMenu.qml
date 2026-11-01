@@ -35,7 +35,16 @@ Rectangle {
         visible = true
         host.selMenuOpen = true
     }
+    // 结束三个数值框的编辑：丢弃未提交的输入 + 交出键盘焦点。焦点留在
+    // TextInput 上时 Ctrl+Z 会被它当「文字撤销」吃掉，Del 也只删字符，
+    // 文档级快捷键看起来全死了。
+    function endEditing() {
+        borderSpin.endEdit()
+        smoothSpin.endEdit()
+        featherSpin.endEdit()
+    }
     function close() {
+        endEditing()
         visible = false
         host.selMenuOpen = false
         host.selFieldEditing = false
@@ -157,6 +166,8 @@ Rectangle {
                 to: 400
                 step: 5
                 value: bridge.selBorder
+                undoHook: () => bridge.undo()
+                redoHook: () => bridge.redo()
                 onEdited: (v) => bridge.sel_set_border(v)
             }
             Text {
@@ -190,6 +201,8 @@ Rectangle {
                 to: 400
                 step: 2
                 value: bridge.selSmooth
+                undoHook: () => bridge.undo()
+                redoHook: () => bridge.redo()
                 onEdited: (v) => bridge.sel_set_smooth(v)
             }
             Text {
@@ -223,6 +236,8 @@ Rectangle {
                 to: 250
                 step: 2
                 value: bridge.selFeather
+                undoHook: () => bridge.undo()
+                redoHook: () => bridge.redo()
                 onEdited: (v) => bridge.sel_set_feather(v)
             }
             Text {

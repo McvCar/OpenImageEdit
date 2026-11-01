@@ -12,6 +12,11 @@ Rectangle {
     property int step: 1
     // 后缀单位（"px"）——只用于宽度估算，输入框里不显示。
     property string unit: "px"
+    // 编辑期间按 Ctrl+Z / Ctrl+Y：TextInput 会先把它们当「文字撤销」吃掉
+    // （它的撤销栈里只有刚敲的两个字符），文档撤销看起来就没反应。宿主
+    // 挂上这两个钩子，输入框里的撤销键也照样作用于文档。
+    property var undoHook: null
+    property var redoHook: null
     // 正在编辑时把快捷键让路（M/L/Q 不能被吞成工具切换）。
     // editingChanged 由属性自动生成，不用再声明。
     property bool editing: input.activeFocus
@@ -30,6 +35,7 @@ Rectangle {
     }
     Component.onCompleted: input.text = String(value)
 
+    // 只提交，不动焦点（↑↓ 键连续微调时还要继续能打字）。
     function commit(raw) {
         let v = parseInt(raw, 10)
         if (isNaN(v))
@@ -38,6 +44,22 @@ Rectangle {
         input.text = String(v)
         if (v !== sb.value)
             sb.edited(v)
+    }
+
+    // 提交并交出键盘。★ 必须交：TextInput 拿着焦点时 Ctrl+Z 会被它自己的
+    // 「文字撤销」吃掉、Delete/Backspace 也只是删字符，用户看到的就是
+    // 「输入完数值以后 Del / 撤销全没反应」（ResizeOverlay 踩过同一个坑）。
+    function finish(raw) {
+        sb.commit(raw)
+        if (input.activeFocus)
+            input.focus = false
+    }
+
+    // Esc / 外部关菜单：丢弃未提交的输入，把键盘还给文档。
+    function endEdit() {
+        input.text = String(sb.value)
+        if (input.activeFocus)
+            input.focus = false
     }
 
     TextInput {
@@ -59,9 +81,24 @@ Rectangle {
             if (!activeFocus)
                 sb.commit(text)
         }
-        onAccepted: sb.commit(text)
+        onAccepted: sb.finish(text)
         Keys.onUpPressed: { sb.commit(String(sb.value + sb.step)); event.accepted = true }
         Keys.onDownPressed: { sb.commit(String(sb.value - sb.step)); event.accepted = true }
+        Keys.onPressed: (event) => {
+            if ((event.modifiers & Qt.ControlModifier) === 0)
+                return
+            const shift = (event.modifiers & Qt.ShiftModifier) !== 0
+            if (event.key === Qt.Key_Z && !shift && sb.undoHook) {
+                sb.endEdit()
+                sb.undoHook()
+                event.accepted = true
+            } else if ((event.key === Qt.Key_Y || (event.key === Qt.Key_Z && shift))
+                       && sb.redoHook) {
+                sb.endEdit()
+                sb.redoHook()
+                event.accepted = true
+            }
+        }
     }
 
     // 上下箭头（右边一列，各占一半高）。
@@ -87,7 +124,7 @@ Rectangle {
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                onClicked: sb.commit(String(sb.value + sb.step))
+                onClicked: sb.finish(String(sb.value + sb.step))
             }
         }
         Rectangle {
@@ -106,7 +143,7 @@ Rectangle {
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                onClicked: sb.commit(String(sb.value - sb.step))
+                onClicked: sb.finish(String(sb.value - sb.step))
             }
         }
     }

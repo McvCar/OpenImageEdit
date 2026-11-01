@@ -434,9 +434,11 @@ Shortcut { sequence: "Escape"; onActivated: onEscape() }
 Shortcut { sequence: "Left"; enabled: canNavigate(); onActivated: navigateRel(-1) }
 Shortcut { sequence: "Right"; enabled: canNavigate(); onActivated: navigateRel(1) }
 // 回车：模态确认框 = 默认动作（保存并打开/切换/关闭）；否则裁剪/粘贴。
+// 数值框正在编辑时禁用：回车属于输入框（提交数值），不能顺手把图裁了。
 Shortcut { sequences: ["Return", "Enter"]
-           enabled: confirmOverlay.visible || root.pasteFloating
-                    || root.selExists || view.canvasSurface.selPolyActive
+           enabled: !root.selFieldEditing
+                    && (confirmOverlay.visible || root.pasteFloating
+                    || root.selExists || view.canvasSurface.selPolyActive)
            onActivated: onEnter() }
 
 Shortcut { sequence: "Left";  enabled: bridge.selected_layer >= 0; onActivated: nudgeLayer(-1, 0) }
@@ -481,6 +483,7 @@ Shortcut { sequence: "Ctrl+Shift+R"; onActivated: bridge.rotate_cw() }
 // 不禁用会吞掉输入框的退格键，还会误删选中的标记/图层。
 Shortcut { sequences: ["Delete", "Backspace"]
            enabled: !view.canvasSurface.textPopup.visible && !fontPopover.sizeInput.activeFocus
+                    && !root.selFieldEditing
                     && root.renamingIndex < 0
                     && (root.selExists || bridge.selected_mark >= 0
                     || bridge.selected_layer >= 0
@@ -492,6 +495,7 @@ Shortcut { sequences: ["Delete", "Backspace"]
            onActivated: onDeleteKey() }
 Shortcut { sequence: "Ctrl+A"
            enabled: bridge.image_width > 0 && root.renamingIndex < 0
+                    && !root.selFieldEditing
            onActivated: selectAllCanvas() }
 // ---- 选区（PS 快捷键）----
 // M / Shift+M = 矩形 / 椭圆选框；L / Shift+L = 套索 / 多边形套索。
@@ -1051,6 +1055,9 @@ function settlePaste() {
 }
 
 function onEscape() {
+    // 选区右键菜单里的数值框正在编辑：Esc 先结束编辑、交出键盘焦点
+    // （第二次 Esc 才关菜单），否则焦点一直卡在 TextInput 上。
+    if (root.selFieldEditing) { selMenu.endEditing(); return }
     if (view.canvasSurface.textPopup.visible) { view.canvasSurface.textPopup.close(false); return }
     // 调色面板：Esc = 放弃（像素从未被改动）。
     if (bridge.adjustOpen) { root.cancelAdjust(); return }
@@ -1083,7 +1090,9 @@ function onEscape() {
         settlePaste()
         return
     }
-    if (root.selMenuOpen) { root.selMenuOpen = false; return }
+    // ★ 必须走 close()：只翻 selMenuOpen 标志菜单根本不会隐藏，数值框
+    // 还留着焦点（selFieldEditing 一直是 true），快捷键就全废了。
+    if (root.selMenuOpen) { selMenu.close(); return }
     if (root.selExists) { bridge.sel_clear(); return }
     if (bridge.selected_layer >= 0) { bridge.select_layer(-1); return }
     if (root.panelVisible) { root.panelVisible = false; return }
