@@ -18,11 +18,19 @@ mod ops;
 mod geom;
 mod config;
 mod paths;
+mod prewarm;
 mod session;
 pub(in crate::bridge) use geom::*;
 pub(in crate::bridge) use config::*;
 pub(in crate::bridge) use paths::*;
 pub(in crate::bridge) use session::*;
+
+/// Kick off the decode of the first file before the window exists, so the
+/// decode overlaps Qt/QML start-up instead of following it. See the module
+/// docs for the measurements behind this.
+pub fn prewarm_open(path: &Path) {
+    prewarm::spawn(path);
+}
 
 pub static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
@@ -39,6 +47,20 @@ fn elapsed_ms() -> i32 {
         .get()
         .map(|t| t.elapsed().as_millis().min(i32::MAX as u128) as i32)
         .unwrap_or(-1)
+}
+
+/// Decode options shared by the bridge and the prewarm path — both must agree,
+/// otherwise a prewarmed bitmap could differ from a normally opened one (for
+/// example by skipping the downsampling-first cap).
+pub(in crate::bridge) fn decode_options(large_downsample: bool) -> DecodeOptions {
+    DecodeOptions {
+        max_pixels: Some(300_000_000),
+        max_dimension: if large_downsample {
+            Some(DOWNSAMPLE_EDGE)
+        } else {
+            None
+        },
+    }
 }
 
 /// Longest-edge cap for the preview bitmap, in PHYSICAL pixels. The preview
@@ -770,6 +792,9 @@ pub struct BridgeRust {
     mark_drag: RefCell<Option<(usize, Mark)>>,
     session: RefCell<Option<Session>>,
     viewport: RefCell<Size>,
+    /// Decode result waiting for a known viewport (prewarm can finish before
+    /// QML has reported one — see `poll_decode`).
+    pending_decode: RefCell<Option<(DecodeMsg, u32)>>,
     /// Screen device-pixel-ratio pushed by QML (1.0 at 100% scaling). The
     /// preview bitmap is rendered at display size × dpr so it stays crisp on
     /// high-DPI displays. `Cell` because `set_dpr` mutates it behind
@@ -852,6 +877,7 @@ impl Default for BridgeRust {
             mark_drag: RefCell::new(None),
             session: RefCell::new(None),
             viewport: RefCell::new(Size::new(0, 0)),
+            pending_decode: RefCell::new(None),
             dpr: std::cell::Cell::new(1.0),
         }
     }
@@ -1055,14 +1081,7 @@ impl qobject::Bridge {
 
     /// Decode options derived from the current preferences.
     fn decode_opts(&self) -> DecodeOptions {
-        DecodeOptions {
-            max_pixels: Some(300_000_000),
-            max_dimension: if *self.large_downsample() {
-                Some(DOWNSAMPLE_EDGE)
-            } else {
-                None
-            },
-        }
+        decode_options(*self.large_downsample())
     }
 
     /// Interactive load: hand the file to the worker thread and return
@@ -1073,6 +1092,16 @@ impl qobject::Bridge {
             "{{\"phase\":\"ui\",\"event\":\"load\",\"file\":\"{}\"}}",
             path.to_string_lossy().replace('\\', "/")
         );
+        // Prewarmed in `main()` before the window existed: the pixels may
+        // already be decoded by now, so just claim the receiver instead of
+        // starting a second decode (see the `prewarm` module).
+        if let Some(rx) = prewarm::take(path) {
+            *self.decode_job.borrow_mut() = Some(rx);
+            self.as_mut().set_loading(true);
+            self.as_mut()
+                .set_status(QString::from("正在打开…"));
+            return;
+        }
         let (tx, rx) = mpsc::channel::<DecodeMsg>();
         let thread_path = path.to_path_buf();
         let opts = self.decode_opts();

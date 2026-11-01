@@ -92,6 +92,12 @@ fn main() {
             instance::queue_pending(extra.clone());
         }
         instance::acquire();
+        // Decode the first document NOW, before Qt/QML start-up (~0.9 s to the
+        // point where `start()` gets called): the two costs overlap instead of
+        // stacking, which is most of the difference on a 50 MP image.
+        if let Some(first) = leftovers.first() {
+            bridge::prewarm_open(first);
+        }
     }
 
     if selftest {

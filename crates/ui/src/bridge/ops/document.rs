@@ -198,31 +198,58 @@ impl qobject::Bridge {
     }
 
     pub fn poll_decode(mut self: Pin<&mut Self>) {
-        let msg = {
-            let mut job = self.decode_job.borrow_mut();
-            let Some(rx) = job.as_ref() else {
+        // 拿到结果（或上一轮就已按住的）之后，还要等 QML 报上 viewport。
+        // 预热会让解码在布局之前就完成：那时 viewport 还是 0×0，直接套用会
+        // 按 fit_zoom=1.0 打开 —— 白渲染一张 8160×6120 的预览（实测多花
+        // 430ms、写 200MB 临时 BMP），然后窗口贴合图片时又全片重渲染一次。
+        // 所以结果先存在 pending_decode 里，viewport 真值到了再落地；
+        // 最多等 2s（40 次轮询），窗口极小/最小化时也不会永远挂着。
+        if self.pending_decode.borrow().is_none() {
+            let received = {
+                let mut job = self.decode_job.borrow_mut();
+                let Some(rx) = job.as_ref() else {
+                    return;
+                };
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        *job = None;
+                        Some(msg)
+                    }
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        *job = None;
+                        return;
+                    }
+                }
+            };
+            let Some(msg) = received else {
                 return;
             };
-            match rx.try_recv() {
-                Ok(msg) => {
-                    *job = None;
-                    Some(msg)
-                }
-                Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    *job = None;
-                    None
-                }
+            *self.pending_decode.borrow_mut() = Some((msg, 0));
+        }
+        let viewport = *self.viewport.borrow();
+        let has_viewport = viewport.width > 0 && viewport.height > 0;
+        let waited = self
+            .pending_decode
+            .borrow()
+            .as_ref()
+            .map_or(0, |(_, n)| *n);
+        // A failed decode has no geometry to fit, so surface it right away.
+        let failed = self
+            .pending_decode
+            .borrow()
+            .as_ref()
+            .is_some_and(|(msg, _)| msg.result.is_err());
+        if !has_viewport && !failed && waited < 40 {
+            if let Some((_, n)) = self.pending_decode.borrow_mut().as_mut() {
+                *n = waited + 1;
             }
-        };
-        if msg.is_none() {
             return;
         }
-        self.as_mut().set_loading(false);
-        let Some(msg) = msg else {
+        let Some((msg, _)) = self.pending_decode.borrow_mut().take() else {
             return;
         };
-        let viewport = *self.viewport.borrow();
+        self.as_mut().set_loading(false);
         match msg.result {
             Ok((decoded, decode_ms)) => {
                 let Decoded {

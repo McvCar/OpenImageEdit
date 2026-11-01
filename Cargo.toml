@@ -48,6 +48,50 @@ tracing-subscriber = "0.3"
 [patch.crates-io]
 psd = { path = "vendor/psd" }
 
+# ---- 开发/测试构建 ----
+#
+# 默认的 dev profile 把所有依赖也按 opt-level 0 编译，代价在解码这种纯像素
+# 循环上是灾难性的：同样一张 8160×6120 / 64MB 的 JPEG，
+#   release 解码 614 ms，debug（依赖未优化）15 331 ms —— 25 倍。
+# 用户看到的"打开大图太慢"，慢的其实是没优化的 zune-jpeg / image 缩放。
+#
+# 只优化图像管线上的依赖，**不用 `[profile.dev.package."*"]`**：那条规则会
+# 连 cxx-qt-lib 一起重编（1000+ 个 MSVC 对象，十几分钟且容易卡住），
+# 而对像素循环没有任何帮助。加新解码器时记得在这里补一行。
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.zune-core]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.weezl]
+opt-level = 3
+[profile.dev.package.gif]
+opt-level = 3
+[profile.dev.package.tiff]
+opt-level = 3
+[profile.dev.package.qoi]
+opt-level = 3
+[profile.dev.package.psd]
+opt-level = 3
+
+# 这三块是自己的 crate，但跑的都是热循环（解码/降采样、预览合成、像素运算），
+# 在 dev 下也值得优化。ui 保持 0：它主要是 cxx-qt 胶水，编译最贵、优化收益最小。
+[profile.dev.package.imageedit-decode]
+opt-level = 3
+[profile.dev.package.imageedit-render]
+opt-level = 3
+[profile.dev.package.imageedit-core]
+opt-level = 3
+
 [profile.release]
 # Thin LTO keeps cross-crate inlining (the cxx-qt bridge benefits from it) but
 # is far cheaper than fat LTO.
