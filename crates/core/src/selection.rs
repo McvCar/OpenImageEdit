@@ -622,6 +622,17 @@ impl SelectionState {
         self.recompute();
     }
 
+    /// 用给定的边界/平滑/羽化参数建一个新选区（「记住上次的参数」）。
+    /// 和 `new` + `set_ops` 的区别是只 recompute 一次 —— 距离变换是
+    /// O(像素数)，大选区连算两遍会明显卡一下。
+    pub fn new_with_ops(base: SelectionMask, ops: SelOps) -> Self {
+        let mut s = Self::default();
+        s.base = base;
+        s.ops = ops;
+        s.recompute();
+        s
+    }
+
     pub fn set_border(&mut self, k: u32) {
         self.ops.border = k;
         self.recompute();
@@ -1223,5 +1234,23 @@ mod tests {
         st.set_feather(12);
         st.set_base(SelectionMask::rect(Rect::new(5, 5, 10, 10)));
         assert_eq!(st.ops.feather, 0);
+    }
+
+    #[test]
+    fn new_with_ops_keeps_the_remembered_parameters() {
+        // 「记住上次的边界/平滑/羽化」：新选区直接带着参数出生，不需要
+        // 先 new 再 set_ops（那样会 recompute 两遍，大选区会卡一下）。
+        let ops = SelOps {
+            border: 0,
+            smooth: 6,
+            feather: 4,
+        };
+        let st = SelectionState::new_with_ops(SelectionMask::rect(Rect::new(10, 10, 80, 60)), ops);
+        assert_eq!(st.ops, ops);
+        // 平滑真的生效了：四角被磨掉，面积比裸矩形小。
+        let plain = SelectionState::new(SelectionMask::rect(Rect::new(10, 10, 80, 60)));
+        assert!(st.mask().area() < plain.mask().area());
+        // 羽化只影响软边，轮廓不动。
+        assert_eq!(st.mask().bounds, plain.mask().bounds);
     }
 }

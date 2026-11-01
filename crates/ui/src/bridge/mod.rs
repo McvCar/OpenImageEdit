@@ -139,6 +139,9 @@ pub mod qobject {
         #[qproperty(i32, sel_feather, cxx_name = "selFeather")]
         /// Quick mask (Q): dim everything outside the selection in the preview.
         #[qproperty(bool, quick_mask, cxx_name = "quickMask")]
+        /// Last used selection tool (settings.ini). QML seeds its `selTool`
+        /// from this so a restart keeps the marquee type the user was using.
+        #[qproperty(QString, sel_tool_saved, cxx_name = "selToolSaved")]
         #[namespace = "imageedit"]
         type Bridge = super::BridgeRust;
 
@@ -333,6 +336,12 @@ pub mod qobject {
         /// Quick mask (Q): dim outside the selection in the preview.
         #[qinvokable]
         fn sel_toggle_quick_mask(self: Pin<&mut Self>);
+
+        /// Remember the selection tool the user picked ("rect" / "ellipse" /
+        /// "lasso" / "polygon") and write it to settings.ini, so the next
+        /// launch starts with the same marquee.
+        #[qinvokable]
+        fn save_sel_tool(self: Pin<&mut Self>, tool: &QString);
 
         /// Crop to the selection's bounding box, then drop the selection
         /// (the canvas coordinate frame changed).
@@ -649,6 +658,10 @@ impl Default for AppConfig {
             save_quality: 92,
             ruler_bottom_up: false,
             max_dimension: 8192,
+            sel_border: 0,
+            sel_smooth: 0,
+            sel_feather: 0,
+            sel_tool: "rect".to_string(),
         }
     }
 }
@@ -737,6 +750,13 @@ pub struct BridgeRust {
     sel_smooth: i32,
     sel_feather: i32,
     quick_mask: bool,
+    /// Last used selection tool, mirrored for QML (`selTool` seeds from it).
+    sel_tool_saved: QString,
+    /// 边界 / 平滑 / 羽化 that a NEWLY drawn selection starts with. Kept on
+    /// the bridge (not on the document) so it survives opening another file
+    /// and is written to settings.ini on every change. `Cell` because
+    /// `Pin<&mut Self>` cannot assign a plain field (E0594).
+    sel_ops_default: std::cell::Cell<SelOps>,
     paste_counter: RefCell<u32>,
     /// Opacity of the selected layer before the current live slider drag, so
     /// the committed history op can record the true pre-drag value.
@@ -820,6 +840,12 @@ impl Default for BridgeRust {
             sel_smooth: 0,
             sel_feather: 0,
             quick_mask: false,
+            sel_tool_saved: QString::from(cfg.sel_tool.as_str()),
+            sel_ops_default: std::cell::Cell::new(SelOps {
+                border: cfg.sel_border,
+                smooth: cfg.sel_smooth,
+                feather: cfg.sel_feather,
+            }),
             paste_counter: RefCell::new(0),
             opacity_live: RefCell::new(None),
             drag_start_offset: RefCell::new(None),
@@ -847,6 +873,10 @@ impl qobject::Bridge {
             save_quality: (*self.save_quality()).clamp(1, 100) as u8,
             ruler_bottom_up: *self.ruler_bottom_up(),
             max_dimension: if *self.large_downsample() { 8192 } else { 0 },
+            sel_border: self.sel_ops_default.get().border,
+            sel_smooth: self.sel_ops_default.get().smooth,
+            sel_feather: self.sel_ops_default.get().feather,
+            sel_tool: self.sel_tool_saved().to_string(),
         }
         .save();
     }

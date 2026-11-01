@@ -128,6 +128,24 @@ impl qobject::Bridge {
         session.doc.set_selection_ops(ops).is_ok()
     }
 
+    /// 把当前选区的参数记成「下次新建选区的默认值」并写盘。用户改一次
+    /// 平滑填 20，之后每画一个新选区都直接是 20，不用反复重填。
+    fn remember_selection_ops(mut self: Pin<&mut Self>) {
+        let ops = self
+            .session
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.doc.selection.as_ref().map(|st| st.ops));
+        let Some(ops) = ops else {
+            return;
+        };
+        if self.sel_ops_default.get() == ops {
+            return;
+        }
+        self.sel_ops_default.set(ops);
+        self.persist_config();
+    }
+
     /// Replace / add / subtract / intersect the current selection with `mask`.
     /// mode: 0 replace, 1 add, 2 subtract, 3 intersect.
     fn combine_selection(mut self: Pin<&mut Self>, mask: SelectionMask, mode: i32) {
@@ -145,7 +163,14 @@ impl qobject::Bridge {
             let Some(session) = guard.as_mut() else {
                 return;
             };
+            let defaults = self.sel_ops_default.get();
             let current = session.doc.selection.as_ref().map(|s| s.mask().clone());
+            let current_ops = session
+                .doc
+                .selection
+                .as_ref()
+                .map(|s| s.ops)
+                .unwrap_or(defaults);
             let combined = match current {
                 _ if mode == 0 => mask,
                 Some(c) if mode == 1 => c.union(&mask),
@@ -157,7 +182,11 @@ impl qobject::Bridge {
             let next = if combined.is_empty() {
                 None
             } else {
-                Some(SelectionState::new(combined))
+                // mode 0 = 用户画了一个新选区 → 套用记住的边界/平滑/羽化；
+                // 加/减/交只是改形状，参数沿用当前选区（不然加选一下就把
+                // 之前设的平滑 20 悄悄清成 0）。
+                let ops = if mode == 0 { defaults } else { current_ops };
+                Some(SelectionState::new_with_ops(combined, ops))
             };
             let _ = session.doc.set_selection(next);
         }
@@ -266,7 +295,16 @@ impl qobject::Bridge {
                 Some(st) => st.mask().invert(canvas),
                 None => SelectionMask::rect(Rect::new(0, 0, canvas.width, canvas.height)),
             };
-            let _ = session.doc.set_selection(Some(SelectionState::new(inverted)));
+            // 反选是同一个选区的延续，参数保持不变（不重置成记住的默认值）。
+            let ops = session
+                .doc
+                .selection
+                .as_ref()
+                .map(|st| st.ops)
+                .unwrap_or(self.sel_ops_default.get());
+            let _ = session
+                .doc
+                .set_selection(Some(SelectionState::new_with_ops(inverted, ops)));
         }
         self.touch_selection();
         self.as_mut().publish_selection();
@@ -279,6 +317,7 @@ impl qobject::Bridge {
         if !self.as_mut().mutate_selection_ops(|ops| ops.border = k) {
             return;
         }
+        self.as_mut().remember_selection_ops();
         self.touch_selection();
         self.as_mut().publish_selection();
         self.as_mut().refresh_for_selection();
@@ -289,6 +328,7 @@ impl qobject::Bridge {
         if !self.as_mut().mutate_selection_ops(|ops| ops.smooth = k) {
             return;
         }
+        self.as_mut().remember_selection_ops();
         self.touch_selection();
         self.as_mut().publish_selection();
         self.as_mut().refresh_for_selection();
@@ -299,9 +339,21 @@ impl qobject::Bridge {
         if !self.as_mut().mutate_selection_ops(|ops| ops.feather = r) {
             return;
         }
+        self.as_mut().remember_selection_ops();
         self.touch_selection();
         self.as_mut().publish_selection();
         self.as_mut().refresh_for_selection();
+    }
+
+    /// 记住用户选的选区工具（下次启动继续用同一个）。
+    pub fn save_sel_tool(mut self: Pin<&mut Self>, tool: &QString) {
+        let name = tool.to_string();
+        let valid = matches!(name.as_str(), "rect" | "ellipse" | "lasso" | "polygon");
+        if !valid || self.sel_tool_saved().to_string() == name {
+            return;
+        }
+        self.as_mut().set_sel_tool_saved(tool.clone());
+        self.persist_config();
     }
 
     pub fn sel_outline(self: Pin<&mut Self>) -> QString {

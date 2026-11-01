@@ -149,7 +149,8 @@ Item {
     readonly property real selOffX: view.canvasSurface ? view.canvasSurface.selOffX : 0
     readonly property real selOffY: view.canvasSurface ? view.canvasSurface.selOffY : 0
     // 当前选区工具："rect" | "ellipse" | "lasso" | "polygon" | "none"
-    property string selTool: "rect"
+    // 初值来自 settings.ini（上次用的那个），切工具时再写回去。
+    property string selTool: bridge.selToolSaved.length > 0 ? bridge.selToolSaved : "rect"
     // 选区工具浮动面板（标记栏的「选区」按钮点开；原来那行固定工具条已取消）。
     property bool selPopoverOpen: false
     // 加选/减选/相交的粘滞模式（拖动时按住的 Shift/Alt 会临时覆盖它）：
@@ -944,6 +945,9 @@ function canUseToolKeys() {
 // 两边同时激活时框选手势永远起不来。
 function setSelTool(tool) {
     root.selTool = tool
+    // 记住这次选的形状：下次启动、以及下次打开面板都用它（写 settings.ini）。
+    if (tool !== "none")
+        bridge.save_sel_tool(tool)
     // 选区入口现在在标记栏里：用快捷键（M / L）激活工具时把标记栏带出来，
     // 否则按钮被藏起来，用户找不到选区面板。
     if (tool !== "none") {
@@ -1740,9 +1744,28 @@ Timer {
                                 bridge.image_height * 0.18,
                                 bridge.image_width * 0.76,
                                 bridge.image_height * 0.70, 0)
-        root.selTool = "rect"
+        // 不要覆盖 setSelTool：selTool 的初值来自 settings.ini（记住上次
+        // 用的形状），探针要能把这个记忆状态截出来。
+        if (root.selTool === "none")
+            root.selTool = "rect"
         root.selPopoverOpen = true
+        selPopGeomTimer.start()
     }
+}
+
+// 几何自检：--probe-selpop 时打印面板的位置/尺寸/层级，排查"面板没出来"
+// 这类问题（常驻行删掉以后，光看截图分不清是没显示还是被别的层盖住）。
+Timer {
+    id: selPopGeomTimer
+    interval: 600
+    onTriggered: bridge.mark("selpop vis=" + selPopover.visible
+                             + " x=" + Math.round(selPopover.x)
+                             + " y=" + Math.round(selPopover.y)
+                             + " w=" + Math.round(selPopover.width)
+                             + " h=" + Math.round(selPopover.height)
+                             + " z=" + selPopover.z
+                             + " markBarZ=" + markBar.z
+                             + " viewZ=" + view.z)
 }
 
 // Prepare-only: enable the mark bar + ellipse tool, then let a REAL

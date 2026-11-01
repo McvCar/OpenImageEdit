@@ -17,6 +17,14 @@ pub(in crate::bridge) struct AppConfig {
     /// Downsampling-first open cap for the longest edge. `0` disables it and
     /// keeps the original resolution (files above 300 MP are still rejected).
     pub(in crate::bridge) max_dimension: i32,
+    /// Last used selection parameters (border / smooth / feather). A newly
+    /// drawn selection inherits them, so the user does not have to retype the
+    /// same numbers on every fresh marquee.
+    pub(in crate::bridge) sel_border: u32,
+    pub(in crate::bridge) sel_smooth: u32,
+    pub(in crate::bridge) sel_feather: u32,
+    /// Last used selection tool: "rect" / "ellipse" / "lasso" / "polygon".
+    pub(in crate::bridge) sel_tool: String,
 }
 
 impl AppConfig {
@@ -51,6 +59,27 @@ impl AppConfig {
                                 cfg.max_dimension = d.max(0);
                             }
                         }
+                        "sel_border" => {
+                            if let Ok(v) = value.parse::<u32>() {
+                                cfg.sel_border = v.min(400);
+                            }
+                        }
+                        "sel_smooth" => {
+                            if let Ok(v) = value.parse::<u32>() {
+                                cfg.sel_smooth = v.min(400);
+                            }
+                        }
+                        "sel_feather" => {
+                            if let Ok(v) = value.parse::<u32>() {
+                                cfg.sel_feather = v.min(250);
+                            }
+                        }
+                        "sel_tool" => match value {
+                            "rect" | "ellipse" | "lasso" | "polygon" => {
+                                cfg.sel_tool = value.to_string()
+                            }
+                            _ => {}
+                        },
                         _ => {}
                     }
                 }
@@ -65,13 +94,17 @@ impl AppConfig {
                 let _ = std::fs::create_dir_all(dir);
             }
             let text = format!(
-                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\nruler_bottom_up={}\nmax_dimension={}\n",
+                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\nruler_bottom_up={}\nmax_dimension={}\nsel_border={}\nsel_smooth={}\nsel_feather={}\nsel_tool={}\n",
                 self.checker_light,
                 self.checker_dark,
                 self.open_in_new_window,
                 self.save_quality,
                 self.ruler_bottom_up,
-                self.max_dimension
+                self.max_dimension,
+                self.sel_border,
+                self.sel_smooth,
+                self.sel_feather,
+                self.sel_tool
             );
             let _ = std::fs::write(path, text);
         }
