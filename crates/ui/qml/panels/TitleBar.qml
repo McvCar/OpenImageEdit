@@ -93,20 +93,40 @@ Rectangle {
         { l: "关闭窗口 (Ctrl+W)", ok: true, run: function () { host.requestQuit() } }
     ]
 
-    // How many icon slots fit between the title and the chrome.
-    property int capacity: barActions.length
-    function updateCapacity() {
-        // 30px icon + 2px spacing each; reserve title, layers button,
-        // "…", window buttons and margins.
-        const chrome = titleText.implicitWidth + 8 + 16 + menuBtn.width
-                       + layersBtn.width + markBarBtn.width + 8
-                       + winRow.width + 24
-        const avail = Math.max(0, toolbar.width - chrome)
-        const per = 32
-        capacity = Math.min(barActions.length, Math.floor(avail / per))
+    // ---- 图标栏容量（纯绑定：窗口宽度 / 标题宽度 / 右侧按钮簇宽度变化都
+    // 会自动重算）--------------------------------------------------------
+    // 之前是命令式的 updateCapacity()（只在 Component.onCompleted 和
+    // onWidthChanged 里跑）。窗口若在布局落地前就被定成最终宽度（新窗口按
+    // 图片尺寸打开、创建时宽度还是 0），capacity 会一直停在 0 —— 整排图标
+    // 消失但分隔线还在，正是"窄窗口下工具栏全被收起来"的那个状态。
+    // 右侧固定簇：窗口按钮 + ⋯ + 图层面板 + 标记栏（含各自的间距/边距）。
+    readonly property real rightCluster: markBarBtn.width + 2 + layersBtn.width + 2
+                                         + menuBtn.width + 6 + winRow.width + 4
+    // 一行里能塞下多少个图标槽（30px 按钮 + 2px 间距，按 32 算）。
+    function slotsFor(titleWidth) {
+        const left = titleWidth > 0 ? titleWidth + 20 : 8
+        const avail = Math.max(0, width - rightCluster - 8 - left)
+        return Math.min(barActions.length, Math.floor(avail / 32))
     }
-    Component.onCompleted: updateCapacity()
-    onWidthChanged: updateCapacity()
+    // 标题文字（全称 / 只留应用名）——测量只用下面两个隐藏 Text，
+    // 不能让 titleText 自己的 implicitWidth 参与判定，否则"显示→占地方→
+    // 隐藏→有地方→显示"会自激振荡。
+    readonly property string titleFullText: bridge.image_width > 0
+        ? "ImageEdit — " + bridge.image_width + "×" + bridge.image_height
+          + (bridge.dirty ? " *" : "")
+        : "ImageEdit"
+    readonly property string titleNameText: "ImageEdit" + (bridge.dirty ? " *" : "")
+    readonly property int capacityFull: slotsFor(titleProbeFull.implicitWidth)
+    readonly property int capacityName: slotsFor(titleProbeName.implicitWidth)
+    // 空间优先给按钮：
+    //   "full" 还不算挤（按钮没被砍掉三分之一）→ 标题带上分辨率；
+    //   "name" 开始挤了 → 先让出分辨率（状态栏里还有一份）；
+    //   "none" 连一个按钮都放不下 → 整块标题让出去。
+    readonly property int roomySlots: Math.min(barActions.length, 8)
+    readonly property string titleMode: capacityFull >= roomySlots ? "full"
+                                      : (capacityName >= 1 ? "name" : "none")
+    readonly property int capacity: titleMode === "full" ? capacityFull
+                                   : (titleMode === "name" ? capacityName : slotsFor(0))
 
     // Drag-to-move (press anywhere on the bar that is not a button);
     // double-click toggles maximize. Move starts only after a small
@@ -140,6 +160,20 @@ Rectangle {
         }
     }
 
+    // 标题文字用的两个"量尺"：不可见，只提供 implicitWidth 给上面判定。
+    Text {
+        id: titleProbeFull
+        visible: false
+        font.pixelSize: 12
+        text: toolbar.titleFullText
+    }
+    Text {
+        id: titleProbeName
+        visible: false
+        font.pixelSize: 12
+        text: toolbar.titleNameText
+    }
+
     Text {
         id: titleText
         anchors.left: parent.left
@@ -147,21 +181,20 @@ Rectangle {
         anchors.verticalCenter: parent.verticalCenter
         width: Math.min(implicitWidth, 220)
         elide: Text.ElideRight
+        // 窄窗口下先丢分辨率、再整块让给图标栏（见 titleMode 的注释）。
+        visible: toolbar.titleMode !== "none"
         // Same content as the (offscreen) window title: unsaved changes
         // are flagged with a trailing asterisk.
-        text: bridge.image_width > 0
-              ? "ImageEdit — " + bridge.image_width + "×" + bridge.image_height
-                + (bridge.dirty ? " *" : "")
-              : "ImageEdit"
+        text: toolbar.titleMode === "full" ? toolbar.titleFullText : toolbar.titleNameText
         color: "#c9cdd2"
         font.pixelSize: 12
-        onImplicitWidthChanged: toolbar.updateCapacity()
     }
 
     Row {
         id: iconRow
-        anchors.left: titleText.right
-        anchors.leftMargin: 10
+        // 标题隐藏时图标从左边距开始，不留标题那一段空白。
+        anchors.left: toolbar.titleMode !== "none" ? titleText.right : parent.left
+        anchors.leftMargin: toolbar.titleMode !== "none" ? 10 : 8
         anchors.verticalCenter: parent.verticalCenter
         spacing: 2
 

@@ -24,6 +24,7 @@ Rectangle {
     z: 59
 
     Row {
+        id: markRow
         anchors.left: parent.left
         anchors.leftMargin: 10
         anchors.verticalCenter: parent.verticalCenter
@@ -309,10 +310,18 @@ Rectangle {
         }
     }
 
+    // 操作提示：贴在按钮行右边剩下的空间里，右对齐 + 省略号，窄窗口下绝不
+    // 盖住左边的按钮（原来是右侧绝对定位，窄窗口会和按钮叠在一起）。
     Text {
+        anchors.left: markRow.right
+        anchors.leftMargin: 12
         anchors.right: parent.right
         anchors.rightMargin: 12
         anchors.verticalCenter: parent.verticalCenter
+        horizontalAlignment: Text.AlignRight
+        elide: Text.ElideRight
+        // 剩不到 120px 就别硬塞了：提示是辅助信息，按钮才是本体。
+        visible: width > 120
         text: host.markTool === "none"
               ? "选择工具绘制 · 点击标记可移动，双击文本可编辑"
               : (host.markTool === "brush"
