@@ -615,7 +615,9 @@ fn apply_quick_mask(image: &mut RgbaImage, sel: Option<&SelectionState>, canvas:
     let Some(state) = sel else {
         return;
     };
-    let mask = state.mask();
+    // ★必须用 effective()（= mask + 羽化），不是 mask()：羽化只在 effective()
+    // 里算，用 mask() 会让快速蒙版在羽化半径内仍是硬边，完全看不出渐变。
+    let mask = state.effective();
     if mask.is_empty() || canvas.width == 0 || canvas.height == 0 {
         return;
     }
