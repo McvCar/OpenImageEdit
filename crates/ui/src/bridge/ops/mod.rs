@@ -15,5 +15,6 @@ pub(super) mod layers;
 pub(super) mod adjust;
 pub(super) mod picker;
 pub(super) mod clipboard;
+pub(super) mod cursor;
 pub(super) mod marks;
 pub(super) mod selection;

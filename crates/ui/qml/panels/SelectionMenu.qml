@@ -253,7 +253,7 @@ Rectangle {
                 id: borderSpin
                 width: 78
                 anchors.right: parent.right
-                anchors.rightMargin: 40
+                anchors.rightMargin: 46
                 anchors.verticalCenter: parent.verticalCenter
                 from: 0
                 to: 400
@@ -270,6 +270,33 @@ Rectangle {
                 text: "px"
                 color: "#8b9096"
                 font.pixelSize: 11
+            }
+            // 归零：边界/平滑/羽化的默认值都是 0，改完随手能退回原样，
+            // 不用一格一格点箭头。已经为 0 时图标压暗（点了也无害）。
+            Rectangle {
+                width: 16
+                height: 16
+                anchors.right: parent.right
+                anchors.rightMargin: 8
+                anchors.verticalCenter: parent.verticalCenter
+                radius: 3
+                color: resetBorder.containsMouse && bridge.selBorder > 0
+                       ? "#3a3d42" : "transparent"
+                Text {
+                    anchors.centerIn: parent
+                    text: "⟲"
+                    color: bridge.selBorder > 0
+                           ? (resetBorder.containsMouse ? "#cfe4ff" : "#9aa3b2")
+                           : "#4a4e54"
+                    font.pixelSize: 12
+                }
+                MouseArea {
+                    id: resetBorder
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: borderSpin.finish("0")
+                }
             }
         }
 
@@ -288,7 +315,7 @@ Rectangle {
                 id: smoothSpin
                 width: 78
                 anchors.right: parent.right
-                anchors.rightMargin: 40
+                anchors.rightMargin: 46
                 anchors.verticalCenter: parent.verticalCenter
                 from: 0
                 to: 400
@@ -305,6 +332,31 @@ Rectangle {
                 text: "px"
                 color: "#8b9096"
                 font.pixelSize: 11
+            }
+            Rectangle {
+                width: 16
+                height: 16
+                anchors.right: parent.right
+                anchors.rightMargin: 8
+                anchors.verticalCenter: parent.verticalCenter
+                radius: 3
+                color: resetSmooth.containsMouse && bridge.selSmooth > 0
+                       ? "#3a3d42" : "transparent"
+                Text {
+                    anchors.centerIn: parent
+                    text: "⟲"
+                    color: bridge.selSmooth > 0
+                           ? (resetSmooth.containsMouse ? "#cfe4ff" : "#9aa3b2")
+                           : "#4a4e54"
+                    font.pixelSize: 12
+                }
+                MouseArea {
+                    id: resetSmooth
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: smoothSpin.finish("0")
+                }
             }
         }
 
@@ -323,7 +375,7 @@ Rectangle {
                 id: featherSpin
                 width: 78
                 anchors.right: parent.right
-                anchors.rightMargin: 40
+                anchors.rightMargin: 46
                 anchors.verticalCenter: parent.verticalCenter
                 from: 0
                 to: 250
@@ -340,6 +392,31 @@ Rectangle {
                 text: "px"
                 color: "#8b9096"
                 font.pixelSize: 11
+            }
+            Rectangle {
+                width: 16
+                height: 16
+                anchors.right: parent.right
+                anchors.rightMargin: 8
+                anchors.verticalCenter: parent.verticalCenter
+                radius: 3
+                color: resetFeather.containsMouse && bridge.selFeather > 0
+                       ? "#3a3d42" : "transparent"
+                Text {
+                    anchors.centerIn: parent
+                    text: "⟲"
+                    color: bridge.selFeather > 0
+                           ? (resetFeather.containsMouse ? "#cfe4ff" : "#9aa3b2")
+                           : "#4a4e54"
+                    font.pixelSize: 12
+                }
+                MouseArea {
+                    id: resetFeather
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: featherSpin.finish("0")
+                }
             }
         }
 

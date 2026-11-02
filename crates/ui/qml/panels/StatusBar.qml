@@ -81,10 +81,14 @@ Rectangle {
         // 靠 elide 截文件名。整串一起 elide 会切在数字中间（"800×600" 变
         // "…0"），比不显示还难读。
         visible: bridge.fileName.length > 0 && leftZone.width >= 150
-        width: Math.min(fileInfoName.implicitWidth
+        // 左边留一个文件夹图标位（点击在资源管理器里定位）；没有真实文件
+        // （新建/粘贴）时不留空位。
+        readonly property bool hasPath: bridge.sourcePath.length > 0
+        readonly property real iconSlot: hasPath ? 20 : 0
+        width: Math.min(fileInfo.iconSlot
+                        + fileInfoName.implicitWidth
                         + (fileInfoMeta.visible ? fileInfoMeta.implicitWidth + 10 : 0),
                         Math.max(72, leftZone.width * 0.45))
-        readonly property bool hasPath: bridge.sourcePath.length > 0
         readonly property string metaText:
             bridge.image_width > 0
             ? bridge.image_width + "×" + bridge.image_height
@@ -99,7 +103,8 @@ Rectangle {
             id: fileInfoName
             anchors.verticalCenter: parent.verticalCenter
             anchors.left: parent.left
-            width: Math.max(0, fileInfo.width
+            anchors.leftMargin: fileInfo.iconSlot
+            width: Math.max(0, fileInfo.width - fileInfo.iconSlot
                                - (fileInfoMeta.visible
                                   ? fileInfoMeta.implicitWidth + 10 : 0))
             elide: Text.ElideMiddle
@@ -178,6 +183,50 @@ Rectangle {
             id: fileInfoCopiedReset
             interval: 2000
             onTriggered: fileInfo.copied = false
+        }
+
+        // 文件名左边的小文件夹图标：点击在资源管理器里定位并选中该文件。
+        // 必须声明在 fileInfoMa 之后（并给更高的 z），否则那块铺满的
+        // MouseArea 会先把点击吃掉（变成"复制路径"）。
+        Item {
+            id: revealBtn
+            z: 10
+            visible: fileInfo.hasPath
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            width: 16
+            height: 16
+
+            Canvas {
+                id: revealIcon
+                anchors.fill: parent
+                // hover 时提亮轮廓，和文件名下划线同一套反馈。
+                property bool hot: revealMa.containsMouse
+                onHotChanged: requestPaint()
+                onPaint: {
+                    const ctx = getContext("2d")
+                    ctx.reset()
+                    ctx.strokeStyle = revealIcon.hot ? "#c9dcf5" : "#8c95a3"
+                    ctx.lineWidth = 1.2
+                    ctx.lineJoin = "round"
+                    ctx.beginPath()
+                    ctx.moveTo(1.5, 12.5)
+                    ctx.lineTo(1.5, 3.5)
+                    ctx.lineTo(5.5, 3.5)
+                    ctx.lineTo(7.0, 5.5)
+                    ctx.lineTo(14.5, 5.5)
+                    ctx.lineTo(14.5, 12.5)
+                    ctx.closePath()
+                    ctx.stroke()
+                }
+            }
+            MouseArea {
+                id: revealMa
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: bridge.reveal_in_explorer()
+            }
         }
     }
 

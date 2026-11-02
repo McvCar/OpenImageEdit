@@ -39,6 +39,24 @@ impl qobject::Bridge {
                 // 删除"当前选区"的像素（不重设选区，探针验证反选后
                 // erase 的作用范围用）。
                 "erase-sel" => self.as_mut().erase_selection_pixels(),
+                // Ctrl+拖动选区的手势核心：把选区像素剪成独立图层（原位挖空），
+                // 并选中新图层。探针里配合 toggle-visible-selected + save
+                // 可以断言"原位置确实空了"。
+                "cut-sel" => {
+                    self.as_mut().cut_selection_to_layer();
+                }
+                // `cursor-dump:C:/tmp/cur` — 把三枚自定义光标渲染成 PNG。
+                // PrintWindow 抓不到系统光标，只能直接导出绘制缓冲目检。
+                other if other.starts_with("cursor-dump:") => {
+                    super::cursor::dump_cursors(other.trim_start_matches("cursor-dump:").trim())
+                }
+                // `cursor:3` — 强制接管画布光标（不用按键，探针断言用）。
+                other if other.starts_with("cursor:") => {
+                    if let Ok(kind) = other.trim_start_matches("cursor:").trim().parse::<i32>() {
+                        self.as_mut().cursor_install();
+                        self.as_mut().cursor_set_kind(kind);
+                    }
+                }
                 // `sel-dump` — 断言用：bounds / ops / rev。
                 "sel-dump" => {
                     let (rect, ops, rev) = {

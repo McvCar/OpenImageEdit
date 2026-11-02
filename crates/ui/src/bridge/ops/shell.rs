@@ -86,6 +86,42 @@ impl qobject::Bridge {
         };
         QString::from(format!("{x},{y}").as_str())
     }
+
+    /// 在资源管理器里定位当前文件（打开所在文件夹并选中它）。
+    /// 路径可能带空格/中文，所以用 `raw_arg` 原样拼命令行：先 format 再
+    /// `arg()` 会被 Rust 重新加引号，explorer 认不出 `/select,` 前缀。
+    pub fn reveal_in_explorer(mut self: Pin<&mut Self>) {
+        let path = self.source_path().to_string();
+        if path.is_empty() {
+            self.as_mut()
+                .set_status(QString::from("这个窗口还没有文件（先保存一次）"));
+            return;
+        }
+        if !Path::new(&path).exists() {
+            self.as_mut()
+                .set_status(QString::from("文件已被移动或删除，无法定位"));
+            return;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let line = format!("/select,\"{path}\"");
+            match std::process::Command::new("explorer.exe")
+                .raw_arg(line)
+                .spawn()
+            {
+                Ok(_) => self
+                    .as_mut()
+                    .set_status(QString::from("已在资源管理器中定位")),
+                Err(err) => self.as_mut().set_status(QString::from(
+                    format!("打开资源管理器失败：{err}").as_str(),
+                )),
+            }
+        }
+        #[cfg(not(windows))]
+        self.as_mut()
+            .set_status(QString::from("当前平台不支持定位到文件夹"));
+    }
 }
 
 /// 进程启动瞬间的光标位置（物理像素）。窗口要等 QML 起来（~0.9s）才摆位，

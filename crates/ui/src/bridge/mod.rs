@@ -645,6 +645,28 @@ pub mod qobject {
         #[qinvokable]
         fn paste_clipboard(self: Pin<&mut Self>) -> bool;
 
+        /// Ctrl+拖动选区：把选区里的像素**剪**成一个独立图层（原位置挖空），
+        /// 选中新图层并返回 true —— QML 接着进入「拖动这个图层」的手势，
+        /// 就是 PS 里按住 Ctrl 出剪刀、拖走选区内容的行为。
+        #[qinvokable]
+        fn cut_selection_to_layer(self: Pin<&mut Self>) -> bool;
+
+        /// 在资源管理器里定位当前文件（打开所在文件夹并选中它）。
+        #[qinvokable]
+        fn reveal_in_explorer(self: Pin<&mut Self>);
+
+        /// 画布光标种类：0 = 交回 Qt，1 = 加选(+)，2 = 减选(−)，3 = 剪刀。
+        #[qinvokable]
+        fn cursor_set_kind(self: Pin<&mut Self>, kind: i32);
+
+        /// 把当前线程的顶层窗口挂上自定义光标（幂等；新窗口出现后再调）。
+        #[qinvokable]
+        fn cursor_install(self: Pin<&mut Self>);
+
+        /// 修饰键状态位：bit0 Shift / bit1 Ctrl / bit2 Alt（QML 轮询用）。
+        #[qinvokable]
+        fn modifier_bits(self: Pin<&mut Self>) -> i32;
+
         /// Pop a file handed over by another process ("" when none). QML polls
         /// this from the primary window and opens it either in a new window or
         /// in place, following the "在单独的新窗口显示" setting. This is what

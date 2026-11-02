@@ -141,6 +141,49 @@ impl qobject::Bridge {
         self.as_mut().delete_selected_layer();
     }
 
+    /// Ctrl+拖动选区 = 剪切并搬走（PS 的剪刀光标）：选区像素抠成新图层、
+    /// 原位置按选区覆盖率挖空（羽化边自然淡化），随后选中新图层让 QML
+    /// 接着走「拖动图层」的手势。
+    pub fn cut_selection_to_layer(mut self: Pin<&mut Self>) -> bool {
+        let viewport = *self.viewport.borrow();
+        let result: Result<usize, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => match session.effective_selection() {
+                    None => Err("没有选区".into()),
+                    Some(mask) => match session.doc.extract_selection(&mask) {
+                        Err(e) => Err(e.to_string()),
+                        Ok(index) => match session.doc.erase_selection(&mask) {
+                            Err(e) => Err(e.to_string()),
+                            Ok(()) => {
+                                session.refit_if_needed(viewport);
+                                session.dirty = true;
+                                Ok(index)
+                            }
+                        },
+                    },
+                },
+            }
+        };
+        match result {
+            Ok(index) => {
+                self.as_mut().set_selected_layer(index as i32);
+                self.as_mut().refresh_preview();
+                self.as_mut()
+                    .set_status(QString::from("已剪出为独立图层：拖动定位，可撤销"));
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"selection-cut-to-layer\",\"index\":{index}}}"
+                );
+                true
+            }
+            Err(message) => {
+                self.as_mut().set_status(QString::from(message.as_str()));
+                false
+            }
+        }
+    }
+
     pub fn paste_clipboard(mut self: Pin<&mut Self>) -> bool {
         let clipboard = clipboard().lock().unwrap().clone();
         let Some(clip) = clipboard else {

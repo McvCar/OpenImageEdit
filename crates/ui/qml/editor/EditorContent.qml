@@ -961,6 +961,40 @@ function snapDisplay(v) {
 // Fed to the canvasHoverHandler below — HoverHandler cursorShape
 // overrides every MouseArea's cursorShape, so this is the single
 // authoritative cursor decision.
+// ---- 画布光标种类 ---------------------------------------------------
+// Qt 内置的 CursorShape 里没有 +/−/剪刀，QML 也构造不了自定义光标，所以
+// 这三种由 Rust 侧的 Win32 光标接管（见 bridge/ops/cursor.rs）。这里只负责
+// 算出"此刻该用哪种"，0 = 交回 Qt 自己的光标。
+//   1 = 加选(+)  按住 Shift
+//   2 = 减选(−)  按住 Alt
+//   3 = 剪刀     按住 Ctrl（按下即准备把选区内容剪走）
+property int cursorKind: 0
+onCursorKindChanged: bridge.cursor_set_kind(cursorKind)
+
+// 只在「有选区 + 鼠标在选区内」时才换光标：选区外按修饰键仍然是画新选区的
+// 十字，换光标反而误导（PS 也是进到选区里才变）。
+function updateCursorKind(x, y) {
+    let kind = 0
+    if (x >= 0 && y >= 0 && root.selExists && root.selTool !== "none"
+            && root.selTool !== "polygon" && root.markTool === "none"
+            && !bridge.pickerOpen
+            && !view.canvasSurface.textPopup.visible) {
+        const ix = x - view.pad
+        const iy = y - view.pad
+        if (ix >= root.selX && ix <= root.selX + root.selW
+                && iy >= root.selY && iy <= root.selY + root.selH) {
+            const bits = bridge.modifier_bits()
+            if ((bits & 2) !== 0)
+                kind = 3      // Ctrl
+            else if ((bits & 1) !== 0)
+                kind = 1      // Shift
+            else if ((bits & 4) !== 0)
+                kind = 2      // Alt
+        }
+    }
+    root.cursorKind = kind
+}
+
 function canvasCursor(x, y) {
     // 文本输入中：普通箭头。
     if (view.canvasSurface.textPopup.visible)

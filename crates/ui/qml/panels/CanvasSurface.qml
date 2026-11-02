@@ -178,6 +178,20 @@ Item {
                     && host.selTool !== "polygon" && host.selTool !== "none") {
                 const pi = toImage(mouse.x, mouse.y)
                 if (bridge.sel_contains(Math.floor(pi[0]), Math.floor(pi[1]))) {
+                    // Ctrl + 按在选区内 = 剪刀（PS 语义）：把选区里的像素剪成
+                    // 独立图层，接着直接进入图层拖动。剪完把选区清掉 —— 像素
+                    // 已经搬走了，留一个空框在原地只会让人以为还能拖它。
+                    if ((mouse.modifiers & Qt.ControlModifier) !== 0
+                            && bridge.cut_selection_to_layer()) {
+                        bridge.sel_clear()
+                        pickDrag = true
+                        pickMoved = false
+                        startX = mouse.x
+                        startY = mouse.y
+                        curX = mouse.x
+                        curY = mouse.y
+                        return
+                    }
                     moveSelActive = true
                     moveFromX = mouse.x
                     moveFromY = mouse.y
@@ -1049,8 +1063,28 @@ Item {
                                                   point.position.y)
         // 尺子读数：handler 是唯一贯穿整块画布的 hover 来源（各个
         // MouseArea 谁在上面不确定），这里补一路坐标。
-        onPointChanged: if (host.rulerOn)
-                            host.noteHover(point.position.x, point.position.y)
-        onHoveredChanged: if (!hovered) host.clearHover()
+        onPointChanged: {
+            if (host.rulerOn)
+                host.noteHover(point.position.x, point.position.y)
+            host.updateCursorKind(point.position.x, point.position.y)
+        }
+        onHoveredChanged: {
+            if (!hovered) {
+                host.clearHover()
+                host.updateCursorKind(-1, -1)
+            }
+        }
+    }
+
+    // 只按住修饰键、鼠标不动时 HoverHandler 不会发 pointChanged，
+    // 而 QML 也拿不到"纯修饰键"事件 —— 悬停期间只能定时问 Rust 要状态。
+    // 120ms 够跟手，又不至于白烧 CPU。
+    Timer {
+        id: cursorModPoll
+        interval: 120
+        repeat: true
+        running: canvasHoverHandler.hovered
+        onTriggered: host.updateCursorKind(canvasHoverHandler.point.position.x,
+                                           canvasHoverHandler.point.position.y)
     }
 }

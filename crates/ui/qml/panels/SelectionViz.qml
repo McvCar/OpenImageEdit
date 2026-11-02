@@ -228,19 +228,23 @@ Item {
     // stays readable over any image content.
     Rectangle {
         id: selBadge
+        // 拖 8 个手柄改大小时也显示 —— 这时最需要看数字。数字跟着正在拖的
+        // 预览框走（松手前 bridge 里的值还没变），所以不能只是解除隐藏。
         visible: host.selExists && !host.rulerOn && !host.selRubberBanding
-                 && !selectionViz.resizingSel
         z: 8
         // host.selX/selY/selW/selH 已经是「显示坐标」（EditorContent 里
         // 由 selImg* × toDispScale() 算好），这里不要再乘一次比例。
+        readonly property var curBox: selectionViz.resizingSel
+            ? selectionViz.liveSelBox
+            : ({ x: host.selX + (host.selOffX || 0),
+                 y: host.selY + (host.selOffY || 0),
+                 width: host.selW, height: host.selH })
         x: previewImage.x
-           + (host.selOffX || 0)
-           + Math.max(0, Math.min(host.selX,
+           + Math.max(0, Math.min(selBadge.curBox.x,
                previewImage.width - selBadge.width))
         y: previewImage.y
-           + (host.selOffY || 0)
            + Math.min(previewImage.height - selBadge.height,
-                      host.selY + host.selH + 4)
+                      selBadge.curBox.y + selBadge.curBox.height + 4)
         width: selBadgeLabel.implicitWidth + 12
         height: selBadgeLabel.implicitHeight + 6
         radius: 3
@@ -251,8 +255,17 @@ Item {
         Text {
             id: selBadgeLabel
             anchors.centerIn: parent
-            text: host.selImgW + " × " + host.selImgH
-                  + (bridge.quickMask ? "　快速蒙版" : "")
+            text: {
+                if (selectionViz.resizingSel) {
+                    const s = Math.max(host.toDispScale(), 0.0001)
+                    return Math.round(Math.abs(selectionViz.liveSelBox.width) / s)
+                         + " × "
+                         + Math.round(Math.abs(selectionViz.liveSelBox.height) / s)
+                         + (bridge.quickMask ? "　快速蒙版" : "")
+                }
+                return host.selImgW + " × " + host.selImgH
+                     + (bridge.quickMask ? "　快速蒙版" : "")
+            }
             color: "#d5d8dd"
             font.pixelSize: 11
         }

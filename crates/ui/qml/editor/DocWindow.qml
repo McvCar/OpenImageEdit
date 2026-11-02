@@ -31,10 +31,10 @@ Window {
                       : Window.Hidden
     // Frameless: same custom title bar as the shell window.
     flags: Qt.Window | Qt.FramelessWindowHint
-    title: content.b.image_width > 0
-           ? "ImageEdit — " + content.b.image_width + "×" + content.b.image_height
-             + (content.b.dirty ? " *" : "")
-           : "ImageEdit"
+    // 任务栏/系统标题用文件名，不再挂分辨率（分辨率在状态栏）。
+    title: content.b.fileName.length > 0
+           ? content.b.fileName + " — ImageEdit" + (content.b.dirty ? " *" : "")
+           : "ImageEdit" + (content.b.dirty ? " *" : "")
 
     onAfterRendering: content.afterFrame()
     onVisibleChanged: {
@@ -52,12 +52,20 @@ Window {
             raise()
             requestActivate()
             frontTimer.restart()
+            // 画布上的 +/−/剪刀光标（Win32 自定义光标，见 ops/cursor.rs）。
+            content.b.cursor_install()
         }
     }
     Timer {
         id: frontTimer
         interval: 300
-        onTriggered: docWin.flags = Qt.Window | Qt.FramelessWindowHint
+        onTriggered: {
+            docWin.flags = Qt.Window | Qt.FramelessWindowHint
+            // ★改 flags 会重建原生窗口，旧 HWND 上的 WndProc 子类化随之
+            // 作废 —— 必须在新窗口上重新挂一次，否则剪刀光标在这个窗口里
+            // 永远不出现。
+            content.b.cursor_install()
+        }
     }
     onClosing: (close) => content.requestClose(close)
 

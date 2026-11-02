@@ -23,13 +23,19 @@ Window {
     // Frameless: the custom title bar (in EditorContent) provides the drag
     // area, window buttons and resize edges.
     flags: Qt.Window | Qt.FramelessWindowHint
-    title: content.b.image_width > 0
-           ? "ImageEdit — " + content.b.image_width + "×" + content.b.image_height
-             + (content.b.dirty ? " *" : "")
-           : "ImageEdit"
+    // 任务栏/系统标题用文件名，不再挂分辨率（分辨率在状态栏）。
+    title: content.b.fileName.length > 0
+           ? content.b.fileName + " — ImageEdit" + (content.b.dirty ? " *" : "")
+           : "ImageEdit" + (content.b.dirty ? " *" : "")
 
     onAfterRendering: content.afterFrame()
-    onVisibleChanged: content.b.mark("window-visible")
+    onVisibleChanged: {
+        content.b.mark("window-visible")
+        // 窗口真正出现后再挂自定义光标（画布上的 +/−/剪刀）。HWND 在这之前
+        // 就存在，但 EnumThreadWindows 拿到的顶层窗口在 show 之后才稳定。
+        if (visible)
+            content.b.cursor_install()
+    }
     onClosing: (close) => content.requestClose(close)
 
     Component.onCompleted: {

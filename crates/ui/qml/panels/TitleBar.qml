@@ -44,12 +44,7 @@ Rectangle {
         { g: "⛶", t: "应用裁剪 (Enter / Ctrl+K)", ok: host.selExists,
           run: function () { host.applyCrop() } },
         { g: "⤢", t: "调整尺寸…", ok: bridge.image_width > 0,
-          run: function () { resizeOverlay.openResizeDialog() } },
-        { g: "", t: "", ok: true, sep: true },
-        { g: "＋", t: "放大 (Ctrl+滚轮)", ok: true,
-          run: function () { view.queueZoom(1.25) } },
-        { g: "－", t: "缩小 (Ctrl+滚轮)", ok: true,
-          run: function () { view.queueZoom(1 / 1.25) } }
+          run: function () { resizeOverlay.openResizeDialog() } }
     ]
 
     // 「⋯」菜单的内容：一级只放分类，命令按类收进二级面板（OverflowMenu
@@ -154,10 +149,12 @@ Rectangle {
     // 标题文字（全称 / 只留应用名）——测量只用下面两个隐藏 Text，
     // 不能让 titleText 自己的 implicitWidth 参与判定，否则"显示→占地方→
     // 隐藏→有地方→显示"会自激振荡。
+    // 标题只显示文件名（不再挂分辨率——状态栏左下角已经有一份，标题栏里
+    // 那串数字只会和图标抢地方）。
     readonly property string titleFullText: bridge.image_width > 0
-        ? "ImageEdit — " + bridge.image_width + "×" + bridge.image_height
-          + (bridge.dirty ? " *" : "")
-        : "ImageEdit"
+                                             && bridge.fileName.length > 0
+        ? bridge.fileName + " — ImageEdit" + (bridge.dirty ? " *" : "")
+        : "ImageEdit" + (bridge.dirty ? " *" : "")
     readonly property string titleNameText: "ImageEdit" + (bridge.dirty ? " *" : "")
     // titleText 自己也钳在 220，测量要跟它一致。
     readonly property real titleFullWidth: Math.min(titleProbeFull.implicitWidth, 220)
