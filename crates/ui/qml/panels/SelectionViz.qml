@@ -314,8 +314,10 @@ Item {
         x: previewImage.x + host.scaleX
         y: Math.min(previewImage.y + previewImage.height - 16,
                     previewImage.y + host.scaleY + host.scaleH + 4)
-        text: Math.round(host.scaleW / host.toDispScale()) + " × "
-              + Math.round(host.scaleH / host.toDispScale()) + "　松手应用缩放 · Esc 取消"
+        // 拖动时只报当前尺寸。原来后面还挂一句「松手应用缩放 · Esc 取消」，
+        // 跟着鼠标一路晃、又长又容易被形状挡住——操作说明放状态栏就够了。
+        text: Math.round(Math.abs(host.scaleW) / host.toDispScale()) + " × "
+              + Math.round(Math.abs(host.scaleH) / host.toDispScale())
         color: "#7fc3ff"
         font.pixelSize: 11
     }

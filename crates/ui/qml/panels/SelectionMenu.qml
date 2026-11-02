@@ -65,6 +65,101 @@ Rectangle {
         anchors.right: parent.right
         anchors.top: parent.top
         anchors.topMargin: 6
+        spacing: 0
+
+        // ---- 选区类型（单选）----
+        // 形状原本只能在标记栏的浮动面板里切：想改边界/平滑就得先关菜单、
+        // 开面板、再右键一次。这里放一组单选按钮就地切换；切换后菜单保持
+        // 打开，方便接着调下面的数值。
+        Text {
+            x: 12
+            width: body.width - 24
+            height: 20
+            verticalAlignment: Text.AlignVCenter
+            text: "选区类型"
+            color: "#8b9096"
+            font.pixelSize: 10
+        }
+        Grid {
+            width: body.width
+            columns: 2
+            rowSpacing: 2
+            columnSpacing: 2
+            bottomPadding: 4
+            Repeater {
+                model: [
+                    { key: "rect", glyph: "▭", label: "矩形选框" },
+                    { key: "ellipse", glyph: "◯", label: "椭圆选框" },
+                    { key: "lasso", glyph: "∿", label: "套索" },
+                    { key: "polygon", glyph: "⬡", label: "多边形" }
+                ]
+                delegate: Item {
+                    id: selTypeCell
+                    required property var modelData
+                    readonly property bool picked: host.selTool === modelData.key
+                    width: (body.width - 8) / 2
+                    height: 26
+
+                    Rectangle {
+                        x: 4
+                        width: parent.width - 4
+                        height: parent.height
+                        radius: 4
+                        color: cellMa.containsMouse ? "#3d5a80" : "transparent"
+                    }
+                    // 单选圆点：空心圈 + 选中时填实心
+                    Rectangle {
+                        x: 9
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: 12
+                        height: 12
+                        radius: 6
+                        color: "transparent"
+                        border.width: 1
+                        border.color: selTypeCell.picked ? "#7fc3ff" : "#6b7076"
+                        Rectangle {
+                            anchors.centerIn: parent
+                            width: 6
+                            height: 6
+                            radius: 3
+                            color: "#7fc3ff"
+                            visible: selTypeCell.picked
+                        }
+                    }
+                    Text {
+                        anchors.left: parent.left
+                        anchors.leftMargin: 27
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        elide: Text.ElideRight
+                        text: selTypeCell.modelData.glyph + "  " + selTypeCell.modelData.label
+                        color: selTypeCell.picked ? "#cfe4ff" : "#e9eaec"
+                        font.pixelSize: 11
+                    }
+                    MouseArea {
+                        id: cellMa
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        // 只切工具、不关菜单（也不能走 pickSelTool，那个会顺手
+                        // 收起浮动面板）。
+                        onClicked: host.setSelTool(selTypeCell.modelData.key)
+                    }
+                }
+            }
+        }
+
+        // ---- 分隔线 ----
+        Item {
+            width: body.width
+            height: 9
+            Rectangle {
+                anchors.centerIn: parent
+                width: parent.width - 24
+                height: 1
+                color: "#3c4043"
+            }
+        }
 
         // ---- 取消选择 ----
         Item {

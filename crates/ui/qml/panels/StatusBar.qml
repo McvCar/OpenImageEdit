@@ -25,8 +25,12 @@ Rectangle {
               ? "粘贴内容可拖动定位：Enter / 点击外部落定，Esc 撤销粘贴"
               : host.selRubberBanding
               ? "松手完成选区（Shift 加选 / Alt 减选 / Shift+Alt 交集）"
+              // 缩放中只报图层当前宽高，不再挂操作说明（跟着鼠标跳的那条
+              // 尺寸标签已经够看了，说明文字属于噪音）。
               : host.scaleW > 0
-              ? "拖角/边调整图层大小（角点等比，Shift 自由）；松手应用，Esc 取消"
+              ? "图层 " + Math.round(Math.abs(host.scaleW) / Math.max(host.toDispScale(), 0.0001))
+                       + " × "
+                       + Math.round(Math.abs(host.scaleH) / Math.max(host.toDispScale(), 0.0001))
               : host.selExists
               ? "已选区：拖选区内可移动，右键出边界/平滑/羽化；Enter 裁剪，Ctrl+D 取消"
               : "已选图层：点住拖动移动，拖手柄缩放；点击空白处或 Esc 取消选择"
