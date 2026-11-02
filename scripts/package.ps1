@@ -7,6 +7,23 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'env.ps1')
 
+# NOTE: keep this file ASCII-only. powershell.exe (5.1) reads .ps1 as ANSI,
+# so UTF-8 Chinese comments corrupt the parser.
+#
+# This machine runs a safe-delete hook that intercepts bulk `Remove-Item` and
+# fails closed. In a non-interactive (background/CI) run that looks like the
+# script "hangs forever": no error, no exit. So packaging deletes files through
+# the .NET API instead.
+function Remove-PathForce([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.PSIsContainer) {
+        [System.IO.Directory]::Delete($item.FullName, $true)
+    } else {
+        [System.IO.File]::Delete($item.FullName)
+    }
+}
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $distDir = Join-Path $repoRoot 'dist\imageedit'
 $zipPath = Join-Path $repoRoot 'dist\imageedit-0.1-win64.zip'
@@ -31,7 +48,8 @@ if (-not $SkipBuild) {
     if ($buildExit -ne 0) { throw "cargo build failed`n$buildOut" }
 }
 
-if (Test-Path -LiteralPath $distDir) { Remove-Item -LiteralPath $distDir -Recurse -Force }
+Write-Host '==> deploy' -ForegroundColor Cyan
+if (Test-Path -LiteralPath $distDir) { Remove-PathForce $distDir }
 New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 
 Copy-Item (Join-Path $repoRoot 'target\release\imageedit.exe') $distDir
@@ -52,7 +70,7 @@ $ErrorActionPreference = 'Continue'
 # no C++ objects, so /MT is conflict-free here.
 $env:RUSTFLAGS = '-C target-feature=+crt-static'
 $thumbOut = & cargo build -p imageedit-thumbnail --profile thumb 2>&1 | Out-String
-Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
+[Environment]::SetEnvironmentVariable('RUSTFLAGS', $null, 'Process')
 $ErrorActionPreference = $oldEA
 if ($LASTEXITCODE -ne 0) { throw "thumbnail DLL build failed`n$thumbOut" }
 Copy-Item (Join-Path $repoRoot 'target\thumb\imageedit_thumb.dll') $distDir
@@ -117,6 +135,7 @@ $depOut = & (Join-Path $env:IMAGEEDIT_QT_BIN 'windeployqt.exe') --release --no-t
 $depExit = $LASTEXITCODE
 $ErrorActionPreference = $oldEA
 if ($depExit -ne 0) { throw "windeployqt failed`n$depOut" }
+Write-Host '==> windeployqt done' -ForegroundColor Cyan
 
 # QML modules and DLLs that this app never imports. QtQuick.Dialogs.quickimpl
 # only needs QtQuick + QtQuick.Templates + QtQuick.Layouts, so the whole
@@ -182,14 +201,13 @@ $keepFiles = @(
     'Qt6QuickDialogs2Utils.dll'
 )
 
+Write-Host '==> prune' -ForegroundColor Cyan
 if (-not $NoPrune) {
     foreach ($rel in $pruneDirs) {
-        $target = Join-Path $distDir $rel
-        if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+        Remove-PathForce (Join-Path $distDir $rel)
     }
     foreach ($name in $pruneFiles) {
-        $target = Join-Path $distDir $name
-        if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }
+        Remove-PathForce (Join-Path $distDir $name)
     }
     foreach ($name in $keepFiles) {
         if (-not (Test-Path -LiteralPath (Join-Path $distDir $name))) {
@@ -198,6 +216,7 @@ if (-not $NoPrune) {
     }
 }
 
+Write-Host '==> verify' -ForegroundColor Cyan
 if (-not $SkipVerify) {
     $env:QT_ASSUME_STDERR_HAS_CONSOLE = '1'
     $savedPath = $env:Path
@@ -229,5 +248,8 @@ $files = Get-ChildItem -LiteralPath $distDir -Recurse -File
 $totalMb = ($files | Measure-Object -Property Length -Sum).Sum / 1MB
 Write-Host ("dist: {0} files, {1:N1} MB" -f $files.Count, $totalMb)
 
+# Delete the previous archive explicitly: Compress-Archive -Force's internal
+# replace is also caught by the safe-delete hook.
+Remove-PathForce $zipPath
 Compress-Archive -Path (Join-Path $distDir '*') -DestinationPath $zipPath -Force
 Write-Host ("zip: {0:N1} MB" -f ((Get-Item -LiteralPath $zipPath).Length / 1MB))

@@ -19,7 +19,12 @@ impl qobject::Bridge {
     /// Publish the selection's public state (bounds / ops / active flag) and
     /// mirror the session's revision into `sel_version` so QML re-pulls the
     /// outline when — and only when — the selection really changed.
-    pub(crate) fn publish_selection(mut self: Pin<&mut Self>) {
+    ///
+    /// Returns true when the quick mask was switched on/off: the mask is drawn
+    /// INTO the preview bitmap, so both directions need a fresh frame — and by
+    /// the time the caller asks, `quick_mask` already holds the NEW value, so
+    /// "is it on now" cannot answer for "just turned off".
+    pub(crate) fn publish_selection(mut self: Pin<&mut Self>) -> bool {
         let (active, rect, ops, rev, quick, can_undo, can_redo) = {
             let guard = self.session.borrow();
             match guard.as_ref() {
@@ -49,6 +54,7 @@ impl qobject::Bridge {
                 None => (false, Rect::default(), (0, 0, 0), 0, false, false, false),
             }
         };
+        let mut mask_changed = false;
         // 选区现在是文档历史的一部分：只动选区也会让"撤销"变成可用。
         // 之前这几步不刷新 preview，工具栏的撤销图标就会一直是灰的。
         if *self.can_undo() != can_undo {
@@ -83,10 +89,12 @@ impl qobject::Bridge {
         }
         if *self.quick_mask() != quick {
             self.as_mut().set_quick_mask(quick);
+            mask_changed = true;
         }
         if *self.sel_version() != rev {
             self.as_mut().set_sel_version(rev);
         }
+        mask_changed
     }
 
     /// Bump the session's selection revision (call after every mutation).
@@ -101,15 +109,22 @@ impl qobject::Bridge {
     /// 发布刷新。放在这里是因为 undo/redo 在 canvas.rs。
     pub(crate) fn sync_selection_after_history(mut self: Pin<&mut Self>) {
         self.touch_selection();
-        self.as_mut().publish_selection();
-        // 快速蒙版是画进预览位图的，选区变了就得重出一帧。
-        self.as_mut().refresh_for_selection();
+        self.as_mut().commit_selection();
+    }
+
+    /// 选区改完之后的统一出口：发布公开状态 + 必要时重出预览帧。
+    pub(crate) fn commit_selection(mut self: Pin<&mut Self>) {
+        let mask_changed = self.as_mut().publish_selection();
+        self.as_mut().refresh_for_selection(mask_changed);
     }
 
     /// The quick mask is drawn INTO the preview bitmap, so every selection
     /// change needs a re-render while it is on (and none while it is off).
-    fn refresh_for_selection(mut self: Pin<&mut Self>) {
-        if *self.quick_mask() && self.session.borrow().is_some() {
+    /// `mask_changed` covers the on→off case: 取消选区会自动关掉快速蒙版，
+    /// 这时 `quick_mask` 已经是 false，只看它就会漏掉那一次重绘，蒙版的
+    /// 暗化层会一直留在屏幕上（必须重出一帧未蒙版的位图才能擦掉）。
+    fn refresh_for_selection(mut self: Pin<&mut Self>, mask_changed: bool) {
+        if (mask_changed || *self.quick_mask()) && self.session.borrow().is_some() {
             self.as_mut().refresh_preview();
         }
     }
@@ -196,8 +211,7 @@ impl qobject::Bridge {
             let _ = session.doc.set_selection(next);
         }
         self.touch_selection();
-        self.as_mut().publish_selection();
-        self.as_mut().refresh_for_selection();
+        self.as_mut().commit_selection();
     }
 
     pub fn sel_set_rect(
@@ -272,8 +286,7 @@ impl qobject::Bridge {
             let _ = session.doc.set_selection(Some(SelectionState::new(mask)));
         }
         self.touch_selection();
-        self.as_mut().publish_selection();
-        self.as_mut().refresh_for_selection();
+        self.as_mut().commit_selection();
     }
 
     pub fn sel_clear(mut self: Pin<&mut Self>) {
@@ -292,8 +305,7 @@ impl qobject::Bridge {
             return;
         }
         self.touch_selection();
-        self.as_mut().publish_selection();
-        self.as_mut().refresh_for_selection();
+        self.as_mut().commit_selection();
         println!("{{\"phase\":\"ui\",\"event\":\"sel-clear\"}}");
     }
 
@@ -321,8 +333,7 @@ impl qobject::Bridge {
             let _ = session.doc.set_selection(Some(inverted));
         }
         self.touch_selection();
-        self.as_mut().publish_selection();
-        self.as_mut().refresh_for_selection();
+        self.as_mut().commit_selection();
         println!("{{\"phase\":\"ui\",\"event\":\"sel-invert\"}}");
     }
 
@@ -333,8 +344,7 @@ impl qobject::Bridge {
         }
         self.as_mut().remember_selection_ops();
         self.touch_selection();
-        self.as_mut().publish_selection();
-        self.as_mut().refresh_for_selection();
+        self.as_mut().commit_selection();
     }
 
     pub fn sel_set_smooth(mut self: Pin<&mut Self>, k: i32) {
@@ -344,8 +354,7 @@ impl qobject::Bridge {
         }
         self.as_mut().remember_selection_ops();
         self.touch_selection();
-        self.as_mut().publish_selection();
-        self.as_mut().refresh_for_selection();
+        self.as_mut().commit_selection();
     }
 
     pub fn sel_set_feather(mut self: Pin<&mut Self>, r: i32) {
@@ -355,8 +364,7 @@ impl qobject::Bridge {
         }
         self.as_mut().remember_selection_ops();
         self.touch_selection();
-        self.as_mut().publish_selection();
-        self.as_mut().refresh_for_selection();
+        self.as_mut().commit_selection();
     }
 
     /// 记住用户选的选区工具（下次启动继续用同一个）。
@@ -410,8 +418,7 @@ impl qobject::Bridge {
             let _ = session.doc.set_selection(next);
         }
         self.touch_selection();
-        self.as_mut().publish_selection();
-        self.as_mut().refresh_for_selection();
+        self.as_mut().commit_selection();
     }
 
     /// 拖手柄改选区大小（图像坐标，浮点）。Rust 侧按新包围盒重采样
@@ -461,8 +468,7 @@ impl qobject::Bridge {
             let _ = session.doc.set_selection(next);
         }
         self.touch_selection();
-        self.as_mut().publish_selection();
-        self.as_mut().refresh_for_selection();
+        self.as_mut().commit_selection();
     }
 
     /// 按下选区手柄：把「已镜像」状态清零，让下一次越过对边重新触发镜像。
