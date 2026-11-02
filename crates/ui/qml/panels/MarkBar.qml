@@ -25,6 +25,11 @@ Rectangle {
     color: "#25272b"
     z: 59
 
+    // 窄窗口：一行的按钮放不下时，从右端成组收起（尺子 / 拾色器 / 它们
+    // 前面的那条分隔线）。这三个命令在「⋯ → 图层与标记」里都有，不会
+    // 变成够不着的功能。阈值按整行实测宽度（≈460）留一点余量。
+    readonly property bool tailFits: width >= 500
+
     Row {
         id: markRow
         anchors.left: parent.left
@@ -268,11 +273,13 @@ Rectangle {
         }
 
         Rectangle { width: 9; height: 18; color: "transparent"
+            visible: markBar.tailFits
             Rectangle { anchors.centerIn: parent; width: 1; height: 18; color: "#3c4043" } }
 
         // 尺子：显示选区 / 选中图层的四角+中心坐标，并跟随鼠标读数。
         IconButton {
             id: rulerBtn
+            visible: markBar.tailFits
             tip: "尺子（显示坐标，用于测量）"
             active: bridge.image_width > 0
             selected: host.rulerOn
@@ -306,6 +313,7 @@ Rectangle {
         // 拾色器：打开取色弹窗，点击图片取色并复制色值。
         IconButton {
             id: pickerBtn
+            visible: markBar.tailFits
             tip: "拾色器（点击图片取色，可复制色值）"
             active: bridge.image_width > 0
             selected: bridge.pickerOpen

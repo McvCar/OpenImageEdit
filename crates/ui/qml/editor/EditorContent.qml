@@ -1615,7 +1615,24 @@ Timer {
 Timer {
     id: menuProbeTimer
     interval: 600
-    onTriggered: overflowMenu.visible = true
+    onTriggered: overflowMenu.open()
+}
+
+// Probe timer: --probe-submenu 顺带把第二个有子项的分类展开（悬停没法脚本
+// 化，直接调 showSub 验二级面板的位置和滚动）。
+Timer {
+    id: submenuProbeTimer
+    interval: 700
+    onTriggered: {
+        overflowMenu.open()
+        const tree = overflowMenu.items
+        for (let i = 0; i < tree.length; i++) {
+            if (tree[i].sub && tree[i].sub.length >= 6) {
+                overflowMenu.showSub(tree[i], 5 + i * 26)
+                return
+            }
+        }
+    }
 }
 
 // Probe timer: --probe-resize opens the resize dialog automatically.
@@ -1935,6 +1952,8 @@ Component.onCompleted: {
             settingsProbeTimer.start();
         if (root.probeMenu)
             menuProbeTimer.start();
+        if (Qt.application.arguments.indexOf("--probe-submenu") !== -1)
+            submenuProbeTimer.start();
         if (root.probeResize)
             resizeProbeTimer.start();
         if (root.probeLayers)

@@ -52,57 +52,94 @@ Rectangle {
           run: function () { view.queueZoom(1 / 1.25) } }
     ]
 
-    // Everything the bar shows as icons, plus the full text-only set.
-    readonly property var menuActions: [
-        { l: "打开图片… (Ctrl+O)", ok: true, run: function () { openDialog.open() } },
-        { l: "新窗口 (Ctrl+N)", ok: true, run: function () { host.requestNewWindow() } },
-        { l: "", ok: true, sep: true },
-        { l: "撤销 (Ctrl+Z)", ok: bridge.can_undo, run: function () { bridge.undo() } },
-        { l: "重做 (Ctrl+Shift+Z)", ok: bridge.can_redo, run: function () { bridge.redo() } },
-        { l: "", ok: true, sep: true },
-        { l: "逆时针旋转 90° (Ctrl+L)", ok: true, run: function () { bridge.rotate_ccw() } },
-        { l: "顺时针旋转 90° (Ctrl+R)", ok: true, run: function () { bridge.rotate_cw() } },
-        { l: "水平翻转", ok: true, run: function () { bridge.flip_horizontal() } },
-        { l: "垂直翻转", ok: true, run: function () { bridge.flip_vertical() } },
-        { l: "", ok: true, sep: true },
-        { l: "应用裁剪 (Enter / Ctrl+K)", ok: host.selExists, run: function () { host.applyCrop() } },
-        { l: "重置裁剪", ok: bridge.image_width > 0, run: function () { bridge.reset_crop() } },
-        { l: "调整尺寸…", ok: bridge.image_width > 0, run: function () { resizeOverlay.openResizeDialog() } },
-        { l: "", ok: true, sep: true },
-        { l: "选区工具…（M / L）", ok: true,
-          run: function () { host.markBarVisible = true; host.selPopoverOpen = !host.selPopoverOpen } },
-        { l: "全选 (Ctrl+A)", ok: bridge.image_width > 0,
-          run: function () { bridge.sel_select_all() } },
-        { l: "选择反选 (Ctrl+Shift+I)", ok: bridge.image_width > 0,
-          run: function () { bridge.sel_invert() } },
-        { l: "取消选择 (Ctrl+D)", ok: host.selExists,
-          run: function () { bridge.sel_clear() } },
-        { l: "快速蒙版 (Q)", ok: host.selExists,
-          run: function () { bridge.sel_toggle_quick_mask() } },
-        { l: "", ok: true, sep: true },
-        { l: "提取图层", ok: host.selExists, run: function () { host.commitExtract() } },
-        { l: "删除选区像素 (Delete)", ok: host.selExists, run: function () { host.deleteSelectionPixels() } },
-        { l: "图层面板", ok: true, run: function () { host.panelVisible = !host.panelVisible } },
-        { l: "标记工具栏", ok: true, run: function () { markBarBtn.clicked() } },
-        { l: "调整颜色… (Ctrl+E)", ok: bridge.image_width > 0,
-          run: function () { host.toggleAdjustPanel() } },
-        { l: "尺子（测量坐标）", ok: bridge.image_width > 0,
-          run: function () { host.toggleRuler() } },
-        { l: "拾色器…", ok: bridge.image_width > 0,
-          run: function () { host.togglePickerPanel() } },
-        { l: "", ok: true, sep: true },
-        { l: "放大 (Ctrl++)", ok: true, run: function () { view.queueZoom(1.25) } },
-        { l: "缩小 (Ctrl+-)", ok: true, run: function () { view.queueZoom(1 / 1.25) } },
-        { l: "适应窗口 (Ctrl+9)", ok: bridge.image_width > 0, run: function () { bridge.zoom_fit() } },
-        { l: "100% 实际大小 (Ctrl+0)", ok: bridge.image_width > 0, run: function () { bridge.zoom_actual() } },
-        { l: "", ok: true, sep: true },
-        { l: "保存 (Ctrl+S)", ok: bridge.image_width > 0, run: function () { host.saveOrSaveAs() } },
-        { l: "另存为… (Ctrl+Shift+S)", ok: true, run: function () { saveDialog.open() } },
-        { l: "", ok: true, sep: true },
-        { l: "设置…", ok: true, run: function () { settingsOverlay.visible = true } },
-        { l: "", ok: true, sep: true },
-        { l: "关闭窗口 (Ctrl+W)", ok: true, run: function () { host.requestQuit() } }
-    ]
+    // 「⋯」菜单的内容：一级只放分类，命令按类收进二级面板（OverflowMenu
+    // 负责展开）。写成函数而不是 property，是为了每次打开都重新求值
+    // ok（can_undo / selExists 这些），否则菜单状态会冻在启动那一刻。
+    function menuTree() {
+        return [
+            { l: "文件", sub: [
+                { l: "打开图片… (Ctrl+O)", ok: true,
+                  run: function () { openDialog.open() } },
+                { l: "新窗口 (Ctrl+N)", ok: true,
+                  run: function () { host.requestNewWindow() } },
+                { l: "", sep: true },
+                { l: "保存 (Ctrl+S)", ok: bridge.image_width > 0,
+                  run: function () { host.saveOrSaveAs() } },
+                { l: "另存为… (Ctrl+Shift+S)", ok: true,
+                  run: function () { saveDialog.open() } },
+                { l: "", sep: true },
+                { l: "关闭窗口 (Ctrl+W)", ok: true,
+                  run: function () { host.requestQuit() } }
+            ] },
+            { l: "编辑", sub: [
+                { l: "撤销 (Ctrl+Z)", ok: bridge.can_undo,
+                  run: function () { bridge.undo() } },
+                { l: "重做 (Ctrl+Shift+Z)", ok: bridge.can_redo,
+                  run: function () { bridge.redo() } },
+                { l: "", sep: true },
+                { l: "删除选区像素 (Delete)", ok: host.selExists,
+                  run: function () { host.deleteSelectionPixels() } },
+                { l: "提取图层", ok: host.selExists,
+                  run: function () { host.commitExtract() } }
+            ] },
+            { l: "图像", sub: [
+                { l: "逆时针旋转 90° (Ctrl+L)", ok: true,
+                  run: function () { bridge.rotate_ccw() } },
+                { l: "顺时针旋转 90° (Ctrl+R)", ok: true,
+                  run: function () { bridge.rotate_cw() } },
+                { l: "水平翻转", ok: true,
+                  run: function () { bridge.flip_horizontal() } },
+                { l: "垂直翻转", ok: true,
+                  run: function () { bridge.flip_vertical() } },
+                { l: "", sep: true },
+                { l: "应用裁剪 (Enter / Ctrl+K)", ok: host.selExists,
+                  run: function () { host.applyCrop() } },
+                { l: "重置裁剪", ok: bridge.image_width > 0,
+                  run: function () { bridge.reset_crop() } },
+                { l: "调整尺寸…", ok: bridge.image_width > 0,
+                  run: function () { resizeOverlay.openResizeDialog() } }
+            ] },
+            { l: "选区", sub: [
+                { l: "选区工具…（M / L）", ok: true,
+                  run: function () { host.markBarVisible = true
+                                     host.selPopoverOpen = !host.selPopoverOpen } },
+                { l: "全选 (Ctrl+A)", ok: bridge.image_width > 0,
+                  run: function () { bridge.sel_select_all() } },
+                { l: "选择反选 (Ctrl+Shift+I)", ok: bridge.image_width > 0,
+                  run: function () { bridge.sel_invert() } },
+                { l: "取消选择 (Ctrl+D)", ok: host.selExists,
+                  run: function () { bridge.sel_clear() } },
+                { l: "快速蒙版 (Q)", ok: host.selExists,
+                  run: function () { bridge.sel_toggle_quick_mask() } }
+            ] },
+            { l: "图层与标记", sub: [
+                { l: "图层面板", ok: true,
+                  run: function () { host.panelVisible = !host.panelVisible } },
+                { l: "标记工具栏", ok: true,
+                  run: function () { markBarBtn.clicked() } },
+                { l: "调整颜色… (Ctrl+E)", ok: bridge.image_width > 0,
+                  run: function () { host.toggleAdjustPanel() } },
+                { l: "尺子（测量坐标）", ok: bridge.image_width > 0,
+                  run: function () { host.toggleRuler() } },
+                { l: "拾色器…", ok: bridge.image_width > 0,
+                  run: function () { host.togglePickerPanel() } }
+            ] },
+            { l: "视图", sub: [
+                { l: "放大 (Ctrl++)", ok: true,
+                  run: function () { view.queueZoom(1.25) } },
+                { l: "缩小 (Ctrl+-)", ok: true,
+                  run: function () { view.queueZoom(1 / 1.25) } },
+                { l: "", sep: true },
+                { l: "适应窗口 (Ctrl+9)", ok: bridge.image_width > 0,
+                  run: function () { bridge.zoom_fit() } },
+                { l: "100% 实际大小 (Ctrl+0)", ok: bridge.image_width > 0,
+                  run: function () { bridge.zoom_actual() } }
+            ] },
+            { l: "", sep: true },
+            { l: "设置…", ok: true,
+              run: function () { settingsOverlay.visible = true } }
+        ]
+    }
 
     // ---- 图标栏容量（纯绑定：窗口宽度 / 标题宽度 / 右侧按钮簇宽度变化都
     // 会自动重算）--------------------------------------------------------
@@ -277,7 +314,7 @@ Rectangle {
         glyph: "⋯"
         tip: "更多操作"
         visible: true
-        onClicked: overflowMenu.visible = !overflowMenu.visible
+        onClicked: overflowMenu.toggle()
     }
 
     Row {

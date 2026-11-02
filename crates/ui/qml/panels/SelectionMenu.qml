@@ -69,8 +69,8 @@ Rectangle {
 
         // ---- 选区类型（单选）----
         // 形状原本只能在标记栏的浮动面板里切：想改边界/平滑就得先关菜单、
-        // 开面板、再右键一次。这里放一组单选按钮就地切换；切换后菜单保持
-        // 打开，方便接着调下面的数值。
+        // 开面板、再右键一次。这里放一组单选按钮就地切换；选完即收菜单
+        // （类型定了下一步就是画选区），不选则继续留在菜单里调数值。
         Text {
             x: 12
             width: body.width - 24
@@ -126,9 +126,13 @@ Rectangle {
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
-                        // 只切工具、不关菜单（也不能走 pickSelTool，那个会顺手
-                        // 收起浮动面板）。
-                        onClicked: host.setSelTool(selTypeCell.modelData.key)
+                        // 选完就收菜单：类型定了下一步一定是去画选区，菜单留着
+                        // 只会挡住画布。不走 pickSelTool —— 那个会顺手把标记栏
+                        // 的浮动面板也收起来，两处一起消失显得像误触。
+                        onClicked: {
+                            host.setSelTool(selTypeCell.modelData.key)
+                            selMenu.close()
+                        }
                     }
                 }
             }

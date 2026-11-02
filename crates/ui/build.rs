@@ -47,6 +47,7 @@ fn main() {
                 "qml/widgets/EdgeHandles.qml",
                 "qml/widgets/IconButton.qml",
                 "qml/widgets/MenuRow.qml",
+                "qml/widgets/MenuPanel.qml",
                 "qml/widgets/SpinBox.qml",
                 "qml/widgets/ToolButton.qml",
                 "qml/widgets/WindowEdges.qml",

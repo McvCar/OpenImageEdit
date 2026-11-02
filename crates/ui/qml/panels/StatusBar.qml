@@ -15,12 +15,42 @@ Rectangle {
     height: host.statusHeight
     color: "#242628"
 
+    // ---- 三块文字的排版 ------------------------------------------------
+    // 右端缩放控件是固定宽度，左边到它之间才是文字区。原来三块各自用
+    // implicitWidth 向外撑（提示文字右锚、文件名左锚），窗口一窄就互相
+    // 压过去：文件名盖住缩放控件、状态提示又盖住文件名。现在统一放进
+    // leftZone，按空间依次退让：先砍提示 → 再砍状态 → 最后压文件名。
+    readonly property real zoomReserve: zoomCtl.width + 20
+
+    Item {
+        id: leftZone
+        anchors.left: parent.left
+        anchors.leftMargin: 10
+        anchors.right: parent.right
+        anchors.rightMargin: zoomReserve
+        anchors.verticalCenter: parent.verticalCenter
+        height: parent.height
+        clip: true
+
+        // 提示文字整条（操作说明，信息密度最低）只在够宽时出现。
+        readonly property bool showHint: width >= 520
+        // 文件名与缩放控件之间至少留 90px 才值得显示状态文字。
+        readonly property bool showStatus:
+            width - (fileInfo.visible ? fileInfo.width + 12 : 0)
+            - (modeHint.visible ? modeHint.width + 10 : 0) >= 90
+    }
+
     Text {
         id: modeHint
+        parent: leftZone
+        anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
-        anchors.right: zoomCtl.left
-        anchors.rightMargin: 10
-        visible: host.modeActive || host.selExists || bridge.selected_layer >= 0
+        // 上限占一半，剩下的留给文件名和状态文字；超长右对齐截断。
+        width: Math.min(implicitWidth, Math.max(0, leftZone.width * 0.52))
+        horizontalAlignment: Text.AlignRight
+        elide: Text.ElideRight
+        visible: leftZone.showHint
+                 && (host.modeActive || host.selExists || bridge.selected_layer >= 0)
         text: host.pasteFloating
               ? "粘贴内容可拖动定位：Enter / 点击外部落定，Esc 撤销粘贴"
               : host.selRubberBanding
@@ -43,30 +73,52 @@ Rectangle {
     // helper), hover shows a hint tooltip.
     Item {
         id: fileInfo
+        parent: leftZone
         anchors.verticalCenter: parent.verticalCenter
         anchors.left: parent.left
-        anchors.leftMargin: 10
         height: parent.height
-        visible: bridge.fileName.length > 0
-        width: fileInfoText.implicitWidth
+        // 文件名 + 分辨率各占一段：窄窗口先丢掉体积、再丢掉分辨率，最后才
+        // 靠 elide 截文件名。整串一起 elide 会切在数字中间（"800×600" 变
+        // "…0"），比不显示还难读。
+        visible: bridge.fileName.length > 0 && leftZone.width >= 150
+        width: Math.min(fileInfoName.implicitWidth
+                        + (fileInfoMeta.visible ? fileInfoMeta.implicitWidth + 10 : 0),
+                        Math.max(72, leftZone.width * 0.45))
         readonly property bool hasPath: bridge.sourcePath.length > 0
+        readonly property string metaText:
+            bridge.image_width > 0
+            ? bridge.image_width + "×" + bridge.image_height
+              + (leftZone.width >= 400 && bridge.fileSizeStr.length > 0
+                 ? "  ·  " + bridge.fileSizeStr
+                 : "")
+            : ""
         property bool hovering: false
         property bool copied: false
 
         Text {
-            id: fileInfoText
+            id: fileInfoName
             anchors.verticalCenter: parent.verticalCenter
-            text: fileInfo.copied
-                  ? "已复制完整路径 ✓"
-                  : bridge.fileName
-                    + (bridge.image_width > 0
-                       ? "   ·   " + bridge.image_width + "×" + bridge.image_height
-                       : "")
-                    + (bridge.fileSizeStr.length > 0 ? "   ·   " + bridge.fileSizeStr : "")
+            anchors.left: parent.left
+            width: Math.max(0, fileInfo.width
+                               - (fileInfoMeta.visible
+                                  ? fileInfoMeta.implicitWidth + 10 : 0))
+            elide: Text.ElideMiddle
+            text: fileInfo.copied ? "已复制完整路径 ✓" : bridge.fileName
             color: fileInfo.copied ? "#7fc3ff"
                    : (fileInfo.hasPath && fileInfo.hovering ? "#c9dcf5" : "#9aa3b2")
             font.pixelSize: 12
             font.underline: fileInfo.hasPath && fileInfo.hovering && !fileInfo.copied
+        }
+
+        Text {
+            id: fileInfoMeta
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.right: parent.right
+            visible: !fileInfo.copied && fileInfo.metaText.length > 0
+                     && leftZone.width >= 300
+            text: fileInfo.metaText
+            color: fileInfo.hasPath && fileInfo.hovering ? "#c9dcf5" : "#8c95a3"
+            font.pixelSize: 12
         }
 
         // Hand-rolled tooltip (no QtQuick.Controls dependency).
@@ -129,12 +181,16 @@ Rectangle {
         }
     }
 
+    // 中间的状态文字：夹在文件名与提示文字之间，两边都空出来时铺满。
     Text {
+        id: statusText
+        parent: leftZone
         anchors.verticalCenter: parent.verticalCenter
         anchors.left: fileInfo.visible ? fileInfo.right : parent.left
-        anchors.leftMargin: fileInfo.visible ? 12 : 10
-        anchors.right: (host.modeActive || host.selExists) ? modeHint.left : zoomCtl.left
-        anchors.rightMargin: 10
+        anchors.leftMargin: fileInfo.visible ? 12 : 0
+        anchors.right: modeHint.visible ? modeHint.left : parent.right
+        anchors.rightMargin: modeHint.visible ? 10 : 0
+        visible: leftZone.showStatus && text.length > 0
         elide: Text.ElideMiddle
         text: bridge.status
         color: "#b8bcc0"
@@ -196,10 +252,13 @@ Rectangle {
         }
 
         // 滑杆：对数刻度 2%..1600%，拖动与滚轮共用同一条节流管线。
+        // 窄窗口下先把它收起来（百分比胶囊和 −/+ 还能用），省下的 100px
+        // 全给左边的文件名/状态文字。
         Item {
             id: zoomSlider
             width: 96
             height: 20
+            visible: statusBar.width >= 640
             anchors.verticalCenter: parent.verticalCenter
 
             property real value: 0.5
