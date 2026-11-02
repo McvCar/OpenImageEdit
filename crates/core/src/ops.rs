@@ -53,6 +53,75 @@ pub(crate) fn apply_base_to_layer(doc: &mut Document) {
     doc.base_converted = true;
 }
 
+/// Punch the selection's outline out of the pixels that will remain on the
+/// canvas: every pixel inside `selection.bounds` keeps `alpha * coverage`,
+/// so ellipse / lasso / feathered selections leave a transparent surround
+/// instead of a hard rectangular crop. Both the base and the layers are
+/// touched — otherwise a layer would keep painting its out-of-selection
+/// pixels over the new transparent area (looks like crop did nothing).
+///
+/// Only the bounding box is scanned: everything outside is dropped by the
+/// crop anyway, so walking the whole image would just be slow.
+pub(crate) fn clear_outside_selection(doc: &mut Document, selection: &SelectionMask) {
+    let canvas_rect = Rect::new(0, 0, doc.canvas.width, doc.canvas.height);
+    let Some(area) = selection.bounds.intersect(canvas_rect) else {
+        return;
+    };
+
+    // Base: canvas (x, y) maps to base (view.x + x, view.y + y).
+    for y in 0..area.height {
+        for x in 0..area.width {
+            let cx = area.x + x as i32;
+            let cy = area.y + y as i32;
+            let cov = selection.coverage_at(cx, cy);
+            if cov == 255 {
+                continue;
+            }
+            let bx = doc.view.x + cx;
+            let by = doc.view.y + cy;
+            if bx < 0 || by < 0 {
+                continue;
+            }
+            let (bx, by) = (bx as u32, by as u32);
+            if bx >= doc.base.width() || by >= doc.base.height() {
+                continue;
+            }
+            let px = doc.base.get_pixel_mut(bx, by);
+            px.0[3] = ((px.0[3] as u32 * cov as u32 + 127) / 255) as u8;
+            if px.0[3] == 0 {
+                px.0 = [0, 0, 0, 0];
+            }
+        }
+    }
+
+    // Layers: layer (x, y) maps to canvas (offset.0 + x, offset.1 + y).
+    // Only the part overlapping the selection's bounding box is visited.
+    for layer in &mut doc.layers {
+        let lx0 = (area.x - layer.offset.0).max(0) as u32;
+        let ly0 = (area.y - layer.offset.1).max(0) as u32;
+        let lx1 = (area.right() - layer.offset.0).min(layer.image.width() as i32);
+        let ly1 = (area.bottom() - layer.offset.1).min(layer.image.height() as i32);
+        if lx1 <= lx0 as i32 || ly1 <= ly0 as i32 {
+            continue;
+        }
+        for ly in ly0..ly1 as u32 {
+            let cy = layer.offset.1 + ly as i32;
+            for lx in lx0..lx1 as u32 {
+                let cx = layer.offset.0 + lx as i32;
+                let cov = selection.coverage_at(cx, cy);
+                if cov == 255 {
+                    continue;
+                }
+                let px = layer.image.get_pixel_mut(lx, ly);
+                px.0[3] = ((px.0[3] as u32 * cov as u32 + 127) / 255) as u8;
+                if px.0[3] == 0 {
+                    px.0 = [0, 0, 0, 0];
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn erase_base_pixels(doc: &mut Document, selection: &SelectionMask) {
     let canvas_rect = Rect::new(0, 0, doc.canvas.width, doc.canvas.height);
     let Some(clipped) = selection.bounds.intersect(canvas_rect) else {

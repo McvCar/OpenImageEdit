@@ -169,6 +169,28 @@ impl Document {
         })
     }
 
+    /// Crop to the selection's **outline** (not just its bounding box): the
+    /// canvas shrinks to the bounds AND every pixel outside the outline fades
+    /// to transparent (scaled by the mask's coverage, so feathered edges stay
+    /// soft). Ellipse / lasso / feathered selections therefore crop to their
+    /// own shape instead of leaving a hard rectangular cut. Base and layers
+    /// are both punched; undo restores the whole snapshot.
+    pub fn crop_to_selection(&mut self, selection: &SelectionMask) -> Result<(), EditError> {
+        let canvas_rect = Rect::new(0, 0, self.canvas.width, self.canvas.height);
+        let area = selection
+            .bounds
+            .intersect(canvas_rect)
+            .ok_or(EditError::EmptyCrop)?;
+        if area.is_empty() || selection.area() == 0 {
+            return Err(EditError::EmptyCrop);
+        }
+        let from = self.snapshot();
+        self.execute(EditOp::CropToSelection {
+            from,
+            selection: selection.clone(),
+        })
+    }
+
     /// Undo every crop, showing the full base image again.
     pub fn reset_crop(&mut self) -> Result<(), EditError> {
         if self.view.x == 0

@@ -1162,10 +1162,10 @@ function pickSelTool(tool) {
 function applyCrop() {
     if (!root.selExists)
         return
-    // PS 语义：裁剪到选区的包围盒（套索/羽化选区也一样）。裁剪会移动画布
-    // 原点，Rust 侧已经顺手清掉选区。
-    bridge.crop_to(root.selImgX, root.selImgY,
-                   Math.max(1, root.selImgW), Math.max(1, root.selImgH))
+    // PS 语义：裁剪到选区**轮廓**，不是包围盒 —— 椭圆/套索/羽化选区之外的
+    // 像素变透明，画布缩到选区包围盒。裁剪会移动画布原点，Rust 侧已经顺手
+    // 清掉选区。
+    bridge.crop_to_selection()
     cancelLayerScale()
 }
 

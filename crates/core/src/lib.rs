@@ -33,7 +33,7 @@ pub(crate) use transform::transform_document;
 pub(crate) use op::History;
 pub(crate) use ops::{
     apply_base_to_layer, apply_canvas_resize, apply_delete_base, apply_resize, apply_view,
-    erase_base_pixels,
+    clear_outside_selection, erase_base_pixels,
 };
 
 #[cfg(test)]
@@ -712,8 +712,53 @@ mod tests {
     }
 
     #[test]
-    fn crop_then_rotate_keeps_the_view_on_the_same_content() {
-        let mut doc = Document::from_image(ramp(64, 48));
+    fn crop_to_ellipse_selection_leaves_transparent_corners() {
+        // 纯色底 + 椭圆选区：裁到包围盒，椭圆之外必须透明。
+        let mut doc = Document::from_image(solid(64, 48, [200, 100, 50, 255]));
+        let sel = SelectionMask::ellipse(Rect::new(10, 6, 20, 12));
+        doc.crop_to_selection(&sel).unwrap();
+
+        assert_eq!(doc.canvas, Size::new(20, 12));
+        assert_eq!(doc.view, Rect::new(10, 6, 20, 12));
+        // 包围盒四角在椭圆外 → 透明；椭圆中心仍是原色。
+        assert_eq!(doc.composite_pixel(0, 0).0[3], 0);
+        assert_eq!(doc.composite_pixel(19, 11).0[3], 0);
+        assert_eq!(doc.composite_pixel(10, 6).0, [200, 100, 50, 255]);
+    }
+
+    #[test]
+    fn crop_to_selection_undo_restores_pixels_and_canvas() {
+        let mut doc = Document::from_image(solid(64, 48, [7, 8, 9, 255]));
+        let original = doc.flatten();
+        doc.crop_to_selection(&SelectionMask::ellipse(Rect::new(10, 6, 20, 12)))
+            .unwrap();
+        doc.undo().unwrap();
+
+        assert_eq!(doc.canvas, Size::new(64, 48));
+        assert_eq!(doc.flatten(), original);
+        // 被挖空的角落也回来了。
+        assert_eq!(doc.composite_pixel(0, 0).0[3], 255);
+    }
+
+    #[test]
+    fn crop_to_selection_punches_layers_too() {
+        // 图层盖满整块画布：轮廓外的部分也必须透明，否则"裁剪"看起来没生效。
+        let mut doc = Document::from_image(solid(40, 30, [0, 0, 0, 255]));
+        let mut layer = Layer::new("full", solid(40, 30, [255, 255, 255, 255]));
+        layer.offset = (0, 0);
+        doc.add_layer(layer).unwrap();
+
+        doc.crop_to_selection(&SelectionMask::ellipse(Rect::new(5, 5, 20, 16)))
+            .unwrap();
+        assert_eq!(doc.canvas, Size::new(20, 16));
+        assert_eq!(doc.layers[0].offset, (-5, -5));
+        // 角落在椭圆外：图层像素已挖空 → 合成 alpha 0（不再是白点）。
+        assert_eq!(doc.composite_pixel(0, 0).0[3], 0);
+        assert_eq!(doc.composite_pixel(10, 8).0[3], 255);
+    }
+
+    #[test]
+    fn crop_then_rotate_keeps_the_view_on_the_same_content() {        let mut doc = Document::from_image(ramp(64, 48));
         doc.crop(Rect::new(10, 6, 20, 12)).unwrap();
         doc.apply_transform(Transform::Rotate90Cw).unwrap();
 

@@ -490,17 +490,52 @@ impl qobject::Bridge {
     }
 
     pub fn crop_to_selection(mut self: Pin<&mut Self>) {
-        let rect = {
+        let viewport = *self.viewport.borrow();
+        // 用 effective()（含羽化）：软边要按覆盖率淡出，不能裁成硬边。
+        let mask = {
             let guard = self.session.borrow();
             guard
                 .as_ref()
                 .and_then(|s| s.doc.selection.as_ref())
-                .map(|st| st.mask().bounds)
+                .map(|st| st.effective())
         };
-        let Some(rect) = rect else {
+        let Some(mask) = mask else {
             return;
         };
-        self.as_mut().crop_to(rect.x, rect.y, rect.width as i32, rect.height as i32);
+        let area = mask.bounds;
+        let result = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Ok(false),
+                Some(session) => session
+                    .doc
+                    .crop_to_selection(&mask)
+                    .map(|_| true)
+                    .map_err(|e| e.to_string()),
+            }
+        };
+        match result {
+            Ok(true) => {
+                {
+                    let mut guard = self.session.borrow_mut();
+                    if let Some(s) = guard.as_mut() {
+                        s.refit_if_needed(viewport);
+                        s.dirty = true;
+                        // canvas 坐标变了：选区（画布坐标）失效。
+                        s.clear_selection();
+                    }
+                }
+                self.as_mut().refresh_preview();
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"cropped\",\"rect\":\"{},{},{},{}\",\"shape\":\"selection\"}}",
+                    area.x, area.y, area.width, area.height
+                );
+            }
+            Ok(false) => {}
+            Err(message) => self
+                .as_mut()
+                .set_status(QString::from(message.as_str())),
+        }
         // Cropping moves the canvas origin: canvas coordinates (and therefore
         // the selection) are no longer meaningful. 裁剪 op 自己已经把选区清
         // 掉了，这里只是顺手关掉快速蒙版并把状态同步回 QML。

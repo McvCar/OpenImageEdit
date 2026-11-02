@@ -26,6 +26,11 @@ pub enum EditError {
 pub enum EditOp {
     TransformDocument { transform: Transform },
     CropDocument { from: Rect, to: Rect },
+    /// 裁剪到选区**轮廓**（不是包围盒）：画布缩到选区的包围盒，同时把
+    /// 轮廓之外的像素按覆盖率清成透明 —— 椭圆/套索/羽化选区裁完是透明
+    /// 外形，而不是一块矩形。base 与所有图层一起处理。
+    /// 选区坐标是裁剪前的画布坐标；`from` 快照让 undo 精确还原。
+    CropToSelection { from: DocumentSnapshot, selection: SelectionMask },
     ResizeDocument { from: DocumentSnapshot, to: Size },
     AddLayer { layer: Layer, index: usize },
     RemoveLayer { layer: Layer, index: usize },
@@ -114,6 +119,27 @@ impl EditOp {
             }
             EditOp::CropDocument { to, .. } => {
                 apply_view(doc, *to);
+                doc.selection = None;
+                Ok(())
+            }
+            EditOp::CropToSelection { selection, .. } => {
+                // 顺序很重要：先按**裁剪前**的画布坐标挖掉轮廓外的像素，
+                // 再动 view（一旦 apply_view 改了原点，坐标就对不上了）。
+                clear_outside_selection(doc, selection);
+                let canvas_rect = Rect::new(0, 0, doc.canvas.width, doc.canvas.height);
+                let area = selection
+                    .bounds
+                    .intersect(canvas_rect)
+                    .ok_or(EditError::EmptyCrop)?;
+                apply_view(
+                    doc,
+                    Rect::new(
+                        doc.view.x + area.x,
+                        doc.view.y + area.y,
+                        area.width,
+                        area.height,
+                    ),
+                );
                 doc.selection = None;
                 Ok(())
             }
@@ -293,6 +319,12 @@ impl EditOp {
             }
             EditOp::CropDocument { from, .. } => {
                 apply_view(doc, *from);
+                doc.selection = None;
+                Ok(())
+            }
+            EditOp::CropToSelection { from, .. } => {
+                // 像素被挖空过，换 view 还原不回来 —— 整份快照回滚。
+                doc.restore(from.clone());
                 doc.selection = None;
                 Ok(())
             }

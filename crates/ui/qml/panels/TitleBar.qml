@@ -149,12 +149,9 @@ Rectangle {
     // 标题文字（全称 / 只留应用名）——测量只用下面两个隐藏 Text，
     // 不能让 titleText 自己的 implicitWidth 参与判定，否则"显示→占地方→
     // 隐藏→有地方→显示"会自激振荡。
-    // 标题只显示文件名（不再挂分辨率——状态栏左下角已经有一份，标题栏里
-    // 那串数字只会和图标抢地方）。
-    readonly property string titleFullText: bridge.image_width > 0
-                                             && bridge.fileName.length > 0
-        ? bridge.fileName + " — ImageEdit" + (bridge.dirty ? " *" : "")
-        : "ImageEdit" + (bridge.dirty ? " *" : "")
+    // 标题栏只显示应用名（未保存时带 *）。文件名/分辨率都在状态栏左下角，
+    // 这里不重复占地方；窗口（任务栏）标题另算，见 main.qml / DocWindow.qml。
+    readonly property string titleFullText: "ImageEdit" + (bridge.dirty ? " *" : "")
     readonly property string titleNameText: "ImageEdit" + (bridge.dirty ? " *" : "")
     // titleText 自己也钳在 220，测量要跟它一致。
     readonly property real titleFullWidth: Math.min(titleProbeFull.implicitWidth, 220)
