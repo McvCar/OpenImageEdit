@@ -698,6 +698,31 @@ impl SelectionState {
         self.recompute();
     }
 
+    /// 从**已有选区**派生出来的新形状（布尔运算 / 全选 / 反选的产物）：
+    /// 边界和平滑已经烘焙进 `base` 的像素里，这里只继承羽化（它是软边
+    /// 属性，不动轮廓）。再套一遍边界就会在该形状的边缘长出一圈环带。
+    pub fn derived(base: SelectionMask, from: &SelOps) -> Self {
+        Self::new_with_ops(
+            base,
+            SelOps {
+                border: 0,
+                smooth: 0,
+                feather: from.feather,
+            },
+        )
+    }
+
+    /// 反选：以当前**可见**选区（已经把边界/平滑烘焙进去的 `mask`）的补集
+    /// 作为新基准。
+    ///
+    /// ★边界/平滑必须在这里归零：它们已经体现在补集的轮廓里（PS 里这两项
+    /// 本来就是一次性烘焙的操作），再让 `recompute` 套一遍，就会在反选结果
+    /// 的边界上又长出一圈环带 —— 用户看到的"反选后删除删错了范围"。
+    /// 羽化是软边属性、不动轮廓，原样保留。
+    pub fn inverted(&self, canvas: Size) -> Self {
+        Self::derived(self.mask.invert(canvas), &self.ops)
+    }
+
     fn recompute(&mut self) {
         let mut m = self.base.clone();
         if self.ops.border > 0 {
@@ -1343,5 +1368,61 @@ mod tests {
         assert!(st.mask().area() < plain.mask().area());
         // 羽化只影响软边，轮廓不动。
         assert_eq!(st.mask().bounds, plain.mask().bounds);
+    }
+
+    #[test]
+    fn invert_uses_visible_ring_and_does_not_add_a_second_border() {
+        // 40×40 的框 + 宽 10 的边界 → 一圈 10px 环带。
+        let canvas = Size::new(100, 100);
+        let mut st = SelectionState::new(SelectionMask::rect(Rect::new(20, 20, 40, 40)));
+        st.set_border(10);
+        let ring_area = st.mask().area();
+
+        let inv = st.inverted(canvas);
+        // 反选结果的轮廓就是环带的补集：参数不该再套一遍。
+        assert_eq!(inv.ops.border, 0);
+        assert_eq!(inv.ops.smooth, 0);
+        // 补集面积 = 画布 - 环带（这里就是 PS 的"环带外全选中"）。
+        assert_eq!(inv.mask().area(), 100 * 100 - ring_area, "ring {ring_area}");
+        // 环带本身没被选中，环带外侧和框内部都选中。
+        // 边界 10 = 总宽 10 的环（内外各 5）：x=16 在环内，x=10 已在环外。
+        assert_eq!(inv.mask().coverage_at(16, 50), 0, "ring stays unselected");
+        assert_eq!(inv.mask().coverage_at(10, 50), 255, "outside of ring");
+        assert_eq!(inv.mask().coverage_at(50, 50), 255, "inside of frame");
+        // 没被二次环带蚕食：环带外一像素处就是全选。
+        assert_eq!(inv.mask().coverage_at(9, 20), 255);
+
+        // 再反选一次回到原环带（边界参数已归零，不会继续膨胀）。
+        let back = inv.inverted(canvas);
+        assert_eq!(back.mask().area(), ring_area);
+    }
+
+    #[test]
+    fn derived_from_selection_drops_baked_border_but_keeps_feather() {
+        // 布尔运算 / 全选的产物：边界、平滑已烘焙进 base，只剩羽化继承。
+        let ops = SelOps {
+            border: 8,
+            smooth: 4,
+            feather: 6,
+        };
+        let base = SelectionMask::rect(Rect::new(10, 10, 40, 40));
+        let st = SelectionState::derived(base.clone(), &ops);
+        assert_eq!(st.ops.border, 0);
+        assert_eq!(st.ops.smooth, 0);
+        assert_eq!(st.ops.feather, 6);
+        // 轮廓就是传进来的 base，没有被再次环带化。
+        assert_eq!(st.mask().area(), base.area());
+        assert_eq!(st.mask().bounds, base.bounds);
+    }
+
+    #[test]
+    fn invert_keeps_feather_only() {
+        let canvas = Size::new(60, 60);
+        let mut st = SelectionState::new(SelectionMask::rect(Rect::new(10, 10, 40, 40)));
+        st.set_border(4);
+        st.set_feather(6);
+        let inv = st.inverted(canvas);
+        assert_eq!(inv.ops.feather, 6);
+        assert!(inv.effective().alpha.iter().any(|&a| a > 0 && a < 255));
     }
 }

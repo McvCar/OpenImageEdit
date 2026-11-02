@@ -36,6 +36,9 @@ impl qobject::Bridge {
                 "sel-invert" => self.as_mut().sel_invert(),
                 "sel-quickmask" => self.as_mut().sel_toggle_quick_mask(),
                 "crop-sel" => self.as_mut().crop_to_selection(),
+                // 删除"当前选区"的像素（不重设选区，探针验证反选后
+                // erase 的作用范围用）。
+                "erase-sel" => self.as_mut().erase_selection_pixels(),
                 // `sel-dump` — 断言用：bounds / ops / rev。
                 "sel-dump" => {
                     let (rect, ops, rev) = {

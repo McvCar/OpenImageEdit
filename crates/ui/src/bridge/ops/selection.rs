@@ -182,11 +182,16 @@ impl qobject::Bridge {
             let next = if combined.is_empty() {
                 None
             } else {
-                // mode 0 = 用户画了一个新选区 → 套用记住的边界/平滑/羽化；
-                // 加/减/交只是改形状，参数沿用当前选区（不然加选一下就把
-                // 之前设的平滑 20 悄悄清成 0）。
-                let ops = if mode == 0 { defaults } else { current_ops };
-                Some(SelectionState::new_with_ops(combined, ops))
+                // mode 0 = 用户画了一个新形状 → 套用记住的边界/平滑/羽化；
+                // 加/减/交 是从**当前可见选区**派生的（边界/平滑已烘焙进那
+                // 张 mask），再套一遍会在结果边缘长出多余环带，所以只继承
+                // 羽化（见 SelectionState::derived）。
+                let state = if mode == 0 {
+                    SelectionState::new_with_ops(combined, defaults)
+                } else {
+                    SelectionState::derived(combined, &current_ops)
+                };
+                Some(state)
             };
             let _ = session.doc.set_selection(next);
         }
@@ -257,7 +262,18 @@ impl qobject::Bridge {
             None => return,
         };
         let mask = SelectionMask::rect(Rect::new(0, 0, canvas.width, canvas.height));
-        self.as_mut().combine_selection(mask, 0);
+        {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            // 全选就是整块画布，**不**套用「记住的边界/平滑」（那会把全选
+            // 变成画布边缘的一圈环带，随后的反选/删除就全错了）。
+            let _ = session.doc.set_selection(Some(SelectionState::new(mask)));
+        }
+        self.touch_selection();
+        self.as_mut().publish_selection();
+        self.as_mut().refresh_for_selection();
     }
 
     pub fn sel_clear(mut self: Pin<&mut Self>) {
@@ -292,19 +308,17 @@ impl qobject::Bridge {
                 return;
             };
             let inverted = match session.doc.selection.as_ref() {
-                Some(st) => st.mask().invert(canvas),
-                None => SelectionMask::rect(Rect::new(0, 0, canvas.width, canvas.height)),
+                // 反选针对"看得见的选区"（含已烘焙的边界/平滑），见
+                // SelectionState::inverted 的注释。
+                Some(st) => st.inverted(canvas),
+                None => SelectionState::new(SelectionMask::rect(Rect::new(
+                    0,
+                    0,
+                    canvas.width,
+                    canvas.height,
+                ))),
             };
-            // 反选是同一个选区的延续，参数保持不变（不重置成记住的默认值）。
-            let ops = session
-                .doc
-                .selection
-                .as_ref()
-                .map(|st| st.ops)
-                .unwrap_or(self.sel_ops_default.get());
-            let _ = session
-                .doc
-                .set_selection(Some(SelectionState::new_with_ops(inverted, ops)));
+            let _ = session.doc.set_selection(Some(inverted));
         }
         self.touch_selection();
         self.as_mut().publish_selection();
