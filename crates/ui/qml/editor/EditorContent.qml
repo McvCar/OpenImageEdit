@@ -315,6 +315,8 @@ Item {
     // 标题栏容量探针：每秒打印宽度 / titleMode / 能放下的槽位，配合外部
     // 改窗口宽度验证"窄窗口下先收标题而不是砍按钮"。
     readonly property bool probeTitleBar: Qt.application.arguments.indexOf("--probe-titlebar") !== -1
+    // 选区工具切换自检：验证"换形状不自动打开标记栏"。
+    readonly property bool probeSelToolSwitch: Qt.application.arguments.indexOf("--probe-seltool") !== -1
     // Ids inside an inline component are invisible from outside, so the
     // shell / DocWindow wrappers reach the Bridge through this alias.
     readonly property alias b: bridge
@@ -512,13 +514,13 @@ Shortcut { sequence: "Ctrl+A"
 // ---- 选区（PS 快捷键）----
 // M / Shift+M = 矩形 / 椭圆选框；L / Shift+L = 套索 / 多边形套索。
 Shortcut { sequence: "M"; enabled: root.canUseToolKeys()
-           onActivated: root.setSelTool("rect") }
+           onActivated: root.setSelToolByShortcut("rect") }
 Shortcut { sequence: "Shift+M"; enabled: root.canUseToolKeys()
-           onActivated: root.setSelTool("ellipse") }
+           onActivated: root.setSelToolByShortcut("ellipse") }
 Shortcut { sequence: "L"; enabled: root.canUseToolKeys()
-           onActivated: root.setSelTool("lasso") }
+           onActivated: root.setSelToolByShortcut("lasso") }
 Shortcut { sequence: "Shift+L"; enabled: root.canUseToolKeys()
-           onActivated: root.setSelTool("polygon") }
+           onActivated: root.setSelToolByShortcut("polygon") }
 Shortcut { sequence: "Ctrl+D"; enabled: root.selExists
            onActivated: bridge.sel_clear() }
 Shortcut { sequence: "Ctrl+Shift+I"; enabled: bridge.image_width > 0
@@ -961,15 +963,23 @@ function setSelTool(tool) {
     // 记住这次选的形状：下次启动、以及下次打开面板都用它（写 settings.ini）。
     if (tool !== "none")
         bridge.save_sel_tool(tool)
-    // 选区入口现在在标记栏里：用快捷键（M / L）激活工具时把标记栏带出来，
-    // 否则按钮被藏起来，用户找不到选区面板。
+    // 只切工具本身：不碰标记栏、不碰标记类弹窗。右键菜单里换形状、或从
+    // 浮动面板里换形状时，标记栏本来就是开的（后者就在栏里），静默切换。
     if (tool !== "none") {
-        root.markBarVisible = true
         root.markTool = "none"
         widthPopover.visible = false
         mosaicPopover.visible = false
     }
     view.canvasSurface.cancelPolygon()
+}
+
+// M / L 这类快捷键：选区入口在标记栏里，光切工具而栏是关着的话用户找不到
+// 浮动面板（也就看不到边界/平滑/羽化），所以快捷键路径顺手把栏带出来。
+// 和 setSelTool 分开，避免右键菜单切形状时把标记栏"自动打开"。
+function setSelToolByShortcut(tool) {
+    if (tool !== "none")
+        root.markBarVisible = true
+    setSelTool(tool)
 }
 
 // 标记栏「选区」按钮：开/关浮动面板。首次打开时顺手激活矩形选框，
@@ -1738,6 +1748,8 @@ Timer {
     interval: 800
     running: root.probeSelection || root.probeSelPoly
     onTriggered: {
+        // 探针要截标记栏上的选中态，显式打开（setSelTool 不再顺手开栏）。
+        root.markBarVisible = true
         root.setSelTool(root.probeSelPoly ? "polygon" : "ellipse")
         // 多边形探针只画预览，不要先落一个椭圆选区（会遮住判断）。
         if (!root.probeSelPoly && bridge.image_width > 0 && !root.selExists)
@@ -1838,6 +1850,28 @@ Timer {
                     + " titleW=" + Math.round(toolbar.titleNameWidth)
                     + "/" + Math.round(toolbar.titleFullWidth)
                     + " right=" + Math.round(toolbar.rightCluster))
+    }
+}
+
+// 选区工具切换自检：--probe-seltool 打印一次 → 走"菜单/面板换形状"的
+// setSelTool → 再打印，最后模拟 M/L 快捷键路径。换形状不该把标记栏带出来
+// （那是快捷键路径才有的行为）。
+Timer {
+    id: selToolProbeTimer
+    interval: 900
+    running: root.probeSelToolSwitch
+    onTriggered: {
+        const orig = root.selTool
+        bridge.mark("seltool before   bar=" + root.markBarVisible + " tool=" + root.selTool)
+        root.setSelTool("lasso")
+        bridge.mark("seltool menu     bar=" + root.markBarVisible + " tool=" + root.selTool)
+        root.setSelToolByShortcut("polygon")
+        bridge.mark("seltool shortcut bar=" + root.markBarVisible + " tool=" + root.selTool)
+        // 探针跑完把"记忆的形状"写回原值：setSelTool 会落盘 settings.ini，
+        // 不还原的话用户下次启动会莫名变成多边形套索。
+        if (orig.length > 0 && orig !== "none")
+            bridge.save_sel_tool(orig)
+        root.selTool = orig
     }
 }
 
