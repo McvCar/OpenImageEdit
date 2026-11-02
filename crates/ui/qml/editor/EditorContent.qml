@@ -41,6 +41,13 @@ Item {
                 return true
         return false
     }
+    // --probe-winfit：自动化里也允许"按图片调窗口尺寸/位置"，专门验证预置
+    // 尺寸、居中保持这些行为（其余探针仍然固定窗口，避免打乱几何基线）。
+    readonly property bool probeWinFit: Qt.application.arguments.indexOf("--probe-winfit") !== -1
+    readonly property bool windowAutoGeometry: !automationRun || probeWinFit
+    // 所属窗口（Window.window 这个附加属性在 EditorContent 里求值会抛异常，
+    // 见 dpr 那段的注释；需要窗口对象的探针/逻辑用这个显式引用）。
+    property var hostWindow: null
     // 新文档装载计数（Rust 装好 session 后自增并放在刷新之后，此时尺寸已
     // 发布）。用它而不是 image_width/h：裁剪、旋转、改画布尺寸同样会改宽高，
     // 那些操作不该动窗口。
@@ -54,40 +61,40 @@ Item {
     // 把 win 调成"刚好装下这张图"：宽高 = 图片 100% 显示尺寸（逻辑像素）
     // + 画布以外的 chrome；装不下时图片按同一比例缩到屏幕内（保宽高比），
     // 不小于窗口最小尺寸；最大化/全屏不动。
+    //
+    // 位置**保持窗口中心不动**：一堆大小不一的图按方向键翻的时候，如果
+    // 每次都保留左上角，窗口看上去就在左右横跳；钉住中心才稳。
     function fitWindowToImage(win) {
-        if (!win || root.automationRun)
+        if (!win || !root.windowAutoGeometry)
             return
         if (bridge.image_width <= 0 || bridge.image_height <= 0)
             return
         // 只在普通窗口下改：最大化/最小化/全屏时用户已经表达过尺寸意愿。
         if (win.visibility !== Window.Windowed)
             return
+        const size = fitSizeFor(win, bridge.image_width, bridge.image_height)
+        if (!size)
+            return
+        resizeWindowKeepingCenter(win, size.w, size.h)
+    }
+
+    // 计算"刚好装下 imgWpx × imgHpx（图像像素）"的窗口尺寸（逻辑像素）。
+    // chrome（工具栏 / 状态栏 / 图层面板）是固定开销，缩图时只缩图片那部分。
+    function fitSizeFor(win, imgWpx, imgHpx) {
+        if (!win || imgWpx <= 0 || imgHpx <= 0)
+            return null
         const dpr = root.dpr > 0 ? root.dpr : 1
-        // 图片本身 100% 显示要的画布尺寸，和画布以外的界面开销分开记，
-        // 后面按比例缩图时只缩图片那部分，chrome 是固定的。
-        const imgW = Math.max(1, bridge.image_width / dpr)
-        const imgH = Math.max(1, bridge.image_height / dpr)
+        const imgW = Math.max(1, imgWpx / dpr)
+        const imgH = Math.max(1, imgHpx / dpr)
         // 图层面板浮在画布右侧，扣掉它之后才是图片可用的宽度。
         const chromeW = root.panelVisible ? layerPanel.width : 0
         const chromeH = root.toolbarHeight + root.statusHeight
                         + (root.markBarVisible ? root.toolbarHeight : 0)
-        // 屏幕可用区域：**不能**用 Screen.availableWidth/availableHeight ——
-        // 那是 Qt 5 的名字，Qt 6 上取到的是 undefined（实测 aw=undefined
-        // ah=undefined），旧代码于是静默 fallback 成整屏 3440×1440，而真实
-        // 工作区只有 3440×1392（底部 48px 任务栏）：大图窗口底边正好压到
-        // 任务栏上。
-        // 用 desktopAvailable*（Qt 6 的名字）再与当前屏尺寸取小，多屏拼接
-        // 时也不会算出跨屏的宽度。
-        const sx = root.Screen.virtualX
-        const sy = root.Screen.virtualY
-        const sw = root.Screen.width
-        const sh = root.Screen.height
-        const availW = Math.min(root.Screen.desktopAvailableWidth || sw, sw)
-        const availH = Math.min(root.Screen.desktopAvailableHeight || sh, sh)
+        const area = root.workArea()
         // 留 48px 边距，别把窗口贴死在屏幕边缘/任务栏上。
         const margin = 48
-        const maxW = availW > 0 ? availW - margin : 0
-        const maxH = availH > 0 ? availH - margin : 0
+        const maxW = area ? Math.max(0, area.w - margin) : 0
+        const maxH = area ? Math.max(0, area.h - margin) : 0
         // 装不下时按**同一比例**缩图片，而不是把宽、高分别砍到屏幕上限：
         // 8160×6120（4:3）分别砍会得到 3392×1344（2.5:1），图只有 1704 宽，
         // 左右各空 844px —— 就是"窗口宽度没有收缩到图片大小"。
@@ -105,20 +112,96 @@ Item {
             targetW = Math.min(targetW, Math.max(minW, maxW))
         if (maxH > 0)
             targetH = Math.min(targetH, Math.max(minH, maxH))
-        win.width = Math.round(targetW)
-        win.height = Math.round(targetH)
-        // 位置也要一起收：只改尺寸不动位置时，窗口若原本开在屏幕中间或
-        // 偏右下，放大到接近满屏后右/下两条边直接跑到屏幕外（标题栏、
-        // 状态栏都看不见）。越界就居中到可见区域，没越界就保持用户摆的
-        // 位置，别每次开图都把窗口搬走。
-        if (availW > 0 && availH > 0) {
-            const maxX = Math.max(sx, sx + availW - targetW)
-            const maxY = Math.max(sy, sy + availH - targetH)
-            if (win.x < sx || win.y < sy || win.x > maxX || win.y > maxY) {
-                win.x = Math.round(sx + (availW - targetW) / 2)
-                win.y = Math.round(sy + (availH - targetH) / 2)
+        return { w: Math.round(targetW), h: Math.round(targetH) }
+    }
+
+    // 当前屏的可用工作区（逻辑像素）——desktopAvailable* 已经扣掉任务栏。
+    // **不能**用 Screen.availableWidth/Height：那是 Qt 5 的名字，Qt 6 上取到
+    // undefined（旧代码于是静默 fallback 成整屏，大图窗口底边压在任务栏上）。
+    function workArea() {
+        const sw = root.Screen.width
+        const sh = root.Screen.height
+        const w = Math.min(root.Screen.desktopAvailableWidth || sw, sw)
+        const h = Math.min(root.Screen.desktopAvailableHeight || sh, sh)
+        if (!(w > 0) || !(h > 0))
+            return null
+        return { x: root.Screen.virtualX, y: root.Screen.virtualY, w: w, h: h }
+    }
+
+    // 把 (x, y, w, h) 夹进工作区：窗口永远整块留在屏幕上，不压任务栏。
+    function clampToWorkArea(x, y, w, h) {
+        const area = root.workArea()
+        if (!area)
+            return { x: Math.round(x), y: Math.round(y) }
+        return {
+            x: Math.round(Math.min(Math.max(x, area.x), Math.max(area.x, area.x + area.w - w))),
+            y: Math.round(Math.min(Math.max(y, area.y), Math.max(area.y, area.y + area.h - h)))
+        }
+    }
+
+    // 改尺寸但钉住窗口中心（换图 / 换 chrome 时不再左右横跳）。
+    function resizeWindowKeepingCenter(win, w, h) {
+        const cx = win.x + win.width / 2
+        const cy = win.y + win.height / 2
+        win.width = w
+        win.height = h
+        const pos = root.clampToWorkArea(cx - w / 2, cy - h / 2, w, h)
+        win.x = pos.x
+        win.y = pos.y
+    }
+
+    // 显示**之前**预置窗口：按文件头量出的尺寸定大小，再摆到鼠标光标中心并
+    // 夹进工作区。这样窗口一出现就是最终大小/位置，不会"先弹个空窗口、
+    // 解码完再跳一下"。url 为空（空窗口启动）时只按默认尺寸摆位置。
+    function presizeWindow(win, url, cascade) {
+        if (!win || !root.windowAutoGeometry)
+            return false
+        const s = url ? url.toString() : ""
+        if (s.length > 0) {
+            const probed = bridge.probe_image_size(s)
+            if (probed.length > 0) {
+                const parts = probed.split("x")
+                const size = fitSizeFor(win, parseInt(parts[0], 10) || 0,
+                                        parseInt(parts[1], 10) || 0)
+                if (size) {
+                    win.width = size.w
+                    win.height = size.h
+                }
             }
         }
+        if (root.placeAtCursor(win, cascade))
+            return true
+        // 光标接口不可用（非 Windows）：至少居中到工作区。
+        const area = root.workArea()
+        if (area) {
+            win.x = Math.round(area.x + (area.w - win.width) / 2)
+            win.y = Math.round(area.y + (area.h - win.height) / 2)
+        }
+        return false
+    }
+
+    // 以鼠标光标为中心摆窗口（cascade 给同时打开的多个窗口错开 28px）。
+    // Rust 侧算的是物理像素，这里除以 dpr 换成 Qt 的逻辑坐标。
+    function placeAtCursor(win, cascade) {
+        const dpr = root.dpr > 0 ? root.dpr : 1
+        const offset = Math.round((cascade || 0) * 28 * dpr)
+        const res = bridge.place_window_at_cursor(Math.round(win.width * dpr),
+                                                  Math.round(win.height * dpr), offset)
+        if (res.length === 0)
+            return false
+        const parts = res.split(",")
+        win.x = Math.round((parseInt(parts[0], 10) || 0) / dpr)
+        win.y = Math.round((parseInt(parts[1], 10) || 0) / dpr)
+        return true
+    }
+
+    // 启动时命令行里的第一个待打开文件（跳过 argv[0] 和所有 -- 开关）。
+    function initialFileArg() {
+        const args = Qt.application.arguments
+        for (let i = 1; i < args.length; ++i)
+            if (args[i].length > 0 && args[i].indexOf("--") !== 0)
+                return args[i]
+        return ""
     }
 
     property bool fullscreen: false
@@ -373,7 +456,9 @@ Item {
             const url = bridge.take_external_open()
             if (url.length === 0)
                 return
-            if (bridge.openInNewWindow)
+            // 和 confirmThenOpen/openFile 同一套规则：空窗口就地打开（否则
+            // 用户双击图片后，留着的那个空窗口反而成了"废窗口"）。
+            if (bridge.openInNewWindow && bridge.image_width > 0)
                 root.requestNewWindow(url)
             else
                 confirmThenOpen(url)
@@ -1472,7 +1557,10 @@ function afterFrame() {
 // Open a file, honoring the settings-panel choice: reuse the current
 // window or spawn a new document window for it.
 function openFile(url) {
-    if (bridge.openInNewWindow)
+    // 空窗口永远就地打开：本窗口还没有图时再开一个新窗口，等于把用户刚
+    // 打开的这个空窗口晾在那儿（"拖图进来却另开一个窗口"就是这么来的）。
+    // "在新窗口打开"这个设置只对已经有图的窗口生效。
+    if (bridge.openInNewWindow && bridge.image_width > 0)
         openNewWindow(url)
     else
         bridge.open_file(url)
@@ -1872,6 +1960,28 @@ Timer {
         if (orig.length > 0 && orig !== "none")
             bridge.save_sel_tool(orig)
         root.selTool = orig
+    }
+}
+
+// 窗口几何自检：--probe-winfit 每 1.5s 打一次窗口 x/y/宽高和中心点，然后
+// 翻下一张图。用来看"换图时窗口中心有没有跑"（位置/尺寸应该围着中心变）。
+Timer {
+    id: winFitProbeTimer
+    interval: 1500
+    repeat: true
+    running: root.probeWinFit
+    property int step: 0
+    onTriggered: {
+        step += 1
+        const w = root.hostWindow
+        if (w)
+            bridge.mark("winfit step=" + step
+                        + " x=" + Math.round(w.x) + " y=" + Math.round(w.y)
+                        + " w=" + Math.round(w.width) + " h=" + Math.round(w.height)
+                        + " cx=" + Math.round(w.x + w.width / 2)
+                        + " cy=" + Math.round(w.y + w.height / 2))
+        if (step <= 4)
+            bridge.navigate(1)
     }
 }
 

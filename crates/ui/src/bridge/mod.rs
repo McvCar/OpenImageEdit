@@ -185,6 +185,22 @@ pub mod qobject {
         #[qinvokable]
         fn navigate(self: Pin<&mut Self>, dir: i32);
 
+        /// 只读文件头取像素尺寸（"宽x高"，失败返回空串）。窗口在**显示之前**
+        /// 用它算最终尺寸，避免"先弹一个空窗口、解码完再跳成图片大小"。
+        #[qinvokable]
+        fn probe_image_size(self: Pin<&mut Self>, target: &QString) -> QString;
+
+        /// 以鼠标光标为中心算窗口左上角，夹进光标所在显示器的**工作区**
+        /// （扣掉任务栏）。返回 "x,y"，**物理像素**（QML 除以 dpr 换成 Qt 的
+        /// 逻辑坐标）。失败返回空串，调用方回落到自己居中。
+        #[qinvokable]
+        fn place_window_at_cursor(
+            self: Pin<&mut Self>,
+            width: i32,
+            height: i32,
+            offset: i32,
+        ) -> QString;
+
         /// Register the app in the Windows "Open with" list and open the
         /// system default-apps settings page (the user picks the default).
         #[qinvokable]

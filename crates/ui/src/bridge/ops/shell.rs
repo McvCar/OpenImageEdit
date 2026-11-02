@@ -1,4 +1,4 @@
-// 窗口级外部打开事件。
+// 窗口级外部打开事件 + 显示前的窗口几何（预置尺寸/位置）。
 use super::super::*;
 
 impl qobject::Bridge {
@@ -46,4 +46,118 @@ impl qobject::Bridge {
         let url = file_url(&path);
         QString::from(url.as_str())
     }
+
+    /// 只读文件头取像素尺寸（"宽x高"；读不出来返回空串）。**不解码像素**，
+    /// 所以对大图也是毫秒级——窗口可以"先按最终尺寸摆好再显示"。
+    ///
+    /// 入参既接受 QML 的 `file:///…` URL，也接受 CLI 给的裸 Windows 路径。
+    pub fn probe_image_size(self: Pin<&mut Self>, target: &QString) -> QString {
+        let raw = target.to_string();
+        if raw.is_empty() {
+            return QString::default();
+        }
+        let path = if raw.starts_with("file:") {
+            PathBuf::from(
+                QUrl::from(raw.as_str())
+                    .to_local_file_or_default()
+                    .to_string(),
+            )
+        } else {
+            PathBuf::from(&raw)
+        };
+        match decode::probe_path(&path) {
+            Ok(info) => QString::from(format!("{}x{}", info.width, info.height).as_str()),
+            Err(err) => {
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"probe-size-failed\",\"detail\":\"{}\"}}",
+                    err.to_string().replace('"', "'")
+                );
+                QString::default()
+            }
+        }
+    }
+
+    /// 以光标为中心算窗口左上角，夹进光标所在显示器的工作区（扣掉任务栏）。
+    /// 单位是**物理像素**：进程是 PerMonitorV2，GetCursorPos/GetMonitorInfo
+    /// 返回的都是物理值，QML 侧再除以 dpr 换成 Qt 的逻辑坐标。
+    pub fn place_window_at_cursor(
+        self: Pin<&mut Self>,
+        width: i32,
+        height: i32,
+        offset: i32,
+    ) -> QString {
+        let Some((x, y)) = cursor_place(width, height, offset) else {
+            return QString::default();
+        };
+        QString::from(format!("{x},{y}").as_str())
+    }
+}
+
+/// Win32：光标位置 + 所在显示器工作区。`width/height` 是窗口尺寸（物理像素），
+/// `offset` 让同时打开的多个窗口错开一点（0 = 正中对着光标）。
+#[cfg(windows)]
+fn cursor_place(width: i32, height: i32, offset: i32) -> Option<(i32, i32)> {
+    mod win {
+        use std::ffi::c_void;
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        pub struct Point {
+            pub x: i32,
+            pub y: i32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        pub struct Rect {
+            pub left: i32,
+            pub top: i32,
+            pub right: i32,
+            pub bottom: i32,
+        }
+        #[repr(C)]
+        pub struct MonitorInfo {
+            pub cb_size: u32,
+            pub rc_monitor: Rect,
+            pub rc_work: Rect,
+            pub dw_flags: u32,
+        }
+        #[link(name = "user32")]
+        extern "system" {
+            pub fn GetCursorPos(point: *mut Point) -> i32;
+            pub fn MonitorFromPoint(point: Point, flags: u32) -> *mut c_void;
+            pub fn GetMonitorInfoW(monitor: *mut c_void, info: *mut MonitorInfo) -> i32;
+        }
+        pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
+    }
+
+    let mut pt = win::Point { x: 0, y: 0 };
+    let mut info = win::MonitorInfo {
+        cb_size: std::mem::size_of::<win::MonitorInfo>() as u32,
+        rc_monitor: win::Rect { left: 0, top: 0, right: 0, bottom: 0 },
+        rc_work: win::Rect { left: 0, top: 0, right: 0, bottom: 0 },
+        dw_flags: 0,
+    };
+    // SAFETY: 结构体布局与 Win32 的 POINT / MONITORINFO 一致（全 4 字节对齐
+    // 的 POD），指针都指向本函数栈上的有效对象。
+    unsafe {
+        if win::GetCursorPos(&mut pt) == 0 {
+            return None;
+        }
+        let monitor = win::MonitorFromPoint(pt, win::MONITOR_DEFAULTTONEAREST);
+        if monitor.is_null() {
+            return None;
+        }
+        if win::GetMonitorInfoW(monitor, &mut info as *mut win::MonitorInfo) == 0 {
+            return None;
+        }
+    }
+    let work = info.rc_work;
+    let x = (pt.x - width / 2 + offset).clamp(work.left, (work.right - width).max(work.left));
+    let y = (pt.y - height / 2 + offset).clamp(work.top, (work.bottom - height).max(work.top));
+    Some((x, y))
+}
+
+#[cfg(not(windows))]
+fn cursor_place(width: i32, height: i32, offset: i32) -> Option<(i32, i32)> {
+    let _ = (width, height, offset);
+    None
 }

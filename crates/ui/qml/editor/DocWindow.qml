@@ -16,16 +16,23 @@ Window {
     // property assignment and the new window stayed BLANK, which also made
     // "copy a layer in window A, paste in window B" look broken.
     property url fileUrl: ""
+    // 同时打开多个窗口时用来错开 28px（0 = 正对着鼠标光标）。
+    property int cascadeIndex: 0
 
     width: 1100
     height: 760
     minimumWidth: 480
     minimumHeight: 320
     color: "#1b1c1e"
-    visible: true
+    // 先不显示：EditorContent 已经把文件头量好了尺寸，等 presizeWindow()
+    // 把窗口摆成最终大小/位置再 show()，避免"空窗口闪一下再跳"。
+    // ★必须用 visibility 而不是 visible：赋 Windowed 会让 QQuickWindow 顺手
+    // setVisible(true)，窗口会抢在 Component.onCompleted 之前冒出来。
+    property bool shown: false
+    visibility: shown ? (content.fullscreen ? Window.FullScreen : Window.Windowed)
+                      : Window.Hidden
     // Frameless: same custom title bar as the shell window.
     flags: Qt.Window | Qt.FramelessWindowHint
-    visibility: content.fullscreen ? Window.FullScreen : Window.Windowed
     title: content.b.image_width > 0
            ? "ImageEdit — " + content.b.image_width + "×" + content.b.image_height
              + (content.b.dirty ? " *" : "")
@@ -55,6 +62,14 @@ Window {
         onTriggered: docWin.flags = Qt.Window | Qt.FramelessWindowHint
     }
     onClosing: (close) => content.requestClose(close)
+
+    Component.onCompleted: {
+        // 子项先完成（EditorContent 已经在解码），这里再按文件头量出的尺寸
+        // 把窗口摆好，然后才显示。
+        content.hostWindow = docWin
+        content.presizeWindow(docWin, docWin.fileUrl, docWin.cascadeIndex)
+        docWin.shown = true
+    }
 
     WindowEdges {}
 

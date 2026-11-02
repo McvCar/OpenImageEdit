@@ -10,12 +10,19 @@ Window {
     height: 760
     minimumWidth: 480
     minimumHeight: 320
-    visible: Qt.application.arguments.indexOf("--hidden") === -1
+    // 先不显示：等 Component.onCompleted 里按待打开的图片把尺寸/位置摆好再
+    // show()。否则会先弹一个 1100×760 的空窗口，解码完再跳到图片大小 ——
+    // 那一跳就是"打开大图时画面闪一下"的来源。
+    // ★只能走 visibility：一旦给 visibility 赋 Windowed，QQuickWindow 内部
+    // 会顺手 setVisible(true)，单写 `visible: false` 顶不住（实测窗口在
+    // Component.onCompleted 之前就冒出来了）。
+    property bool shown: false
+    visibility: shown ? (content.fullscreen ? Window.FullScreen : Window.Windowed)
+                      : Window.Hidden
     color: "#1b1c1e"
     // Frameless: the custom title bar (in EditorContent) provides the drag
     // area, window buttons and resize edges.
     flags: Qt.Window | Qt.FramelessWindowHint
-    visibility: content.fullscreen ? Window.FullScreen : Window.Windowed
     title: content.b.image_width > 0
            ? "ImageEdit — " + content.b.image_width + "×" + content.b.image_height
              + (content.b.dirty ? " *" : "")
@@ -24,6 +31,15 @@ Window {
     onAfterRendering: content.afterFrame()
     onVisibleChanged: content.b.mark("window-visible")
     onClosing: (close) => content.requestClose(close)
+
+    Component.onCompleted: {
+        // 有命令行图片就按文件头量出的尺寸预置，再摆到鼠标光标中心；
+        // 空启动只摆位置（保持默认大小，不超出屏幕/任务栏）。
+        content.hostWindow = shell
+        content.presizeWindow(shell, content.initialFileArg(), 0)
+        if (Qt.application.arguments.indexOf("--hidden") === -1)
+            shell.shown = true
+    }
 
     WindowEdges {}
 
@@ -44,10 +60,14 @@ Window {
     property var docWindows: []
 
     function openNewWindow(fileUrl) {
-        const offset = shell.windowCascade * 32
-        shell.windowCascade = (shell.windowCascade + 1) % 8
+        // 第一个新窗口正对着鼠标光标，后面几个依次错开 28px（cascadeIndex
+        // 交给 presizeWindow 用；x/y 只是自动布局不可用时的兜底位置）。
+        const slot = shell.windowCascade
+        const offset = slot * 32
+        shell.windowCascade = (slot + 1) % 8
         const win = docWindowFactory.createObject(null, {
             x: 80 + offset, y: 60 + offset,
+            cascadeIndex: slot,
             newWindowFn: openNewWindow,
             fileUrl: fileUrl !== undefined ? fileUrl : ""
         })
