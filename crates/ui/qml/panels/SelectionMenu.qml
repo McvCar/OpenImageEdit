@@ -100,36 +100,21 @@ Rectangle {
                     width: (body.width - 8) / 2
                     height: 26
 
+                    // 不做单选圆点：当前类型靠整格高亮表示（菜单里的其它项
+                    // 也都是"点了就生效"的样式，圆点在这反而多余）。
                     Rectangle {
-                        x: 4
-                        width: parent.width - 4
+                        x: 2
+                        width: parent.width - 2
                         height: parent.height
                         radius: 4
-                        color: cellMa.containsMouse ? "#3d5a80" : "transparent"
-                    }
-                    // 单选圆点：空心圈 + 选中时填实心
-                    Rectangle {
-                        x: 9
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: 12
-                        height: 12
-                        radius: 6
-                        color: "transparent"
-                        border.width: 1
-                        border.color: selTypeCell.picked ? "#7fc3ff" : "#6b7076"
-                        Rectangle {
-                            anchors.centerIn: parent
-                            width: 6
-                            height: 6
-                            radius: 3
-                            color: "#7fc3ff"
-                            visible: selTypeCell.picked
-                        }
+                        color: selTypeCell.picked ? "#3d5a80"
+                                                   : (cellMa.containsMouse ? "#3a3d42" : "transparent")
                     }
                     Text {
                         anchors.left: parent.left
-                        anchors.leftMargin: 27
+                        anchors.leftMargin: 10
                         anchors.right: parent.right
+                        anchors.rightMargin: 4
                         anchors.verticalCenter: parent.verticalCenter
                         elide: Text.ElideRight
                         text: selTypeCell.modelData.glyph + "  " + selTypeCell.modelData.label

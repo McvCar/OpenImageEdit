@@ -349,6 +349,22 @@ Item {
         z: 6
         renderStrategy: Canvas.Immediate
         renderTarget: Canvas.Image
+        // 蚂蚁线相位：由 selPreviewTimer 每帧推进，虚线看起来在流动。
+        property real antPhase: 0
+        // 用当前路径画一条蚂蚁线（白实线打底 + 黑虚线）。路径不能清，
+        // 所以这里只动描边状态，两次 stroke() 复用同一段 path。
+        function strokeAnts(ctx) {
+            ctx.lineWidth = 1
+            ctx.setLineDash([])
+            ctx.strokeStyle = "#ffffff"
+            ctx.stroke()
+            ctx.setLineDash([4, 4])
+            ctx.lineDashOffset = -antPhase
+            ctx.strokeStyle = "rgba(0,0,0,0.9)"
+            ctx.stroke()
+            ctx.setLineDash([])
+            ctx.lineDashOffset = 0
+        }
         onPaint: {
             try {
                 var ctx = getContext("2d")
@@ -359,9 +375,8 @@ Item {
             }
         }
         function paintImpl(ctx) {
-            ctx.lineWidth = 1
-            ctx.setLineDash([4, 3])
-            ctx.strokeStyle = "#000000"
+            // 预览线一律走「白实线打底 + 黑虚线叠在上面」的蚂蚁线：纯黑虚线
+            // 在深色照片上看不见（原来是 #000000 单色，全黑图上等于没画）。
             ctx.fillStyle = "rgba(255,255,255,0.08)"
             if (selPolyActive) {
                 if (polyPts.length === 0)
@@ -373,10 +388,10 @@ Item {
                 for (var i = 1; i < polyPts.length; i++)
                     ctx.lineTo(px(polyPts[i][0]), px(polyPts[i][1]))
                 ctx.lineTo(polyCurX, polyCurY)
-                ctx.stroke()
+                strokeAnts(ctx)
                 // 顶点小方块：方便看清已提交的点在哪。
-                ctx.setLineDash([])
                 ctx.fillStyle = "#ffffff"
+                ctx.strokeStyle = "#000000"
                 for (var j = 0; j < polyPts.length; j++) {
                     const vx = px(polyPts[j][0])
                     const vy = px(polyPts[j][1])
@@ -402,7 +417,7 @@ Item {
                 for (var k = 1; k < selDragMouse.lassoPts.length; k++)
                     ctx.lineTo(qx(selDragMouse.lassoPts[k][0]),
                                qx(selDragMouse.lassoPts[k][1]))
-                ctx.stroke()
+                strokeAnts(ctx)
                 return
             }
             if (host.selTool === "ellipse") {
@@ -420,13 +435,16 @@ Item {
                 ctx.beginPath()
                 ctx.arc(0, 0, 1, 0, Math.PI * 2)
                 ctx.restore()
-                ctx.stroke()
+                strokeAnts(ctx)
                 return
             }
             const rx = Math.min(x0, x1)
             const ry = Math.min(y0, y1)
             ctx.fillRect(rx, ry, Math.abs(x1 - x0), Math.abs(y1 - y0))
-            ctx.strokeRect(rx, ry, Math.abs(x1 - x0), Math.abs(y1 - y0))
+            // 描边走路径（strokeRect 只能一种颜色），才能白底 + 黑虚线。
+            ctx.beginPath()
+            ctx.rect(rx, ry, Math.abs(x1 - x0), Math.abs(y1 - y0))
+            strokeAnts(ctx)
         }
     }
 
@@ -435,7 +453,11 @@ Item {
         interval: 16
         repeat: true
         running: selDragMouse.dragging || selPolyActive
-        onTriggered: selPreview.requestPaint()
+        onTriggered: {
+            // 虚线相位推进（0.25px/帧 ≈ 15px/s，和已提交选区的蚂蚁线同速）。
+            selPreview.antPhase = (selPreview.antPhase + 0.25) % 8
+            selPreview.requestPaint()
+        }
     }
 
     // ---- 标记绘制/编辑区：标记工具激活时盖在选择交互之上 -------
