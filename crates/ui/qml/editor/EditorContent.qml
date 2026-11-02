@@ -312,6 +312,9 @@ Item {
     // 平移锁定探针：打印一次内容/可视几何，再调一次 panBy，看它有没有动。
     // 「适应窗口」下两轴都装得下，panBy 应该原样返回（before == after）。
     readonly property bool probePanLock: Qt.application.arguments.indexOf("--probe-panlock") !== -1
+    // 标题栏容量探针：每秒打印宽度 / titleMode / 能放下的槽位，配合外部
+    // 改窗口宽度验证"窄窗口下先收标题而不是砍按钮"。
+    readonly property bool probeTitleBar: Qt.application.arguments.indexOf("--probe-titlebar") !== -1
     // Ids inside an inline component are invisible from outside, so the
     // shell / DocWindow wrappers reach the Bridge through this alias.
     readonly property alias b: bridge
@@ -1813,6 +1816,28 @@ Timer {
         bridge.mark("panlock before " + geom())
         view.panBy(180, 120)
         bridge.mark("panlock after  " + geom())
+    }
+}
+
+// 标题栏容量自检：--probe-titlebar 每秒打一行，配合外部改窗口宽度，看
+// titleMode / capacity 有没有跟着变（按钮被藏起来时到底剩几个）。
+Timer {
+    id: titleBarProbeTimer
+    interval: 1000
+    repeat: true
+    running: root.probeTitleBar
+    onTriggered: {
+        let shown = 0
+        for (let i = 0; i < toolbar.barActions.length; ++i)
+            if (toolbar.barActions[i].sep !== true && i < toolbar.capacity)
+                shown += 1
+        bridge.mark("titlebar w=" + Math.round(root.width)
+                    + " mode=" + toolbar.titleMode
+                    + " cap=" + toolbar.capacity + "/" + toolbar.allSlots
+                    + " buttons=" + shown + "/9"
+                    + " titleW=" + Math.round(toolbar.titleNameWidth)
+                    + "/" + Math.round(toolbar.titleFullWidth)
+                    + " right=" + Math.round(toolbar.rightCluster))
     }
 }
 

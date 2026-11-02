@@ -151,12 +151,6 @@ Rectangle {
     readonly property real rightCluster: markBarBtn.width + 2
                                          + layersBtn.width + 2
                                          + menuBtn.width + 6 + winRow.width + 4
-    // 一行里能塞下多少个图标槽（30px 按钮 + 2px 间距，按 32 算）。
-    function slotsFor(titleWidth) {
-        const left = titleWidth > 0 ? titleWidth + 20 : 8
-        const avail = Math.max(0, width - rightCluster - 8 - left)
-        return Math.min(barActions.length, Math.floor(avail / 32))
-    }
     // 标题文字（全称 / 只留应用名）——测量只用下面两个隐藏 Text，
     // 不能让 titleText 自己的 implicitWidth 参与判定，否则"显示→占地方→
     // 隐藏→有地方→显示"会自激振荡。
@@ -165,17 +159,52 @@ Rectangle {
           + (bridge.dirty ? " *" : "")
         : "ImageEdit"
     readonly property string titleNameText: "ImageEdit" + (bridge.dirty ? " *" : "")
-    readonly property int capacityFull: slotsFor(titleProbeFull.implicitWidth)
-    readonly property int capacityName: slotsFor(titleProbeName.implicitWidth)
-    // 空间优先给按钮：
-    //   "full" 还不算挤（按钮没被砍掉三分之一）→ 标题带上分辨率；
-    //   "name" 开始挤了 → 先让出分辨率（状态栏里还有一份）；
-    //   "none" 连一个按钮都放不下 → 整块标题让出去。
-    readonly property int roomySlots: Math.min(barActions.length, 8)
-    readonly property string titleMode: capacityFull >= roomySlots ? "full"
-                                      : (capacityName >= 1 ? "name" : "none")
+    // titleText 自己也钳在 220，测量要跟它一致。
+    readonly property real titleFullWidth: Math.min(titleProbeFull.implicitWidth, 220)
+    readonly property real titleNameWidth: Math.min(titleProbeName.implicitWidth, 220)
+
+    // 给定留给图标行的宽度，能完整放下几个槽位——按真实宽度累加（按钮 30、
+    // 分隔线 9、间距 2）。原来用 floor(avail / 32) 估算，把 9px 的分隔线也
+    // 当 32 算，估出来偏少一格：明明还放得下一个按钮，却被藏进 ⋯ 菜单。
+    function fitCount(availWidth) {
+        let used = 0
+        let count = 0
+        for (let i = 0; i < barActions.length; ++i) {
+            const w = (barActions[i].sep === true ? 9 : 30) + (count > 0 ? 2 : 0)
+            if (used + w > availWidth)
+                break
+            used += w
+            count += 1
+        }
+        return count
+    }
+    function capacityFor(titleWidth) {
+        const left = titleWidth > 0 ? titleWidth + 20 : 8
+        return fitCount(Math.max(0, width - rightCluster - 8 - left))
+    }
+    // 分隔线后面还有可见按钮吗：按钮被宽度挤掉之后，右端不能留一条悬空的
+    // 竖线（看着像还有个按钮，其实是空的）。
+    function hasActionAfter(i, cap) {
+        for (let j = i + 1; j < barActions.length && j < cap; ++j)
+            if (barActions[j].sep !== true)
+                return true
+        return false
+    }
+
+    readonly property int capacityFull: capacityFor(titleFullWidth)
+    readonly property int capacityName: capacityFor(titleNameWidth)
+    readonly property int capacityBare: capacityFor(0)
+    readonly property int allSlots: barActions.length
+    // 空间优先给按钮：标题是纯装饰（分辨率状态栏里也有一份），只要按当前
+    // 标题宽度还有按钮放不下，就先收标题 ——
+    //   "full" 带分辨率的全称能把所有按钮放下；
+    //   "name" 只留 "ImageEdit" 才放得下；
+    //   "none" 标题整个让出去（窗口非常窄时连标题也不要，别为了几个字把
+    //          按钮挤成"点不到"）。
+    readonly property string titleMode: capacityFull >= allSlots ? "full"
+                                      : (capacityName >= allSlots ? "name" : "none")
     readonly property int capacity: titleMode === "full" ? capacityFull
-                                   : (titleMode === "name" ? capacityName : slotsFor(0))
+                                   : (titleMode === "name" ? capacityName : capacityBare)
 
     // Drag-to-move (press anywhere on the bar that is not a button);
     // double-click toggles maximize. Move starts only after a small
@@ -263,7 +292,10 @@ Rectangle {
                         || toolbar.barActions[index].ok === true
                 selected: modelData.sel === true
                           || (toolbar.barActions[index].sel === true)
-                visible: modelData.sep === true || index < toolbar.capacity
+                visible: modelData.sep === true
+                         ? (index < toolbar.capacity
+                            && toolbar.hasActionAfter(index, toolbar.capacity))
+                         : index < toolbar.capacity
                 onClicked: modelData.run()
             }
         }
