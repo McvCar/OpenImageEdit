@@ -36,7 +36,7 @@ Window {
         // 有命令行图片就按文件头量出的尺寸预置，再摆到鼠标光标中心；
         // 空启动只摆位置（保持默认大小，不超出屏幕/任务栏）。
         content.hostWindow = shell
-        content.presizeWindow(shell, content.initialFileArg(), 0)
+        content.presizeWindow(shell, content.initialFileArg())
         if (Qt.application.arguments.indexOf("--hidden") === -1)
             shell.shown = true
     }
@@ -52,7 +52,6 @@ Window {
         onRequestNewWindow: (fileUrl) => openNewWindow(fileUrl)
     }
 
-    property int windowCascade: 0
     // Strong references to every live secondary document window. createObject
     // with a null parent transfers ownership to the JS engine, so without
     // this array the GC may collect a visible window — it would just close
@@ -60,14 +59,10 @@ Window {
     property var docWindows: []
 
     function openNewWindow(fileUrl) {
-        // 第一个新窗口正对着鼠标光标，后面几个依次错开 28px（cascadeIndex
-        // 交给 presizeWindow 用；x/y 只是自动布局不可用时的兜底位置）。
-        const slot = shell.windowCascade
-        const offset = slot * 32
-        shell.windowCascade = (slot + 1) % 8
+        // 每个新窗口都精确居中鼠标光标（DocWindow 在显示前自己量尺寸+定位；
+        // x/y 只是自动布局不可用时的兜底）。
         const win = docWindowFactory.createObject(null, {
-            x: 80 + offset, y: 60 + offset,
-            cascadeIndex: slot,
+            x: 80, y: 60,
             newWindowFn: openNewWindow,
             fileUrl: fileUrl !== undefined ? fileUrl : ""
         })

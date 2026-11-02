@@ -42,6 +42,11 @@ pub fn mark_process_start() {
     let _ = PROCESS_START.set(Instant::now());
 }
 
+/// 记住"用户双击那一刻"的光标位置（窗口稍后才摆位，见 shell.rs 的注释）。
+pub fn remember_cursor_start() {
+    ops::shell::remember_cursor_start();
+}
+
 fn elapsed_ms() -> i32 {
     PROCESS_START
         .get()
@@ -193,13 +198,10 @@ pub mod qobject {
         /// 以鼠标光标为中心算窗口左上角，夹进光标所在显示器的**工作区**
         /// （扣掉任务栏）。返回 "x,y"，**物理像素**（QML 除以 dpr 换成 Qt 的
         /// 逻辑坐标）。失败返回空串，调用方回落到自己居中。
+        /// 不做级联错开：每个新窗口都精确居中光标（用户要求"打开就摆在鼠标
+        /// 中间"，错开 28px 会让第二张以后的图看起来没居中）。
         #[qinvokable]
-        fn place_window_at_cursor(
-            self: Pin<&mut Self>,
-            width: i32,
-            height: i32,
-            offset: i32,
-        ) -> QString;
+        fn place_window_at_cursor(self: Pin<&mut Self>, width: i32, height: i32) -> QString;
 
         /// Register the app in the Windows "Open with" list and open the
         /// system default-apps settings page (the user picks the default).

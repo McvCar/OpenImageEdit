@@ -16,8 +16,6 @@ Window {
     // property assignment and the new window stayed BLANK, which also made
     // "copy a layer in window A, paste in window B" look broken.
     property url fileUrl: ""
-    // 同时打开多个窗口时用来错开 28px（0 = 正对着鼠标光标）。
-    property int cascadeIndex: 0
 
     width: 1100
     height: 760
@@ -67,7 +65,7 @@ Window {
         // 子项先完成（EditorContent 已经在解码），这里再按文件头量出的尺寸
         // 把窗口摆好，然后才显示。
         content.hostWindow = docWin
-        content.presizeWindow(docWin, docWin.fileUrl, docWin.cascadeIndex)
+        content.presizeWindow(docWin, docWin.fileUrl)
         docWin.shown = true
     }
 

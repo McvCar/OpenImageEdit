@@ -80,23 +80,61 @@ impl qobject::Bridge {
     /// 以光标为中心算窗口左上角，夹进光标所在显示器的工作区（扣掉任务栏）。
     /// 单位是**物理像素**：进程是 PerMonitorV2，GetCursorPos/GetMonitorInfo
     /// 返回的都是物理值，QML 侧再除以 dpr 换成 Qt 的逻辑坐标。
-    pub fn place_window_at_cursor(
-        self: Pin<&mut Self>,
-        width: i32,
-        height: i32,
-        offset: i32,
-    ) -> QString {
-        let Some((x, y)) = cursor_place(width, height, offset) else {
+    pub fn place_window_at_cursor(self: Pin<&mut Self>, width: i32, height: i32) -> QString {
+        let Some((x, y)) = cursor_place(width, height) else {
             return QString::default();
         };
         QString::from(format!("{x},{y}").as_str())
     }
 }
 
-/// Win32：光标位置 + 所在显示器工作区。`width/height` 是窗口尺寸（物理像素），
-/// `offset` 让同时打开的多个窗口错开一点（0 = 正中对着光标）。
+/// 进程启动瞬间的光标位置（物理像素）。窗口要等 QML 起来（~0.9s）才摆位，
+/// 这期间用户可能已经把鼠标挪开了 —— 那时用"当下"的光标就会摆在人手现在
+/// 的位置，看起来"没有对准我双击的地方"。记住启动时的位置，**只给进程里的
+/// 第一次摆位（也就是主窗口）用**，之后各窗口（新开文档窗、转发进来的图）
+/// 一律用当下光标。
+static CURSOR_AT_START: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
+
+/// main() 一开始调用：把光标位置钉在"用户双击的时候"。
+pub fn remember_cursor_start() {
+    #[cfg(windows)]
+    if let Some(pt) = current_cursor() {
+        if let Ok(mut slot) = CURSOR_AT_START.lock() {
+            *slot = Some(pt);
+        }
+    }
+}
+
+/// 现取光标物理坐标。
 #[cfg(windows)]
-fn cursor_place(width: i32, height: i32, offset: i32) -> Option<(i32, i32)> {
+fn current_cursor() -> Option<(i32, i32)> {
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetCursorPos(point: *mut Point) -> i32;
+    }
+    let mut pt = Point { x: 0, y: 0 };
+    // SAFETY: POINT 是两个 i32 的 POD，指针指向本函数栈上的有效对象。
+    unsafe {
+        if GetCursorPos(&mut pt) == 0 {
+            return None;
+        }
+    }
+    Some((pt.x, pt.y))
+}
+
+#[cfg(not(windows))]
+fn current_cursor() -> Option<(i32, i32)> {
+    None
+}
+
+/// Win32：光标位置 + 所在显示器工作区。`width/height` 是窗口尺寸（物理像素）。
+#[cfg(windows)]
+fn cursor_place(width: i32, height: i32) -> Option<(i32, i32)> {
     mod win {
         use std::ffi::c_void;
         #[repr(C)]
@@ -122,14 +160,21 @@ fn cursor_place(width: i32, height: i32, offset: i32) -> Option<(i32, i32)> {
         }
         #[link(name = "user32")]
         extern "system" {
-            pub fn GetCursorPos(point: *mut Point) -> i32;
             pub fn MonitorFromPoint(point: Point, flags: u32) -> *mut c_void;
             pub fn GetMonitorInfoW(monitor: *mut c_void, info: *mut MonitorInfo) -> i32;
         }
         pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
     }
 
-    let mut pt = win::Point { x: 0, y: 0 };
+    // 启动快照只服务第一次摆位（主窗口），取走即失效。
+    let snapped = CURSOR_AT_START.lock().ok().and_then(|mut s| s.take());
+    let pt = match snapped {
+        Some((x, y)) => win::Point { x, y },
+        None => {
+            let (x, y) = current_cursor()?;
+            win::Point { x, y }
+        }
+    };
     let mut info = win::MonitorInfo {
         cb_size: std::mem::size_of::<win::MonitorInfo>() as u32,
         rc_monitor: win::Rect { left: 0, top: 0, right: 0, bottom: 0 },
@@ -139,9 +184,6 @@ fn cursor_place(width: i32, height: i32, offset: i32) -> Option<(i32, i32)> {
     // SAFETY: 结构体布局与 Win32 的 POINT / MONITORINFO 一致（全 4 字节对齐
     // 的 POD），指针都指向本函数栈上的有效对象。
     unsafe {
-        if win::GetCursorPos(&mut pt) == 0 {
-            return None;
-        }
         let monitor = win::MonitorFromPoint(pt, win::MONITOR_DEFAULTTONEAREST);
         if monitor.is_null() {
             return None;
@@ -151,13 +193,13 @@ fn cursor_place(width: i32, height: i32, offset: i32) -> Option<(i32, i32)> {
         }
     }
     let work = info.rc_work;
-    let x = (pt.x - width / 2 + offset).clamp(work.left, (work.right - width).max(work.left));
-    let y = (pt.y - height / 2 + offset).clamp(work.top, (work.bottom - height).max(work.top));
+    let x = (pt.x - width / 2).clamp(work.left, (work.right - width).max(work.left));
+    let y = (pt.y - height / 2).clamp(work.top, (work.bottom - height).max(work.top));
     Some((x, y))
 }
 
 #[cfg(not(windows))]
-fn cursor_place(width: i32, height: i32, offset: i32) -> Option<(i32, i32)> {
-    let _ = (width, height, offset);
+fn cursor_place(width: i32, height: i32) -> Option<(i32, i32)> {
+    let _ = (width, height);
     None
 }

@@ -58,6 +58,24 @@ Item {
     }
     signal windowFitRequested()
 
+    // 用户手动挪过窗口（拖标题栏 / 拖边框）之后，以新位置为"意图中心"，
+    // 换图时围着它缩放。程序自己摆位时 adjustingWindow 挡住，不算手动。
+    // 全屏/最大化不算（那套几何退出后不该污染普通窗口的中心）。
+    Connections {
+        target: root.hostWindow
+        enabled: target !== null
+        function onXChanged() {
+            if (!root.adjustingWindow && root.hostWindow
+                    && root.hostWindow.visibility === Window.Windowed)
+                root.syncWindowCenter(root.hostWindow)
+        }
+        function onYChanged() {
+            if (!root.adjustingWindow && root.hostWindow
+                    && root.hostWindow.visibility === Window.Windowed)
+                root.syncWindowCenter(root.hostWindow)
+        }
+    }
+
     // 把 win 调成"刚好装下这张图"：宽高 = 图片 100% 显示尺寸（逻辑像素）
     // + 画布以外的 chrome；装不下时图片按同一比例缩到屏幕内（保宽高比），
     // 不小于窗口最小尺寸；最大化/全屏不动。
@@ -139,21 +157,43 @@ Item {
         }
     }
 
-    // 改尺寸但钉住窗口中心（换图 / 换 chrome 时不再左右横跳）。
+    // 换图 / 换 chrome 时要守住的"意图中心"（逻辑坐标，-1 = 还没定）。
+    // ★必须记意图而不是上一帧的实际中心：大图被屏幕边缘夹住之后实际中心
+    // 已经偏移，下一张小图若以它为心，窗口就整体挪走了（"翻图库时窗口乱动"）。
+    property real windowCenterX: -1
+    property real windowCenterY: -1
+    // 我们自己在改窗口几何时置位，避免把程序摆位误判成用户手动拖动。
+    property bool adjustingWindow: false
+
+    // 记下窗口当前中心作为"意图中心"（首次摆位 / 用户手动拖动后用）。
+    function syncWindowCenter(win) {
+        if (!win)
+            return
+        root.windowCenterX = win.x + win.width / 2
+        root.windowCenterY = win.y + win.height / 2
+    }
+
+    // 改尺寸但钉住意图中心（换图 / 换 chrome 时不再左右横跳）。
     function resizeWindowKeepingCenter(win, w, h) {
-        const cx = win.x + win.width / 2
-        const cy = win.y + win.height / 2
+        if (!win)
+            return
+        if (root.windowCenterX < 0 || root.windowCenterY < 0)
+            root.syncWindowCenter(win)
+        const cx = root.windowCenterX
+        const cy = root.windowCenterY
+        root.adjustingWindow = true
         win.width = w
         win.height = h
         const pos = root.clampToWorkArea(cx - w / 2, cy - h / 2, w, h)
         win.x = pos.x
         win.y = pos.y
+        root.adjustingWindow = false
     }
 
     // 显示**之前**预置窗口：按文件头量出的尺寸定大小，再摆到鼠标光标中心并
     // 夹进工作区。这样窗口一出现就是最终大小/位置，不会"先弹个空窗口、
     // 解码完再跳一下"。url 为空（空窗口启动）时只按默认尺寸摆位置。
-    function presizeWindow(win, url, cascade) {
+    function presizeWindow(win, url) {
         if (!win || !root.windowAutoGeometry)
             return false
         const s = url ? url.toString() : ""
@@ -169,7 +209,7 @@ Item {
                 }
             }
         }
-        if (root.placeAtCursor(win, cascade))
+        if (root.placeAtCursor(win))
             return true
         // 光标接口不可用（非 Windows）：至少居中到工作区。
         const area = root.workArea()
@@ -177,21 +217,25 @@ Item {
             win.x = Math.round(area.x + (area.w - win.width) / 2)
             win.y = Math.round(area.y + (area.h - win.height) / 2)
         }
+        root.syncWindowCenter(win)
         return false
     }
 
-    // 以鼠标光标为中心摆窗口（cascade 给同时打开的多个窗口错开 28px）。
-    // Rust 侧算的是物理像素，这里除以 dpr 换成 Qt 的逻辑坐标。
-    function placeAtCursor(win, cascade) {
+    // 以鼠标光标为中心摆窗口。Rust 侧算的是物理像素，这里除以 dpr 换成 Qt
+    // 的逻辑坐标。★所有窗口都精确居中，不做级联错开：错开 28px 会让第二张
+    // 以后的图看起来"没对准鼠标"。
+    function placeAtCursor(win) {
         const dpr = root.dpr > 0 ? root.dpr : 1
-        const offset = Math.round((cascade || 0) * 28 * dpr)
         const res = bridge.place_window_at_cursor(Math.round(win.width * dpr),
-                                                  Math.round(win.height * dpr), offset)
+                                                  Math.round(win.height * dpr))
         if (res.length === 0)
             return false
         const parts = res.split(",")
+        root.adjustingWindow = true
         win.x = Math.round((parseInt(parts[0], 10) || 0) / dpr)
         win.y = Math.round((parseInt(parts[1], 10) || 0) / dpr)
+        root.adjustingWindow = false
+        root.syncWindowCenter(win)
         return true
     }
 

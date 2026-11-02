@@ -52,6 +52,9 @@ fn force_per_monitor_v2() {}
 fn main() {
     force_per_monitor_v2();
     bridge::mark_process_start();
+    // 双击到窗口真正摆位之间有 ~1s，先钉住此刻的光标，免得用户挪了鼠标
+    // 窗口就跟着跑到新位置（"没对准我双击的地方"）。
+    bridge::remember_cursor_start();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let selftest = args.iter().any(|a| a == "--selftest");
