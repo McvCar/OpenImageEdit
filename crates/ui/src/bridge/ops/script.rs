@@ -146,6 +146,17 @@ impl qobject::Bridge {
                 "save" => self.as_mut().save_edited(),
                 "reset-crop" => self.as_mut().reset_crop(),
                 "toggle-visible-selected" => self.as_mut().toggle_selected_visible(),
+                // `select-layer:0` — 选中某个图层（探针：验证"选中图层后翻转
+                // 只作用于该层"这类依赖选中态的路径）。
+                other if other.starts_with("select-layer:") => {
+                    if let Some(ix) = other
+                        .strip_prefix("select-layer:")
+                        .and_then(|v| v.trim().parse::<i32>().ok())
+                    {
+                        self.as_mut().set_selected_layer(ix);
+                        self.as_mut().refresh_layers_only();
+                    }
+                }
                 "delete-selected" => self.as_mut().delete_selected_layer(),
                 "layer-up" => self.as_mut().move_selected_up(),
                 "layer-down" => self.as_mut().move_selected_down(),

@@ -171,6 +171,9 @@ Item {
     property real scaleY: 0
     property real scaleW: 0
     property real scaleH: 0
+    // 图层手柄被拖过对边（负宽高）：松手时按这两个标记镜像图层位图。
+    property bool scaleFlipX: false
+    property bool scaleFlipY: false
     property int renamingIndex: -1
     readonly property var layerList: Layers.parseLayers(bridge.layers_json)
     // The layer PANEL rebuilds its Repeater whenever the model array is
@@ -866,32 +869,29 @@ function canvasCursor(x, y) {
 }
 
 // Live scale-target box for the selected layer; committed on release.
+// 拖过对边（负宽高）时框照样显示成正尺寸，另外记下镜像方向，松手后
+// Rust 侧按 `flip_x/flip_y` 翻转图层位图 —— 这就是「宽高拖成负数 = 镜像」。
 function resizeLayerFrom(startRect, role, dx, dy, free) {
     const s = Math.max(toDispScale(), 0.001)
-    let x = startRect.x, y = startRect.y, w = startRect.width, h = startRect.height
-    if (role.indexOf("w") >= 0) {
-        let nx = snapDisplay(startRect.x + dx)
-        nx = Math.max(0, Math.min(nx, startRect.x + startRect.width - s))
-        w = startRect.x + startRect.width - nx
-        x = nx
-    }
-    if (role.indexOf("e") >= 0) {
-        w = Math.min(Math.max(s, snapDisplay(startRect.width + dx)),
-                     view.previewImage.width - x)
-    }
-    if (role.indexOf("n") >= 0) {
-        let ny = snapDisplay(startRect.y + dy)
-        ny = Math.max(0, Math.min(ny, startRect.y + startRect.height - s))
-        h = startRect.y + startRect.height - ny
-        y = ny
-    }
-    if (role.indexOf("s") >= 0) {
-        h = Math.min(Math.max(s, snapDisplay(startRect.height + dy)),
-                     view.previewImage.height - y)
-    }
-    if (role.length === 2 && !free) {
+    const maxW = view.previewImage.width
+    const maxH = view.previewImage.height
+    let l = startRect.x, t = startRect.y
+    let r = startRect.x + startRect.width, b = startRect.y + startRect.height
+    if (role.indexOf("w") >= 0)
+        l = Math.max(0, Math.min(snapDisplay(startRect.x + dx), maxW))
+    if (role.indexOf("e") >= 0)
+        r = Math.max(0, Math.min(snapDisplay(startRect.x + startRect.width + dx), maxW))
+    if (role.indexOf("n") >= 0)
+        t = Math.max(0, Math.min(snapDisplay(startRect.y + dy), maxH))
+    if (role.indexOf("s") >= 0)
+        b = Math.max(0, Math.min(snapDisplay(startRect.y + startRect.height + dy), maxH))
+    const flipX = r < l, flipY = b < t
+    let x = Math.min(l, r), y = Math.min(t, b)
+    let w = Math.abs(r - l), h = Math.abs(b - t)
+    if (role.length === 2 && !free && !flipX && !flipY) {
         // Corner handles keep the layer's aspect ratio by default
-        // (D5-A); hold Shift for a free resize.
+        // (D5-A); hold Shift for a free resize. 镜像状态下不锁比例：
+        // 锚点在对侧，锁比例会让框跳一下。
         const ar = startRect.width / Math.max(1, startRect.height)
         if (w / Math.max(1, h) > ar)
             w = h * ar
@@ -902,6 +902,8 @@ function resizeLayerFrom(startRect, role, dx, dy, free) {
         if (role.indexOf("n") >= 0)
             y = startRect.y + startRect.height - h
     }
+    root.scaleFlipX = flipX
+    root.scaleFlipY = flipY
     root.scaleX = x; root.scaleY = y
     root.scaleW = Math.max(1, w); root.scaleH = Math.max(1, h)
     if (!view.canvasSurface.scaleTimer.running) {
@@ -915,20 +917,25 @@ function commitLayerScale() {
     view.canvasSurface.scaleTimer.stop()
     const s = toDispScale()
     if (root.scaleW >= 1 && root.scaleH >= 1 && s > 0) {
+        // offset 始终是框的左上角（镜像后图层仍填满同一个框），镜像本身
+        // 走 flip_x/flip_y。
         bridge.scale_layer_end(
             true,
             Math.max(1, Math.round(root.scaleW / s)),
             Math.max(1, Math.round(root.scaleH / s)),
-            Math.round(root.scaleX / s), Math.round(root.scaleY / s))
+            Math.round(root.scaleX / s), Math.round(root.scaleY / s),
+            root.scaleFlipX, root.scaleFlipY)
     }
     root.scaleX = 0; root.scaleY = 0; root.scaleW = 0; root.scaleH = 0
+    root.scaleFlipX = false; root.scaleFlipY = false
 }
 
 function cancelLayerScale() {
     view.canvasSurface.scaleTimer.stop()
     if (root.scaleW > 0)
-        bridge.scale_layer_end(false, 0, 0, 0, 0)
+        bridge.scale_layer_end(false, 0, 0, 0, 0, false, false)
     root.scaleX = 0; root.scaleY = 0; root.scaleW = 0; root.scaleH = 0
+    root.scaleFlipX = false; root.scaleFlipY = false
 }
 
 // ---- 选区工具 -------------------------------------------------------

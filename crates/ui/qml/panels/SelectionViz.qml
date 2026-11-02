@@ -18,24 +18,26 @@ Item {
     property rect liveSelBox: Qt.rect(0, 0, 0, 0)
 
     // 角色（nw/n/ne/e/se/s/sw/w）→ 新包围盒（显示坐标，钳在画布内）。
+    // 手柄拖过对边时（负宽高）的方向标记：liveSelBox 始终是正尺寸的框，
+    // 松开时用它把「镜像」告诉 Rust。
+    property bool liveFlipX: false
+    property bool liveFlipY: false
+
     function resizedSelBox(r, role, dx, dy) {
-        const s = Math.max(host.toDispScale(), 0.0001)
-        let x = r.x, y = r.y, w = r.width, h = r.height
-        if (role.indexOf("w") >= 0) {
-            const nx = Math.max(0, Math.min(Math.round(x + dx), x + w - s))
-            w = x + w - nx
-            x = nx
-        } else if (role.indexOf("e") >= 0) {
-            w = Math.min(Math.max(s, Math.round(w + dx)), previewImage.width - x)
-        }
-        if (role.indexOf("n") >= 0) {
-            const ny = Math.max(0, Math.min(Math.round(y + dy), y + h - s))
-            h = y + h - ny
-            y = ny
-        } else if (role.indexOf("s") >= 0) {
-            h = Math.min(Math.max(s, Math.round(h + dy)), previewImage.height - y)
-        }
-        return Qt.rect(x, y, Math.max(w, s), Math.max(h, s))
+        let l = r.x, t = r.y
+        let rr = r.x + r.width, bb = r.y + r.height
+        // 允许拖过对边：两个边各自跟手，最后取 min/abs 得到正尺寸的框。
+        // 钳制在预览区域内，否则框会跑到画布外，松手后选区被裁掉一半。
+        if (role.indexOf("w") >= 0)
+            l = Math.max(0, Math.min(Math.round(r.x + dx), previewImage.width))
+        if (role.indexOf("e") >= 0)
+            rr = Math.max(0, Math.min(Math.round(r.x + r.width + dx), previewImage.width))
+        if (role.indexOf("n") >= 0)
+            t = Math.max(0, Math.min(Math.round(r.y + dy), previewImage.height))
+        if (role.indexOf("s") >= 0)
+            bb = Math.max(0, Math.min(Math.round(r.y + r.height + dy), previewImage.height))
+        return Qt.rect(Math.min(l, rr), Math.min(t, bb),
+                        Math.abs(rr - l), Math.abs(bb - t))
     }
 
     // ---- 选区轮廓（蚂蚁线）--------------------------------------------
@@ -187,19 +189,38 @@ Item {
         resizeFn: function(startRect, role, dx, dy, free) {
             selectionViz.liveSelBox = selectionViz.resizedSelBox(
                         startRect, role, dx, dy)
+            // 拖过对边 = 镜像：记下方向，松手时以负宽高交给 Rust。
+            selectionViz.liveFlipX =
+                (role.indexOf("w") >= 0 && startRect.x + dx >= startRect.x + startRect.width)
+                || (role.indexOf("e") >= 0 && startRect.x + startRect.width + dx <= startRect.x)
+            selectionViz.liveFlipY =
+                (role.indexOf("n") >= 0 && startRect.y + dy >= startRect.y + startRect.height)
+                || (role.indexOf("s") >= 0 && startRect.y + startRect.height + dy <= startRect.y)
             if (!selectionViz.resizingSel)
                 selectionViz.resizingSel = true
         }
         onEngagedChanged: {
-            if (selHandles.engaged)
+            if (selHandles.engaged) {
+                // 按下手柄：清掉上一次的镜像状态，这一次越过对边才能重新触发。
+                bridge.sel_resize_begin()
                 return
+            }
             if (!selectionViz.resizingSel)
                 return
             selectionViz.resizingSel = false
             const s = Math.max(host.toDispScale(), 0.0001)
             const b = selectionViz.liveSelBox
-            if (b.width >= 1 && b.height >= 1)
-                bridge.sel_resize(b.x / s, b.y / s, b.width / s, b.height / s)
+            if (b.width >= 1 && b.height >= 1) {
+                // 负宽高语义：Rust 侧把 `x` 当作被拖那条边的新位置，负的
+                // width 表示框向左生长（即镜像），所以镜像时传对侧锚点。
+                const ax = selectionViz.liveFlipX ? b.x + b.width : b.x
+                const ay = selectionViz.liveFlipY ? b.y + b.height : b.y
+                bridge.sel_resize(ax / s, ay / s,
+                                  (selectionViz.liveFlipX ? -b.width : b.width) / s,
+                                  (selectionViz.liveFlipY ? -b.height : b.height) / s)
+            }
+            selectionViz.liveFlipX = false
+            selectionViz.liveFlipY = false
         }
     }
 

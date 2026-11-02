@@ -422,12 +422,21 @@ impl qobject::Bridge {
                     snapshot: layer.image.clone(),
                     to: Size::new(layer.image.width(), layer.image.height()),
                     offset: layer.offset,
+                    flip: (false, false),
                 });
             }
         }
     }
 
-    pub fn scale_layer_update(self: Pin<&mut Self>, w: i32, h: i32, ox: i32, oy: i32) {
+    pub fn scale_layer_update(
+        self: Pin<&mut Self>,
+        w: i32,
+        h: i32,
+        ox: i32,
+        oy: i32,
+        flip_x: bool,
+        flip_y: bool,
+    ) {
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
             return;
         };
@@ -443,6 +452,7 @@ impl qobject::Bridge {
                 Some(ls) if ls.index == ix => {
                     ls.to = Size::new(w as u32, h as u32);
                     ls.offset = (ox, oy);
+                    ls.flip = (flip_x, flip_y);
                 }
                 _ => return,
             }
@@ -450,7 +460,17 @@ impl qobject::Bridge {
         self.refresh_preview();
     }
 
-    pub fn scale_layer_end(mut self: Pin<&mut Self>, commit: bool, w: i32, h: i32, ox: i32, oy: i32) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn scale_layer_end(
+        mut self: Pin<&mut Self>,
+        commit: bool,
+        w: i32,
+        h: i32,
+        ox: i32,
+        oy: i32,
+        flip_x: bool,
+        flip_y: bool,
+    ) {
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
             return;
         };
@@ -462,10 +482,11 @@ impl qobject::Bridge {
                 // modified during the gesture, so a cancel needs no rollback.
                 match session.live_scale.take() {
                     Some(ls) if ls.index == ix && commit => {
-                        match session.doc.scale_layer(
+                        match session.doc.scale_layer_flipped(
                             ix,
                             Size::new(w.max(1) as u32, h.max(1) as u32),
                             (ox, oy),
+                            (flip_x, flip_y),
                         ) {
                             Ok(()) => {
                                 session.dirty = true;

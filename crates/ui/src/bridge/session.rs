@@ -22,6 +22,10 @@ pub(in crate::bridge) struct Session {
     /// `to`/`offset` via `PreviewComposer::composite_live_scale`, and
     /// `scale_layer_end` applies the real (undoable) resize exactly once.
     pub(in crate::bridge) live_scale: Option<LiveScaleState>,
+    /// 选区缩放手柄的「当前是否已越过对边」。负宽高拖拽一帧一帧地进来，
+    /// 只在符号翻转的那一帧真正镜像 mask（每帧都翻会让拖动中的内容来回抖）。
+    /// `sel_resize_begin` 在按下手柄时清零。
+    pub(in crate::bridge) sel_flip_sign: (bool, bool),
     /// Cached preview-scaled base/layers; invalidated by doc.edit_epoch so
     /// live drag ticks skip the per-layer resample.
     pub(in crate::bridge) composer: render::PreviewComposer,
@@ -99,6 +103,8 @@ pub(in crate::bridge) struct LiveScaleState {
     pub(in crate::bridge) snapshot: RgbaImage,
     pub(in crate::bridge) to: Size,
     pub(in crate::bridge) offset: (i32, i32),
+    /// 手柄被拖过对边：预览也要镜像（负宽高的可视化）。
+    pub(in crate::bridge) flip: (bool, bool),
 }
 
 pub(in crate::bridge) struct Rendered {
@@ -177,6 +183,7 @@ impl Session {
                 save_quality,
                 preview_hidden_mark: -1,
                 live_scale: None,
+                sel_flip_sign: (false, false),
                 composer: render::PreviewComposer::new(),
                 last_display: Size::new(0, 0),
                 last_render: None,
@@ -353,6 +360,7 @@ impl Session {
                 ls.to,
                 ls.offset,
                 adjust,
+                ls.flip,
             ),
             None => self.composer.composite_adjusted(&self.doc, target, adjust),
         }

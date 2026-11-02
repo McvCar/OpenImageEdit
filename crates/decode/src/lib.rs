@@ -129,8 +129,14 @@ pub fn probe_path(path: &Path) -> Result<ImageInfo, DecodeError> {
         let bytes = std::fs::read(path)?;
         return probe_bytes(&bytes);
     }
-    let format = format_from_path(path).ok_or(DecodeError::UnsupportedFormat)?;
-    let reader = ImageReader::open(path)?;
+    // Content first, extension second. Files whose extension lies are common
+    // (`.png` holding JPEG bytes, renamed `.jpg` screenshots …) and the old
+    // extension-first order handed the wrong decoder to `into_dimensions`,
+    // which surfaced as "this image cannot be opened". `with_guessed_format`
+    // reads the magic bytes and only keeps the extension guess when the
+    // content is unrecognisable (TGA and friends have no signature).
+    let reader = ImageReader::open(path)?.with_guessed_format()?;
+    let format = reader.format().ok_or(DecodeError::UnsupportedFormat)?;
     let (width, height) = reader.into_dimensions()?;
     Ok(ImageInfo {
         format: SourceFormat::Image(format),
@@ -152,8 +158,11 @@ pub fn decode_path(path: &Path, options: DecodeOptions) -> Result<Decoded, Decod
     if bytes.starts_with(PSD_MAGIC) {
         return decode_psd_bytes(&bytes, options);
     }
-    let format = format_from_path(path)
-        .or_else(|| detect_format(&bytes))
+    // Same "content first" rule as `probe_path`: a `.png` that actually holds
+    // JPEG data must be decoded by the JPEG decoder, otherwise `decode_with`
+    // fails with a signature error and the user only sees "cannot open".
+    let format = detect_format(&bytes)
+        .or_else(|| format_from_path(path))
         .ok_or(DecodeError::UnsupportedFormat)?;
     decode_with(&bytes, format, options)
 }

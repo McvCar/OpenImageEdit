@@ -283,6 +283,68 @@ mod tests {
     }
 
     #[test]
+    fn transform_layer_flips_only_that_layer_and_undoes() {
+        let base = solid(8, 4, [10, 20, 30, 255]);
+        let mut doc = Document::from_image(base.clone());
+        // 左红右蓝的一层：镜像后左半必须是蓝的。
+        let image = RgbaImage::from_fn(4, 2, |x, _| {
+            if x < 2 {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            }
+        });
+        let index = doc.add_layer(Layer::new("clip", image)).unwrap();
+
+        doc.transform_layer(index, Transform::FlipHorizontal).unwrap();
+        let layer = &doc.layers[index];
+        assert_eq!(layer.image.get_pixel(0, 0), &image::Rgba([0, 0, 255, 255]));
+        assert_eq!(layer.image.get_pixel(3, 0), &image::Rgba([255, 0, 0, 255]));
+        // 图层自身的框不动（以自身为轴翻转），base 一个像素都没变。
+        assert_eq!(layer.offset, (0, 0));
+        assert_eq!(doc.base, base);
+
+        doc.undo().unwrap();
+        assert_eq!(
+            doc.layers[index].image.get_pixel(0, 0),
+            &image::Rgba([255, 0, 0, 255])
+        );
+        doc.redo().unwrap();
+        assert_eq!(
+            doc.layers[index].image.get_pixel(0, 0),
+            &image::Rgba([0, 0, 255, 255])
+        );
+    }
+
+    #[test]
+    fn scale_layer_flipped_mirrors_the_resampled_bitmap() {
+        let mut doc = Document::from_image(solid(16, 16, [0, 0, 0, 255]));
+        let image = RgbaImage::from_fn(4, 2, |x, _| {
+            if x < 2 {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            }
+        });
+        let index = doc.add_layer(Layer::new("clip", image)).unwrap();
+
+        doc.scale_layer_flipped(index, Size::new(8, 4), (0, 0), (true, false))
+            .unwrap();
+        let px = *doc.layers[index].image.get_pixel(0, 0);
+        assert!(px[2] > 192 && px[0] < 64, "left edge should be blue: {px:?}");
+        let right = *doc.layers[index].image.get_pixel(7, 0);
+        assert!(
+            right[0] > 192 && right[2] < 64,
+            "right edge should be red: {right:?}"
+        );
+
+        // 撤销回到翻转前（左红）。
+        doc.undo().unwrap();
+        let px = *doc.layers[index].image.get_pixel(0, 0);
+        assert!(px[0] > 192 && px[2] < 64, "undo should restore red: {px:?}");
+    }
+
+    #[test]
     fn scale_layer_rejects_bad_size_and_index() {
         let mut doc = Document::from_image(checker(16, 16));
         let index = doc.add_layer(Layer::new("clip", checker(4, 4))).unwrap();

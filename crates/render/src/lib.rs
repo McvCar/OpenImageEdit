@@ -201,6 +201,10 @@ pub struct PreviewComposer {
     /// Scaled bitmap of the layer being live-resized (kept separate from
     /// `layers` so a cancelled gesture cannot poison the layer's cache).
     live: Option<CachedScaled>,
+    /// Mirror flags of the cached live bitmap. A handle dragged past the
+    /// opposite edge must show the mirrored stretch, and the cache key is
+    /// only (w, h) — flipping the flags has to invalidate it.
+    live_flip: (bool, bool),
 }
 
 /// In-flight layer-resize gesture state for
@@ -222,6 +226,7 @@ impl PreviewComposer {
             base: None,
             layers: Vec::new(),
             live: None,
+            live_flip: (false, false),
         }
     }
 
@@ -448,12 +453,13 @@ impl PreviewComposer {
             to,
             offset,
             None,
+            (false, false),
         )
     }
 
     /// [`PreviewComposer::composite_live_scale`] plus an optional live color
     /// adjustment (the "调整颜色" panel can stay open while a layer handle is
-    /// dragged).
+    /// dragged) and mirroring for handles dragged past the opposite edge.
     #[allow(clippy::too_many_arguments)]
     pub fn composite_live_scale_adjusted(
         &mut self,
@@ -464,6 +470,7 @@ impl PreviewComposer {
         to: Size,
         offset: (i32, i32),
         adjust: Option<(AdjustTarget, Adjust)>,
+        flip: (bool, bool),
     ) -> RgbaImage {
         let Some((sx, sy)) = self.prepare(doc, target) else {
             return RgbaImage::new(target.width.max(1), target.height.max(1));
@@ -496,16 +503,31 @@ impl PreviewComposer {
         if drag_opacity > 0.0 {
             let nw = ((to.width as f64 * sx).round() as u32).max(1);
             let nh = ((to.height as f64 * sy).round() as u32).max(1);
-            let src = match Self::cached_hit(&self.live, nw, nh) {
+            // 缓存键只有 (w, h)：翻转标记变了就必须重算，否则镜像前后会
+            // 复用同一张未翻转的位图。
+            let hit = if self.live_flip == flip {
+                Self::cached_hit(&self.live, nw, nh)
+            } else {
+                None
+            };
+            let src = match hit {
                 Some(img) => img,
                 None => {
-                    let img = Arc::new(image::imageops::resize(
+                    let mut img = image::imageops::resize(
                         snapshot,
                         nw,
                         nh,
                         FilterType::Nearest,
-                    ));
+                    );
+                    if flip.0 {
+                        img = image::imageops::flip_horizontal(&img);
+                    }
+                    if flip.1 {
+                        img = image::imageops::flip_vertical(&img);
+                    }
+                    let img = Arc::new(img);
                     self.live = Some((nw, nh, img.clone()));
+                    self.live_flip = flip;
                     img
                 }
             };

@@ -992,7 +992,7 @@ Item {
             if (w === lastW && h === lastH && x === lastX && y === lastY)
                 return
             lastW = w; lastH = h; lastX = x; lastY = y
-            bridge.scale_layer_update(w, h, x, y)
+            bridge.scale_layer_update(w, h, x, y, host.scaleFlipX, host.scaleFlipY)
         }
     }
 

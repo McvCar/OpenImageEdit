@@ -352,8 +352,14 @@ pub mod qobject {
         fn sel_translate(self: Pin<&mut Self>, dx: i32, dy: i32);
 
         /// Resize the selection to a new bounding box (dragging a handle).
+        /// Negative `w` / `h` = the handle crossed the opposite edge, so the
+        /// selection mirrors on that axis instead of collapsing.
         #[qinvokable]
         fn sel_resize(self: Pin<&mut Self>, x: f64, y: f64, w: f64, h: f64);
+
+        /// 按下选区手柄时调用：清零「已镜像」标记，下一次越过对边重新镜像。
+        #[qinvokable]
+        fn sel_resize_begin(self: Pin<&mut Self>);
 
         /// Quick mask (Q): dim outside the selection in the preview.
         #[qinvokable]
@@ -656,8 +662,18 @@ pub mod qobject {
         #[qinvokable]
         fn scale_layer_begin(self: Pin<&mut Self>);
 
+        /// `w` / `h` are always positive; `flip_x` / `flip_y` say the handle
+        /// was dragged past the opposite edge, so the bitmap mirrors.
         #[qinvokable]
-        fn scale_layer_update(self: Pin<&mut Self>, w: i32, h: i32, ox: i32, oy: i32);
+        fn scale_layer_update(
+            self: Pin<&mut Self>,
+            w: i32,
+            h: i32,
+            ox: i32,
+            oy: i32,
+            flip_x: bool,
+            flip_y: bool,
+        );
 
         #[qinvokable]
         fn scale_layer_end(
@@ -667,6 +683,8 @@ pub mod qobject {
             h: i32,
             ox: i32,
             oy: i32,
+            flip_x: bool,
+            flip_y: bool,
         );
     }
 }
@@ -1164,28 +1182,58 @@ impl qobject::Bridge {
 
     fn apply_transform(mut self: Pin<&mut Self>, transform: Transform, label: &str) {
         let viewport = *self.viewport.borrow();
+        // PS 语义：选中一个普通图层时，翻转变换只作用于该图层（背景和其它
+        // 图层不动）。没有选中图层、或选中的是背景行时，仍然翻整幅。
+        // 旋转不在此列：转 90° 会换掉画布坐标系，图层单独转语义完全不同。
+        let layer_only = match transform {
+            Transform::FlipHorizontal | Transform::FlipVertical => {
+                let ix = *self.selected_layer();
+                self.selected_guard(ix)
+                    .filter(|ix| !self.layer_locked(*ix))
+            }
+            _ => None,
+        };
         let outcome: Result<bool, String> = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
                 None => Ok(false),
-                Some(session) => match session.doc.apply_transform(transform) {
-                    Ok(()) => {
-                        println!(
-                            "{{\"phase\":\"ui\",\"event\":\"edit\",\"op\":\"{label}\",\"width\":{},\"height\":{}}}",
-                            session.doc.canvas.width, session.doc.canvas.height
-                        );
-                        session.refit_if_needed(viewport);
-                        session.dirty = true;
-                        // 旋转/翻转换掉了画布坐标系：选区随之失效。
-                        session.clear_selection();
-                        Ok(true)
+                Some(session) => {
+                    let result = match layer_only {
+                        Some(ix) => session.doc.transform_layer(ix, transform),
+                        None => session.doc.apply_transform(transform),
+                    };
+                    match result {
+                        Ok(()) => {
+                            println!(
+                                "{{\"phase\":\"ui\",\"event\":\"edit\",\"op\":\"{label}\",\"scope\":\"{}\",\"width\":{},\"height\":{}}}",
+                                if layer_only.is_some() { "layer" } else { "document" },
+                                session.doc.canvas.width,
+                                session.doc.canvas.height
+                            );
+                            session.refit_if_needed(viewport);
+                            session.dirty = true;
+                            // 整幅旋转/翻转换掉了画布坐标系：选区随之失效。
+                            // 只翻一个图层时坐标没变，选区必须留着（用户很可能
+                            // 就是要"选中某图层 → 翻它 → 继续在那个区域操作"）。
+                            if layer_only.is_none() {
+                                session.clear_selection();
+                            }
+                            Ok(true)
+                        }
+                        Err(err) => Err(err.to_string()),
                     }
-                    Err(err) => Err(err.to_string()),
-                },
+                }
             }
         };
         match outcome {
-            Ok(true) => self.as_mut().refresh_preview(),
+            Ok(true) => {
+                if layer_only.is_some() {
+                    // 选区还在：刷新它的发布态（尺寸/轮廓没变，但预览换了）。
+                    self.as_mut().touch_selection();
+                    self.as_mut().publish_selection();
+                }
+                self.as_mut().refresh_preview();
+            }
             Ok(false) => {}
             Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
         }

@@ -25,7 +25,7 @@ impl Transform {
         matches!(self, Transform::Rotate90Cw | Transform::Rotate90Ccw)
     }
 
-    fn apply_to_image(self, image: &RgbaImage) -> RgbaImage {
+    pub(crate) fn apply_to_image(self, image: &RgbaImage) -> RgbaImage {
         match self {
             Transform::Rotate90Cw => image::imageops::rotate90(image),
             Transform::Rotate90Ccw => image::imageops::rotate270(image),

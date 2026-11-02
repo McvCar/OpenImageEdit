@@ -89,6 +89,44 @@ impl SelectionMask {
         self.coverage_at(x.floor() as i32, y.floor() as i32) >= 128
     }
 
+    /// 在自身包围盒内水平镜像。拖手柄越过对边时用它做「镜像选区」，
+    /// bounds 不变，只有覆盖图左右互换。
+    pub fn flip_horizontal(&self) -> Self {
+        let (w, h) = (self.bounds.width as usize, self.bounds.height as usize);
+        if w == 0 || h == 0 || self.alpha.len() < w * h {
+            return self.clone();
+        }
+        let mut alpha = vec![0u8; self.alpha.len()];
+        for y in 0..h {
+            let row = y * w;
+            for x in 0..w {
+                alpha[row + x] = self.alpha[row + (w - 1 - x)];
+            }
+        }
+        Self {
+            bounds: self.bounds,
+            alpha,
+        }
+    }
+
+    /// 垂直镜像（同上）。
+    pub fn flip_vertical(&self) -> Self {
+        let (w, h) = (self.bounds.width as usize, self.bounds.height as usize);
+        if w == 0 || h == 0 || self.alpha.len() < w * h {
+            return self.clone();
+        }
+        let mut alpha = vec![0u8; self.alpha.len()];
+        for y in 0..h {
+            let src = (h - 1 - y) * w;
+            let dst = y * w;
+            alpha[dst..dst + w].copy_from_slice(&self.alpha[src..src + w]);
+        }
+        Self {
+            bounds: self.bounds,
+            alpha,
+        }
+    }
+
     // ---- 光栅化 ----------------------------------------------------------
 
     pub fn from_shape(shape: &SelShape) -> Self {
@@ -673,6 +711,18 @@ impl SelectionState {
 
     /// 拖手柄改选区大小：把 base 重采样到新包围盒，边界/平滑/羽化
     /// 参数保持不变后重算（算子本来就按新尺寸跑）。
+    /// 镜像当前选区（边框/平滑/羽化参数保留，从 base 重算）。
+    /// 拖手柄越过对边时由 `sel_resize` 调用 —— 这是「负宽高」的语义。
+    pub fn flip_horizontal(&mut self) {
+        self.base = self.base.flip_horizontal();
+        self.recompute();
+    }
+
+    pub fn flip_vertical(&mut self) {
+        self.base = self.base.flip_vertical();
+        self.recompute();
+    }
+
     pub fn resize_to(&mut self, new_bounds: Rect, canvas: Size) {
         let full = Rect::new(0, 0, canvas.width, canvas.height);
         let Some(r) = new_bounds.intersect(full) else {
@@ -1216,6 +1266,47 @@ mod tests {
         assert!(once > 1400 && once < 1800, "ring area {once}");
         st.set_border(0);
         assert_eq!(st.mask().area(), plain);
+    }
+
+    #[test]
+    fn mask_flip_mirrors_coverage_without_moving_bounds() {
+        // 左两列选中、右两列空 —— 镜像后应当正好反过来。
+        let mut m = SelectionMask::rect(Rect::new(3, 5, 4, 2));
+        for y in 0..2 {
+            for x in 2..4 {
+                m.alpha[y * 4 + x] = 0;
+            }
+        }
+        let f = m.flip_horizontal();
+        assert_eq!(f.bounds, m.bounds);
+        assert_eq!(f.coverage_at(3, 5), 0);
+        assert_eq!(f.coverage_at(5, 5), 255);
+        assert_eq!(f.coverage_at(6, 6), 255);
+        // 翻两次回到原样。
+        assert_eq!(f.flip_horizontal().alpha, m.alpha);
+
+        let v = m.flip_vertical();
+        // 上下相同的数据翻完还是同一张（每行内容一致），只验证形状没变。
+        assert_eq!(v.bounds, m.bounds);
+        assert_eq!(v.alpha.len(), m.alpha.len());
+    }
+
+    #[test]
+    fn state_flip_keeps_ops_and_swaps_geometry() {
+        let mut mask = SelectionMask::rect(Rect::new(0, 0, 4, 2));
+        for y in 0..2 {
+            for x in 2..4 {
+                mask.alpha[y * 4 + x] = 0;
+            }
+        }
+        let mut st = SelectionState::new(mask);
+        st.set_feather(7);
+        st.flip_horizontal();
+        // 参数不因镜像丢失（羽化仍在）。
+        assert_eq!(st.ops.feather, 7);
+        assert_eq!(st.mask().coverage_at(0, 0), 0);
+        assert_eq!(st.mask().coverage_at(3, 0), 255);
+        assert_eq!(st.mask().bounds, Rect::new(0, 0, 4, 2));
     }
 
     #[test]

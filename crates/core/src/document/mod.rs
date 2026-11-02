@@ -328,6 +328,20 @@ impl Document {
         to: Size,
         offset: (i32, i32),
     ) -> Result<(), EditError> {
+        self.scale_layer_flipped(index, to, offset, (false, false))
+    }
+
+    /// `scale_layer` plus mirroring: `flip` mirrors the resampled bitmap on
+    /// that axis. The UI passes `true` when a handle was dragged past the
+    /// opposite edge (negative width/height), which is how "resize to a
+    /// negative size" is expressed here — `Size` stays unsigned.
+    pub fn scale_layer_flipped(
+        &mut self,
+        index: usize,
+        to: Size,
+        offset: (i32, i32),
+        flip: (bool, bool),
+    ) -> Result<(), EditError> {
         if to.width < 1 || to.height < 1 {
             return Err(EditError::InvalidCanvasSize);
         }
@@ -335,7 +349,24 @@ impl Document {
             return Err(EditError::LayerIndex(index));
         }
         let from = self.snapshot();
-        self.execute(EditOp::ScaleLayer { index, from, to, offset })
+        self.execute(EditOp::ScaleLayer {
+            index,
+            from,
+            to,
+            offset,
+            flip,
+        })
+    }
+
+    /// Flip / rotate one layer in place (its box — offset and image size
+    /// except for 90° rotations — stays where it is). This is the PS
+    /// behaviour when a layer is selected: the transform hits that layer
+    /// only, not the whole document.
+    pub fn transform_layer(&mut self, index: usize, transform: Transform) -> Result<(), EditError> {
+        if index >= self.layers.len() {
+            return Err(EditError::LayerIndex(index));
+        }
+        self.execute(EditOp::TransformLayer { index, transform })
     }
 
     /// "Delete" the base layer: the canvas becomes fully transparent while

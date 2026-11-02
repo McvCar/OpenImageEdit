@@ -130,7 +130,7 @@ impl qobject::Bridge {
 
     /// 把当前选区的参数记成「下次新建选区的默认值」并写盘。用户改一次
     /// 平滑填 20，之后每画一个新选区都直接是 20，不用反复重填。
-    fn remember_selection_ops(mut self: Pin<&mut Self>) {
+    fn remember_selection_ops(self: Pin<&mut Self>) {
         let ops = self
             .session
             .borrow()
@@ -402,19 +402,27 @@ impl qobject::Bridge {
 
     /// 拖手柄改选区大小（图像坐标，浮点）。Rust 侧按新包围盒重采样
     /// mask，QML 拖动期间只画本地预览框 —— 每帧重采样大选区会卡。
+    /// 按手柄拖拽的新框重采样选区。`w` / `h` 允许为负：表示手柄拖过了
+    /// 对边，此时选区在该轴做镜像（PS 的行为），`x` / `y` 仍是被拖动那条
+    /// 边带动后的锚点，负值代表框向左/向上生长。
     pub fn sel_resize(mut self: Pin<&mut Self>, x: f64, y: f64, w: f64, h: f64) {
         let canvas = match self.session.borrow().as_ref().map(|s| s.doc.canvas) {
             Some(c) => c,
             None => return,
         };
-        if w < 1.0 || h < 1.0 {
+        let flip_x = w < 0.0;
+        let flip_y = h < 0.0;
+        let w_abs = w.abs();
+        let h_abs = h.abs();
+        // 拖到厚度为 0 时先忽略（避免产生 0 宽选区）；再往外拖就开始镜像。
+        if w_abs < 1.0 || h_abs < 1.0 {
             return;
         }
         let bounds = Rect::new(
-            x.round() as i32,
-            y.round() as i32,
-            w.round().max(1.0) as u32,
-            h.round().max(1.0) as u32,
+            (if flip_x { x + w } else { x }).round() as i32,
+            (if flip_y { y + h } else { y }).round() as i32,
+            w_abs.round().max(1.0) as u32,
+            h_abs.round().max(1.0) as u32,
         );
         {
             let mut guard = self.session.borrow_mut();
@@ -424,6 +432,15 @@ impl qobject::Bridge {
             let Some(mut st) = session.doc.selection.clone() else {
                 return;
             };
+            // 只在跨过对边的那一帧镜像，之后继续往外拖就只是放大。
+            let sign = (flip_x, flip_y);
+            if session.sel_flip_sign.0 != sign.0 {
+                st.flip_horizontal();
+            }
+            if session.sel_flip_sign.1 != sign.1 {
+                st.flip_vertical();
+            }
+            session.sel_flip_sign = sign;
             st.resize_to(bounds, canvas);
             // 拖到没有面积了 = 取消选区（PS 里手柄拖过对边也是这个结果）。
             let next = if st.is_empty() { None } else { Some(st) };
@@ -432,6 +449,13 @@ impl qobject::Bridge {
         self.touch_selection();
         self.as_mut().publish_selection();
         self.as_mut().refresh_for_selection();
+    }
+
+    /// 按下选区手柄：把「已镜像」状态清零，让下一次越过对边重新触发镜像。
+    pub fn sel_resize_begin(self: Pin<&mut Self>) {
+        if let Some(session) = self.session.borrow_mut().as_mut() {
+            session.sel_flip_sign = (false, false);
+        }
     }
 
     pub fn sel_toggle_quick_mask(mut self: Pin<&mut Self>) {

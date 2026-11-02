@@ -48,7 +48,16 @@ pub enum EditOp {
         from: DocumentSnapshot,
         to: Size,
         offset: (i32, i32),
+        /// Handles dragged past the opposite edge: mirror the resampled
+        /// bitmap on that axis (negative width / height in the UI).
+        flip: (bool, bool),
     },
+    /// Flip / rotate ONE layer's bitmap around its own centre (PS: with a
+    /// layer selected, "flip horizontal" transforms that layer only, the
+    /// base and the other layers stay put). The offset is untouched — the
+    /// layer occupies the same box, its pixels are just mirrored inside it.
+    /// Purely self-inverse for flips; rotations undo through `inverted()`.
+    TransformLayer { index: usize, transform: Transform },
     /// "Delete" the base layer: the canvas becomes fully transparent while
     /// layers stay untouched. Undo restores the previous base pixels.
     DeleteBase { from: DocumentSnapshot },
@@ -171,7 +180,7 @@ impl EditOp {
                 erase_base_pixels(doc, selection);
                 Ok(())
             }
-            EditOp::ScaleLayer { index, to, offset, .. } => {
+            EditOp::ScaleLayer { index, to, offset, flip, .. } => {
                 let layer = doc
                     .layers
                     .get_mut(*index)
@@ -179,13 +188,29 @@ impl EditOp {
                 if to.width < 1 || to.height < 1 {
                     return Err(EditError::InvalidCanvasSize);
                 }
-                layer.image = image::imageops::resize(
+                let mut image = image::imageops::resize(
                     &layer.image,
                     to.width,
                     to.height,
                     image::imageops::FilterType::Lanczos3,
                 );
+                // 拖过对边 = 镜像。先重采样再翻，尺寸语义与正拖完全一致。
+                if flip.0 {
+                    image = image::imageops::flip_horizontal(&image);
+                }
+                if flip.1 {
+                    image = image::imageops::flip_vertical(&image);
+                }
+                layer.image = image;
                 layer.offset = *offset;
+                Ok(())
+            }
+            EditOp::TransformLayer { index, transform } => {
+                let layer = doc
+                    .layers
+                    .get_mut(*index)
+                    .ok_or(EditError::LayerIndex(*index))?;
+                layer.image = transform.apply_to_image(&layer.image);
                 Ok(())
             }
             EditOp::DeleteBase { .. } => {
@@ -336,6 +361,14 @@ impl EditOp {
             }
             EditOp::ScaleLayer { from, .. } => {
                 doc.restore(from.clone());
+                Ok(())
+            }
+            EditOp::TransformLayer { index, transform } => {
+                let layer = doc
+                    .layers
+                    .get_mut(*index)
+                    .ok_or(EditError::LayerIndex(*index))?;
+                layer.image = transform.inverted().apply_to_image(&layer.image);
                 Ok(())
             }
             EditOp::DeleteBase { from } => {
