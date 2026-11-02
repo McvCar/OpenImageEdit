@@ -34,17 +34,25 @@ Flickable {
     contentWidth: Math.max(width, previewImage.width + 2 * pad)
     contentHeight: Math.max(height, previewImage.height + 2 * pad)
 
+    // 画布显示尺寸没超出可视区的轴 = 不需要滚动。适应窗口时两轴都装得下
+    // （fit 保证不超过可视区），此时任何平移手势都只是把画面拖出可视区、
+    // 露出空白，所以这一轴要吃掉手势。
+    readonly property bool canPanX: previewImage.width > width
+    readonly property bool canPanY: previewImage.height > height
+
     // In fit mode the content includes the 64px work-area pad on every
     // side, so it is slightly larger than the viewport — without recentring
     // the image would sit 64px down (blank top, cut bottom). Center the
     // image in the viewport whenever fit sizing changes.
+    // 装得下的轴一律居中（不只是 fit 模式）：缩小到比可视区小时 pad 也让
+    // contentWidth 大出 128，不居中就会偏出半个 pad。
     function centerContent() {
-        if (!bridge.fit_mode)
-            return
-        // 取整：contentX/Y 若带 .5，整块内容（含 1:1 的预览位图）都会被
-        // 半像素采样糊掉，与 previewImage.x/y 取整是同一件事的两半。
-        contentX = Math.round(Math.max(0, (contentWidth - width) / 2))
-        contentY = Math.round(Math.max(0, (contentHeight - height) / 2))
+        if (bridge.fit_mode || !canPanX)
+            // 取整：contentX/Y 若带 .5，整块内容（含 1:1 的预览位图）都会被
+            // 半像素采样糊掉，与 previewImage.x/y 取整是同一件事的两半。
+            contentX = Math.round(Math.max(0, (contentWidth - width) / 2))
+        if (bridge.fit_mode || !canPanY)
+            contentY = Math.round(Math.max(0, (contentHeight - height) / 2))
     }
     onContentWidthChanged: centerContent()
     onContentHeightChanged: centerContent()
@@ -159,13 +167,25 @@ Flickable {
     }
 
     // Clamp-and-shift the visible region by (dx, dy) viewport px.
+    // 装得下的轴不响应平移：适应窗口（或缩小到比可视区小）时画面是铺满
+    // 的，滚轮/触摸板/中键拖动只会把它拖偏、露出空白，这一轴直接忽略，
+    // 并顺手把已经偏掉的轴拉回居中（从放大状态缩回来时 contentX 还停在
+    // 旧值上）。
     function panBy(dx, dy) {
-        const maxX = Math.max(0, contentWidth - width)
-        const maxY = Math.max(0, contentHeight - height)
-        // 取整：触摸板/滚轮的增量常带小数，contentX 一旦是 .5，1:1 的预览
-        // 位图就会按半像素中心采样（整幅变糊）。
-        contentX = Math.round(Math.min(maxX, Math.max(0, contentX + dx)))
-        contentY = Math.round(Math.min(maxY, Math.max(0, contentY + dy)))
+        const overX = Math.max(0, contentWidth - width)
+        const overY = Math.max(0, contentHeight - height)
+        if (canPanX) {
+            // 取整：触摸板/滚轮的增量常带小数，contentX 一旦是 .5，1:1 的
+            // 预览位图就会按半像素中心采样（整幅变糊）。
+            contentX = Math.round(Math.min(overX, Math.max(0, contentX + dx)))
+        } else {
+            contentX = Math.round(overX / 2)
+        }
+        if (canPanY) {
+            contentY = Math.round(Math.min(overY, Math.max(0, contentY + dy)))
+        } else {
+            contentY = Math.round(overY / 2)
+        }
     }
 
     // PS-style checkerboard behind the image: transparent pixels show

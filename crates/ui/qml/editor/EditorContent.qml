@@ -309,6 +309,9 @@ Item {
     // 选区浮动面板（标记栏里的那个按钮弹出来的）：核对面板排版 + 画布是否
     // 正确让位。选区工具条改成浮层后没有常驻行，只能靠它截图。
     readonly property bool probeSelPop: Qt.application.arguments.indexOf("--probe-selpop") !== -1
+    // 平移锁定探针：打印一次内容/可视几何，再调一次 panBy，看它有没有动。
+    // 「适应窗口」下两轴都装得下，panBy 应该原样返回（before == after）。
+    readonly property bool probePanLock: Qt.application.arguments.indexOf("--probe-panlock") !== -1
     // Ids inside an inline component are invisible from outside, so the
     // shell / DocWindow wrappers reach the Bridge through this alias.
     readonly property alias b: bridge
@@ -1773,6 +1776,27 @@ Timer {
                              + " z=" + selPopover.z
                              + " markBarZ=" + markBar.z
                              + " viewZ=" + view.z)
+}
+
+// 平移锁定自检：--probe-panlock 打印一次几何 → 调 panBy → 再打印一次。
+// 「装得下」的轴必须纹丝不动（适应窗口就是这种状态）。
+Timer {
+    id: panLockProbeTimer
+    interval: 900
+    running: root.probePanLock
+    onTriggered: {
+        const geom = () => "contentX=" + Math.round(view.contentX)
+                          + " contentY=" + Math.round(view.contentY)
+                          + " img=" + Math.round(view.previewImage.width)
+                          + "x" + Math.round(view.previewImage.height)
+                          + " vp=" + Math.round(view.width)
+                          + "x" + Math.round(view.height)
+                          + " fit=" + bridge.fit_mode
+                          + " zoom=" + bridge.zoom_percent
+        bridge.mark("panlock before " + geom())
+        view.panBy(180, 120)
+        bridge.mark("panlock after  " + geom())
+    }
 }
 
 // Prepare-only: enable the mark bar + ellipse tool, then let a REAL
