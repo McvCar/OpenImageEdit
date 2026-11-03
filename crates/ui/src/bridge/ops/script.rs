@@ -621,6 +621,26 @@ impl qobject::Bridge {
                         println!("{{\"phase\":\"ui\",\"event\":\"gradient\"}}");
                     }
                 }
+                // `rotate-handle:index,degrees[,expand]` —— 模拟拖一次画布旋柄
+                // （begin keep_session → update → finish apply）。连写两条就等于
+                // 用户来回拖两次，用来验证「不会越拖越糊」。
+                other if other.starts_with("rotate-handle:") => {
+                    let n = parse_nums(other);
+                    if n.len() >= 2 {
+                        let (ix, deg) = (n[0] as i32, n[1]);
+                        let expand = n.get(2).copied().unwrap_or(1.0) > 0.5;
+                        self.as_mut().rotate_layer_begin(ix, true);
+                        self.as_mut().rotate_layer_update(deg, expand);
+                        self.as_mut().rotate_layer_finish(true, deg, expand);
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"rotate-handle\",\"degrees\":{deg:.2}}}"
+                        );
+                    } else {
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        )
+                    }
+                }
                 // `rotate-layer:index,degrees[,expand]`
                 other if other.starts_with("rotate-layer:") => {
                     let n = parse_nums(other);

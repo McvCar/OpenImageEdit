@@ -365,31 +365,45 @@ Item {
                 // 命中范围比圆点大一圈，不然很难点中。
                 anchors.fill: parent
                 anchors.margins: -5
+                // Qt 没有旋转光标，这里让 Rust 侧的 Win32 光标接管（kind 4）。
                 cursorShape: Qt.CrossCursor
+                hoverEnabled: true
                 preventStealing: true
                 property real startAngle: 0
+                // 旋转中心在按下那一刻就锁死：图层一扩边界，框会跟着变大，
+                // 每帧重算中心会让同一个鼠标位置算出不同角度，手感像在抖。
+                property real pivotX: 0
+                property real pivotY: 0
+                // 悬停 → 旋转光标；拖动中即使滑出圆点也保持住。
+                onEntered: host.rotateKnobHover = true
+                onExited: if (!pressed) host.rotateKnobHover = false
                 onPressed: (mouse) => {
+                    host.rotateKnobHover = true
+                    pivotX = rotateHandleBox.bx + rotateHandleBox.bw / 2
+                    pivotY = rotateHandleBox.by + rotateHandleBox.bh / 2
                     const p = mapToItem(previewImage, mouse.x, mouse.y)
-                    const cx = rotateHandleBox.bx + rotateHandleBox.bw / 2
-                    const cy = rotateHandleBox.by + rotateHandleBox.bh / 2
-                    startAngle = Math.atan2(p.y - cy, p.x - cx) * 180 / Math.PI
+                    startAngle = Math.atan2(p.y - pivotY, p.x - pivotX) * 180 / Math.PI
                     host.startLayerRotate()
                 }
                 onPositionChanged: (mouse) => {
                     if (!pressed)
                         return
                     const p = mapToItem(previewImage, mouse.x, mouse.y)
-                    const cx = rotateHandleBox.bx + rotateHandleBox.bw / 2
-                    const cy = rotateHandleBox.by + rotateHandleBox.bh / 2
-                    const a = Math.atan2(p.y - cy, p.x - cx) * 180 / Math.PI
+                    const a = Math.atan2(p.y - pivotY, p.x - pivotX) * 180 / Math.PI
                     let d = a - startAngle
                     // 跨 ±180 时不要跳一整圈。
                     while (d > 180) d -= 360
                     while (d < -180) d += 360
                     host.previewLayerRotate(d)
                 }
-                onReleased: host.finishLayerRotate(true)
-                onCanceled: host.finishLayerRotate(false)
+                onReleased: {
+                    host.finishLayerRotate(true)
+                    host.rotateKnobHover = containsMouse
+                }
+                onCanceled: {
+                    host.finishLayerRotate(false)
+                    host.rotateKnobHover = false
+                }
             }
         }
     }

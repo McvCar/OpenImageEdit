@@ -5,6 +5,10 @@
 // 这样一次涂抹只会留下一条 Ctrl+Z，而不是每帧一条。
 use super::super::*;
 
+/// 旋转拖动中实时预览的长边上限（像素）。拖动期间合成是在预览尺度上做的，
+/// 这里只负责把 4K 屏上的超大预览再压一档；松手那一帧恢复满分辨率。
+const LIVE_ROTATE_EDGE: u32 = 1600;
+
 /// 目标位图左上角的画布坐标：位图坐标 = 画布坐标 - origin。
 fn target_origin(doc: &Document, target: AdjustTarget) -> (i32, i32) {
     match target {
@@ -570,81 +574,167 @@ impl qobject::Bridge {
 
     // ---- 图层旋转 ----------------------------------------------------
 
-    pub fn rotate_layer_begin(self: Pin<&mut Self>, index: i32) {
+    /// 开始一次旋转会话，返回会话的起始角（= 之前已经累计转过的角度）。
+    ///
+    /// `keep_session` = true（画布手柄）时，如果上一次旋转之后图层没被别的
+    /// 操作改过，就从**没被重采样过的原图**继续转：来回拖多少次手柄，位图
+    /// 都只被插值一次，画质不会越拖越糊。角度对话框用 false —— 它每次都是
+    /// 从「图层当前的样子」出发的一次性操作。
+    pub fn rotate_layer_begin(self: Pin<&mut Self>, index: i32, keep_session: bool) -> f64 {
         let mut guard = self.session.borrow_mut();
-        let Some(session) = guard.as_mut() else { return };
+        let Some(session) = guard.as_mut() else {
+            return 0.0;
+        };
         let ix = index.max(0) as usize;
         let Some(layer) = session.doc.layers.get(ix) else {
-            return;
+            return 0.0;
         };
         if layer.locked {
-            return;
+            return 0.0;
         }
-        let before = layer.clone();
+        let history_len = session.doc.history_len();
+        session.rotate_token = session.rotate_token.wrapping_add(1);
+        let token = session.rotate_token;
+        if !keep_session {
+            session.rotate_origin = None;
+            let one = std::rc::Rc::new(session.doc.layers[ix].clone());
+            session.rotate_live = Some(RotateLive {
+                index: ix,
+                before: one.clone(),
+                token,
+                start: one,
+                base_degrees: 0.0,
+                last_delta: 0.0,
+                expand: true,
+                keep: false,
+            });
+            return 0.0;
+        }
+        // 锚点还新鲜才复用（同图层 + 之后没人改过文档 + 真的转出过角度）。
+        let reusable = session
+            .rotate_origin
+            .as_ref()
+            .map(|o| {
+                o.index == ix
+                    && o.history_len == history_len
+                    && o.degrees.abs() > 0.001
+            })
+            .unwrap_or(false);
+        let (before, start, base) = if reusable {
+            let origin = session.rotate_origin.as_ref().expect("checked above");
+            (
+                origin.layer.clone(),
+                std::rc::Rc::new(session.doc.layers[ix].clone()),
+                origin.degrees,
+            )
+        } else {
+            session.rotate_origin = None;
+            let one = std::rc::Rc::new(session.doc.layers[ix].clone());
+            (one.clone(), one, 0.0)
+        };
         session.rotate_live = Some(RotateLive {
             index: ix,
-            before: before.clone(),
-            current: before,
-            degrees: 0.0,
+            before,
+            token,
+            start,
+            base_degrees: base,
+            last_delta: 0.0,
             expand: true,
+            keep: true,
         });
+        base as f64
     }
 
+    /// `degrees` 是相对本次会话起点的增量角（拖动手柄的位移量）。
+    ///
+    /// 拖动期间**不碰文档像素**：只把角度交给合成器，由它按预览尺寸临时旋
+    /// 转（见 `composite_live_rotate_adjusted`）。整层重采样留到松手那一帧，
+    /// 所以来回拖多少次，位图都只被插值一次 —— 不会越拖越糊。
     pub fn rotate_layer_update(mut self: Pin<&mut Self>, degrees: f64, expand: bool) {
-        let update;
         {
             let mut guard = self.session.borrow_mut();
             let Some(session) = guard.as_mut() else { return };
             let Some(st) = session.rotate_live.as_mut() else {
                 return;
             };
-            let mut after = st.before.clone();
-            let (image, delta) = editcore::rotate_image(&st.before.image, degrees as f32, expand);
-            after.image = image;
-            after.offset = (
-                st.before.offset.0 + delta.0,
-                st.before.offset.1 + delta.1,
-            );
-            st.current = after.clone();
-            st.degrees = degrees as f32;
+            let total = st.base_degrees + degrees as f32;
+            st.last_delta = degrees as f32;
             st.expand = expand;
-            update = (st.index, after);
-        }
-        {
-            let mut guard = self.session.borrow_mut();
-            if let Some(session) = guard.as_mut() {
-                let _ = session.doc.preview_layer(update.0, update.1);
-            }
+            // 超大画布上顺手把预览压到 1600 长边（QML 会拉回窗口尺寸）。
+            session.live_cap = Some(LIVE_ROTATE_EDGE);
+            let index = st.index;
+            let snapshot = st.before.clone();
+            let token = st.token;
+            session.live_rotate = Some(LiveRotate {
+                index,
+                snapshot,
+                degrees: total,
+                expand,
+                token,
+            });
         }
         self.as_mut().refresh_preview();
     }
 
-    pub fn rotate_layer_finish(mut self: Pin<&mut Self>, apply: bool) {
-        let changed;
+    /// 结束会话：把拖动期间只存在于合成器里的角度真正落到位图上（一次重采样），
+    /// 或者直接丢掉（取消）。
+    pub fn rotate_layer_finish(mut self: Pin<&mut Self>, apply: bool, degrees: f64, expand: bool) {
         {
             let mut guard = self.session.borrow_mut();
             let Some(session) = guard.as_mut() else { return };
             let Some(st) = session.rotate_live.take() else {
                 return;
             };
-            if apply {
-                changed = session
-                    .doc
-                    .commit_layer(st.index, st.before.clone(), st.current.clone())
-                    .is_ok();
+            // 会话结束：撤销预览上限，丢掉临时旋转态（文档像素本来就还没动）。
+            session.live_cap = None;
+            session.live_rotate = None;
+            let total = st.base_degrees + degrees as f32;
+            // 这次拖拽的净效果为零（含「压根没动」）：文档没被改过，什么都不用做。
+            let neutral = !apply || (total - st.base_degrees).abs() < 0.001;
+            if neutral {
+                if !apply {
+                    // 取消 = 丢掉连续会话的锚点，下次从头开始。
+                    session.rotate_origin = None;
+                }
             } else {
-                let _ = session.doc.preview_layer(st.index, st.before);
-                changed = true;
+                let (image, delta) = editcore::rotate_image(&st.before.image, total, expand);
+                let after = Layer {
+                    name: st.before.name.clone(),
+                    image,
+                    offset: (st.before.offset.0 + delta.0, st.before.offset.1 + delta.1),
+                    opacity: st.before.opacity,
+                    visible: st.before.visible,
+                    locked: st.before.locked,
+                };
+                // 像素其实没变（拖一圈又回原位）：别再记一条空历史。
+                if *st.start != after {
+                    let _ = session
+                        .doc
+                        .commit_layer(st.index, (*st.start).clone(), after);
+                }
+                if st.keep {
+                    // 锚点推进到最新角度：手柄下一次拖动还是从没被插值过的
+                    // 原图出发，角度累加。
+                    session.rotate_origin = Some(RotateOrigin {
+                        index: st.index,
+                        layer: st.before,
+                        degrees: total,
+                        history_len: session.doc.history_len(),
+                    });
+                } else {
+                    session.rotate_origin = None;
+                }
             }
         }
-        if changed {
-            self.as_mut().refresh_preview();
-        }
+        // 不管提交还是取消，都要重画一帧：拖动中看到的那张是临时合成出来的。
+        self.as_mut().refresh_preview();
     }
 
     pub fn rotate_layer_angle(mut self: Pin<&mut Self>, index: i32, degrees: f64, expand: bool) {
         let mut changed = false;
         if let Some(session) = self.session.borrow_mut().as_mut() {
+            // 一次性旋转是直接改当前位图（会累加重采样），锚点必须作废。
+            session.rotate_origin = None;
             changed = session
                 .doc
                 .rotate_layer_angle(index.max(0) as usize, degrees as f32, expand)
@@ -665,7 +755,7 @@ impl qobject::Bridge {
             .borrow()
             .as_ref()
             .and_then(|s| s.rotate_live.as_ref())
-            .map(|s| format!("{:.2},{}", s.degrees, s.expand as i32))
+            .map(|s| format!("{:.2},{}", s.base_degrees + s.last_delta, s.expand as i32))
             .unwrap_or_default();
         QString::from(text.as_str())
     }

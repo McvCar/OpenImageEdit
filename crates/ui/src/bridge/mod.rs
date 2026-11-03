@@ -529,14 +529,22 @@ pub mod qobject {
         fn gradient_cancel(self: Pin<&mut Self>);
 
         /// 图层旋转：begin 记下旋转前状态，update 实时预览，finish 提交/放弃。
+        /// `keep_session` = true 时沿用上一次旋转留下的原图锚点（手柄连拖不糊）；
+        /// 返回会话起始角。
         #[qinvokable]
-        fn rotate_layer_begin(self: Pin<&mut Self>, index: i32);
+        fn rotate_layer_begin(self: Pin<&mut Self>, index: i32, keep_session: bool) -> f64;
 
         #[qinvokable]
         fn rotate_layer_update(self: Pin<&mut Self>, degrees: f64, expand: bool);
 
+        /// `degrees` = 最终增量角（不必先调 update）。
         #[qinvokable]
-        fn rotate_layer_finish(self: Pin<&mut Self>, apply: bool);
+        fn rotate_layer_finish(
+            self: Pin<&mut Self>,
+            apply: bool,
+            degrees: f64,
+            expand: bool,
+        );
 
         /// 一次性旋转（角度对话框确认 / 脚本探针）。
         #[qinvokable]
@@ -812,7 +820,8 @@ pub mod qobject {
         #[qinvokable]
         fn reveal_in_explorer(self: Pin<&mut Self>);
 
-        /// 画布光标种类：0 = 交回 Qt，1 = 加选(+)，2 = 减选(−)，3 = 剪刀。
+        /// 画布光标种类：0 = 交回 Qt，1 = 加选(+)，2 = 减选(−)，
+        /// 3 = 剪刀，4 = 图层旋转。
         #[qinvokable]
         fn cursor_set_kind(self: Pin<&mut Self>, kind: i32);
 
@@ -1540,6 +1549,7 @@ impl qobject::Bridge {
                 adjust_target_name,
                 adjust_values,
                 adjust_histogram,
+                live,
             } => {
                 // The status bar's left side already shows the file name and
                 // size; a second resolution readout here was redundant, so
@@ -1548,10 +1558,12 @@ impl qobject::Bridge {
                 // "degraded" means it is smaller than the physical display
                 // size (zoomed past the native resolution or past the memory
                 // cap) — not merely different from the logical display size.
+                // 拖动中的降质实时帧不算（否则旋转时状态栏一直在闪提示）。
                 let dpr = self.dpr.get();
                 let phys_w = ((display.width as f64 * dpr).round() as u32).max(1);
                 let phys_h = ((display.height as f64 * dpr).round() as u32).max(1);
-                let degraded = preview.width < phys_w || preview.height < phys_h;
+                let degraded =
+                    !live && (preview.width < phys_w || preview.height < phys_h);
                 let mut status = if degraded {
                     format!(
                         "{}  (预览 {}x{})",

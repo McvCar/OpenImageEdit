@@ -101,12 +101,16 @@ pub(crate) fn transform_document(doc: &mut Document, transform: Transform) {
 /// `expand` = true 时按旋转后的包围盒扩大位图（内容不裁切）；false 时
 /// 保持原尺寸、四角被裁掉。返回新位图与「新左上角相对旧左上角」的偏移，
 /// 调用方据此让图层绕自己的中心转（PS 的行为）。
+///
+/// 性能：直接读写 `[u8]` 原始缓冲（`get_pixel`/`put_pixel` 每像素都要过一遍
+/// 泛型 `Pixel` 转换，拖动时每 60ms 就要重算整层，那点开销会翻几倍）。四邻域
+/// 全在图内时走无边界检查的快路径，只有贴边的像素才逐点判越界。
 pub fn rotate_image(img: &RgbaImage, degrees: f32, expand: bool) -> (RgbaImage, (i32, i32)) {
-    let w = img.width() as f32;
-    let h = img.height() as f32;
-    if w < 1.0 || h < 1.0 || degrees.abs() < 0.001 {
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    if iw < 1 || ih < 1 || degrees.abs() < 0.001 {
         return (img.clone(), (0, 0));
     }
+    let (w, h) = (iw as f32, ih as f32);
     let rad = degrees.to_radians();
     let (sin, cos) = (rad.sin(), rad.cos());
     let (nw, nh) = if expand {
@@ -119,55 +123,36 @@ pub fn rotate_image(img: &RgbaImage, degrees: f32, expand: bool) -> (RgbaImage, 
     };
     let (scx, scy) = (w / 2.0, h / 2.0);
     let (dcx, dcy) = (nw as f32 / 2.0, nh as f32 / 2.0);
-    let (iw, ih) = (img.width() as i32, img.height() as i32);
     let mut out = RgbaImage::new(nw, nh);
-    for dy in 0..nh {
-        for dx in 0..nw {
-            // 目标像素中心 → 相对新中心 → 反向旋转 → 源图坐标（像素中心）。
-            let rx = dx as f32 + 0.5 - dcx;
-            let ry = dy as f32 + 0.5 - dcy;
-            let sx = cos * rx + sin * ry + scx - 0.5;
-            let sy = -sin * rx + cos * ry + scy - 0.5;
-            let x0 = sx.floor() as i32;
-            let y0 = sy.floor() as i32;
-            let tx = sx - x0 as f32;
-            let ty = sy - y0 as f32;
-            let mut acc = [0f32; 4];
-            let mut asum = 0f32;
-            for (ox, oy, wt) in [
-                (0, 0, (1.0 - tx) * (1.0 - ty)),
-                (1, 0, tx * (1.0 - ty)),
-                (0, 1, (1.0 - tx) * ty),
-                (1, 1, tx * ty),
-            ] {
-                if wt <= 0.0 {
-                    continue;
+    let ctx = RotCtx {
+        iw,
+        ih,
+        stride: iw as usize * 4,
+        nstride: nw as usize * 4,
+        cos,
+        sin,
+        scx,
+        scy,
+        dcx,
+        dcy,
+        nw,
+    };
+    {
+        let src: &[u8] = img.as_raw();
+        let dst: &mut [u8] = &mut out;
+        // 按输出行切给几个线程：拖手柄时每帧都要重算整层，单线程在 debug
+        // 下 2752×1152 要 79ms，超出节流周期，手感就成了「一下一下跳」。
+        let threads = rot_threads(nh);
+        if threads > 1 {
+            let rows = (nh as usize).div_ceil(threads);
+            let cref = &ctx;
+            std::thread::scope(|scope| {
+                for (ti, chunk) in dst.chunks_mut(rows * cref.nstride).enumerate() {
+                    scope.spawn(move || render_rows(chunk, ti * rows, src, cref));
                 }
-                let (x, y) = (x0 + ox, y0 + oy);
-                if x < 0 || y < 0 || x >= iw || y >= ih {
-                    continue;
-                }
-                let p = img.get_pixel(x as u32, y as u32).0;
-                let a = p[3] as f32 / 255.0 * wt;
-                for k in 0..3 {
-                    acc[k] += p[k] as f32 * a;
-                }
-                asum += a;
-            }
-            if asum <= 1e-5 {
-                out.put_pixel(dx, dy, image::Rgba([0, 0, 0, 0]));
-                continue;
-            }
-            out.put_pixel(
-                dx,
-                dy,
-                image::Rgba([
-                    (acc[0] / asum).round().clamp(0.0, 255.0) as u8,
-                    (acc[1] / asum).round().clamp(0.0, 255.0) as u8,
-                    (acc[2] / asum).round().clamp(0.0, 255.0) as u8,
-                    (asum * 255.0).round().clamp(0.0, 255.0) as u8,
-                ]),
-            );
+            });
+        } else {
+            render_rows(dst, 0, src, &ctx);
         }
     }
     let delta = (
@@ -175,4 +160,132 @@ pub fn rotate_image(img: &RgbaImage, degrees: f32, expand: bool) -> (RgbaImage, 
         ((h - nh as f32) / 2.0).round() as i32,
     );
     (out, delta)
+}
+
+/// 一次旋转运算的常量参数（各线程共享只读）。
+struct RotCtx {
+    iw: i32,
+    ih: i32,
+    stride: usize,
+    nstride: usize,
+    cos: f32,
+    sin: f32,
+    scx: f32,
+    scy: f32,
+    dcx: f32,
+    dcy: f32,
+    nw: u32,
+}
+
+fn rot_threads(nh: u32) -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let n = *N.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(1)
+            .min(8)
+    });
+    // 太矮的图分线程得不偿失（线程开销比计算还大）。
+    if nh < 96 {
+        1
+    } else {
+        n
+    }
+}
+
+/// 把输出缓冲按行切块后逐块渲染。`dy0` 是本次负责的首行在整幅图上的行号。
+fn render_rows(dst: &mut [u8], dy0: usize, src: &[u8], c: &RotCtx) {
+    for (r, row) in dst.chunks_mut(c.nstride).enumerate() {
+        let ry = (dy0 + r) as f32 + 0.5 - c.dcy;
+        for dx in 0..c.nw as usize {
+            // 目标像素中心 → 相对新中心 → 反向旋转 → 源图坐标（像素中心）。
+            let rx = dx as f32 + 0.5 - c.dcx;
+            let sx = c.cos * rx + c.sin * ry + c.scx - 0.5;
+            let sy = -c.sin * rx + c.cos * ry + c.scy - 0.5;
+            let fx = sx.floor();
+            let fy = sy.floor();
+            let x0 = fx as i32;
+            let y0 = fy as i32;
+            let tx = sx - fx;
+            let ty = sy - fy;
+            let pixel = if x0 >= 0 && y0 >= 0 && x0 + 1 < c.iw && y0 + 1 < c.ih {
+                let i00 = y0 as usize * c.stride + x0 as usize * 4;
+                let (w00, w10) = ((1.0 - tx) * (1.0 - ty), tx * (1.0 - ty));
+                let (w01, w11) = ((1.0 - tx) * ty, tx * ty);
+                let a00 = src[i00 + 3] as f32 * w00;
+                let a10 = src[i00 + 7] as f32 * w10;
+                let a01 = src[i00 + c.stride + 3] as f32 * w01;
+                let a11 = src[i00 + c.stride + 7] as f32 * w11;
+                blend4(src, i00, c.stride, (a00, a10, a01, a11))
+            } else {
+                edge_pixel(src, c, x0, y0, tx, ty)
+            };
+            row[dx * 4..dx * 4 + 4].copy_from_slice(&pixel);
+        }
+    }
+}
+
+/// 贴边的像素：四个 tap 逐个判越界（数量少，慢一点无所谓）。
+fn edge_pixel(src: &[u8], c: &RotCtx, x0: i32, y0: i32, tx: f32, ty: f32) -> [u8; 4] {
+    let mut acc = [0f32; 3];
+    let mut a_sum = 0f32;
+    for &(ox, oy, wt) in &[
+        (0, 0, (1.0 - tx) * (1.0 - ty)),
+        (1, 0, tx * (1.0 - ty)),
+        (0, 1, (1.0 - tx) * ty),
+        (1, 1, tx * ty),
+    ] {
+        if wt <= 0.0 {
+            continue;
+        }
+        let (x, y) = (x0 + ox, y0 + oy);
+        if x < 0 || y < 0 || x >= c.iw || y >= c.ih {
+            continue;
+        }
+        let i = y as usize * c.stride + x as usize * 4;
+        let a = src[i + 3] as f32 * wt;
+        if a <= 0.0 {
+            continue;
+        }
+        acc[0] += src[i] as f32 * a;
+        acc[1] += src[i + 1] as f32 * a;
+        acc[2] += src[i + 2] as f32 * a;
+        a_sum += a;
+    }
+    normalize(acc, a_sum)
+}
+
+/// 四个 tap 都在图内时的快路径（调用方已保证不越界）。
+#[inline]
+fn blend4(src: &[u8], i00: usize, stride: usize, a: (f32, f32, f32, f32)) -> [u8; 4] {
+    let (a00, a10, a01, a11) = a;
+    let offs = [i00, i00 + 4, i00 + stride, i00 + stride + 4];
+    let ws = [a00, a10, a01, a11];
+    let mut acc = [0f32; 3];
+    for n in 0..4 {
+        let wt = ws[n];
+        if wt <= 0.0 {
+            continue;
+        }
+        let i = offs[n];
+        acc[0] += src[i] as f32 * wt;
+        acc[1] += src[i + 1] as f32 * wt;
+        acc[2] += src[i + 2] as f32 * wt;
+    }
+    normalize(acc, a00 + a10 + a01 + a11)
+}
+
+/// 把加权和还原成 straight-alpha 的像素。
+#[inline]
+fn normalize(acc: [f32; 3], a_sum: f32) -> [u8; 4] {
+    if a_sum <= 0.00255 {
+        return [0, 0, 0, 0];
+    }
+    let inv = 1.0 / a_sum;
+    [
+        (acc[0] * inv).round().clamp(0.0, 255.0) as u8,
+        (acc[1] * inv).round().clamp(0.0, 255.0) as u8,
+        (acc[2] * inv).round().clamp(0.0, 255.0) as u8,
+        a_sum.round().clamp(0.0, 255.0) as u8,
+    ]
 }

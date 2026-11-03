@@ -205,6 +205,10 @@ pub struct PreviewComposer {
     /// opposite edge must show the mirrored stretch, and the cache key is
     /// only (w, h) — flipping the flags has to invalidate it.
     live_flip: (bool, bool),
+    /// 旋转手势里「缩到预览尺寸的那张快照」。整层缩放一次就要十几毫秒，
+    /// 而拖动时快照和预览尺寸都不变，所以按 (会话号, w, h) 缓存，每帧只
+    /// 剩下旋转本身。
+    rotate_small: Option<(u64, u32, u32, Arc<RgbaImage>)>,
 }
 
 /// In-flight layer-resize gesture state for
@@ -227,6 +231,7 @@ impl PreviewComposer {
             layers: Vec::new(),
             live: None,
             live_flip: (false, false),
+            rotate_small: None,
         }
     }
 
@@ -542,6 +547,84 @@ impl PreviewComposer {
                 _ => (*src).clone(),
             };
             Self::blend_layer(&mut out, target, &stretched, ox, oy, drag_opacity);
+        }
+        Self::draw_marks(doc, &mut out, sx, sy);
+        out
+    }
+
+    /// 拖动旋转时的实时合成（文档完全不动，和 `live_scale` 一个套路）。
+    ///
+    /// 顺序是「先把图层缩到预览尺寸，再在小图上转」：单帧代价只跟预览像素
+    /// 数有关，原图多大都一样。反过来（先转整层再缩放）在 2200×1500 的图上
+    /// 每帧要 40ms 以上 —— 那正是旋转手柄一顿一顿的原因。
+    pub fn composite_live_rotate_adjusted(
+        &mut self,
+        doc: &Document,
+        target: Size,
+        layer_index: usize,
+        snapshot: &RgbaImage,
+        offset: (i32, i32),
+        degrees: f32,
+        expand: bool,
+        token: u64,
+        adjust: Option<(AdjustTarget, Adjust)>,
+    ) -> RgbaImage {
+        let Some((sx, sy)) = self.prepare(doc, target) else {
+            return RgbaImage::new(target.width.max(1), target.height.max(1));
+        };
+        let drag_opacity = doc
+            .layers
+            .get(layer_index)
+            .map(|l| if l.visible { l.opacity } else { 0.0 })
+            .unwrap_or(0.0);
+        let mut out = self.base_buffer(doc, target, sx, sy);
+        if let Some((AdjustTarget::Base, params)) = adjust {
+            params.apply_in_place(&mut out);
+        }
+        for (li, layer) in doc.layers.iter().enumerate() {
+            if !layer.visible || layer.opacity <= 0.0 || li == layer_index {
+                continue;
+            }
+            let src = self.scaled_layer(li, &layer.image, sx, sy);
+            let ox = (layer.offset.0 as f64 * sx).round() as i32;
+            let oy = (layer.offset.1 as f64 * sy).round() as i32;
+            match adjust {
+                Some((AdjustTarget::Layer(index), params)) if index == li => {
+                    let mut adjusted = (*src).clone();
+                    params.apply_in_place(&mut adjusted);
+                    Self::blend_layer(&mut out, target, &adjusted, ox, oy, layer.opacity);
+                }
+                _ => Self::blend_layer(&mut out, target, &src, ox, oy, layer.opacity),
+            }
+        }
+        if drag_opacity > 0.0 {
+            // 预览尺度下的图层尺寸：Triangle 是「每个输出像素读 2×2」，代价
+            // 随输出走，不会因为原图巨大而爆炸。
+            let pw = ((snapshot.width() as f64 * sx).round() as u32).max(1);
+            let ph = ((snapshot.height() as f64 * sy).round() as u32).max(1);
+            // 缩放结果按 (会话号, w, h) 缓存：拖动时这三个值都不变，每帧省掉
+            // 一次整层降采样（debug 下这是最大的一笔开销）。
+            let hit = self
+                .rotate_small
+                .as_ref()
+                .is_some_and(|(t, w, h, _)| *t == token && *w == pw && *h == ph);
+            if !hit {
+                let small = image::imageops::resize(snapshot, pw, ph, FilterType::Triangle);
+                self.rotate_small = Some((token, pw, ph, Arc::new(small)));
+            }
+            let small = &self.rotate_small.as_ref().expect("just filled").3;
+            let (rotated, delta) = editcore::rotate_image(small, degrees, expand);
+            let ox = (offset.0 as f64 * sx).round() as i32 + delta.0;
+            let oy = (offset.1 as f64 * sy).round() as i32 + delta.1;
+            let src = match adjust {
+                Some((AdjustTarget::Layer(index), params)) if index == layer_index => {
+                    let mut adjusted = rotated;
+                    params.apply_in_place(&mut adjusted);
+                    adjusted
+                }
+                _ => rotated,
+            };
+            Self::blend_layer(&mut out, target, &src, ox, oy, drag_opacity);
         }
         Self::draw_marks(doc, &mut out, sx, sy);
         out

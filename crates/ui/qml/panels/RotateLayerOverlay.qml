@@ -24,7 +24,9 @@ Item {
         targetIndex = index
         angle = 0
         expand = true
-        bridge.rotate_layer_begin(index)
+        // keep_session = false：对话框是从「图层当前的样子」出发的一次性
+        // 操作，0 度永远等于现状（不会因为之前用手柄转过而跳回去）。
+        bridge.rotate_layer_begin(index, false)
         visible = true
         previewTimer.restart()
     }
@@ -32,7 +34,7 @@ Item {
     function close(apply) {
         previewTimer.stop()
         if (targetIndex >= 0 && bridge.rotate_layer_state().length > 0)
-            bridge.rotate_layer_finish(apply)
+            bridge.rotate_layer_finish(apply, angle, expand)
         targetIndex = -1
         visible = false
     }

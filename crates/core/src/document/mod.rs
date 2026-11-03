@@ -463,6 +463,12 @@ impl Document {
         !self.history.undo.is_empty()
     }
 
+    /// 已提交历史的条数。旋转会话用它判断「图层在这之后有没有被别的操作
+    /// 改过」—— 改过就不能再拿会话开头那份原图继续转，否则会吃掉别人的修改。
+    pub fn history_len(&self) -> usize {
+        self.history.undo.len()
+    }
+
     pub fn can_redo(&self) -> bool {
         !self.history.redo.is_empty()
     }

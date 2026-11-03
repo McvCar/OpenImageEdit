@@ -71,6 +71,16 @@ pub(in crate::bridge) struct Session {
     pub(in crate::bridge) heal_source: Option<(f32, f32)>,
     /// 图层旋转的进行中手势（手柄拖动 / 角度对话框预览共用）。
     pub(in crate::bridge) rotate_live: Option<RotateLive>,
+    /// 旋转拖动期间的实时预览状态：文档不动，合成时按预览尺寸临时转。
+    pub(in crate::bridge) live_rotate: Option<LiveRotate>,
+    /// 连续旋转会话的原图锚点（见 `RotateOrigin`）。
+    pub(in crate::bridge) rotate_origin: Option<RotateOrigin>,
+    /// 拖动中的实时预览上限（长边像素）。旋转这类「每帧都要重算整层」的
+    /// 手势用它把合成/编码/写盘都压到小图上；松手立刻恢复原分辨率。
+    /// None = 不限（普通渲染）。
+    pub(in crate::bridge) live_cap: Option<u32>,
+    /// 旋转会话自增号（见 `LiveRotate::token`）。
+    pub(in crate::bridge) rotate_token: u64,
 }
 
 impl Session {
@@ -163,10 +173,47 @@ pub(in crate::bridge) struct PatchLive {
 /// 图层旋转的进行中手势。每次预览都从 `before` 重算，松手才写历史。
 pub(in crate::bridge) struct RotateLive {
     pub(in crate::bridge) index: usize,
-    pub(in crate::bridge) before: Layer,
-    pub(in crate::bridge) current: Layer,
+    /// 本次会话的起点位图。跨多次拖拽时会话会复用「未被重采样过的原图」，
+    /// 所以这里不一定是图层当前的样子。
+    pub(in crate::bridge) before: std::rc::Rc<Layer>,
+    /// 会话编号（见 `LiveRotate::token`）。
+    pub(in crate::bridge) token: u64,
+    /// 本次**拖拽**开始时图层的样子（取消时还原到它，而不是还原到 `before`）。
+    pub(in crate::bridge) start: std::rc::Rc<Layer>,
+    /// 会话开始前已经转过的角度（`before` 就是那个状态）。
+    pub(in crate::bridge) base_degrees: f32,
+    /// 最后一次 update 传进来的增量角（`rotate_layer_state` 报告用）。
+    pub(in crate::bridge) last_delta: f32,
+    pub(in crate::bridge) expand: bool,
+    /// 是否允许把原图留给下一次拖拽复用（画布手柄 = true，角度对话框 =
+    /// false：对话框每次都是一个独立的一次性操作）。
+    pub(in crate::bridge) keep: bool,
+}
+
+/// 旋转拖动期间喂给合成器的临时状态（文档像素不动，松手才落地）。
+pub(in crate::bridge) struct LiveRotate {
+    pub(in crate::bridge) index: usize,
+    pub(in crate::bridge) snapshot: std::rc::Rc<Layer>,
     pub(in crate::bridge) degrees: f32,
     pub(in crate::bridge) expand: bool,
+    /// 会话编号：合成器用它判定「缩到预览尺寸的那张快照」还能不能复用。
+    /// 必须每次 begin 换一个新值，否则下一次拖拽会拿上一次的旧快照出图。
+    pub(in crate::bridge) token: u64,
+}
+
+/// 连续旋转会话的「锚」：原图 + 已累计角度 + 提交当时的历史条数。
+///
+/// 手柄拖完一次就会提交一条 `RotateLayer`，图层里的像素已经被重采样过一
+/// 遍；如果下一次拖拽还从这份像素出发，来回拖几下画面就糊了。所以提交时
+/// 顺手把「没被插值过的原图」留下来，下一次 begin 直接拿它出发（角度累加），
+/// 一次会话来多少次单次拖拽都只插值一次。
+pub(in crate::bridge) struct RotateOrigin {
+    pub(in crate::bridge) index: usize,
+    /// `Rc` 是为了每次起手都不必再复制一份十几 MB 的位图。
+    pub(in crate::bridge) layer: std::rc::Rc<Layer>,
+    pub(in crate::bridge) degrees: f32,
+    /// 提交后文档的历史条数：对不上说明图层被别的操作改过，锚点作废。
+    pub(in crate::bridge) history_len: usize,
 }
 
 pub(in crate::bridge) struct Rendered {
@@ -208,6 +255,9 @@ pub(in crate::bridge) enum Refresh {
         adjust_target_name: String,
         adjust_values: String,
         adjust_histogram: String,
+        /// 这一帧是「拖动中的降质实时预览」（见 `live_cap`）：状态栏不该
+        /// 因此报「预览降质」。
+        live: bool,
     },
     Err(String),
 }
@@ -261,6 +311,10 @@ impl Session {
                 patch_region: None,
                 heal_source: None,
                 rotate_live: None,
+                live_rotate: None,
+                rotate_origin: None,
+                live_cap: None,
+                rotate_token: 0,
             },
             ms,
         )
@@ -311,13 +365,21 @@ impl Session {
         let canvas = self.doc.canvas;
         let display = display_size(canvas, self.zoom, dpr);
         let target = preview_target(display, canvas, dpr);
+        // 拖动中的实时预览可以先用小图顶上：QML 会把它拉到 display 尺寸，
+        // 松手那一帧再按原分辨率重画。合成/编码/写盘的开销都随像素数线性
+        // 下降，这是让旋转跟手最划算的一刀。
+        let target = match self.live_cap {
+            Some(cap) => capped(target, cap),
+            None => target,
+        };
         if target.pixels() == 0 {
             return Err("empty canvas".into());
         }
         self.last_display = display;
         let special = self.adjust.is_some()
             || self.preview_hidden_mark >= 0
-            || self.live_scale.is_some();
+            || self.live_scale.is_some()
+            || self.live_rotate.is_some();
         if zoom_only && !special {
             let reusable = self.last_render.as_ref().is_some_and(|c| {
                 !c.special && size_close(c.target, target) && c.epoch == self.doc.edit_epoch
@@ -419,6 +481,21 @@ impl Session {
         target: Size,
         adjust: Option<(AdjustTarget, Adjust)>,
     ) -> RgbaImage {
+        // 手势优先级：缩放拖动 > 旋转拖动 > 普通合成。两者都不会改文档
+        // 像素，松手才落地（所以拖动期间撤销栈、缓存 epoch 都不动）。
+        if let Some(lr) = self.live_rotate.as_ref() {
+            return self.composer.composite_live_rotate_adjusted(
+                &self.doc,
+                target,
+                lr.index,
+                &lr.snapshot.image,
+                lr.snapshot.offset,
+                lr.degrees,
+                lr.expand,
+                lr.token,
+                adjust,
+            );
+        }
         match self.live_scale.as_ref() {
             Some(ls) => self.composer.composite_live_scale_adjusted(
                 &self.doc,
@@ -639,6 +716,7 @@ impl Session {
                         &adjust.map(|state| state.params).unwrap_or_default(),
                     ),
                     adjust_histogram: rendered.histogram.unwrap_or_default(),
+                    live: self.live_cap.is_some(),
                 }
             }
             Err(err) => Refresh::Err(err),

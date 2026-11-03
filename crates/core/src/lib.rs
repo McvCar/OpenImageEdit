@@ -1542,3 +1542,4 @@ mod paint_tests {
         assert_eq!(doc.base.get_pixel(0, 0).0, [10, 10, 10, 255]);
     }
 }
+

@@ -1088,14 +1088,20 @@ function snapDisplay(v) {
 // overrides every MouseArea's cursorShape, so this is the single
 // authoritative cursor decision.
 // ---- 画布光标种类 ---------------------------------------------------
-// Qt 内置的 CursorShape 里没有 +/−/剪刀，QML 也构造不了自定义光标，所以
-// 这三种由 Rust 侧的 Win32 光标接管（见 bridge/ops/cursor.rs）。这里只负责
+// Qt 内置的 CursorShape 里没有 +/−/剪刀/旋转，QML 也构造不了自定义光标，所以
+// 这几种由 Rust 侧的 Win32 光标接管（见 bridge/ops/cursor.rs）。这里只负责
 // 算出"此刻该用哪种"，0 = 交回 Qt 自己的光标。
 //   1 = 加选(+)  按住 Shift
 //   2 = 减选(−)  按住 Alt
 //   3 = 剪刀     按住 Ctrl（按下即准备把选区内容剪走）
-property int cursorKind: 0
+//   4 = 旋转     悬停在图层旋转手柄上
+property int cursorKindBase: 0
+// 手柄悬停时强行接管：别的逻辑（画布 hover）也会改 cursorKindBase，直接拼
+// 一个派生值最稳，不会互相覆盖。
+readonly property int cursorKind: root.rotateKnobHover ? 4 : root.cursorKindBase
 onCursorKindChanged: bridge.cursor_set_kind(cursorKind)
+// 旋转手柄悬停中（SelectionViz 里的小圆点写这个）。
+property bool rotateKnobHover: false
 
 // 只在「有选区 + 鼠标在选区内」时才换光标：选区外按修饰键仍然是画新选区的
 // 十字，换光标反而误导（PS 也是进到选区里才变）。
@@ -1119,7 +1125,7 @@ function updateCursorKind(x, y) {
                 kind = 2      // Alt
         }
     }
-    root.cursorKind = kind
+    root.cursorKindBase = kind
 }
 
 function canvasCursor(x, y) {
@@ -1733,20 +1739,36 @@ function openRotateLayer(index) {
 }
 
 // ---- 画布上的旋转手柄 ------------------------------------------------
-// 拖动期间每 60ms 才重算一次整层重采样；松手时补最后一帧再提交。
+// 手感：按下即出第一帧，之后按 ~30fps 节流重采样（Rust 侧多线程算一层大约
+// 4-16ms），松手把最终角度交给 finish 提交。
 function startLayerRotate() {
     if (bridge.selected_layer < 0)
         return
     root.rotating = true
     root.rotateAnglePreview = 0
-    bridge.rotate_layer_begin(bridge.selected_layer)
+    // keep_session = true：连续拖手柄时沿用上次留下的原图，避免一遍遍
+    // 重新插值（否则越拖越糊）。
+    bridge.rotate_layer_begin(bridge.selected_layer, true)
+}
+
+function applyRotateFrame() {
+    if (root.rotating)
+        bridge.rotate_layer_update(root.rotateAnglePreview, true)
 }
 
 function previewLayerRotate(deg) {
     if (!root.rotating)
         return
     root.rotateAnglePreview = deg
-    rotateThrottle.restart()
+    // ★ 这里是「节流 + 首帧立即出」：
+    //   - 不能每次事件都 restart()，那是防抖 —— 拖的时候定时器一直被推迟，
+    //     一帧都不出，松手才跳一下，就是之前那种"卡住"的手感；
+    //   - 也不能每个事件都同步重采样，鼠标事件比帧率密得多，白算。
+    //   所以：没在跑就先立刻算一帧（跟手），再让定时器接管后续帧。
+    if (!rotateThrottle.running) {
+        applyRotateFrame()
+        rotateThrottle.start()
+    }
 }
 
 function finishLayerRotate(apply) {
@@ -1754,23 +1776,15 @@ function finishLayerRotate(apply) {
     if (!root.rotating)
         return
     root.rotating = false
-    if (apply) {
-        // 松手时可能还有一帧没算：补上，否则最后几个像素的拖动会被丢掉。
-        bridge.rotate_layer_update(root.rotateAnglePreview, true)
-        bridge.rotate_layer_finish(true)
-    } else {
-        bridge.rotate_layer_finish(false)
-    }
+    // 松手时可能还有一帧没算：把最终角度交给 finish，由它决定复用还是重算。
+    bridge.rotate_layer_finish(apply, root.rotateAnglePreview, true)
 }
 
 Timer {
     id: rotateThrottle
-    interval: 60
-    repeat: false
-    onTriggered: {
-        if (root.rotating)
-            bridge.rotate_layer_update(root.rotateAnglePreview, true)
-    }
+    interval: 33
+    repeat: true
+    onTriggered: root.applyRotateFrame()
 }
 
 function nudgeLayer(dx, dy) {
@@ -2651,6 +2665,39 @@ Timer {
         if (Qt.application.arguments.indexOf("--rotate-dialog") !== -1
                 && bridge.selected_layer >= 0)
             root.openRotateLayer(bridge.selected_layer)
+        const b = root.selLayerBox
+        bridge.mark("rotbox:" + (b ? (Math.round(b.x) + "," + Math.round(b.y) + ","
+                                      + Math.round(b.w) + "," + Math.round(b.h)) : "null")
+                    + " scale=" + root.toDispScale().toFixed(4)
+                    + " previewW=" + Math.round(view.previewImage.width)
+                    + " canvas=" + bridge.image_width + "x" + bridge.image_height
+                    + " scaleW=" + Math.round(root.scaleW) + "," + Math.round(root.scaleH)
+                    + " rotating=" + root.rotating)
+    }
+}
+
+// Probe: --probe-rotate-bench 连着跑 N 帧「整层重采样 + 预览刷新」，量每次
+// 耗时（手柄拖动的跟手程度直接由它决定），跑完自己退出。
+Timer {
+    id: rotateBenchTimer
+    interval: 900
+    onTriggered: {
+        if (bridge.selected_layer < 0 && bridge.layer_count > 0)
+            bridge.select_layer(0)
+        if (bridge.selected_layer < 0) {
+            bridge.mark("rotate-bench:no-layer")
+            Qt.quit()
+            return
+        }
+        const n = 20
+        bridge.rotate_layer_begin(bridge.selected_layer, true)
+        const t0 = Date.now()
+        for (let i = 1; i <= n; ++i)
+            bridge.rotate_layer_update(i * 1.5, true)
+        const t1 = Date.now()
+        bridge.rotate_layer_finish(false, 0, true)
+        bridge.mark("rotate-bench:" + ((t1 - t0) / n).toFixed(1) + "ms/frame")
+        Qt.quit()
     }
 }
 
@@ -2696,6 +2743,8 @@ Component.onCompleted: {
             paintProbeTimer.start();
         if (root.probeRotate)
             rotateProbeTimer.start();
+        if (Qt.application.arguments.indexOf("--probe-rotate-bench") !== -1)
+            rotateBenchTimer.start();
         if (Qt.application.arguments.indexOf("--probe-adjustdrag") !== -1)
             adjustDragProbeTimer.start();
         if (root.probeRuler)

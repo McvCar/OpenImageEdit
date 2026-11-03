@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 impl qobject::Bridge {
-    /// 0 = 交回 Qt（跟随 cursorShape），1 = 加选(+)，2 = 减选(−)，3 = 剪刀。
-    /// QML 侧的 `cursorKind` 绑定变化时调用；重复值会被忽略。
+    /// 0 = 交回 Qt（跟随 cursorShape），1 = 加选(+)，2 = 减选(−)，3 = 剪刀，
+    /// 4 = 图层旋转。QML 侧的 `cursorKind` 绑定变化时调用；重复值会被忽略。
     pub fn cursor_set_kind(self: Pin<&mut Self>, kind: i32) {
         set_kind(kind);
     }
@@ -45,13 +45,13 @@ static KIND: AtomicI32 = AtomicI32::new(0);
 static PREV_CURSOR: Mutex<isize> = Mutex::new(0);
 
 /// 已创建的光标句柄（下标 = 种类）。
-static CURSORS: OnceLock<[isize; 4]> = OnceLock::new();
+static CURSORS: OnceLock<[isize; 5]> = OnceLock::new();
 
 /// 已子类化的窗口：(hwnd, 原 WndProc)。
 static HOOKED: Mutex<Vec<(isize, isize)>> = Mutex::new(Vec::new());
 
 fn set_kind(kind: i32) {
-    let kind = kind.clamp(0, 3);
+    let kind = kind.clamp(0, 4);
     let prev = KIND.swap(kind, Ordering::Relaxed);
     if prev == kind {
         return;
@@ -191,10 +191,10 @@ const CURSOR_SIZE: usize = 32;
 #[cfg(windows)]
 type Pixels = [[f32; 4]; CURSOR_SIZE * CURSOR_SIZE];
 
-/// 三枚光标 + 一个空位（下标 0 不用）。建不出来就退化成「不接管」。
+/// 四枚光标 + 一个空位（下标 0 不用）。建不出来就退化成「不接管」。
 #[cfg(windows)]
-fn build_cursors() -> [isize; 4] {
-    let mut out = [0isize; 4];
+fn build_cursors() -> [isize; 5] {
+    let mut out = [0isize; 5];
     let mut buf: Pixels = [[0.0; 4]; CURSOR_SIZE * CURSOR_SIZE];
     // 加选：十字 + 右下角 "+"
     paint_crosshair(&mut buf);
@@ -209,6 +209,10 @@ fn build_cursors() -> [isize; 4] {
     reset(&mut buf);
     paint_scissors(&mut buf);
     out[3] = unsafe { create_cursor(&buf, 16, 16) }.unwrap_or(0);
+    // 旋转：绕圈的箭头，热点在圆心
+    reset(&mut buf);
+    paint_rotate(&mut buf);
+    out[4] = unsafe { create_cursor(&buf, 16, 16) }.unwrap_or(0);
     out
 }
 
@@ -339,6 +343,36 @@ fn paint_scissors(buf: &mut Pixels) {
     // 刀轴
     stroke_ring(buf, 17.5, 16.5, 0.5, 1.4, HALO);
     stroke_ring(buf, 16.5, 15.5, 0.5, 1.4, INK);
+}
+
+/// 旋转：一个留缺口的圆弧 + 缺口端的两根箭头，读起来就是「转一圈」。
+#[cfg(windows)]
+fn paint_rotate(buf: &mut Pixels) {
+    use std::f32::consts::PI;
+    let (cx, cy, r) = (16.0f32, 16.5f32, 8.5f32);
+    // 从 -140° 顺时针扫到 +125°，缺口留在左侧，箭头挂在弧的末端。
+    let (a0, a1) = (-2.44f32, 2.18f32);
+    let steps = 30;
+    let mut prev = (cx + r * a0.cos(), cy + r * a0.sin());
+    for i in 1..=steps {
+        let t = a0 + (a1 - a0) * (i as f32) / (steps as f32);
+        let p = (cx + r * t.cos(), cy + r * t.sin());
+        shadowed_line(buf, prev.0, prev.1, p.0, p.1, 0.8);
+        prev = p;
+    }
+    // 箭头：从弧末端沿着切线**向后**张开两根倒刺，指向前进方向。
+    let (ex, ey) = (cx + r * a1.cos(), cy + r * a1.sin());
+    for spread in [-0.62f32, 0.62] {
+        let back = a1 + PI + spread;
+        shadowed_line(
+            buf,
+            ex,
+            ey,
+            ex + 5.0 * back.cos(),
+            ey + 5.0 * back.sin(),
+            0.8,
+        );
+    }
 }
 
 /// 把 RGBA 缓冲做成一枚 Win32 光标（32bpp 颜色 + 1bpp 透明掩码）。
@@ -544,3 +578,4 @@ mod win {
         pub fn DeleteObject(obj: Handle) -> i32;
     }
 }
+

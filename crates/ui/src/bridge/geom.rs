@@ -82,6 +82,19 @@ pub(in crate::bridge) fn preview_target(display: Size, canvas: Size, dpr: f64) -
     Size::new(w, h)
 }
 
+/// 把预览目标按长边钳到一个上限（拖动中的实时预览用），保持宽高比。
+pub(in crate::bridge) fn capped(target: Size, cap: u32) -> Size {
+    let longest = target.width.max(target.height);
+    if cap == 0 || longest <= cap {
+        return target;
+    }
+    let scale = cap as f64 / longest as f64;
+    Size::new(
+        ((target.width as f64 * scale).round() as u32).max(1),
+        ((target.height as f64 * scale).round() as u32).max(1),
+    )
+}
+
 /// Selection that replaces a just-deleted layer: prefer the neighbour above
 /// (`ix-1`), clamped to the remaining list. Deleting layer 0 selects the new
 /// layer 0 (usize underflow guard — this crashed debug builds via the cxx FFI
