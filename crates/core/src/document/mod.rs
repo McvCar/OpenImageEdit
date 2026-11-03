@@ -129,6 +129,25 @@ impl Document {
         self.execute_selection(EditOp::SetSelection { from, to: next })
     }
 
+    /// 拖动类工具（快速选择 / 笔刷选区）的临时选区：只改状态，**不进
+    /// 历史、不 bump epoch**。
+    ///
+    /// 这类工具拖动期间每帧都要重算一次选区，若每帧都走 `set_selection`，
+    /// 一次涂抹就会塞进几十条撤销记录（Ctrl+Z 要按到手酸）。松开时用
+    /// [`Document::commit_selection_change`] 把整段操作补成一条。
+    pub fn preview_selection(&mut self, next: Option<SelectionState>) {
+        self.selection = next;
+    }
+
+    /// 把一次已经生效的选区变更记进历史，与 `preview_selection` 配对。
+    pub fn commit_selection_change(&mut self, from: Option<SelectionState>) {
+        let to = self.selection.clone();
+        if from == to {
+            return;
+        }
+        self.history.push(EditOp::SetSelection { from, to });
+    }
+
     /// 改边界 / 平滑 / 羽化参数（从 base 重算，不叠加）。
     pub fn set_selection_ops(&mut self, ops: SelOps) -> Result<(), EditError> {
         let Some(state) = self.selection.as_ref() else {
@@ -619,6 +638,32 @@ impl Document {
             }
             Some(AdjustTarget::Layer(index)) => {
                 SelectionMask::magic_wand(self.canvas, (x, y), opts, |px, py| {
+                    self.layer_pixel(index, px, py)
+                })
+            }
+        }
+    }
+
+    /// 快速选择的取样源，规则与 `magic_wand_selection` 相同：
+    /// `None` = 可见合成（取样全部图层），`Some(..)` = 只取该层。
+    pub fn quick_select_selection(
+        &self,
+        pen: &[(f32, f32)],
+        radius: u32,
+        opts: QuickSelectOptions,
+        target: Option<AdjustTarget>,
+    ) -> SelectionMask {
+        match target {
+            None => SelectionMask::quick_select(self.canvas, pen, radius, opts, |px, py| {
+                self.composite_pixel(px, py).0
+            }),
+            Some(AdjustTarget::Base) => {
+                SelectionMask::quick_select(self.canvas, pen, radius, opts, |px, py| {
+                    self.base_pixel_at(px, py)
+                })
+            }
+            Some(AdjustTarget::Layer(index)) => {
+                SelectionMask::quick_select(self.canvas, pen, radius, opts, |px, py| {
                     self.layer_pixel(index, px, py)
                 })
             }

@@ -9,8 +9,8 @@ use std::time::Instant;
 use cxx_qt_lib::{QString, QUrl};
 use decode::{decode_path, encode, format_from_path, DecodeOptions, Decoded, Format};
 use editcore::{
-    adjust_json, Adjust, AdjustTarget, Document, Histogram, Layer, Mark, MarkKind, PickedColor, Rect,
-    SelOps, SelectionMask, SelectionState, Size, Transform, WandOptions,
+    adjust_json, Adjust, AdjustTarget, Document, Histogram, Layer, Mark, MarkKind, PickedColor,
+    QuickSelectOptions, Rect, SelOps, SelectionMask, SelectionState, Size, Transform, WandOptions,
 };
 use image::RgbaImage;
 
@@ -410,6 +410,30 @@ pub mod qobject {
         #[qinvokable]
         fn save_sel_tool(self: Pin<&mut Self>, tool: &QString);
 
+        /// 快速选择：把「上一个笔迹点 → (x, y)」这一段当成一粒种子，按颜色
+        /// 相近 + 边缘保护向外扩散，再并进本次拖动的累积选区。
+        /// 拖动期间**不进历史**（每帧一条会把撤销栈撑爆），松开时由
+        /// `quick_select_commit` 补成一条。
+        /// `mode`：0 替换 / 1 加选 / 2 减选。
+        #[qinvokable]
+        fn quick_select_brush(
+            self: Pin<&mut Self>,
+            x: f64,
+            y: f64,
+            radius: f64,
+            tolerance: i32,
+            grow: i32,
+            mode: i32,
+        );
+
+        /// 松开鼠标：把整段涂抹提交为一次撤销记录。
+        #[qinvokable]
+        fn quick_select_commit(self: Pin<&mut Self>);
+
+        /// 放弃本次涂抹（Esc），恢复按下前的选区。
+        #[qinvokable]
+        fn quick_select_cancel(self: Pin<&mut Self>);
+
         /// Crop to the selection's bounding box, then drop the selection
         /// (the canvas coordinate frame changed).
         #[qinvokable]
@@ -768,6 +792,24 @@ impl Default for AppConfig {
     }
 }
 
+/// 快速选择一次涂抹的临时状态。
+///
+/// 拖动期间每一帧都会重算选区，但**只有松手时**才写一条历史（见
+/// `Document::preview_selection`）。`from` 既是撤销目标，也是加选/减选的
+/// 基准；`base` 是那个基准的硬轮廓（`mask()`，不含羽化）。
+pub(in crate::bridge) struct QuickDrag {
+    /// 按下鼠标前的选区。
+    pub from: Option<SelectionState>,
+    /// 按下鼠标前选区的硬轮廓（加/减的基准）。
+    pub base: Option<SelectionMask>,
+    /// 本次涂抹已累积的扩散结果。
+    pub accum: Option<SelectionMask>,
+    /// 上一个笔迹点：下一段从它连到新位置。
+    pub last: (f32, f32),
+    /// 0 替换 / 1 加选 / 2 减选。
+    pub mode: i32,
+}
+
 pub struct BridgeRust {
     status: QString,
     preview_url: QString,
@@ -856,6 +898,8 @@ pub struct BridgeRust {
     sel_tool_saved: QString,
     /// 魔术棒参数 `tol,contiguous,sample_all`（settings.ini 里的原样字符串）。
     sel_wand_saved: QString,
+    /// 快速选择涂抹中的临时状态；`None` = 当前没在涂。
+    quick_drag: RefCell<Option<QuickDrag>>,
     /// 边界 / 平滑 / 羽化 that a NEWLY drawn selection starts with. Kept on
     /// the bridge (not on the document) so it survives opening another file
     /// and is written to settings.ini on every change. `Cell` because
@@ -949,6 +993,7 @@ impl Default for BridgeRust {
             quick_mask: false,
             sel_tool_saved: QString::from(cfg.sel_tool.as_str()),
             sel_wand_saved: QString::from(cfg.sel_wand.as_str()),
+            quick_drag: RefCell::new(None),
             sel_ops_default: std::cell::Cell::new(SelOps {
                 border: cfg.sel_border,
                 smooth: cfg.sel_smooth,

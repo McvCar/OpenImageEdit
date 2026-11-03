@@ -162,6 +162,60 @@ impl qobject::Bridge {
                         name
                     );
                 }
+                // `qsel:x1,y1 x2,y2 ...|radius,tol,grow@mode`
+                // 快速选择：一条笔迹（空格分隔的坐标点），`|` 后面是参数，
+                // 省略则用 24,40,160。整条涂抹按一次撤销提交。
+                other if other.starts_with("qsel:") => {
+                    let (body, mode) = split_mode(other);
+                    let rest = body.trim_start_matches("qsel:");
+                    let (pts_part, args_part) = match rest.split_once('|') {
+                        Some((a, b)) => (a, Some(b)),
+                        None => (rest, None),
+                    };
+                    // 注意：不能用 parse_nums —— 它只解析第一个冒号后面的内容，
+                    // 而这里的参数块（"24,40,160"）没有冒号。
+                    let args: Vec<f64> = args_part
+                        .map(|s| {
+                            s.split(',')
+                                .filter_map(|t| t.trim().parse::<f64>().ok())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let radius = args.first().copied().unwrap_or(24.0);
+                    let tol = args.get(1).copied().unwrap_or(40.0) as i32;
+                    let grow = args.get(2).copied().unwrap_or(160.0) as i32;
+                    let pts: Vec<(f64, f64)> = pts_part
+                        .split_whitespace()
+                        .filter_map(|p| {
+                            let (x, y) = p.split_once(',')?;
+                            Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+                        })
+                        .collect();
+                    if pts.is_empty() {
+                        println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}");
+                    } else {
+                        for (px, py) in &pts {
+                            self.as_mut()
+                                .quick_select_brush(*px, *py, radius, tol, grow, mode);
+                        }
+                        self.as_mut().quick_select_commit();
+                        let area = self
+                            .session
+                            .borrow()
+                            .as_ref()
+                            .and_then(|s| s.doc.selection.as_ref().map(|st| st.mask().area()))
+                            .unwrap_or(0);
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"quick-select\",\"points\":{},\"radius\":{},\"tolerance\":{},\"grow\":{},\"mode\":{},\"area\":{}}}",
+                            pts.len(),
+                            radius,
+                            tol,
+                            grow,
+                            mode,
+                            area
+                        );
+                    }
+                }
                 other if other.starts_with("sel-resize:") => {
                     let nums = parse_nums(other);
                     if nums.len() == 4 {

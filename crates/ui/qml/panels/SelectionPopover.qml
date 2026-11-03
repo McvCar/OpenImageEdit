@@ -79,9 +79,15 @@ Rectangle {
             }
             IconButton {
                 glyph: "✦"
-                tip: "魔术棒 (W)：按颜色自动选取相连（或全图同色）区域"
+                tip: "魔术棒 (Shift+W)：按颜色自动选取相连（或全图同色）区域"
                 selected: host.selTool === "wand"
                 onClicked: host.pickSelTool("wand")
+            }
+            IconButton {
+                glyph: "◔"
+                tip: "快速选择 (W)：在画布上涂抹，自动吸附到相近颜色并长出选区"
+                selected: host.selTool === "quick"
+                onClicked: host.pickSelTool("quick")
             }
         }
 
@@ -200,11 +206,91 @@ Rectangle {
             }
         }
 
+        // ---- 快速选择参数（只在快速选择工具下出现）----
+        // PS 的快速选择是画笔式的：笔刷多大、颜色多宽容、往外长多远。
+        // 笔刷大小按 [ / ] 调，这里也给个数字框方便精调。
+        Column {
+            id: quickBox
+            width: parent.width
+            spacing: 5
+            visible: host.selTool === "quick"
+
+            Row {
+                spacing: 6
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "笔刷"
+                    color: "#e9eaec"
+                    font.pixelSize: 11
+                }
+                SpinBox {
+                    width: 62
+                    from: 2
+                    to: 200
+                    step: 2
+                    value: host.quickRadius
+                    onEdited: (v) => host.setQuickRadius(v)
+                }
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "[ / ] 调整"
+                    color: "#6b7076"
+                    font.pixelSize: 10
+                }
+            }
+            Row {
+                spacing: 6
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "容差"
+                    color: "#e9eaec"
+                    font.pixelSize: 11
+                }
+                SpinBox {
+                    width: 62
+                    from: 0
+                    to: 255
+                    step: 4
+                    value: host.quickTolerance
+                    onEdited: (v) => host.setQuickTolerance(v)
+                }
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: host.quickTolerance === 0 ? "只吃完全同色" : "越大吃得越宽"
+                    color: "#6b7076"
+                    font.pixelSize: 10
+                }
+            }
+            Row {
+                spacing: 6
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "扩散"
+                    color: "#e9eaec"
+                    font.pixelSize: 11
+                }
+                SpinBox {
+                    width: 62
+                    from: 0
+                    to: 1000
+                    step: 10
+                    value: host.quickGrow
+                    onEdited: (v) => host.setQuickGrow(v)
+                }
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "从笔迹往外最多长多少像素"
+                    color: "#6b7076"
+                    font.pixelSize: 10
+                }
+            }
+        }
+
         Rectangle {
             width: parent.width
             height: 1
             color: "#3c4043"
-            visible: wandBox.visible
+            visible: wandBox.visible || quickBox.visible
         }
 
         // ---- 当前选区尺寸 / 操作提示 ----
@@ -212,7 +298,9 @@ Rectangle {
             width: parent.width
             text: host.selExists
                   ? ("选区 " + host.selImgW + " × " + host.selImgH)
-                  : (host.selTool === "wand" ? "在画布上点击取色" : "在画布上拖出选区")
+                  : (host.selTool === "wand" ? "在画布上点击取色"
+                     : (host.selTool === "quick" ? "在画布上按住涂抹"
+                                                 : "在画布上拖出选区"))
             color: host.selExists ? "#e9eaec" : "#8b9096"
             font.pixelSize: 11
         }
@@ -225,7 +313,9 @@ Rectangle {
                      ? "按住拖出不规则选区"
                      : (host.selTool === "wand"
                         ? "点击取色选中一片 · Shift 加选 · Alt 减选"
-                        : "Shift 加选 · Alt 减选 · Shift+Alt 交集"))
+                        : (host.selTool === "quick"
+                           ? "按住涂抹 · Shift 加选 · Alt 减选 · [ ] 改笔刷"
+                           : "Shift 加选 · Alt 减选 · Shift+Alt 交集")))
             color: "#6b7076"
             font.pixelSize: 10
         }

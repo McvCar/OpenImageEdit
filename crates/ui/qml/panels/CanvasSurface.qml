@@ -26,6 +26,11 @@ Item {
     // 加选/减选模式在「第一个点」时锁定：中途松掉 Shift 不该改变意图。
     property int polyMode: 0
 
+    // ---- 快速选择正在涂抹 ----
+    // 按下到松开之间，每次移动都把新的一段笔迹送去扩散（Rust 侧是增量，
+    // 所以选区能跟着笔尖长）。放在根上是为了让切工具/Esc 能取消它。
+    property bool quickDrag: false
+
     // ---- 拖动已有选区（PS 默认：按住选区内部拖 = 移动蚂蚁线）----
     // 拖动期间只在 QML 里给轮廓加偏移，松手才让 Rust 一次性平移 mask：
     // 每帧跨语言重算 mask + 重抽轮廓，大选区会明显掉帧。
@@ -48,6 +53,15 @@ Item {
         selPolyActive = false
         polyPts = []
         selPreview.requestPaint()
+    }
+
+    // 放弃正在进行的快速选择涂抹（切工具 / Esc）：回到按下前的选区，
+    // 也不留撤销记录。
+    function cancelQuickSelect() {
+        if (!quickDrag)
+            return
+        quickDrag = false
+        bridge.quick_select_cancel()
     }
 
     // 闭合多边形 → 提交给 Rust（mode 取决于按下时的 Shift/Alt）。
@@ -182,6 +196,16 @@ Item {
                                       selMode)
                 return
             }
+            // 快速选择：按住涂抹。第一笔就决定这次的合成模式（Shift 加选 /
+            // Alt 减选），中途改修饰键不会让选区跳变。
+            if (host.selTool === "quick") {
+                const pw = toImage(mouse.x, mouse.y)
+                quickDrag = true
+                bridge.quick_select_brush(pw[0], pw[1], host.quickRadius,
+                                          host.quickTolerance, host.quickGrow,
+                                          selMode)
+                return
+            }
             // 已有选区时按在选区内部 = 移动选区（不动像素）。带 Shift/Alt
             // 说明想加选/减选，那就照常新建，不进移动手势。
             if (host.selExists && selMode === 0
@@ -244,6 +268,14 @@ Item {
         onPositionChanged: (mouse) => {
             if (host.rulerOn)
                 host.noteHover(mouse.x, mouse.y)
+            // 快速选择涂抹：每一步都送一段过去，选区跟着笔尖长。
+            if (quickDrag) {
+                const pw = toImage(mouse.x, mouse.y)
+                bridge.quick_select_brush(pw[0], pw[1], host.quickRadius,
+                                          host.quickTolerance, host.quickGrow,
+                                          selMode)
+                return
+            }
             // 多边形套索的橡皮筋跟随光标（不需要按住）。
             if (selPolyActive) {
                 polyCurX = mouse.x
@@ -291,6 +323,12 @@ Item {
         }
 
         onReleased: (mouse) => {
+            if (quickDrag) {
+                quickDrag = false
+                // 松手才把整段涂抹记成一条撤销记录。
+                bridge.quick_select_commit()
+                return
+            }
             if (mouse.button !== Qt.LeftButton)
                 return
             if (moveSelActive) {
@@ -1060,6 +1098,25 @@ Item {
             bridge.picker_pick(Math.floor((mouse.x - view.pad) / s),
                                Math.floor((mouse.y - view.pad) / s))
         }
+    }
+
+    // 快速选择的笔刷轮廓：跟着光标画一个圈，直观表示这一笔有多粗。
+    // 直径 = 半径 × 2 × 显示比例（笔刷半径是画布像素，不是屏幕像素）。
+    Rectangle {
+        id: quickBrushRing
+        visible: host.selTool === "quick" && canvasHoverHandler.hovered
+        readonly property real diam: Math.max(8, host.quickRadius * 2 * host.toDispScale())
+        width: diam
+        height: diam
+        radius: diam / 2
+        x: canvasHoverHandler.point.position.x - diam / 2
+        y: canvasHoverHandler.point.position.y - diam / 2
+        color: "transparent"
+        border.color: "#e9eaec"
+        border.width: 1
+        opacity: 0.8
+        antialiasing: true
+        z: 500
     }
 
     // Authoritative canvas cursor: a HoverHandler's cursorShape beats

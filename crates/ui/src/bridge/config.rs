@@ -78,7 +78,7 @@ impl AppConfig {
                             }
                         }
                         "sel_tool" => match value {
-                            "rect" | "ellipse" | "lasso" | "polygon" | "wand" => {
+                            "rect" | "ellipse" | "lasso" | "polygon" | "wand" | "quick" => {
                                 cfg.sel_tool = value.to_string()
                             }
                             _ => {}

@@ -372,7 +372,7 @@ impl qobject::Bridge {
         let name = tool.to_string();
         let valid = matches!(
             name.as_str(),
-            "rect" | "ellipse" | "lasso" | "polygon" | "wand"
+            "rect" | "ellipse" | "lasso" | "polygon" | "wand" | "quick"
         );
         if !valid || self.sel_tool_saved().to_string() == name {
             return;
@@ -438,6 +438,150 @@ impl qobject::Bridge {
             area,
             mode
         );
+    }
+
+    /// 快速选择：把「上一笔迹点 → (x, y)」这一段当种子扩散一次，并并入本次
+    /// 涂抹的累积选区。
+    ///
+    /// 拖动期间只走 `preview_selection`（不进历史），每帧的工作量只有
+    /// 「一个胶囊体 + grow 窗口」，大图上也是毫秒级。松手时由
+    /// `quick_select_commit` 把整段涂抹补成一条撤销记录。
+    pub fn quick_select_brush(
+        mut self: Pin<&mut Self>,
+        x: f64,
+        y: f64,
+        radius: f64,
+        tolerance: i32,
+        grow: i32,
+        mode: i32,
+    ) {
+        let p = (x as f32, y as f32);
+        let r = radius.clamp(1.0, 400.0) as u32;
+
+        // 第一次调用：快照按下前的选区（撤销目标 + 加/减基准）。
+        if self.quick_drag.borrow().is_none() {
+            let (from, base) = {
+                let guard = self.session.borrow();
+                let Some(session) = guard.as_ref() else {
+                    return;
+                };
+                let from = session.doc.selection.clone();
+                let base = from.as_ref().map(|st| st.mask().clone());
+                (from, base)
+            };
+            *self.quick_drag.borrow_mut() = Some(QuickDrag {
+                from,
+                base,
+                accum: None,
+                last: p,
+                mode,
+            });
+        }
+
+        // 本段 = 上次的点 → 当前点。
+        let (seg, mode, base) = {
+            let mut drag = self.quick_drag.borrow_mut();
+            let Some(d) = drag.as_mut() else {
+                return;
+            };
+            let seg = [d.last, p];
+            d.last = p;
+            (seg, d.mode, d.base.clone())
+        };
+
+        let opts = QuickSelectOptions {
+            tolerance: tolerance.clamp(0, 255) as u8,
+            // 边缘保护跟着容差走：容差开得大，允许的局部跳变也要跟着放宽，
+            // 否则大容差会被一个细噪点边缘挡住，反而选不动。
+            edge: (tolerance * 2).clamp(20, 120) as u8,
+            grow: grow.clamp(0, 2000) as u32,
+        };
+        let spread = {
+            let guard = self.session.borrow();
+            let Some(session) = guard.as_ref() else {
+                return;
+            };
+            // None = 取样可见合成（PS 快速选择默认吃「所有图层」）。
+            session.doc.quick_select_selection(&seg, r, opts, None)
+        };
+
+        // 累积扩散结果，再按 mode 与按下前的选区合成。
+        let (result, from_ops) = {
+            let mut drag = self.quick_drag.borrow_mut();
+            let Some(d) = drag.as_mut() else {
+                return;
+            };
+            let accum = match d.accum.take() {
+                Some(a) => a.union(&spread),
+                None => spread,
+            };
+            d.accum = Some(accum.clone());
+            let from_ops = d.from.as_ref().map(|st| st.ops);
+            let result = match mode {
+                1 => match &base {
+                    Some(b) => b.union(&accum),
+                    None => accum.clone(),
+                },
+                2 => match &base {
+                    Some(b) => b.subtract(&accum),
+                    None => SelectionMask::empty(),
+                },
+                _ => accum,
+            };
+            (result, from_ops)
+        };
+
+        let defaults = self.sel_ops_default.get();
+        let state = if result.is_empty() {
+            None
+        } else if mode == 0 {
+            Some(SelectionState::new_with_ops(result, defaults))
+        } else {
+            // 加/减是从当前可见选区派生的：边界/平滑已经烘焙进那张 mask，
+            // 再套一遍会在结果边缘长出多余环带（同 combine_selection）。
+            Some(SelectionState::derived(
+                result,
+                &from_ops.unwrap_or(defaults),
+            ))
+        };
+        {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            session.doc.preview_selection(state);
+        }
+        self.as_mut().commit_selection();
+    }
+
+    /// 松开鼠标：把整段涂抹提交为一条撤销记录。
+    pub fn quick_select_commit(mut self: Pin<&mut Self>) {
+        let Some(drag) = self.quick_drag.borrow_mut().take() else {
+            return;
+        };
+        {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            session.doc.commit_selection_change(drag.from);
+        }
+        self.as_mut().commit_selection();
+    }
+
+    /// 放弃本次涂抹（Esc）：回到按下前的选区，不留历史。
+    pub fn quick_select_cancel(mut self: Pin<&mut Self>) {
+        let Some(drag) = self.quick_drag.borrow_mut().take() else {
+            return;
+        };
+        {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return;
+            };
+            session.doc.preview_selection(drag.from);
+        }
+        self.as_mut().commit_selection();
     }
 
     pub fn sel_outline(self: Pin<&mut Self>) -> QString {

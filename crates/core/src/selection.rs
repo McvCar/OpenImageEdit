@@ -72,6 +72,31 @@ impl Default for WandOptions {
     }
 }
 
+/// 快速选择参数（PS 的「快速选择工具」）。
+///
+/// 与魔术棒的区别：魔术棒以**一个**点击点为种子，快速选择以**整条笔迹**
+/// 覆盖的像素为种子，所以刷哪儿长哪儿，而且允许长到笔迹外面一段距离。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuickSelectOptions {
+    /// 与笔迹平均色的最大容差（逐通道）。越大吃得越宽。
+    pub tolerance: u8,
+    /// 边缘保护：相邻两像素的色差超过它就当遇到边界，不再跨过去。
+    /// 0 = 关闭（会顺着渐变一路漫出去）。
+    pub edge: u8,
+    /// 从笔迹向外最多扩散多少像素。0 = 不限（走遍整幅图，大图上很慢）。
+    pub grow: u32,
+}
+
+impl Default for QuickSelectOptions {
+    fn default() -> Self {
+        Self {
+            tolerance: 40,
+            edge: 60,
+            grow: 160,
+        }
+    }
+}
+
 impl SelectionMask {
     pub fn empty() -> Self {
         Self::default()
@@ -348,6 +373,211 @@ impl SelectionMask {
                 let gx = x0 + x as i32;
                 let gy = y0 + y as i32;
                 let i = gy as usize * stride + gx as usize;
+                if hit[i / 64] & (1u64 << (i % 64)) != 0 {
+                    alpha[y * bw + x] = 255;
+                }
+            }
+        }
+        Self { bounds, alpha }
+    }
+
+    /// 快速选择（PS 的「快速选择工具」）：以笔迹覆盖的像素为种子，按
+    /// 「颜色接近笔迹平均色」且「不跨越明显边缘」向外扩散。
+    ///
+    /// `pen` 是画布坐标下的笔迹折线（相邻两点连成一段胶囊体），`radius`
+    /// 是笔刷半径（画布像素）。返回的选区只覆盖真正扩散到的像素。
+    ///
+    /// 和魔术棒一样用 `sample` 回调取色：只有泛洪走到的像素才采样，大图上
+    /// 省掉一次全画布合成。
+    pub fn quick_select<F>(
+        canvas: Size,
+        pen: &[(f32, f32)],
+        radius: u32,
+        opts: QuickSelectOptions,
+        sample: F,
+    ) -> Self
+    where
+        F: Fn(i32, i32) -> [u8; 4],
+    {
+        let (cw, ch) = (canvas.width as i32, canvas.height as i32);
+        if cw <= 0 || ch <= 0 || pen.is_empty() {
+            return Self::empty();
+        }
+        let r = radius.max(1) as i32;
+        let r2 = (r * r) as f32;
+
+        // ---- 1) 笔迹覆盖（胶囊体并集）及其 bbox ---------------------------
+        let (mut px0, mut py0, mut px1, mut py1) = (cw, ch, -1, -1);
+        for &(x, y) in pen {
+            let (ix, iy) = (x.round() as i32, y.round() as i32);
+            px0 = px0.min(ix - r);
+            py0 = py0.min(iy - r);
+            px1 = px1.max(ix + r);
+            py1 = py1.max(iy + r);
+        }
+        px0 = px0.max(0);
+        py0 = py0.max(0);
+        px1 = px1.min(cw - 1);
+        py1 = py1.min(ch - 1);
+        if px1 < px0 || py1 < py0 {
+            return Self::empty();
+        }
+        let (pw, ph) = ((px1 - px0 + 1) as usize, (py1 - py0 + 1) as usize);
+        let mut pen_mask = vec![false; pw * ph];
+        // 单点笔迹也要落下一个圆盘，所以末点与自身组成退化线段。
+        for i in 0..pen.len() {
+            let (ax, ay) = pen[i];
+            let (bx, by) = if i + 1 < pen.len() { pen[i + 1] } else { pen[i] };
+            let lx0 = ((ax.min(bx).floor() as i32) - r).max(px0);
+            let lx1 = ((ax.max(bx).ceil() as i32) + r).min(px1);
+            let ly0 = ((ay.min(by).floor() as i32) - r).max(py0);
+            let ly1 = ((ay.max(by).ceil() as i32) + r).min(py1);
+            for gy in ly0..=ly1 {
+                for gx in lx0..=lx1 {
+                    let d2 = dist2_to_segment(gx as f32 + 0.5, gy as f32 + 0.5, ax, ay, bx, by);
+                    if d2 <= r2 {
+                        pen_mask[(gy - py0) as usize * pw + (gx - px0) as usize] = true;
+                    }
+                }
+            }
+        }
+
+        // ---- 2) 笔迹的平均色（不透明的像素才有意义）----------------------
+        let mut sum = [0u64; 4];
+        let mut count = 0u64;
+        for y in 0..ph {
+            for x in 0..pw {
+                if !pen_mask[y * pw + x] {
+                    continue;
+                }
+                let c = sample(px0 + x as i32, py0 + y as i32);
+                if c[3] == 0 {
+                    continue;
+                }
+                for k in 0..4 {
+                    sum[k] += c[k] as u64;
+                }
+                count += 1;
+            }
+        }
+        // 整条笔迹都落在透明区：直接把它当成选区（不往外长）。
+        if count == 0 {
+            let mut alpha = vec![0u8; pw * ph];
+            for i in 0..pw * ph {
+                if pen_mask[i] {
+                    alpha[i] = 255;
+                }
+            }
+            return Self {
+                bounds: Rect::new(px0, py0, pw as u32, ph as u32),
+                alpha,
+            };
+        }
+        let mut refc = [0u8; 4];
+        for k in 0..4 {
+            refc[k] = (sum[k] / count) as u8;
+        }
+
+        // ---- 3) 从笔迹向外泛洪 -------------------------------------------
+        // 只在「笔迹 bbox 外扩 grow」的窗口里跑：grow 是用户给的最大扩散
+        // 距离，窗口外的像素无论如何都不会被选中，没必要为它们分配位图。
+        let grow = opts.grow as i32;
+        let sxp0 = (px0 - grow).max(0);
+        let syp0 = (py0 - grow).max(0);
+        let sxp1 = (px1 + grow).min(cw - 1);
+        let syp1 = (py1 + grow).min(ch - 1);
+        let (sw, sh) = ((sxp1 - sxp0 + 1) as usize, (syp1 - syp0 + 1) as usize);
+        let total = sw * sh;
+        let words = (total + 63) / 64;
+        let mut visited = vec![0u64; words];
+        let mut hit = vec![0u64; words];
+        let idx = |gx: i32, gy: i32| (gy - syp0) as usize * sw + (gx - sxp0) as usize;
+
+        // 必须是**广度**优先：`grow` 限制的是「离笔迹多远」，只有 BFS 的
+        // 层数才等于曼哈顿距离。用栈做深度优先时 depth 是"绕行了多少步"，
+        // 在开阔区域蛇形走几十个像素就吃满上限，扩散会莫名其妙地停住。
+        let mut queue: std::collections::VecDeque<(i32, i32, [u8; 4], i32)> =
+            std::collections::VecDeque::with_capacity(4096);
+        for y in 0..ph {
+            for x in 0..pw {
+                if !pen_mask[y * pw + x] {
+                    continue;
+                }
+                let (gx, gy) = (px0 + x as i32, py0 + y as i32);
+                let i = idx(gx, gy);
+                if visited[i / 64] & (1u64 << (i % 64)) != 0 {
+                    continue;
+                }
+                visited[i / 64] |= 1u64 << (i % 64);
+                hit[i / 64] |= 1u64 << (i % 64);
+                queue.push_back((gx, gy, sample(gx, gy), 0));
+            }
+        }
+
+        let tol = opts.tolerance as i32;
+        let edge = opts.edge as i32;
+        while let Some((x, y, cur, depth)) = queue.pop_front() {
+            if grow > 0 && depth >= grow {
+                continue;
+            }
+            for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+                if nx < sxp0 || ny < syp0 || nx > sxp1 || ny > syp1 {
+                    continue;
+                }
+                let i = idx(nx, ny);
+                let bit = 1u64 << (i % 64);
+                if visited[i / 64] & bit != 0 {
+                    continue;
+                }
+                visited[i / 64] |= bit;
+                let c = sample(nx, ny);
+                // 两边都全透明 = 同色（残留 RGB 不可信，和魔术棒一致）。
+                let near_ref = if cur[3] == 0 && c[3] == 0 {
+                    true
+                } else {
+                    (0..4).all(|k| (c[k] as i32 - refc[k] as i32).abs() <= tol)
+                };
+                if !near_ref {
+                    continue;
+                }
+                // 边缘保护：与**当前**像素的突变说明跨了边界。没有它，渐变
+                // 背景会被一口气吃穿（容差大时尤其明显）。
+                if edge > 0 && !(cur[3] == 0 && c[3] == 0) {
+                    let jump = (0..4).any(|k| (c[k] as i32 - cur[k] as i32).abs() > edge);
+                    if jump {
+                        continue;
+                    }
+                }
+                hit[i / 64] |= bit;
+                queue.push_back((nx, ny, c, depth + 1));
+            }
+        }
+
+        // ---- 4) 位图 → 选区（收紧到命中的包围盒）-------------------------
+        let (mut x0, mut y0, mut x1, mut y1) = (sxp1 + 1, syp1 + 1, sxp0 - 1, syp0 - 1);
+        for y in 0..sh {
+            for x in 0..sw {
+                let i = y * sw + x;
+                if hit[i / 64] & (1u64 << (i % 64)) == 0 {
+                    continue;
+                }
+                let (gx, gy) = (sxp0 + x as i32, syp0 + y as i32);
+                x0 = x0.min(gx);
+                y0 = y0.min(gy);
+                x1 = x1.max(gx);
+                y1 = y1.max(gy);
+            }
+        }
+        if x1 < x0 || y1 < y0 {
+            return Self::empty();
+        }
+        let bounds = Rect::new(x0, y0, (x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32);
+        let (bw, bh) = (bounds.width as usize, bounds.height as usize);
+        let mut alpha = vec![0u8; bw * bh];
+        for y in 0..bh {
+            for x in 0..bw {
+                let (gx, gy) = (bounds.x + x as i32, bounds.y + y as i32);
+                let i = idx(gx, gy);
                 if hit[i / 64] & (1u64 << (i % 64)) != 0 {
                     alpha[y * bw + x] = 255;
                 }
@@ -771,6 +1001,22 @@ impl SelectionMask {
         }
         paths
     }
+}
+
+/// 点 (px,py) 到线段 (ax,ay)-(bx,by) 的最短距离平方。
+///
+/// 快速选择用它把一条笔迹段光栅化成胶囊体：距离 <= 半径的像素都属于笔迹。
+/// 退化线段（两端重合，即单击）返回点到点的距离。
+fn dist2_to_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let (vx, vy) = (bx - ax, by - ay);
+    let len2 = vx * vx + vy * vy;
+    let t = if len2 <= f32::EPSILON {
+        0.0
+    } else {
+        (((px - ax) * vx + (py - ay) * vy) / len2).clamp(0.0, 1.0)
+    };
+    let (dx, dy) = (px - (ax + vx * t), py - (ay + vy * t));
+    dx * dx + dy * dy
 }
 
 /// 选区状态 = 矢量光栅化出来的基准 mask + 可回改的参数。
@@ -1663,5 +1909,161 @@ mod tests {
         let (size, px) = wand_fixture();
         assert!(wand_of(size, &px, (-1, 3), 32, true).is_empty());
         assert!(wand_of(size, &px, (20, 3), 32, true).is_empty());
+    }
+
+    // ---- 快速选择 --------------------------------------------------------
+
+    /// 40×40：左半纯红、右半纯蓝，中间一条竖直硬边界。
+    fn qs_fixture() -> (Size, Vec<[u8; 4]>) {
+        let size = Size::new(40, 40);
+        let mut px = vec![[0u8, 0, 255, 255]; 1600];
+        for y in 0..40 {
+            for x in 0..20 {
+                px[y * 40 + x] = [255, 0, 0, 255];
+            }
+        }
+        (size, px)
+    }
+
+    fn qs_of(
+        size: Size,
+        px: &[[u8; 4]],
+        pen: &[(f32, f32)],
+        radius: u32,
+        opts: QuickSelectOptions,
+    ) -> SelectionMask {
+        SelectionMask::quick_select(size, pen, radius, opts, |x, y| {
+            px[y as usize * size.width as usize + x as usize]
+        })
+    }
+
+    #[test]
+    fn quick_select_spreads_over_uniform_area_but_not_across_edge() {
+        let (size, px) = qs_fixture();
+        let opts = QuickSelectOptions {
+            tolerance: 10,
+            edge: 40,
+            grow: 200,
+        };
+        // 笔迹是左红区中间的一个点，半径 3。
+        let mask = qs_of(size, &px, &[(10.0, 20.0)], 3, opts);
+        // 整个左半都被吃下来，蓝色那边一个像素都没碰。
+        assert_eq!(mask.area(), 800);
+        assert_eq!(mask.bounds, Rect::new(0, 0, 20, 40));
+        assert_eq!(mask.coverage_at(25, 20), 0);
+        assert_eq!(mask.coverage_at(19, 20), 255);
+    }
+
+    #[test]
+    fn quick_select_grow_limits_how_far_it_spreads() {
+        let (size, px) = qs_fixture();
+        let short = qs_of(
+            size,
+            &px,
+            &[(10.0, 20.0)],
+            2,
+            QuickSelectOptions {
+                tolerance: 10,
+                edge: 40,
+                grow: 2,
+            },
+        );
+        let far = qs_of(
+            size,
+            &px,
+            &[(10.0, 20.0)],
+            2,
+            QuickSelectOptions {
+                tolerance: 10,
+                edge: 40,
+                grow: 200,
+            },
+        );
+        assert_eq!(far.area(), 800);
+        // grow=2 只能长出笔迹外两圈，远小于整块红区。
+        assert!(short.area() > 0 && short.area() < 200, "area={}", short.area());
+        assert!(short.bounds.width < 20);
+    }
+
+    #[test]
+    fn quick_select_tolerance_decides_gradient_breadth() {
+        // 横向灰度渐变，每列 +6。边缘保护挡不住渐变（每步只差 6），
+        // 所以能扩多宽完全由容差决定。
+        let size = Size::new(40, 40);
+        let mut px = vec![[0u8, 0, 0, 255]; 1600];
+        for y in 0..40 {
+            for x in 0..40 {
+                let v = (x * 6) as u8;
+                px[y * 40 + x] = [v, v, v, 255];
+            }
+        }
+        let narrow = qs_of(
+            size,
+            &px,
+            &[(20.0, 20.0)],
+            2,
+            QuickSelectOptions {
+                tolerance: 8,
+                edge: 0,
+                grow: 200,
+            },
+        );
+        let wide = qs_of(
+            size,
+            &px,
+            &[(20.0, 20.0)],
+            2,
+            QuickSelectOptions {
+                tolerance: 48,
+                edge: 0,
+                grow: 200,
+            },
+        );
+        assert!(
+            narrow.bounds.width < wide.bounds.width,
+            "narrow={} wide={}",
+            narrow.bounds.width,
+            wide.bounds.width
+        );
+        assert!(wide.bounds.width >= 10, "wide={}", wide.bounds.width);
+    }
+
+    #[test]
+    fn quick_select_grow_reaches_whole_uniform_canvas() {
+        // 纯色画布 + grow 足够大 → 整张图都被选中。
+        // 这条踩过坑：泛洪用栈（DFS）时，depth 记的是「绕行了多少步」而不是
+        // 离笔迹的距离，蛇形走几十个像素就把 grow 吃满，扩散会停在中途；
+        // 换成 BFS（队列）后 depth 才等于曼哈顿距离。
+        let size = Size::new(200, 100);
+        let px = vec![[255u8, 0, 0, 255]; 20000];
+        let mask = qs_of(
+            size,
+            &px,
+            &[(100.0, 50.0)],
+            8,
+            QuickSelectOptions {
+                tolerance: 10,
+                edge: 20,
+                grow: 200,
+            },
+        );
+        assert_eq!(mask.area(), 20000);
+        assert_eq!(mask.bounds, Rect::new(0, 0, 200, 100));
+    }
+
+    #[test]
+    fn quick_select_empty_pen_is_empty() {
+        let (size, px) = qs_fixture();
+        let mask = qs_of(size, &px, &[], 3, QuickSelectOptions::default());
+        assert!(mask.is_empty());
+    }
+
+    #[test]
+    fn quick_select_pen_on_transparent_area_returns_pen_itself() {
+        let size = Size::new(20, 20);
+        let px = vec![[0u8, 0, 0, 0]; 400];
+        let mask = qs_of(size, &px, &[(10.0, 10.0)], 2, QuickSelectOptions::default());
+        // 没有颜色可扩散 → 就是笔迹那块圆盘，不会长成整张画布。
+        assert!(mask.area() > 0 && mask.area() < 100, "area={}", mask.area());
     }
 }

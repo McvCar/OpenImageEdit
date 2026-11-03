@@ -95,7 +95,8 @@ Rectangle {
                     { key: "ellipse", glyph: "◯", label: "椭圆选框" },
                     { key: "lasso", glyph: "∿", label: "套索" },
                     { key: "polygon", glyph: "⬡", label: "多边形套索" },
-                    { key: "wand", glyph: "✦", label: "魔术棒：按颜色自动选取" }
+                    { key: "wand", glyph: "✦", label: "魔术棒：按颜色自动选取" },
+                    { key: "quick", glyph: "◔", label: "快速选择：涂抹吸附相近颜色" }
                 ]
                 delegate: IconButton {
                     required property var modelData
