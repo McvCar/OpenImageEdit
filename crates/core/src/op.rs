@@ -95,6 +95,23 @@ pub enum EditOp {
         from: RgbaImage,
         params: Adjust,
     },
+    /// 像素级修补（污点修复 / 修复画笔 / 修补 / 油漆桶 / 渐变）：只保存
+    /// 改动矩形内的前后两份位图。撤销/重做就是把那一块贴回去 —— 不必为
+    /// 每一次涂抹留整图层快照。`rect` 是目标位图自己的坐标（base 用 view
+    /// 换算后的坐标，图层用图层内坐标）。
+    PixelPatch {
+        target: AdjustTarget,
+        rect: Rect,
+        before: RgbaImage,
+        after: RgbaImage,
+    },
+    /// 图层整体旋转（任意角度）：位图尺寸与左上角偏移都会变，直接存旋转
+    /// 前后的整层状态，撤销/重做都是整体替换。
+    RotateLayer {
+        index: usize,
+        before: Layer,
+        after: Layer,
+    },
     /// Replace the whole selection (new marquee / invert / clear / move /
     /// resize). Selection is document state in PS and here too, so Ctrl+Z
     /// walks it back together with the pixel edits in one unified history.
@@ -297,6 +314,23 @@ impl EditOp {
                     }
                 }
             }
+            EditOp::PixelPatch {
+                target,
+                rect,
+                after,
+                ..
+            } => {
+                apply_region(doc, *target, *rect, after);
+                Ok(())
+            }
+            EditOp::RotateLayer { index, after, .. } => {
+                let layer = doc
+                    .layers
+                    .get_mut(*index)
+                    .ok_or(EditError::LayerIndex(*index))?;
+                *layer = after.clone();
+                Ok(())
+            }
             EditOp::SetSelection { to, .. } => {
                 doc.selection = to.clone();
                 Ok(())
@@ -457,6 +491,23 @@ impl EditOp {
                         Ok(())
                     }
                 }
+            }
+            EditOp::PixelPatch {
+                target,
+                rect,
+                before,
+                ..
+            } => {
+                apply_region(doc, *target, *rect, before);
+                Ok(())
+            }
+            EditOp::RotateLayer { index, before, .. } => {
+                let layer = doc
+                    .layers
+                    .get_mut(*index)
+                    .ok_or(EditError::LayerIndex(*index))?;
+                *layer = before.clone();
+                Ok(())
             }
             EditOp::SetSelection { from, .. } => {
                 doc.selection = from.clone();

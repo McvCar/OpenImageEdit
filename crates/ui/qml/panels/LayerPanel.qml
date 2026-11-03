@@ -584,6 +584,16 @@ Item {
             spacing: 0
 
             MenuRow {
+                label: "旋转角度…"
+                active: layerContext.targetIndex >= 0 && !layerContext.targetLocked
+                onActivated: {
+                    layerContext.visible = false
+                    const i = layerContext.targetIndex
+                    if (i >= 0)
+                        host.openRotateLayer(i)
+                }
+            }
+            MenuRow {
                 label: "删除图层"
                 active: layerContext.targetIndex >= 0 && !layerContext.targetLocked
                 onActivated: {

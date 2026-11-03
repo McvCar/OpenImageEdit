@@ -175,6 +175,7 @@ Item {
         visible: host.selExists && !host.selRubberBanding && !host.rulerOn
                  && host.selTool !== "none" && bridge.image_width > 0
                  && !bridge.pickerOpen && !host.selMenuOpen
+                 && host.paintTool === "none"
         z: 9
         x: previewImage.x
         y: previewImage.y
@@ -275,6 +276,7 @@ Item {
     DashedRect {
         id: layerBoxViz
         visible: host.selLayer !== null && host.scaleW === 0
+                 && host.paintTool === "none"
         z: 6
         x: previewImage.x
         y: previewImage.y
@@ -293,6 +295,7 @@ Item {
         visible: host.selLayer !== null && host.selLayer.base !== true
                  && !host.selExists && bridge.image_width > 0
                  && !bridge.pickerOpen
+                 && host.paintTool === "none" && !host.rotating
         z: 8
         x: previewImage.x
         y: previewImage.y
@@ -317,6 +320,76 @@ Item {
                     bridge.scale_layer_begin()
             } else if (host.scaleW > 0) {
                 host.commitLayerScale()
+            }
+        }
+    }
+
+    // ---- 图层旋转手柄：框上方的小圆点，拖着绕图层中心转 ----------
+    // 旋转期间位图是实时重采样的（Rust 侧每 60ms 一帧），松手才写历史。
+    Item {
+        id: rotateHandleBox
+        visible: host.selLayer !== null && host.selLayer.base !== true
+                 && !host.selExists && bridge.image_width > 0
+                 && !bridge.pickerOpen && host.scaleW === 0
+                 && host.paintTool === "none"
+        z: 10
+        readonly property real s: host.toDispScale()
+        readonly property real bx: host.selLayerBox !== null ? host.selLayerBox.x * s : 0
+        readonly property real by: host.selLayerBox !== null ? host.selLayerBox.y * s : 0
+        readonly property real bw: host.selLayerBox !== null ? host.selLayerBox.w * s : 0
+        readonly property real bh: host.selLayerBox !== null ? host.selLayerBox.h * s : 0
+        x: previewImage.x + bx + bw / 2
+        y: previewImage.y + by - 22
+
+        // 连到框顶的细线
+        Rectangle {
+            x: -0.5
+            y: 8
+            width: 1
+            height: 14
+            color: "#5b9dff"
+        }
+        Rectangle {
+            id: rotateKnob
+            width: 14
+            height: 14
+            radius: 7
+            x: -width / 2
+            y: -3
+            color: host.rotating ? "#7fc3ff" : "#2f4a6b"
+            border.color: "#cfe4ff"
+            border.width: 1
+
+            MouseArea {
+                id: rotateMa
+                // 命中范围比圆点大一圈，不然很难点中。
+                anchors.fill: parent
+                anchors.margins: -5
+                cursorShape: Qt.CrossCursor
+                preventStealing: true
+                property real startAngle: 0
+                onPressed: (mouse) => {
+                    const p = mapToItem(previewImage, mouse.x, mouse.y)
+                    const cx = rotateHandleBox.bx + rotateHandleBox.bw / 2
+                    const cy = rotateHandleBox.by + rotateHandleBox.bh / 2
+                    startAngle = Math.atan2(p.y - cy, p.x - cx) * 180 / Math.PI
+                    host.startLayerRotate()
+                }
+                onPositionChanged: (mouse) => {
+                    if (!pressed)
+                        return
+                    const p = mapToItem(previewImage, mouse.x, mouse.y)
+                    const cx = rotateHandleBox.bx + rotateHandleBox.bw / 2
+                    const cy = rotateHandleBox.by + rotateHandleBox.bh / 2
+                    const a = Math.atan2(p.y - cy, p.x - cx) * 180 / Math.PI
+                    let d = a - startAngle
+                    // 跨 ±180 时不要跳一整圈。
+                    while (d > 180) d -= 360
+                    while (d < -180) d += 360
+                    host.previewLayerRotate(d)
+                }
+                onReleased: host.finishLayerRotate(true)
+                onCanceled: host.finishLayerRotate(false)
             }
         }
     }

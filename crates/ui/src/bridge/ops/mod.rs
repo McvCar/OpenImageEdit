@@ -18,3 +18,4 @@ pub(super) mod clipboard;
 pub(super) mod cursor;
 pub(super) mod marks;
 pub(super) mod selection;
+pub(super) mod paint;

@@ -31,6 +31,22 @@ Item {
     // 所以选区能跟着笔尖长）。放在根上是为了让切工具/Esc 能取消它。
     property bool quickDrag: false
 
+    // ---- 修复 / 油漆手势 ----
+    // paintStroke：污点修复 / 修复画笔 / 渐变 的按住拖动。
+    property bool paintStroke: false
+    // patchDrawing：修补工具的第一段（圈区域）。
+    property bool patchDrawing: false
+    // patchDragging：修补工具的第二段（把区域拖到取样处）。
+    property bool patchDragging: false
+    // 圈区域时的临时顶点 + 已提交区域的顶点（图像坐标，QML 侧留着画轮廓）。
+    property var patchPts: []
+    property var patchRegion: []
+    // 第二段拖动中的显示偏移（像素，画布坐标）。
+    property real patchDx: 0
+    property real patchDy: 0
+    property real patchStartX: 0
+    property real patchStartY: 0
+
     // ---- 拖动已有选区（PS 默认：按住选区内部拖 = 移动蚂蚁线）----
     // 拖动期间只在 QML 里给轮廓加偏移，松手才让 Rust 一次性平移 mask：
     // 每帧跨语言重算 mask + 重抽轮廓，大选区会明显掉帧。
@@ -62,6 +78,40 @@ Item {
             return
         quickDrag = false
         bridge.quick_select_cancel()
+    }
+
+    // 放弃正在进行的修复 / 渐变手势（切工具 / Esc）：把已经预览写入的像素
+    // 还原回去，不产生撤销记录。
+    function cancelPaint() {
+        if (paintStroke) {
+            paintStroke = false
+            if (host.paintTool === "gradient")
+                bridge.gradient_cancel()
+            else
+                bridge.retouch_cancel()
+        }
+        if (patchDragging) {
+            patchDragging = false
+            patchDx = 0
+            patchDy = 0
+            bridge.patch_drag_cancel()
+            patchViz.requestPaint()
+        }
+        if (patchDrawing) {
+            patchDrawing = false
+            patchPts = []
+            patchViz.requestPaint()
+        }
+    }
+
+    // 放弃修补区域（Esc / 切工具）：只清区域，不动像素。
+    function clearPatchRegion() {
+        patchRegion = []
+        patchPts = []
+        patchDx = 0
+        patchDy = 0
+        bridge.patch_clear_region()
+        patchViz.requestPaint()
     }
 
     // 闭合多边形 → 提交给 Rust（mode 取决于按下时的 Shift/Alt）。
@@ -161,8 +211,18 @@ Item {
             // 在画布上按下 = 选区面板收起（不吞掉这次点击）。
             if (host.selPopoverOpen)
                 host.selPopoverOpen = false
-            // 右键：落在选区内 → 弹选区菜单（PS 的右键菜单）。
+            // 修复 / 油漆工具的参数面板同理：点画布就收起来，但这一下继续用来画。
+            if (host.paintPopoverOpen)
+                host.closePaintPopovers()
+            // 右键：修复 / 油漆工具 → 光标处弹参数面板；否则落在选区内 →
+            // 弹选区菜单（PS 的右键菜单）。
             if (mouse.button === Qt.RightButton) {
+                if (host.paintTool !== "none") {
+                    const g = mapToItem(host, mouse.x, mouse.y)
+                    host.openPaintMenu(g.x, g.y)
+                    mouse.accepted = true
+                    return
+                }
                 const p = toImage(mouse.x, mouse.y)
                 if (bridge.sel_contains(Math.floor(p[0]), Math.floor(p[1]))) {
                     const g = mapToItem(host, mouse.x, mouse.y)
@@ -171,7 +231,55 @@ Item {
                 }
                 return
             }
-            const hit = host.selExists ? null : host.topLayerAt(mouse.x, mouse.y)
+            // ---- 修复 / 油漆工具：优先于图层选择与选区手势 ----
+            if (host.paintTool !== "none") {
+                const p = toImage(mouse.x, mouse.y)
+                if (host.paintTool === "bucket") {
+                    bridge.bucket_fill(p[0], p[1], host.bucketTolerance,
+                                       host.bucketContiguous,
+                                       host.bucketOpacity / 100, host.markColor)
+                    return
+                }
+                if (host.paintTool === "patch") {
+                    if (patchRegion.length >= 3
+                            && bridge.patch_contains(p[0], p[1])) {
+                        patchDragging = true
+                        patchStartX = mouse.x
+                        patchStartY = mouse.y
+                        patchDx = 0
+                        patchDy = 0
+                        bridge.patch_drag_begin(p[0], p[1], host.patchFeather)
+                    } else {
+                        patchDrawing = true
+                        patchRegion = []
+                        patchPts = [[p[0], p[1]]]
+                    }
+                    patchViz.requestPaint()
+                    return
+                }
+                // 修复画笔：Alt + 点击 = 重新取样（不起笔）。
+                if (host.paintTool === "heal"
+                        && (mouse.modifiers & Qt.AltModifier) !== 0) {
+                    bridge.retouch_set_source(p[0], p[1])
+                    host.healHasSource = true
+                    return
+                }
+                paintStroke = true
+                if (host.paintTool === "gradient") {
+                    bridge.gradient_begin(p[0], p[1], host.gradRadial,
+                                          host.gradReverse,
+                                          host.gradOpacity / 100,
+                                          host.markColor, host.markFillColor)
+                } else {
+                    bridge.retouch_begin(host.paintTool, p[0], p[1],
+                                         host.healSize, host.healHardness / 100,
+                                         host.healSpacing / 100,
+                                         host.healStrength / 100)
+                }
+                return
+            }
+            const hit = (host.selExists || host.paintTool !== "none")
+                        ? null : host.topLayerAt(mouse.x, mouse.y)
             if (hit !== null) {
                 if (bridge.selected_mark >= 0)
                     bridge.select_mark(-1)   // 标记/图层选中互斥
@@ -268,6 +376,32 @@ Item {
         onPositionChanged: (mouse) => {
             if (host.rulerOn)
                 host.noteHover(mouse.x, mouse.y)
+            // 修补工具：第一段收顶点，第二段拖动取样偏移。
+            if (patchDrawing) {
+                const pp = toImage(mouse.x, mouse.y)
+                const last = patchPts.length > 0
+                             ? patchPts[patchPts.length - 1] : null
+                if (!last || Math.abs(pp[0] - last[0]) + Math.abs(pp[1] - last[1]) >= 1)
+                    patchPts = patchPts.concat([[pp[0], pp[1]]])
+                patchViz.requestPaint()
+                return
+            }
+            if (patchDragging) {
+                patchDx = mouse.x - patchStartX
+                patchDy = mouse.y - patchStartY
+                const s = Math.max(host.toDispScale(), 0.0001)
+                bridge.patch_drag_move(patchDx / s, patchDy / s)
+                patchViz.requestPaint()
+                return
+            }
+            if (paintStroke) {
+                const pp = toImage(mouse.x, mouse.y)
+                if (host.paintTool === "gradient")
+                    bridge.gradient_move(pp[0], pp[1])
+                else
+                    bridge.retouch_move(pp[0], pp[1])
+                return
+            }
             // 快速选择涂抹：每一步都送一段过去，选区跟着笔尖长。
             if (quickDrag) {
                 const pw = toImage(mouse.x, mouse.y)
@@ -323,6 +457,40 @@ Item {
         }
 
         onReleased: (mouse) => {
+            if (patchDrawing) {
+                patchDrawing = false
+                if (patchPts.length >= 3) {
+                    patchRegion = patchPts
+                    const text = patchPts
+                        .map(q => q[0].toFixed(1) + "," + q[1].toFixed(1))
+                        .join(" ")
+                    bridge.patch_set_region(text)
+                } else {
+                    patchRegion = []
+                    bridge.patch_clear_region()
+                }
+                patchPts = []
+                patchViz.requestPaint()
+                return
+            }
+            if (patchDragging) {
+                patchDragging = false
+                const applied = bridge.patch_drag_end()
+                if (applied)
+                    patchRegion = []
+                patchDx = 0
+                patchDy = 0
+                patchViz.requestPaint()
+                return
+            }
+            if (paintStroke) {
+                paintStroke = false
+                if (host.paintTool === "gradient")
+                    bridge.gradient_end()
+                else
+                    bridge.retouch_end()
+                return
+            }
             if (quickDrag) {
                 quickDrag = false
                 // 松手才把整段涂抹记成一条撤销记录。
@@ -1100,12 +1268,48 @@ Item {
         }
     }
 
+    // 修补工具的轮廓：第一段画正在圈的折线，第二段画跟着拖动偏移的区域。
+    Canvas {
+        id: patchViz
+        anchors.fill: parent
+        z: 500
+        visible: host.paintTool === "patch"
+                 && (patchDrawing || patchRegion.length >= 3)
+        renderStrategy: Canvas.Immediate
+        antialiasing: true
+        onPaint: {
+            const ctx = getContext("2d")
+            ctx.clearRect(0, 0, width, height)
+            const s = Math.max(host.toDispScale(), 0.0001)
+            const pts = patchDrawing ? patchPts : patchRegion
+            if (!pts || pts.length < 2)
+                return
+            const ox = view.pad + (patchDrawing ? 0 : patchDx)
+            const oy = view.pad + (patchDrawing ? 0 : patchDy)
+            ctx.lineWidth = 1.5
+            ctx.setLineDash([5, 3])
+            ctx.strokeStyle = "#f5e14a"
+            ctx.beginPath()
+            ctx.moveTo(pts[0][0] * s + ox, pts[0][1] * s + oy)
+            for (let i = 1; i < pts.length; i++)
+                ctx.lineTo(pts[i][0] * s + ox, pts[i][1] * s + oy)
+            if (!patchDrawing)
+                ctx.closePath()
+            ctx.stroke()
+            ctx.setLineDash([])
+        }
+    }
+
     // 快速选择的笔刷轮廓：跟着光标画一个圈，直观表示这一笔有多粗。
     // 直径 = 半径 × 2 × 显示比例（笔刷半径是画布像素，不是屏幕像素）。
     Rectangle {
         id: quickBrushRing
-        visible: host.selTool === "quick" && canvasHoverHandler.hovered
-        readonly property real diam: Math.max(8, host.quickRadius * 2 * host.toDispScale())
+        visible: (host.selTool === "quick"
+                  || host.paintTool === "spot" || host.paintTool === "heal")
+                 && canvasHoverHandler.hovered
+        readonly property real diam: Math.max(8, (host.selTool === "quick"
+                                                  ? host.quickRadius * 2
+                                                  : host.healSize) * host.toDispScale())
         width: diam
         height: diam
         radius: diam / 2

@@ -1,8 +1,7 @@
 // crates/core/src/ops.rs
 use super::*;
 
-pub(crate) fn apply_view(doc: &mut Document, view: Rect) {
-    // Layer offsets and marks are CANVAS-relative. Cropping moves the canvas
+pub(crate) fn apply_view(doc: &mut Document, view: Rect) {    // Layer offsets and marks are CANVAS-relative. Cropping moves the canvas
     // origin, so their positions must ride along with the content: the whole
     // composition shifts by (old origin - new origin) inside the new canvas.
     // Without this, cropping after adding layers / marks made them jump back
@@ -244,5 +243,35 @@ pub(crate) fn apply_resize(doc: &mut Document, to: Size) {
             *p = ((p.0 as f64 * sx) as f32, (p.1 as f64 * sy) as f32);
         }
         mark.stroke = ((mark.stroke as f64 * ss).round() as i64).clamp(1, 255) as u8;
+    }
+}
+
+/// 把一块补丁贴进目标位图的 `rect` 位置（都是位图坐标）。图片尺寸与 rect
+/// 对不上时按较小的一边裁，越界部分丢弃 —— 撤销/重做用的前后两份补丁永远
+/// 由同一次改动生成，理论上不会错位，这里只做防御。
+pub(crate) fn apply_region(doc: &mut Document, target: AdjustTarget, rect: Rect, img: &RgbaImage) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let dst = match target {
+        AdjustTarget::Base => &mut doc.base,
+        AdjustTarget::Layer(index) => match doc.layers.get_mut(index) {
+            Some(layer) => &mut layer.image,
+            None => return,
+        },
+    };
+    let w = rect.width.min(img.width()).min(dst.width().saturating_sub(rect.x.max(0) as u32));
+    let h = rect
+        .height
+        .min(img.height())
+        .min(dst.height().saturating_sub(rect.y.max(0) as u32));
+    if rect.x < 0 || rect.y < 0 || w == 0 || h == 0 {
+        return;
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let px = img.get_pixel(x, y);
+            dst.put_pixel(rect.x as u32 + x, rect.y as u32 + y, *px);
+        }
     }
 }

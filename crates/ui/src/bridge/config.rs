@@ -28,6 +28,10 @@ pub(in crate::bridge) struct AppConfig {
     pub(in crate::bridge) sel_tool: String,
     /// 魔术棒参数，原样存 `容差,连续,取样全部图层`（如 "32,1,0"）。
     pub(in crate::bridge) sel_wand: String,
+    /// 修复 / 油漆工具的参数，`|` 分隔：
+    /// `工具|笔刷|硬度|间距|强度|扩散|容差|连续|不透明|径向|反向|渐变不透明`
+    /// （如 "none|40|70|20|100|2|32|1|100|0|0|100"）。
+    pub(in crate::bridge) paint_spec: String,
 }
 
 impl AppConfig {
@@ -88,6 +92,9 @@ impl AppConfig {
                                 cfg.sel_wand = v;
                             }
                         },
+                        "paint_spec" if !value.is_empty() => {
+                            cfg.paint_spec = value.to_string()
+                        }
                         _ => {}
                     }
                 }
@@ -102,7 +109,7 @@ impl AppConfig {
                 let _ = std::fs::create_dir_all(dir);
             }
             let text = format!(
-                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\nruler_bottom_up={}\nmax_dimension={}\nsel_border={}\nsel_smooth={}\nsel_feather={}\nsel_tool={}\nsel_wand={}\n",
+                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\nruler_bottom_up={}\nmax_dimension={}\nsel_border={}\nsel_smooth={}\nsel_feather={}\nsel_tool={}\nsel_wand={}\npaint_spec={}\n",
                 self.checker_light,
                 self.checker_dark,
                 self.open_in_new_window,
@@ -113,7 +120,8 @@ impl AppConfig {
                 self.sel_smooth,
                 self.sel_feather,
                 self.sel_tool,
-                self.sel_wand
+                self.sel_wand,
+                self.paint_spec
             );
             let _ = std::fs::write(path, text);
         }

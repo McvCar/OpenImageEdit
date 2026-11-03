@@ -574,8 +574,99 @@ impl Document {
         })
     }
 
-    pub fn composite_pixel(&self, x: i32, y: i32) -> image::Rgba<u8> {
-        if x < 0 || y < 0 || x >= self.canvas.width as i32 || y >= self.canvas.height as i32 {
+    /// 拖动中的实时预览：把一块像素补丁直接写进目标并 bump epoch（渲染缓存
+    /// 因此失效、下一帧就是新像素），**不**写历史。松手时由 `commit_patch`
+    /// 把同一个矩形的前后两份位图补成一条撤销记录。
+    pub fn write_patch(&mut self, target: AdjustTarget, patch: &Patch) {
+        if patch.is_empty() {
+            return;
+        }
+        apply_region(self, target, patch.rect, &patch.image);
+        self.edit_epoch = self.edit_epoch.wrapping_add(1);
+    }
+
+    /// 提交一块已经生效的像素改动。`before` / `after` 是同一矩形的两份位图，
+    /// 撤销贴回 before、重做贴回 after，不必为一次涂抹留整图层快照。
+    pub fn commit_patch(
+        &mut self,
+        target: AdjustTarget,
+        rect: Rect,
+        before: RgbaImage,
+        after: RgbaImage,
+    ) -> Result<(), EditError> {
+        if rect.width == 0 || rect.height == 0 {
+            return Ok(());
+        }
+        self.execute(EditOp::PixelPatch {
+            target,
+            rect,
+            before,
+            after,
+        })
+    }
+
+    /// 实时预览用：直接替换某图层的位图 / 偏移，不写历史，只 bump epoch。
+    /// 拖动旋转手柄或角度对话框改数值时每帧调它。
+    pub fn preview_layer(&mut self, index: usize, layer: Layer) -> Result<(), EditError> {
+        if index >= self.layers.len() {
+            return Err(EditError::LayerIndex(index));
+        }
+        self.layers[index] = layer;
+        self.edit_epoch = self.edit_epoch.wrapping_add(1);
+        Ok(())
+    }
+
+    /// 提交一次图层整体替换（旋转手柄 / 角度对话框松手时）。
+    pub fn commit_layer(
+        &mut self,
+        index: usize,
+        before: Layer,
+        after: Layer,
+    ) -> Result<(), EditError> {
+        if index >= self.layers.len() {
+            return Err(EditError::LayerIndex(index));
+        }
+        if before == after {
+            return Ok(());
+        }
+        self.execute(EditOp::RotateLayer {
+            index,
+            before,
+            after,
+        })
+    }
+
+    /// 任意角度旋转某个图层（绕图层中心）。`expand` = true 时位图按旋转后
+    /// 的包围盒放大，内容不裁切；false 时保持原尺寸。
+    pub fn rotate_layer_angle(
+        &mut self,
+        index: usize,
+        degrees: f32,
+        expand: bool,
+    ) -> Result<(), EditError> {
+        let layer = self
+            .layers
+            .get(index)
+            .ok_or(EditError::LayerIndex(index))?;
+        if degrees.abs() < 0.01 {
+            return Ok(());
+        }
+        let before = layer.clone();
+        let (image, delta) = rotate_image(&layer.image, degrees, expand);
+        let mut after = before.clone();
+        after.image = image;
+        after.offset = (before.offset.0 + delta.0, before.offset.1 + delta.1);
+        if after == before {
+            return Ok(());
+        }
+        self.execute(EditOp::RotateLayer {
+            index,
+            before,
+            after,
+        })
+    }
+
+    pub fn composite_pixel(&self, x: i32, y: i32) -> image::Rgba<u8> {        if x < 0 || y < 0 || x >= self.canvas.width as i32 || y >= self.canvas.height as i32 {
             return image::Rgba([0, 0, 0, 0]);
         }
         let bx = (self.view.x + x) as u32;

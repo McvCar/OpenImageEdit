@@ -95,3 +95,84 @@ pub(crate) fn transform_document(doc: &mut Document, transform: Transform) {
         doc.canvas = Size::new(canvas.height, canvas.width);
     }
 }
+
+/// 任意角度旋转一张位图（双线性重采样，预乘 alpha，避免边缘发黑）。
+///
+/// `expand` = true 时按旋转后的包围盒扩大位图（内容不裁切）；false 时
+/// 保持原尺寸、四角被裁掉。返回新位图与「新左上角相对旧左上角」的偏移，
+/// 调用方据此让图层绕自己的中心转（PS 的行为）。
+pub fn rotate_image(img: &RgbaImage, degrees: f32, expand: bool) -> (RgbaImage, (i32, i32)) {
+    let w = img.width() as f32;
+    let h = img.height() as f32;
+    if w < 1.0 || h < 1.0 || degrees.abs() < 0.001 {
+        return (img.clone(), (0, 0));
+    }
+    let rad = degrees.to_radians();
+    let (sin, cos) = (rad.sin(), rad.cos());
+    let (nw, nh) = if expand {
+        (
+            (w * cos.abs() + h * sin.abs()).ceil().max(1.0) as u32,
+            (w * sin.abs() + h * cos.abs()).ceil().max(1.0) as u32,
+        )
+    } else {
+        (img.width(), img.height())
+    };
+    let (scx, scy) = (w / 2.0, h / 2.0);
+    let (dcx, dcy) = (nw as f32 / 2.0, nh as f32 / 2.0);
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    let mut out = RgbaImage::new(nw, nh);
+    for dy in 0..nh {
+        for dx in 0..nw {
+            // 目标像素中心 → 相对新中心 → 反向旋转 → 源图坐标（像素中心）。
+            let rx = dx as f32 + 0.5 - dcx;
+            let ry = dy as f32 + 0.5 - dcy;
+            let sx = cos * rx + sin * ry + scx - 0.5;
+            let sy = -sin * rx + cos * ry + scy - 0.5;
+            let x0 = sx.floor() as i32;
+            let y0 = sy.floor() as i32;
+            let tx = sx - x0 as f32;
+            let ty = sy - y0 as f32;
+            let mut acc = [0f32; 4];
+            let mut asum = 0f32;
+            for (ox, oy, wt) in [
+                (0, 0, (1.0 - tx) * (1.0 - ty)),
+                (1, 0, tx * (1.0 - ty)),
+                (0, 1, (1.0 - tx) * ty),
+                (1, 1, tx * ty),
+            ] {
+                if wt <= 0.0 {
+                    continue;
+                }
+                let (x, y) = (x0 + ox, y0 + oy);
+                if x < 0 || y < 0 || x >= iw || y >= ih {
+                    continue;
+                }
+                let p = img.get_pixel(x as u32, y as u32).0;
+                let a = p[3] as f32 / 255.0 * wt;
+                for k in 0..3 {
+                    acc[k] += p[k] as f32 * a;
+                }
+                asum += a;
+            }
+            if asum <= 1e-5 {
+                out.put_pixel(dx, dy, image::Rgba([0, 0, 0, 0]));
+                continue;
+            }
+            out.put_pixel(
+                dx,
+                dy,
+                image::Rgba([
+                    (acc[0] / asum).round().clamp(0.0, 255.0) as u8,
+                    (acc[1] / asum).round().clamp(0.0, 255.0) as u8,
+                    (acc[2] / asum).round().clamp(0.0, 255.0) as u8,
+                    (asum * 255.0).round().clamp(0.0, 255.0) as u8,
+                ]),
+            );
+        }
+    }
+    let delta = (
+        ((w - nw as f32) / 2.0).round() as i32,
+        ((h - nh as f32) / 2.0).round() as i32,
+    );
+    (out, delta)
+}

@@ -16,6 +16,8 @@ mod op;
 mod ops;
 mod document;
 mod selection;
+mod paint;
+mod retouch;
 
 pub use geometry::{Size, Rect, Selection};
 pub use selection::{
@@ -23,7 +25,11 @@ pub use selection::{
 };
 pub use mark::{MarkKind, Mark};
 pub use layer::Layer;
-pub use transform::Transform;
+pub use transform::{rotate_image, Transform};
+pub use paint::{crop_region, flood_fill, gradient_fill, Patch};
+pub use retouch::{
+    heal_clone, patch_fill, spot_heal, stroke_mask, BrushSpec, StrokeMask,
+};
 pub use op::{EditError, EditOp};
 pub use document::Document;
 pub(crate) use document::DocumentSnapshot;
@@ -34,8 +40,8 @@ pub(crate) use mark::norm_rect;
 pub(crate) use transform::transform_document;
 pub(crate) use op::History;
 pub(crate) use ops::{
-    apply_base_to_layer, apply_canvas_resize, apply_delete_base, apply_resize, apply_view,
-    clear_outside_selection, erase_base_pixels,
+    apply_base_to_layer, apply_canvas_resize, apply_delete_base, apply_region, apply_resize,
+    apply_view, clear_outside_selection, erase_base_pixels,
 };
 
 #[cfg(test)]
@@ -1307,5 +1313,232 @@ mod tests {
         assert_eq!(layer_hist.bin_counts(0)[BINS - 1], 256);
         assert_eq!(layer_hist.bin_counts(1)[0], 256);
         assert_eq!(layer_hist.bin_counts(2)[0], 256);
+    }
+}
+
+#[cfg(test)]
+mod paint_tests {
+    use super::*;
+
+    fn two_halves() -> RgbaImage {
+        RgbaImage::from_fn(20, 20, |x, _| {
+            if x < 10 {
+                image::Rgba([200, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 200, 255])
+            }
+        })
+    }
+
+    #[test]
+    fn flood_fill_touches_only_the_contiguous_half() {
+        let img = two_halves();
+        let patch = flood_fill(
+            &img,
+            (0, 0),
+            (2, 2),
+            10,
+            true,
+            None,
+            [0, 255, 0, 255],
+            1.0,
+        )
+        .unwrap();
+        // 右半边是蓝色，容差 10 不会越过去。
+        assert_eq!(patch.rect, Rect::new(0, 0, 10, 20));
+        assert_eq!(patch.image.get_pixel(0, 0).0, [0, 255, 0, 255]);
+        // 原图未被改动（补丁只是返回值）。
+        assert_eq!(img.get_pixel(0, 0).0, [200, 0, 0, 255]);
+    }
+
+    #[test]
+    fn flood_fill_respects_selection_coverage() {
+        let img = two_halves();
+        let sel = SelectionMask::rect(Rect::new(5, 0, 5, 20));
+        let patch = flood_fill(
+            &img,
+            (0, 0),
+            (2, 2),
+            10,
+            true,
+            Some(&sel),
+            [0, 0, 0, 255],
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(patch.rect, Rect::new(5, 0, 5, 20));
+    }
+
+    #[test]
+    fn gradient_runs_from_dark_to_light() {
+        let img = RgbaImage::from_pixel(10, 10, image::Rgba([0, 0, 0, 255]));
+        let patch = gradient_fill(
+            &img,
+            (0, 0),
+            Size::new(10, 10),
+            None,
+            (0.0, 0.0),
+            (10.0, 0.0),
+            [0, 0, 0, 255],
+            [255, 255, 255, 255],
+            false,
+            false,
+            1.0,
+            false,
+        )
+        .unwrap();
+        let left = patch.image.get_pixel(0, 0).0[0];
+        let right = patch.image.get_pixel(9, 0).0[0];
+        assert!(right > left + 100, "left={left} right={right}");
+    }
+
+    #[test]
+    fn spot_heal_pulls_surrounding_color_over_the_spot() {
+        let mut img = RgbaImage::from_pixel(40, 40, image::Rgba([180, 180, 180, 255]));
+        for y in 18..23 {
+            for x in 18..23 {
+                img.put_pixel(x, y, image::Rgba([0, 0, 0, 255]));
+            }
+        }
+        let mask = stroke_mask(
+            &[(20.0, 20.0)],
+            (0, 0),
+            Size::new(40, 40),
+            BrushSpec {
+                size: 10.0,
+                hardness: 0.6,
+                spacing: 0.2,
+            },
+        )
+        .unwrap();
+        let patch = spot_heal(&img, &mask, 1.0).unwrap();
+        let c = patch
+            .image
+            .get_pixel(
+                (20 - patch.rect.x) as u32,
+                (20 - patch.rect.y) as u32,
+            )
+            .0;
+        assert!(
+            c[0] > 120,
+            "healed pixel should approach the gray background, got {c:?}"
+        );
+    }
+
+    #[test]
+    fn heal_clone_copies_texture_but_keeps_destination_color() {
+        // 左边是黑白条纹（纹理），右边是均匀灰。修复画笔的语义是「取源的
+        // 纹理、留目标的明暗色彩」，所以涂过的地方应该出现明暗起伏，但
+        // 平均色仍接近灰。
+        let mut img = RgbaImage::from_pixel(60, 20, image::Rgba([128, 128, 128, 255]));
+        for y in 0..20 {
+            for x in 0..20 {
+                let v = if x % 4 < 2 { 40 } else { 220 };
+                img.put_pixel(x, y, image::Rgba([v, v, v, 255]));
+            }
+        }
+        let mask = stroke_mask(
+            &[(40.0, 10.0)],
+            (0, 0),
+            Size::new(60, 20),
+            BrushSpec {
+                size: 8.0,
+                hardness: 1.0,
+                spacing: 0.2,
+            },
+        )
+        .unwrap();
+        let patch = heal_clone(&img, &mask, (40.0, 10.0), (10.0, 10.0), 1.0).unwrap();
+        let mut lo = 255u8;
+        let mut hi = 0u8;
+        for y in 7..13 {
+            for x in 37..43 {
+                let c = patch
+                    .image
+                    .get_pixel((x - patch.rect.x) as u32, (y - patch.rect.y) as u32)
+                    .0;
+                lo = lo.min(c[0]);
+                hi = hi.max(c[0]);
+            }
+        }
+        assert!(hi - lo > 60, "texture should come through, lo={lo} hi={hi}");
+    }
+
+    #[test]
+    fn patch_fill_copies_the_offset_region() {
+        let mut img = RgbaImage::from_pixel(60, 20, image::Rgba([255, 255, 255, 255]));
+        for y in 0..20 {
+            for x in 0..20 {
+                img.put_pixel(x, y, image::Rgba([0, 120, 0, 255]));
+            }
+        }
+        let region = SelectionMask::rect(Rect::new(40, 0, 10, 20));
+        let patch = patch_fill(&img, (0, 0), &region, (-40, 0), 0, 1.0).unwrap();
+        let c = patch.image.get_pixel((40 - patch.rect.x) as u32, 10).0;
+        assert!(c[1] > 80, "expected green sample, got {c:?}");
+    }
+
+    #[test]
+    fn rotate_image_expands_and_keeps_the_center() {
+        let mut img = RgbaImage::from_pixel(10, 10, image::Rgba([255, 255, 255, 255]));
+        img.put_pixel(5, 5, image::Rgba([0, 0, 0, 255]));
+        let (out, delta) = rotate_image(&img, 45.0, true);
+        assert!(out.width() > 13 && out.width() < 16, "w={}", out.width());
+        assert!(out.height() > 13 && out.height() < 16);
+        // 黑点仍存在，且位于输出画面的中心附近（旋转不移动中心）。
+        let mut dark = (0u32, 0u32, 0u32);
+        for y in 0..out.height() {
+            for x in 0..out.width() {
+                let c = out.get_pixel(x, y).0;
+                if c[0] < 60 {
+                    dark.0 += x;
+                    dark.1 += y;
+                    dark.2 += 1;
+                }
+            }
+        }
+        assert!(dark.2 > 0, "the dark dot should survive the rotation");
+        let cx = dark.0 as f32 / dark.2 as f32;
+        let cy = dark.1 as f32 / dark.2 as f32;
+        assert!((cx - out.width() as f32 / 2.0).abs() < 1.5, "cx={cx}");
+        assert!((cy - out.height() as f32 / 2.0).abs() < 1.5, "cy={cy}");
+        // 左上角向外扩，偏移为负。
+        assert!(delta.0 <= 0 && delta.1 <= 0);
+    }
+
+    #[test]
+    fn rotate_layer_angle_is_undoable() {
+        let mut doc = Document::from_image(RgbaImage::from_pixel(
+            20,
+            10,
+            image::Rgba([10, 20, 30, 255]),
+        ));
+        doc.add_layer(Layer::new(
+            "l",
+            RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255])),
+        ))
+        .unwrap();
+        let before = doc.layers[0].clone();
+        doc.rotate_layer_angle(0, 30.0, true).unwrap();
+        assert!(doc.layers[0].image.width() > 8);
+        doc.undo().unwrap();
+        assert_eq!(doc.layers[0], before);
+    }
+
+    #[test]
+    fn pixel_patch_undo_restores_only_the_rectangle() {
+        let mut doc = Document::from_image(RgbaImage::from_pixel(
+            20,
+            20,
+            image::Rgba([10, 10, 10, 255]),
+        ));
+        let before = crop_region(&doc.base, Rect::new(4, 4, 6, 6));
+        let after = RgbaImage::from_pixel(6, 6, image::Rgba([200, 0, 0, 255]));
+        doc.commit_patch(AdjustTarget::Base, before.0, before.1, after)
+            .unwrap();
+        assert_eq!(doc.base.get_pixel(5, 5).0, [200, 0, 0, 255]);
+        doc.undo().unwrap();
+        assert_eq!(doc.base.get_pixel(5, 5).0, [10, 10, 10, 255]);
+        assert_eq!(doc.base.get_pixel(0, 0).0, [10, 10, 10, 255]);
     }
 }

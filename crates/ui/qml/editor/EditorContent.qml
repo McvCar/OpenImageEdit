@@ -351,6 +351,34 @@ Item {
     property bool markItalic: false
     property bool markUnderline: false
     property int markAlign: 0 // 0 left / 1 center / 2 right
+    // ---- 修复 / 油漆工具族 ----------------------------------------
+    // paintTool 与 markTool / selTool 三者互斥：同一时刻只有一个工具族在画布上
+    // 接管手势。修复类改像素（可撤销），不产生标记。
+    property string paintTool: "none" // none | spot | heal | patch | bucket | gradient
+    property bool paintPopoverOpen: false
+    property string paintGroup: "heal" // 参数面板当前展示的组
+    property bool paintMenuOpen: false
+    // 笔刷参数（修复类共用）：大小按画布像素，硬度/间距/强度按百分比。
+    property int healSize: 40
+    property int healHardness: 70
+    property int healSpacing: 20
+    property int healStrength: 100
+    // 修复画笔是否已经有取样点（Alt + 点击设置）。
+    property bool healHasSource: false
+    // 修补：扩散（羽化半径，像素）。
+    property int patchFeather: 2
+    readonly property bool patchHasRegion: view.canvasSurface.patchRegion.length >= 3
+    // 油漆桶参数。
+    property int bucketTolerance: 32
+    property bool bucketContiguous: true
+    property int bucketOpacity: 100
+    // 渐变参数（起止色直接用描边色 / 填充色）。
+    property bool gradRadial: false
+    property bool gradReverse: false
+    property int gradOpacity: 100
+    // ---- 图层旋转（画布手柄）----
+    property bool rotating: false
+    property real rotateAnglePreview: 0
     readonly property var markList: Marks.parseMarks(bridge.marks_json)
     // ---- 调整颜色（macOS 预览风格）----
     // Mirrored parameters (slider positions) and the throttled live push.
@@ -370,6 +398,21 @@ Item {
     // Exercises the Ctrl+S / menu 保存 path (saveOrSaveAs → save_edited)
     // so QML scope errors on that route fail loudly in probe runs.
     readonly property bool probeSave: Qt.application.arguments.indexOf("--probe-save") !== -1
+    // 修复 / 油漆工具面板的探针：`--probe-paint [--paint-tool=spot|heal|patch|
+    // bucket|gradient] [--paint-menu]`。`--paint-menu` 走右键浮层那条路径。
+    readonly property bool probePaint: Qt.application.arguments.indexOf("--probe-paint") !== -1
+    readonly property string paintProbeTool: {
+        const flag = "--paint-tool="
+        for (let i = 0; i < Qt.application.arguments.length; ++i) {
+            const a = Qt.application.arguments[i]
+            if (a.indexOf(flag) === 0)
+                return a.substring(flag.length)
+        }
+        return "heal"
+    }
+    // 图层旋转探针：`--probe-rotate [--rotate-dialog]`。不带 --rotate-dialog
+    // 就只显示画布上的旋转手柄。
+    readonly property bool probeRotate: Qt.application.arguments.indexOf("--probe-rotate") !== -1
     // ---- 尺子（测量坐标）----
     // 开关只是显示层，不动文档；坐标全部是「相对画布」的图像像素坐标。
     property bool rulerOn: false
@@ -666,11 +709,36 @@ Shortcut { sequence: "W"; enabled: root.canUseToolKeys()
            onActivated: root.setSelToolByShortcut("quick") }
 Shortcut { sequence: "Shift+W"; enabled: root.canUseToolKeys()
            onActivated: root.setSelToolByShortcut("wand") }
-// [ / ]：快速选择的笔刷半径（PS 的笔刷大小快捷键）。
+// J：修复组（污点修复 → 修复画笔 → 修补 循环）；G：油漆组（油漆桶 / 渐变）。
+Shortcut { sequence: "J"; enabled: root.canUseToolKeys()
+           onActivated: {
+               const order = ["spot", "heal", "patch"]
+               const i = order.indexOf(root.paintTool)
+               root.setPaintTool(order[(i + 1) % order.length])
+               root.markBarVisible = true
+           } }
+Shortcut { sequence: "G"; enabled: root.canUseToolKeys()
+           onActivated: {
+               const order = ["bucket", "gradient"]
+               const i = order.indexOf(root.paintTool)
+               root.setPaintTool(order[(i + 1) % order.length])
+               root.markBarVisible = true
+           } }
+// [ / ]：修复笔刷大小（PS 的笔刷大小快捷键）；不在修复工具下时调快速选择。
 Shortcut { sequence: "["; enabled: root.canUseToolKeys()
-           onActivated: root.setQuickRadius(root.quickRadius - 4) }
+           onActivated: {
+               if (root.paintTool === "spot" || root.paintTool === "heal")
+                   root.setHealSize(root.healSize - 4)
+               else
+                   root.setQuickRadius(root.quickRadius - 4)
+           } }
 Shortcut { sequence: "]"; enabled: root.canUseToolKeys()
-           onActivated: root.setQuickRadius(root.quickRadius + 4) }
+           onActivated: {
+               if (root.paintTool === "spot" || root.paintTool === "heal")
+                   root.setHealSize(root.healSize + 4)
+               else
+                   root.setQuickRadius(root.quickRadius + 4)
+           } }
 Shortcut { sequence: "Ctrl+D"; enabled: root.selExists
            onActivated: bridge.sel_clear() }
 Shortcut { sequence: "Ctrl+Shift+I"; enabled: bridge.image_width > 0
@@ -727,14 +795,51 @@ SelectionMenu {
     bridge: bridge
 }
 
+// ---- 修复 / 油漆：两个工具组面板 + 画布右键的紧凑参数面板 ----------
+PaintPopover {
+    id: healPop
+    host: root
+    bridge: bridge
+    markBar: markBar
+    toolbar: toolbar
+    group: "heal"
+}
+PaintPopover {
+    id: paintPop
+    host: root
+    bridge: bridge
+    markBar: markBar
+    toolbar: toolbar
+    group: "paint"
+}
+PaintPopover {
+    id: paintMenu
+    host: root
+    bridge: bridge
+    markBar: markBar
+    toolbar: toolbar
+    mode: "context"
+    group: "heal"
+}
+
+// 图层旋转角度对话框（图层面板右键 / 「图像」菜单打开）。
+RotateLayerOverlay {
+    id: rotateOverlay
+    host: root
+    bridge: bridge
+}
+
 // 点空白处关掉选区菜单（菜单本身在更高的 z 上，点击不会穿透到这里）。
 MouseArea {
     z: 295
     anchors.fill: parent
-    visible: root.selMenuOpen
-    enabled: root.selMenuOpen
+    visible: root.selMenuOpen || root.paintMenuOpen
+    enabled: root.selMenuOpen || root.paintMenuOpen
     onPressed: (mouse) => {
-        selMenu.close()
+        if (root.selMenuOpen)
+            selMenu.close()
+        if (root.paintMenuOpen)
+            root.closePaintMenu()
         mouse.accepted = true
     }
 }
@@ -998,6 +1103,7 @@ function updateCursorKind(x, y) {
     let kind = 0
     if (x >= 0 && y >= 0 && root.selExists && root.selTool !== "none"
             && root.selTool !== "polygon" && root.markTool === "none"
+            && root.paintTool === "none"
             && !bridge.pickerOpen
             && !view.canvasSurface.textPopup.visible) {
         const ix = x - view.pad
@@ -1022,6 +1128,10 @@ function canvasCursor(x, y) {
         return Qt.ArrowCursor
     // 拾色器打开：整块画布都是取色十字。
     if (bridge.pickerOpen)
+        return Qt.CrossCursor
+    // 修复 / 油漆工具：画布上永远只是十字 —— 它们没有移动 / 缩放语义，
+    // 也不该在图层上变成 SizeAll（否则看起来像能拖图层）。
+    if (root.paintTool !== "none")
         return Qt.CrossCursor
     // 标记工具激活：手柄 → 缩放光标；标记上 → 移动；文本工具 → 工字；
     // 其余 → 十字。
@@ -1196,6 +1306,13 @@ function setSelTool(tool) {
     // 浮动面板里换形状时，标记栏本来就是开的（后者就在栏里），静默切换。
     if (tool !== "none") {
         root.markTool = "none"
+        // 选区工具与修复 / 油漆工具互斥（后者的手势会抢在选区之前）。
+        if (root.paintTool !== "none") {
+            view.canvasSurface.cancelPaint()
+            root.paintTool = "none"
+            root.closePaintPopovers()
+            root.savePaintSpec()
+        }
         widthPopover.visible = false
         mosaicPopover.visible = false
     }
@@ -1337,6 +1454,17 @@ function onEscape() {
     if (bridge.adjustOpen) { root.cancelAdjust(); return }
     // 拾色器：Esc = 关面板（已取的色保留）。
     if (bridge.pickerOpen) { bridge.picker_close(); return }
+    // 图层旋转对话框：Esc = 放弃（还原旋转前的位图）。
+    if (rotateOverlay.visible) { rotateOverlay.close(false); return }
+    // 修复 / 油漆：菜单 → 参数面板 → 进行中的手势 → 修补区域，逐层退出。
+    if (root.paintMenuOpen) { root.closePaintMenu(); return }
+    if (root.paintPopoverOpen) { root.closePaintPopovers(); return }
+    if (view.canvasSurface.paintStroke || view.canvasSurface.patchDragging
+            || view.canvasSurface.patchDrawing) {
+        view.canvasSurface.cancelPaint()
+        return
+    }
+    if (root.patchHasRegion) { view.canvasSurface.clearPatchRegion(); return }
     if (root.selPopoverOpen) { root.selPopoverOpen = false; return }
     if (widthPopover.visible || colorPopover.visible
         || mosaicPopover.visible || fontPopover.visible || zoomMenu.visible) {
@@ -1408,6 +1536,240 @@ function setMarkTool(tool) {
     if (root.markTool === "none") {
         widthPopover.visible = false
         mosaicPopover.visible = false
+    } else if (root.paintTool !== "none") {
+        // 标记工具与修复 / 油漆工具互斥。
+        view.canvasSurface.cancelPaint()
+        root.paintTool = "none"
+        root.closePaintPopovers()
+        root.savePaintSpec()
+    }
+}
+
+// ---- 修复 / 油漆工具族 -------------------------------------------------
+
+function paintGroupOf(tool) {
+    if (tool === "spot" || tool === "heal" || tool === "patch")
+        return "heal"
+    if (tool === "bucket" || tool === "gradient")
+        return "paint"
+    return ""
+}
+
+// 切换修复 / 油漆工具。三个工具族互斥；切走时把进行中的手势撤销掉。
+function setPaintTool(tool) {
+    const next = (root.paintTool === tool) ? "none" : tool
+    view.canvasSurface.cancelPaint()
+    root.paintTool = next
+    if (next !== "patch")
+        view.canvasSurface.clearPatchRegion()
+    if (next !== "none") {
+        root.markTool = "none"
+        root.selTool = "none"
+        root.selPopoverOpen = false
+        view.canvasSurface.cancelPolygon()
+        view.canvasSurface.cancelQuickSelect()
+        widthPopover.visible = false
+        mosaicPopover.visible = false
+        colorPopover.visible = false
+        fontPopover.visible = false
+    }
+    root.savePaintSpec()
+}
+
+// 标记栏上的两个工具组按钮：点开/收起对应的参数面板。
+function togglePaintGroup(group) {
+    if (group !== "heal" && group !== "paint")
+        return
+    root.markBarVisible = true
+    if (root.paintPopoverOpen && root.paintGroup === group) {
+        root.closePaintPopovers()
+        return
+    }
+    root.paintGroup = group
+    healPop.visible = (group === "heal")
+    paintPop.visible = (group === "paint")
+    root.paintPopoverOpen = true
+    // 组里还没有激活的工具时，默认选第一个。
+    const cur = root.paintTool
+    const inside = group === "heal"
+                   ? (cur === "spot" || cur === "heal" || cur === "patch")
+                   : (cur === "bucket" || cur === "gradient")
+    if (!inside)
+        root.setPaintTool(group === "heal" ? "spot" : "bucket")
+}
+
+function closePaintPopovers() {
+    healPop.visible = false
+    paintPop.visible = false
+    root.paintPopoverOpen = false
+}
+
+// 幂等地「选中某个工具 + 展开它那一组面板」：setPaintTool 是切换语义
+// （再点一次取消），所以先比一下，避免把已经选中的工具关掉。
+function openPaintPanelFor(tool) {
+    const g = root.paintGroupOf(tool)
+    if (g === "")
+        return
+    if (root.paintTool !== tool)
+        root.setPaintTool(tool)
+    if (!root.paintPopoverOpen || root.paintGroup !== g) {
+        root.togglePaintGroup(g)
+        return
+    }
+    // 面板已经开着：只同步可见性，不要重复走 toggle（会把它收起来）。
+    healPop.visible = (g === "heal")
+    paintPop.visible = (g === "paint")
+}
+
+// 画布右键：当前工具的紧凑参数面板（PS 的右键调参）。
+function openPaintMenu(x, y) {
+    const g = root.paintGroupOf(root.paintTool)
+    if (g === "")
+        return false
+    paintMenu.group = g
+    paintMenu.anchorX = x
+    paintMenu.anchorY = y
+    paintMenu.visible = true
+    root.paintMenuOpen = true
+    return true
+}
+
+function closePaintMenu() {
+    paintMenu.visible = false
+    root.paintMenuOpen = false
+}
+
+// 打开颜色面板并把目标切到「描边」或「填充」：油漆桶用描边色，
+// 渐变的终点色用填充色（顺手复用已有的两个颜色通道）。
+function openColorFor(fill) {
+    root.closePaintPopovers()
+    colorPopover.editingFill = fill
+    colorPopover.visible = true
+}
+
+function setHealSize(v) {
+    root.healSize = Math.max(2, Math.min(400, Math.round(v)))
+    root.savePaintSpec()
+}
+function setHealHardness(v) {
+    root.healHardness = Math.max(0, Math.min(100, Math.round(v)))
+    root.savePaintSpec()
+}
+function setHealSpacing(v) {
+    root.healSpacing = Math.max(1, Math.min(100, Math.round(v)))
+    root.savePaintSpec()
+}
+function setHealStrength(v) {
+    root.healStrength = Math.max(1, Math.min(100, Math.round(v)))
+    root.savePaintSpec()
+}
+function setPatchFeather(v) {
+    root.patchFeather = Math.max(0, Math.min(40, Math.round(v)))
+    root.savePaintSpec()
+}
+function setBucketTolerance(v) {
+    root.bucketTolerance = Math.max(0, Math.min(255, Math.round(v)))
+    root.savePaintSpec()
+}
+function setBucketContiguous(v) {
+    root.bucketContiguous = v
+    root.savePaintSpec()
+}
+function setBucketOpacity(v) {
+    root.bucketOpacity = Math.max(1, Math.min(100, Math.round(v)))
+    root.savePaintSpec()
+}
+function setGradRadial(v) {
+    root.gradRadial = v
+    root.savePaintSpec()
+}
+function toggleGradReverse() {
+    root.gradReverse = !root.gradReverse
+    root.savePaintSpec()
+}
+function setGradOpacity(v) {
+    root.gradOpacity = Math.max(1, Math.min(100, Math.round(v)))
+    root.savePaintSpec()
+}
+
+// 12 段：工具|大小|硬度|间距|强度|扩散|容差|连续|不透明|径向|反向|渐变不透明
+function paintSpecString() {
+    return [root.paintTool, root.healSize, root.healHardness, root.healSpacing,
+            root.healStrength, root.patchFeather, root.bucketTolerance,
+            root.bucketContiguous ? 1 : 0, root.bucketOpacity,
+            root.gradRadial ? 1 : 0, root.gradReverse ? 1 : 0,
+            root.gradOpacity].join("|")
+}
+function savePaintSpec() {
+    bridge.save_paint_spec(root.paintSpecString())
+}
+function applyPaintSpec(spec) {
+    const p = String(spec).split("|")
+    if (p.length !== 12)
+        return
+    const num = function (i, lo, hi, dflt) {
+        const v = parseInt(p[i], 10)
+        return isNaN(v) ? dflt : Math.max(lo, Math.min(hi, v))
+    }
+    const tools = ["none", "spot", "heal", "patch", "bucket", "gradient"]
+    root.paintTool = tools.indexOf(p[0]) >= 0 ? p[0] : "none"
+    root.healSize = num(1, 2, 400, 40)
+    root.healHardness = num(2, 0, 100, 70)
+    root.healSpacing = num(3, 1, 100, 20)
+    root.healStrength = num(4, 1, 100, 100)
+    root.patchFeather = num(5, 0, 40, 2)
+    root.bucketTolerance = num(6, 0, 255, 32)
+    root.bucketContiguous = p[7] === "1"
+    root.bucketOpacity = num(8, 1, 100, 100)
+    root.gradRadial = p[9] === "1"
+    root.gradReverse = p[10] === "1"
+    root.gradOpacity = num(11, 1, 100, 100)
+}
+
+function openRotateLayer(index) {
+    if (index < 0)
+        return
+    rotateOverlay.open(index)
+}
+
+// ---- 画布上的旋转手柄 ------------------------------------------------
+// 拖动期间每 60ms 才重算一次整层重采样；松手时补最后一帧再提交。
+function startLayerRotate() {
+    if (bridge.selected_layer < 0)
+        return
+    root.rotating = true
+    root.rotateAnglePreview = 0
+    bridge.rotate_layer_begin(bridge.selected_layer)
+}
+
+function previewLayerRotate(deg) {
+    if (!root.rotating)
+        return
+    root.rotateAnglePreview = deg
+    rotateThrottle.restart()
+}
+
+function finishLayerRotate(apply) {
+    rotateThrottle.stop()
+    if (!root.rotating)
+        return
+    root.rotating = false
+    if (apply) {
+        // 松手时可能还有一帧没算：补上，否则最后几个像素的拖动会被丢掉。
+        bridge.rotate_layer_update(root.rotateAnglePreview, true)
+        bridge.rotate_layer_finish(true)
+    } else {
+        bridge.rotate_layer_finish(false)
+    }
+}
+
+Timer {
+    id: rotateThrottle
+    interval: 60
+    repeat: false
+    onTriggered: {
+        if (root.rotating)
+            bridge.rotate_layer_update(root.rotateAnglePreview, true)
     }
 }
 
@@ -2254,10 +2616,50 @@ Timer {
                      adjustPanel.moveTo(adjustPanel.x + 150, adjustPanel.y + 130)
 }
 
+// Probe: --probe-paint 打开修复 / 油漆工具面板（贴工具栏 or 右键浮层）,
+// 让截图能核对参数行与工具互斥态。
+Timer {
+    id: paintProbeTimer
+    interval: 900
+    onTriggered: {
+        root.markBarVisible = true
+        if (Qt.application.arguments.indexOf("--paint-menu") !== -1) {
+            // 只拍右键浮层：先把工具选上但不展开工具组面板。
+            if (root.paintTool !== root.paintProbeTool)
+                root.setPaintTool(root.paintProbeTool)
+            root.openPaintMenu(420, 300)
+            return
+        }
+        root.openPaintPanelFor(root.paintProbeTool)
+    }
+}
+
+// Probe: --probe-rotate 选中最上面的图层（配合 --script=extract:… 造图层），
+// 显示画布旋转手柄；再加 --rotate-dialog 打开角度对话框。
+Timer {
+    id: rotateProbeTimer
+    interval: 1100
+    onTriggered: {
+        root.markBarVisible = true
+        // 旋转手柄只在「没有选区、没有绘画工具」时出现。
+        if (root.paintTool !== "none") {
+            root.paintTool = "none"
+            root.closePaintPopovers()
+        }
+        if (bridge.selected_layer < 0 && bridge.layer_count > 0)
+            bridge.select_layer(0)
+        if (Qt.application.arguments.indexOf("--rotate-dialog") !== -1
+                && bridge.selected_layer >= 0)
+            root.openRotateLayer(bridge.selected_layer)
+    }
+}
+
 Component.onCompleted: {
     bridge.mark("qml-completed");
     // 魔术棒参数：settings.ini 里的 "容差,连续,全部图层"。
     root.applyWandSpec(bridge.selWandSaved);
+    // 修复 / 油漆工具参数（含上次使用的工具），`|` 分隔 12 段。
+    root.applyPaintSpec(bridge.paintSpecSaved);
     // Push the screen's device-pixel-ratio so the first preview frame is
     // rendered at the physical resolution (onDprChanged alone may not fire
     // for the initial value).
@@ -2290,6 +2692,10 @@ Component.onCompleted: {
             markBarProbeTimer.start();
         if (root.probeAdjust)
             adjustProbeTimer.start();
+        if (root.probePaint)
+            paintProbeTimer.start();
+        if (root.probeRotate)
+            rotateProbeTimer.start();
         if (Qt.application.arguments.indexOf("--probe-adjustdrag") !== -1)
             adjustDragProbeTimer.start();
         if (root.probeRuler)

@@ -86,6 +86,8 @@ Rectangle {
                   run: function () { bridge.flip_horizontal() } },
                 { l: "垂直翻转", ok: true,
                   run: function () { bridge.flip_vertical() } },
+                { l: "旋转图层…", ok: bridge.selected_layer >= 0,
+                  run: function () { host.openRotateLayer(bridge.selected_layer) } },
                 { l: "", sep: true },
                 { l: "应用裁剪 (Enter / Ctrl+K)", ok: host.selExists,
                   run: function () { host.applyCrop() } },

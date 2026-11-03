@@ -17,6 +17,9 @@ Rectangle {
     readonly property alias colorBtn: colorBtn
     // 选区面板的锚点（选区工具已从独立工具条搬到这里）。
     readonly property alias selBtn: selBtn
+    // 两个「工具组」按钮的锚点（PaintPopover 贴它们下面弹）。
+    readonly property alias healBtn: healBtn
+    readonly property alias paintBtn: paintBtn
     visible: host.markBarVisible
     anchors.top: toolbar.bottom
     anchors.left: parent.left
@@ -262,6 +265,94 @@ Rectangle {
         Rectangle { width: 9; height: 18; color: "transparent"
             Rectangle { anchors.centerIn: parent; width: 1; height: 18; color: "#3c4043" } }
 
+        // ---- 修复工具组（污点修复 / 修复画笔 / 修补）------------------
+        // 三个工具的入口收在同一个按钮里，点开是分组面板（PS 的工具组）。
+        IconButton {
+            id: healBtn
+            tip: "修复工具组：污点修复 / 修复画笔 / 修补 (J)"
+            active: bridge.image_width > 0
+            selected: host.paintTool === "spot" || host.paintTool === "heal"
+                      || host.paintTool === "patch"
+            onClicked: host.togglePaintGroup("heal")
+            // 创可贴图标：斜置的圆角长条 + 中间两条透气线。
+            Canvas {
+                width: 22
+                height: 22
+                anchors.centerIn: parent
+                property color ink: healBtn.selected ? "#ffffff" : "#e9eaec"
+                onInkChanged: requestPaint()
+                onPaint: {
+                    const c = getContext("2d")
+                    c.clearRect(0, 0, width, height)
+                    c.save()
+                    c.translate(11, 11)
+                    c.rotate(-Math.PI / 4)
+                    c.strokeStyle = ink
+                    c.lineWidth = 1.3
+                    const r = 3.2
+                    const w = 15, h = 8
+                    c.beginPath()
+                    c.moveTo(-w / 2 + r, -h / 2)
+                    c.lineTo(w / 2 - r, -h / 2)
+                    c.quadraticCurveTo(w / 2, -h / 2, w / 2, -h / 2 + r)
+                    c.lineTo(w / 2, h / 2 - r)
+                    c.quadraticCurveTo(w / 2, h / 2, w / 2 - r, h / 2)
+                    c.lineTo(-w / 2 + r, h / 2)
+                    c.quadraticCurveTo(-w / 2, h / 2, -w / 2, h / 2 - r)
+                    c.lineTo(-w / 2, -h / 2 + r)
+                    c.quadraticCurveTo(-w / 2, -h / 2, -w / 2 + r, -h / 2)
+                    c.closePath()
+                    c.stroke()
+                    c.beginPath()
+                    c.moveTo(-2.2, -2.4); c.lineTo(-2.2, 2.4)
+                    c.moveTo(2.2, -2.4); c.lineTo(2.2, 2.4)
+                    c.stroke()
+                    c.restore()
+                }
+            }
+        }
+
+        // ---- 油漆工具组（油漆桶 / 渐变）-------------------------------
+        IconButton {
+            id: paintBtn
+            tip: "油漆工具组：油漆桶 / 渐变 (G)"
+            active: bridge.image_width > 0
+            selected: host.paintTool === "bucket" || host.paintTool === "gradient"
+            onClicked: host.togglePaintGroup("paint")
+            // 油漆桶：梯形桶身 + 提手 + 一滴颜料。
+            Canvas {
+                width: 22
+                height: 22
+                anchors.centerIn: parent
+                property color ink: paintBtn.selected ? "#ffffff" : "#e9eaec"
+                onInkChanged: requestPaint()
+                onPaint: {
+                    const c = getContext("2d")
+                    c.clearRect(0, 0, width, height)
+                    c.strokeStyle = ink
+                    c.fillStyle = ink
+                    c.lineWidth = 1.3
+                    c.beginPath()
+                    c.moveTo(5.5, 8.5)
+                    c.lineTo(17.5, 8.5)
+                    c.lineTo(15.2, 18.5)
+                    c.lineTo(7.8, 18.5)
+                    c.closePath()
+                    c.stroke()
+                    c.beginPath()
+                    c.moveTo(7.5, 8.5)
+                    c.quadraticCurveTo(11.5, 3.0, 15.5, 8.5)
+                    c.stroke()
+                    c.beginPath()
+                    c.ellipse(18.6, 5.2, 2.0, 2.6)
+                    c.fill()
+                }
+            }
+        }
+
+        Rectangle { width: 9; height: 18; color: "transparent"
+            Rectangle { anchors.centerIn: parent; width: 1; height: 18; color: "#3c4043" } }
+
         // 调整颜色（macOS 预览风格）：打开实时调色面板；再点一次 = 应用。
         IconButton {
             id: adjustBtn
@@ -364,13 +455,27 @@ Rectangle {
         elide: Text.ElideRight
         // 剩不到 120px 就别硬塞了：提示是辅助信息，按钮才是本体。
         visible: width > 120
-        text: host.markTool === "none"
-              ? "选择工具绘制 · 点击标记可移动，双击文本可编辑"
-              : (host.markTool === "brush"
-                 ? "按住拖拽绘制笔画"
-                 : host.markTool === "mosaic"
-                 ? "按住拖拽划选区打码 · 强度可调"
-                 : "按住拖拽绘制 · 点击已有标记可移动/缩放")
+        text: host.paintTool === "spot"
+              ? "按住涂抹 · 周边像素自动盖住瑕疵 · [ ] 调笔刷"
+              : host.paintTool === "heal"
+              ? (host.healHasSource
+                 ? "按住涂抹复制取样点 · Alt 重新取样 · [ ] 调笔刷"
+                 : "Alt + 点击一处干净的地方取样")
+              : host.paintTool === "patch"
+              ? (host.patchHasRegion
+                 ? "拖住区域到取样处松手 · Esc 放弃区域"
+                 : "先拖出一个要修补的区域")
+              : host.paintTool === "bucket"
+              ? "点击填色 · 有选区时只填选区里 · 右键调参数"
+              : host.paintTool === "gradient"
+              ? "拖一条线定义渐变方向 · 右键调参数"
+              : (host.markTool === "none"
+                 ? "选择工具绘制 · 点击标记可移动，双击文本可编辑"
+                 : (host.markTool === "brush"
+                    ? "按住拖拽绘制笔画"
+                    : host.markTool === "mosaic"
+                    ? "按住拖拽划选区打码 · 强度可调"
+                    : "按住拖拽绘制 · 点击已有标记可移动/缩放"))
         color: "#6b7076"
         font.pixelSize: 11
     }

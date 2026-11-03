@@ -506,6 +506,136 @@ impl qobject::Bridge {
                         println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}")
                     }
                 }
+                // ---- 修复 / 油漆 / 图层旋转探针 ----
+                // `spot:x,y[,size][,strength]` — 单点污点修复（begin 即落一帧）。
+                other if other.starts_with("spot:") => {
+                    let n = parse_nums(other);
+                    let a = |i: usize, d: f64| n.get(i).copied().unwrap_or(d);
+                    self.as_mut().retouch_begin(
+                        &QString::from("spot"),
+                        a(0, 0.0),
+                        a(1, 0.0),
+                        a(2, 40.0),
+                        70.0,
+                        20.0,
+                        a(3, 100.0),
+                    );
+                    self.as_mut().retouch_end();
+                    println!("{{\"phase\":\"ui\",\"event\":\"spot-heal\"}}");
+                }
+                // `heal:size,sx,sy,x1,y1,x2,y2[,x3,y3…]` — 修复画笔：
+                // 先在 (sx,sy) 取源，再沿折线涂（每段都走 move 的完整重算）。
+                other if other.starts_with("heal:") => {
+                    let n = parse_nums(other);
+                    if n.len() >= 6 {
+                        let pts: Vec<(f64, f64)> = n[3..]
+                            .chunks(2)
+                            .filter(|c| c.len() == 2)
+                            .map(|c| (c[0], c[1]))
+                            .collect();
+                        if !pts.is_empty() {
+                            self.as_mut().retouch_set_source(n[1], n[2]);
+                            self.as_mut().retouch_begin(
+                                &QString::from("heal"),
+                                pts[0].0,
+                                pts[0].1,
+                                n[0],
+                                70.0,
+                                20.0,
+                                100.0,
+                            );
+                            for p in &pts[1..] {
+                                self.as_mut().retouch_move(p.0, p.1);
+                            }
+                            self.as_mut().retouch_end();
+                            println!(
+                                "{{\"phase\":\"ui\",\"event\":\"heal-clone\",\"points\":{}}}",
+                                pts.len()
+                            );
+                        }
+                    }
+                }
+                // `patch-fill:x,y,w,h,dx,dy,feather` — 圈一块矩形区域再拖 dx/dy。
+                other if other.starts_with("patch-fill:") => {
+                    let n = parse_nums(other);
+                    if n.len() == 7 {
+                        let (x, y, w, h) = (n[0], n[1], n[2], n[3]);
+                        let poly = format!(
+                            "{x},{y} {},{} {},{} {},{}",
+                            x + w,
+                            y,
+                            x + w,
+                            y + h,
+                            x,
+                            y + h
+                        );
+                        self.as_mut().patch_set_region(&QString::from(poly.as_str()));
+                        self.as_mut().patch_drag_begin(x + w / 2.0, y + h / 2.0, n[6] as i32);
+                        self.as_mut().patch_drag_move(n[4], n[5]);
+                        let ok = self.as_mut().patch_drag_end();
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"patch-fill\",\"ok\":{ok}}}"
+                        );
+                    }
+                }
+                // `bucket:x,y[,tol][,contiguous][,R][,G][,B][,opacity]`
+                other if other.starts_with("bucket:") => {
+                    let n = parse_nums(other);
+                    if n.len() >= 2 {
+                        let a = |i: usize, d: f64| n.get(i).copied().unwrap_or(d);
+                        let hex = format!(
+                            "#{:02X}{:02X}{:02X}",
+                            a(4, 255.0) as u8,
+                            a(5, 0.0) as u8,
+                            a(6, 0.0) as u8
+                        );
+                        self.as_mut().bucket_fill(
+                            n[0],
+                            n[1],
+                            a(2, 32.0) as i32,
+                            a(3, 1.0) > 0.5,
+                            a(7, 100.0),
+                            &QString::from(hex.as_str()),
+                        );
+                    }
+                }
+                // `gradient:x0,y0,x1,y1,radial,reverse,RRGGBB,RRGGBB[,opacity]`
+                other if other.starts_with("gradient:") => {
+                    let body = other.trim_start_matches("gradient:");
+                    let parts: Vec<&str> = body.split(',').map(str::trim).collect();
+                    if parts.len() == 9 {
+                        let f = |i: usize, d: f64| parts[i].parse::<f64>().unwrap_or(d);
+                        let c0 = format!("#{}", parts[6].trim_start_matches('#'));
+                        let c1 = format!("#{}", parts[7].trim_start_matches('#'));
+                        self.as_mut().gradient_begin(
+                            f(0, 0.0),
+                            f(1, 0.0),
+                            f(4, 0.0) > 0.5,
+                            f(5, 0.0) > 0.5,
+                            f(8, 100.0),
+                            &QString::from(c0.as_str()),
+                            &QString::from(c1.as_str()),
+                        );
+                        self.as_mut().gradient_move(f(2, 10.0), f(3, 10.0));
+                        self.as_mut().gradient_end();
+                        println!("{{\"phase\":\"ui\",\"event\":\"gradient\"}}");
+                    }
+                }
+                // `rotate-layer:index,degrees[,expand]`
+                other if other.starts_with("rotate-layer:") => {
+                    let n = parse_nums(other);
+                    if n.len() >= 2 {
+                        self.as_mut().rotate_layer_angle(
+                            n[0] as i32,
+                            n[1],
+                            n.get(2).copied().unwrap_or(1.0) > 0.5,
+                        );
+                    } else {
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        )
+                    }
+                }
                 other => match other
                     .strip_prefix("copy:")
                     .or_else(|| other.strip_prefix("cut:"))

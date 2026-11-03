@@ -171,6 +171,8 @@ pub mod qobject {
         #[qproperty(QString, sel_tool_saved, cxx_name = "selToolSaved")]
         /// 魔术棒参数（settings.ini）：`tol,contiguous,sample_all`。
         #[qproperty(QString, sel_wand_saved, cxx_name = "selWandSaved")]
+        /// 修复 / 油漆工具与参数（settings.ini，`|` 分隔）。
+        #[qproperty(QString, paint_spec_saved, cxx_name = "paintSpecSaved")]
         #[namespace = "imageedit"]
         type Bridge = super::BridgeRust;
 
@@ -404,6 +406,10 @@ pub mod qobject {
         #[qinvokable]
         fn save_sel_wand(self: Pin<&mut Self>, spec: &QString);
 
+        /// 记住修复 / 油漆工具与参数（`|` 分隔的 12 段，见 AppConfig）。
+        #[qinvokable]
+        fn save_paint_spec(self: Pin<&mut Self>, spec: &QString);
+
         /// Remember the selection tool the user picked ("rect" / "ellipse" /
         /// "lasso" / "polygon") and write it to settings.ini, so the next
         /// launch starts with the same marquee.
@@ -433,6 +439,112 @@ pub mod qobject {
         /// 放弃本次涂抹（Esc），恢复按下前的选区。
         #[qinvokable]
         fn quick_select_cancel(self: Pin<&mut Self>);
+
+        // ---- 修复 / 油漆 / 图层旋转 ------------------------------------
+
+        /// 开始一笔修复。`kind` = "spot"（周边插值）/ "heal"（Alt 取样复制）。
+        /// 目标：有选中图层改图层，否则改背景。拖动期间不进历史，松开时
+        /// `retouch_end` 补成一条记录。
+        #[qinvokable]
+        fn retouch_begin(
+            self: Pin<&mut Self>,
+            kind: &QString,
+            x: f64,
+            y: f64,
+            size: f64,
+            hardness: f64,
+            spacing: f64,
+            strength: f64,
+        );
+
+        #[qinvokable]
+        fn retouch_move(self: Pin<&mut Self>, x: f64, y: f64);
+
+        #[qinvokable]
+        fn retouch_end(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn retouch_cancel(self: Pin<&mut Self>);
+
+        /// 修复画笔的取样锚点（Alt + 点击，画布坐标）。
+        #[qinvokable]
+        fn retouch_set_source(self: Pin<&mut Self>, x: f64, y: f64);
+
+        /// 修补工具：第一次拖动圈出区域（画布坐标的折线，空格分隔）。
+        #[qinvokable]
+        fn patch_set_region(self: Pin<&mut Self>, points: &QString);
+
+        #[qinvokable]
+        fn patch_contains(self: Pin<&mut Self>, x: f64, y: f64) -> bool;
+
+        /// 修补工具：在区域里按下，拖到取样位置。`feather` = 扩散（像素）。
+        #[qinvokable]
+        fn patch_drag_begin(self: Pin<&mut Self>, x: f64, y: f64, feather: i32);
+
+        #[qinvokable]
+        fn patch_drag_move(self: Pin<&mut Self>, dx: f64, dy: f64);
+
+        /// 松手：提交改动并返回是否真的改了（QML 据此清掉区域轮廓）。
+        #[qinvokable]
+        fn patch_drag_end(self: Pin<&mut Self>) -> bool;
+
+        #[qinvokable]
+        fn patch_drag_cancel(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn patch_clear_region(self: Pin<&mut Self>);
+
+        /// 油漆桶：按容差填充。有选区时只填选区内的部分。
+        #[qinvokable]
+        fn bucket_fill(
+            self: Pin<&mut Self>,
+            x: f64,
+            y: f64,
+            tolerance: i32,
+            contiguous: bool,
+            opacity: f64,
+            color: &QString,
+        );
+
+        /// 渐变：按下定起点，拖动定终点（每帧预览），松手提交。
+        #[qinvokable]
+        fn gradient_begin(
+            self: Pin<&mut Self>,
+            x: f64,
+            y: f64,
+            radial: bool,
+            reverse: bool,
+            opacity: f64,
+            c0: &QString,
+            c1: &QString,
+        );
+
+        #[qinvokable]
+        fn gradient_move(self: Pin<&mut Self>, x: f64, y: f64);
+
+        #[qinvokable]
+        fn gradient_end(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn gradient_cancel(self: Pin<&mut Self>);
+
+        /// 图层旋转：begin 记下旋转前状态，update 实时预览，finish 提交/放弃。
+        #[qinvokable]
+        fn rotate_layer_begin(self: Pin<&mut Self>, index: i32);
+
+        #[qinvokable]
+        fn rotate_layer_update(self: Pin<&mut Self>, degrees: f64, expand: bool);
+
+        #[qinvokable]
+        fn rotate_layer_finish(self: Pin<&mut Self>, apply: bool);
+
+        /// 一次性旋转（角度对话框确认 / 脚本探针）。
+        #[qinvokable]
+        fn rotate_layer_angle(self: Pin<&mut Self>, index: i32, degrees: f64, expand: bool);
+
+        /// 进行中旋转的状态 "角度,是否扩展"，无手势时为空串。
+        #[qinvokable]
+        fn rotate_layer_state(self: Pin<&mut Self>) -> QString;
 
         /// Crop to the selection's bounding box, then drop the selection
         /// (the canvas coordinate frame changed).
@@ -788,6 +900,7 @@ impl Default for AppConfig {
             sel_feather: 0,
             sel_tool: "rect".to_string(),
             sel_wand: "32,1,1".to_string(),
+            paint_spec: "none|40|70|20|100|2|32|1|100|0|0|100".to_string(),
         }
     }
 }
@@ -898,6 +1011,8 @@ pub struct BridgeRust {
     sel_tool_saved: QString,
     /// 魔术棒参数 `tol,contiguous,sample_all`（settings.ini 里的原样字符串）。
     sel_wand_saved: QString,
+    /// 修复 / 油漆工具参数（settings.ini，`|` 分隔）。
+    paint_spec_saved: QString,
     /// 快速选择涂抹中的临时状态；`None` = 当前没在涂。
     quick_drag: RefCell<Option<QuickDrag>>,
     /// 边界 / 平滑 / 羽化 that a NEWLY drawn selection starts with. Kept on
@@ -993,6 +1108,7 @@ impl Default for BridgeRust {
             quick_mask: false,
             sel_tool_saved: QString::from(cfg.sel_tool.as_str()),
             sel_wand_saved: QString::from(cfg.sel_wand.as_str()),
+            paint_spec_saved: QString::from(cfg.paint_spec.as_str()),
             quick_drag: RefCell::new(None),
             sel_ops_default: std::cell::Cell::new(SelOps {
                 border: cfg.sel_border,
@@ -1032,6 +1148,7 @@ impl qobject::Bridge {
             sel_feather: self.sel_ops_default.get().feather,
             sel_tool: self.sel_tool_saved().to_string(),
             sel_wand: self.sel_wand_saved().to_string(),
+            paint_spec: self.paint_spec_saved().to_string(),
         }
         .save();
     }

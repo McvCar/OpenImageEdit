@@ -60,6 +60,17 @@ pub(in crate::bridge) struct Session {
     /// published copy of it changes. Kept on the session so a plain refresh
     /// never looks like a selection change.
     pub(in crate::bridge) sel_rev: u32,
+    /// 修复 / 油漆类工具的进行中手势。拖动期间像素直接写进文档（不记
+    /// 历史），松手时补成一条撤销记录 —— 与选区的手势模型一致。
+    pub(in crate::bridge) brush_live: Option<BrushLive>,
+    pub(in crate::bridge) gradient_live: Option<GradientLive>,
+    pub(in crate::bridge) patch_live: Option<PatchLive>,
+    /// 修补工具圈出来的区域（画布坐标）。第二次拖动把这块区域拖到取样点。
+    pub(in crate::bridge) patch_region: Option<SelectionMask>,
+    /// 修复画笔的取样锚点（画布坐标），Alt + 点击设置。
+    pub(in crate::bridge) heal_source: Option<(f32, f32)>,
+    /// 图层旋转的进行中手势（手柄拖动 / 角度对话框预览共用）。
+    pub(in crate::bridge) rotate_live: Option<RotateLive>,
 }
 
 impl Session {
@@ -105,6 +116,57 @@ pub(in crate::bridge) struct LiveScaleState {
     pub(in crate::bridge) offset: (i32, i32),
     /// 手柄被拖过对边：预览也要镜像（负宽高的可视化）。
     pub(in crate::bridge) flip: (bool, bool),
+}
+
+/// 修复画笔 / 污点修复的进行中手势。
+pub(in crate::bridge) struct BrushLive {
+    /// true = 从 Alt 取样点复制（修复画笔），false = 周边插值（污点修复）。
+    pub(in crate::bridge) clone_from_source: bool,
+    pub(in crate::bridge) target: AdjustTarget,
+    /// 目标位图左上角的画布坐标（位图 = 画布 - origin）。
+    pub(in crate::bridge) origin: (i32, i32),
+    /// 手势开始时的整张目标位图：每次预览都从它重算，避免反复涂抹叠加。
+    pub(in crate::bridge) from: RgbaImage,
+    pub(in crate::bridge) points: Vec<(f32, f32)>,
+    pub(in crate::bridge) source: Option<(f32, f32)>,
+    pub(in crate::bridge) brush: editcore::BrushSpec,
+    pub(in crate::bridge) strength: f32,
+    /// 已经写进文档的区域（下一次更新前先按 `from` 还原）。
+    pub(in crate::bridge) dirty: Option<Rect>,
+}
+
+/// 渐变的进行中手势。
+pub(in crate::bridge) struct GradientLive {
+    pub(in crate::bridge) target: AdjustTarget,
+    pub(in crate::bridge) origin: (i32, i32),
+    pub(in crate::bridge) from: RgbaImage,
+    pub(in crate::bridge) start: (f32, f32),
+    pub(in crate::bridge) end: (f32, f32),
+    pub(in crate::bridge) radial: bool,
+    pub(in crate::bridge) reverse: bool,
+    pub(in crate::bridge) opacity: f32,
+    pub(in crate::bridge) c0: [u8; 4],
+    pub(in crate::bridge) c1: [u8; 4],
+    pub(in crate::bridge) dirty: Option<Rect>,
+}
+
+/// 修补工具「拖到取样点」的进行中手势。
+pub(in crate::bridge) struct PatchLive {
+    pub(in crate::bridge) target: AdjustTarget,
+    pub(in crate::bridge) origin: (i32, i32),
+    pub(in crate::bridge) from: RgbaImage,
+    pub(in crate::bridge) offset: (i32, i32),
+    pub(in crate::bridge) feather: u32,
+    pub(in crate::bridge) dirty: Option<Rect>,
+}
+
+/// 图层旋转的进行中手势。每次预览都从 `before` 重算，松手才写历史。
+pub(in crate::bridge) struct RotateLive {
+    pub(in crate::bridge) index: usize,
+    pub(in crate::bridge) before: Layer,
+    pub(in crate::bridge) current: Layer,
+    pub(in crate::bridge) degrees: f32,
+    pub(in crate::bridge) expand: bool,
 }
 
 pub(in crate::bridge) struct Rendered {
@@ -193,6 +255,12 @@ impl Session {
                 dpr,
                 quick_mask: false,
                 sel_rev: 0,
+                brush_live: None,
+                gradient_live: None,
+                patch_live: None,
+                patch_region: None,
+                heal_source: None,
+                rotate_live: None,
             },
             ms,
         )
