@@ -275,9 +275,14 @@ Item {
     // 拖动选区时的临时显示偏移（真值仍由 Rust 在松手时平移）。
     readonly property real selOffX: view.canvasSurface ? view.canvasSurface.selOffX : 0
     readonly property real selOffY: view.canvasSurface ? view.canvasSurface.selOffY : 0
-    // 当前选区工具："rect" | "ellipse" | "lasso" | "polygon" | "none"
+    // 当前选区工具："rect" | "ellipse" | "lasso" | "polygon" | "wand" | "none"
     // 初值来自 settings.ini（上次用的那个），切工具时再写回去。
     property string selTool: bridge.selToolSaved.length > 0 ? bridge.selToolSaved : "rect"
+    // 魔术棒参数（PS 的三个关键项）：容差 / 连续 / 取样全部图层。
+    // 初值同样来自 settings.ini（bridge.selWandSaved = "容差,连续,全部图层"）。
+    property int wandTolerance: 32
+    property bool wandContiguous: true
+    property bool wandSampleAll: true
     // 选区工具浮动面板（标记栏的「选区」按钮点开；原来那行固定工具条已取消）。
     property bool selPopoverOpen: false
     // 加选/减选/相交的粘滞模式（拖动时按住的 Shift/Alt 会临时覆盖它）：
@@ -650,6 +655,9 @@ Shortcut { sequence: "L"; enabled: root.canUseToolKeys()
            onActivated: root.setSelToolByShortcut("lasso") }
 Shortcut { sequence: "Shift+L"; enabled: root.canUseToolKeys()
            onActivated: root.setSelToolByShortcut("polygon") }
+// W：魔术棒（PS 里魔棒也是 W）。
+Shortcut { sequence: "W"; enabled: root.canUseToolKeys()
+           onActivated: root.setSelToolByShortcut("wand") }
 Shortcut { sequence: "Ctrl+D"; enabled: root.selExists
            onActivated: bridge.sel_clear() }
 Shortcut { sequence: "Ctrl+Shift+I"; enabled: bridge.image_width > 0
@@ -1029,8 +1037,8 @@ function canvasCursor(x, y) {
             return Qt.SizeAllCursor
     }
     // 选区工具下：边/角 → 方向光标（可拖手柄改大小），框内 → 移动光标。
-    // 用包围盒估算（hover 是高频路径，不做跨语言 alpha 命中）。
-    if (root.selExists && root.selTool !== "none") {
+    // 魔术棒例外：它没有拖拽语义，始终是十字（取色）。
+    if (root.selExists && root.selTool !== "none" && root.selTool !== "wand") {
         const c = Geometry.boxCursor(ix, iy, root.selX, root.selY,
                                      root.selW, root.selH)
         if (c >= 0)
@@ -1117,6 +1125,37 @@ function canUseToolKeys() {
         && root.renamingIndex < 0
         && !root.selFieldEditing
         && !fontPopover.sizeInput.activeFocus
+}
+
+// 魔术棒参数：从 settings.ini 的 "容差,连续,全部图层" 读入 / 写回。
+function applyWandSpec(spec) {
+    const parts = String(spec).split(",")
+    if (parts.length >= 1) {
+        const t = parseInt(parts[0], 10)
+        if (!isNaN(t))
+            root.wandTolerance = Math.max(0, Math.min(255, t))
+    }
+    if (parts.length >= 2)
+        root.wandContiguous = parts[1].trim() !== "0"
+    if (parts.length >= 3)
+        root.wandSampleAll = parts[2].trim() !== "0"
+}
+function saveWandSpec() {
+    bridge.save_sel_wand(root.wandTolerance + ","
+                         + (root.wandContiguous ? 1 : 0) + ","
+                         + (root.wandSampleAll ? 1 : 0))
+}
+function setWandTolerance(v) {
+    root.wandTolerance = v
+    root.saveWandSpec()
+}
+function setWandContiguous(v) {
+    root.wandContiguous = v
+    root.saveWandSpec()
+}
+function setWandSampleAll(v) {
+    root.wandSampleAll = v
+    root.saveWandSpec()
 }
 
 // 切换选区工具。选区工具与标记工具互斥：markMa 盖在画布按下事件之上，
@@ -2187,6 +2226,8 @@ Timer {
 
 Component.onCompleted: {
     bridge.mark("qml-completed");
+    // 魔术棒参数：settings.ini 里的 "容差,连续,全部图层"。
+    root.applyWandSpec(bridge.selWandSaved);
     // Push the screen's device-pixel-ratio so the first preview frame is
     // rendered at the physical resolution (onDprChanged alone may not fire
     // for the initial value).

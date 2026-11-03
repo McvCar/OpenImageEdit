@@ -135,6 +135,33 @@ impl qobject::Bridge {
                         println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}")
                     }
                 }
+                // `wand:x,y[,tol[,contig[,sampleAll]]]@mode`
+                // 魔术棒：默认容差 32、连续、取样全部图层。
+                other if other.starts_with("wand:") => {
+                    let (body, mode) = split_mode(other);
+                    let nums = parse_nums(body);
+                    if nums.len() >= 2 {
+                        let tol = nums.get(2).copied().unwrap_or(32.0) as i32;
+                        let contig = nums.get(3).copied().unwrap_or(1.0) != 0.0;
+                        let all = nums.get(4).copied().unwrap_or(1.0) != 0.0;
+                        self.as_mut()
+                            .sel_magic_wand(nums[0], nums[1], tol, contig, all, mode);
+                    } else {
+                        println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}")
+                    }
+                }
+                // `sel-tool:wand` — 切到指定选区工具。
+                // QML 的 selTool 初值绑定在 selToolSaved 上，改这个属性即可
+                // 让标记栏/右键菜单露出对应的参数区（截图目检用）。
+                other if other.starts_with("sel-tool:") => {
+                    let name = other["sel-tool:".len()..].trim();
+                    self.as_mut()
+                        .set_sel_tool_saved(QString::from(name));
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"sel-tool\",\"tool\":\"{}\"}}",
+                        name
+                    );
+                }
                 other if other.starts_with("sel-resize:") => {
                     let nums = parse_nums(other);
                     if nums.len() == 4 {

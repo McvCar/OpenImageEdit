@@ -18,7 +18,7 @@ mod document;
 mod selection;
 
 pub use geometry::{Size, Rect, Selection};
-pub use selection::{SelOps, SelShape, SelectionMask, SelectionState};
+pub use selection::{SelOps, SelShape, SelectionMask, SelectionState, WandOptions};
 pub use mark::{MarkKind, Mark};
 pub use layer::Layer;
 pub use transform::Transform;

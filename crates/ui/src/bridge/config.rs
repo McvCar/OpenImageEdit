@@ -23,8 +23,11 @@ pub(in crate::bridge) struct AppConfig {
     pub(in crate::bridge) sel_border: u32,
     pub(in crate::bridge) sel_smooth: u32,
     pub(in crate::bridge) sel_feather: u32,
-    /// Last used selection tool: "rect" / "ellipse" / "lasso" / "polygon".
+    /// Last used selection tool: "rect" / "ellipse" / "lasso" / "polygon" /
+    /// "wand".
     pub(in crate::bridge) sel_tool: String,
+    /// 魔术棒参数，原样存 `容差,连续,取样全部图层`（如 "32,1,0"）。
+    pub(in crate::bridge) sel_wand: String,
 }
 
 impl AppConfig {
@@ -75,10 +78,15 @@ impl AppConfig {
                             }
                         }
                         "sel_tool" => match value {
-                            "rect" | "ellipse" | "lasso" | "polygon" => {
+                            "rect" | "ellipse" | "lasso" | "polygon" | "wand" => {
                                 cfg.sel_tool = value.to_string()
                             }
                             _ => {}
+                        },
+                        "sel_wand" => {
+                            if let Some(v) = normalize_wand(value) {
+                                cfg.sel_wand = v;
+                            }
                         },
                         _ => {}
                     }
@@ -94,7 +102,7 @@ impl AppConfig {
                 let _ = std::fs::create_dir_all(dir);
             }
             let text = format!(
-                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\nruler_bottom_up={}\nmax_dimension={}\nsel_border={}\nsel_smooth={}\nsel_feather={}\nsel_tool={}\n",
+                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\nruler_bottom_up={}\nmax_dimension={}\nsel_border={}\nsel_smooth={}\nsel_feather={}\nsel_tool={}\nsel_wand={}\n",
                 self.checker_light,
                 self.checker_dark,
                 self.open_in_new_window,
@@ -104,11 +112,23 @@ impl AppConfig {
                 self.sel_border,
                 self.sel_smooth,
                 self.sel_feather,
-                self.sel_tool
+                self.sel_tool,
+                self.sel_wand
             );
             let _ = std::fs::write(path, text);
         }
     }
+}
+
+/// 把 `容差,连续,取样全部图层` 规范化成 "32,1,0"；非法输入返回 None
+/// （调用方保留默认值）。写在配置里的是原样字符串，QML 直接解析。
+pub(in crate::bridge) fn normalize_wand(spec: &str) -> Option<String> {
+    let mut it = spec.split(',');
+    let tol: i32 = it.next()?.trim().parse().ok()?;
+    let contig = it.next().unwrap_or("1").trim();
+    let all = it.next().unwrap_or("1").trim();
+    let flag = |s: &str| if s == "1" || s.eq_ignore_ascii_case("true") { 1 } else { 0 };
+    Some(format!("{},{},{}", tol.clamp(0, 255), flag(contig), flag(all)))
 }
 
 pub(in crate::bridge) fn human_size(bytes: u64) -> String {

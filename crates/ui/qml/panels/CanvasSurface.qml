@@ -172,6 +172,16 @@ Item {
             }
             host.settlePaste()
             selMode = modeFrom(mouse.modifiers)
+            // 魔术棒：一次点击出一片选区，没有拖拽过程（PS 也是点一下就好）。
+            // 必须排在「按在选区内 = 移动选区」前面：魔棒每次点击都是重新
+            // 取色，不能因为点在旧选区里就变成拖选区。
+            if (host.selTool === "wand") {
+                const pw = toImage(mouse.x, mouse.y)
+                bridge.sel_magic_wand(pw[0], pw[1], host.wandTolerance,
+                                      host.wandContiguous, host.wandSampleAll,
+                                      selMode)
+                return
+            }
             // 已有选区时按在选区内部 = 移动选区（不动像素）。带 Shift/Alt
             // 说明想加选/减选，那就照常新建，不进移动手势。
             if (host.selExists && selMode === 0

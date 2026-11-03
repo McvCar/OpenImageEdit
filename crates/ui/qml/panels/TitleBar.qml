@@ -95,9 +95,11 @@ Rectangle {
                   run: function () { resizeOverlay.openResizeDialog() } }
             ] },
             { l: "选区", sub: [
-                { l: "选区工具…（M / L）", ok: true,
+                { l: "选区工具…（M / L / W）", ok: true,
                   run: function () { host.markBarVisible = true
                                      host.selPopoverOpen = !host.selPopoverOpen } },
+                { l: "魔术棒 (W)", ok: bridge.image_width > 0,
+                  run: function () { host.setSelToolByShortcut("wand") } },
                 { l: "全选 (Ctrl+A)", ok: bridge.image_width > 0,
                   run: function () { bridge.sel_select_all() } },
                 { l: "选择反选 (Ctrl+Shift+I)", ok: bridge.image_width > 0,

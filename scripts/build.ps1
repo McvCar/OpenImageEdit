@@ -47,8 +47,16 @@ try {
     . (Join-Path $PSScriptRoot 'env.ps1')
     $sw = [Diagnostics.Stopwatch]::StartNew()
     Write-Host "==> cargo $($CargoArgs -join ' ')" -ForegroundColor Cyan
+    # cargo writes warnings to stderr. Under $ErrorActionPreference = 'Stop'
+    # PowerShell 5.1 turns the first of those into a *terminating*
+    # NativeCommandError, so the command appears to fail while cargo is in fact
+    # still compiling. Relax the preference for the child only and judge the
+    # result by the exit code.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     & cargo @CargoArgs
     $code = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
     $sw.Stop()
     $msg = "==> cargo exit {0}, {1:n1}s" -f $code, $sw.Elapsed.TotalSeconds
     $color = if ($code -eq 0) { 'Green' } else { 'Red' }

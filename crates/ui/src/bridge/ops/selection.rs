@@ -370,12 +370,74 @@ impl qobject::Bridge {
     /// 记住用户选的选区工具（下次启动继续用同一个）。
     pub fn save_sel_tool(mut self: Pin<&mut Self>, tool: &QString) {
         let name = tool.to_string();
-        let valid = matches!(name.as_str(), "rect" | "ellipse" | "lasso" | "polygon");
+        let valid = matches!(
+            name.as_str(),
+            "rect" | "ellipse" | "lasso" | "polygon" | "wand"
+        );
         if !valid || self.sel_tool_saved().to_string() == name {
             return;
         }
         self.as_mut().set_sel_tool_saved(tool.clone());
         self.persist_config();
+    }
+
+    /// 记住魔术棒参数（容差 / 连续 / 取样全部图层）。
+    pub fn save_sel_wand(mut self: Pin<&mut Self>, spec: &QString) {
+        let Some(normalized) = super::super::config::normalize_wand(&spec.to_string()) else {
+            return;
+        };
+        if self.sel_wand_saved().to_string() == normalized {
+            return;
+        }
+        self.as_mut().set_sel_wand_saved(QString::from(normalized.as_str()));
+        self.persist_config();
+    }
+
+    /// 魔术棒：按点击处的颜色选出一片区域。
+    ///
+    /// 采样源：`sample_all` = 可见合成（PS 的「取样全部图层」）；否则取当前
+    /// 选中的图层，没有选中图层时取背景。
+    pub fn sel_magic_wand(
+        mut self: Pin<&mut Self>,
+        x: f64,
+        y: f64,
+        tolerance: i32,
+        contiguous: bool,
+        sample_all: bool,
+        mode: i32,
+    ) {
+        let target = if sample_all {
+            None
+        } else {
+            match *self.selected_layer() {
+                i if i >= 0 => Some(AdjustTarget::Layer(i as usize)),
+                _ => Some(AdjustTarget::Base),
+            }
+        };
+        let opts = WandOptions {
+            tolerance: tolerance.clamp(0, 255) as u8,
+            contiguous,
+        };
+        let seed = (x.floor() as i32, y.floor() as i32);
+        let mask = {
+            let guard = self.session.borrow();
+            let Some(session) = guard.as_ref() else {
+                return;
+            };
+            session.doc.magic_wand_selection(seed.0, seed.1, opts, target)
+        };
+        let area = mask.area();
+        self.as_mut().combine_selection(mask, mode);
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"sel-wand\",\"seed\":\"{},{}\",\"tolerance\":{},\"contiguous\":{},\"sample_all\":{},\"area\":{},\"mode\":{}}}",
+            seed.0,
+            seed.1,
+            opts.tolerance,
+            contiguous,
+            sample_all,
+            area,
+            mode
+        );
     }
 
     pub fn sel_outline(self: Pin<&mut Self>) -> QString {

@@ -596,6 +596,66 @@ impl Document {
         image::Rgba(out)
     }
 
+    /// 魔术棒采样：选区的形状由「某一层（或可见合成）的颜色」决定。
+    ///
+    /// `target = None` → 可见合成（PS 的「取样全部图层」）；`Some(Base)` /
+    /// `Some(Layer(i))` → 只取那一层。坐标是画布坐标，图层偏移在这里换算，
+    /// 调用方（QML/探针）给的都是用户在画布上点到的位置。
+    pub fn magic_wand_selection(
+        &self,
+        x: i32,
+        y: i32,
+        opts: WandOptions,
+        target: Option<AdjustTarget>,
+    ) -> SelectionMask {
+        match target {
+            None => SelectionMask::magic_wand(self.canvas, (x, y), opts, |px, py| {
+                self.composite_pixel(px, py).0
+            }),
+            Some(AdjustTarget::Base) => {
+                SelectionMask::magic_wand(self.canvas, (x, y), opts, |px, py| {
+                    self.base_pixel_at(px, py)
+                })
+            }
+            Some(AdjustTarget::Layer(index)) => {
+                SelectionMask::magic_wand(self.canvas, (x, y), opts, |px, py| {
+                    self.layer_pixel(index, px, py)
+                })
+            }
+        }
+    }
+
+    /// 背景像素（画布坐标 → 原始位图坐标，算上裁剪视图的偏移）。
+    pub fn base_pixel_at(&self, x: i32, y: i32) -> [u8; 4] {
+        if self.base_hidden {
+            return [0, 0, 0, 0];
+        }
+        let bx = self.view.x + x;
+        let by = self.view.y + y;
+        if bx < 0 || by < 0 || bx as u32 >= self.base.width() || by as u32 >= self.base.height() {
+            return [0, 0, 0, 0];
+        }
+        self.base.get_pixel(bx as u32, by as u32).0
+    }
+
+    /// 单个图层的像素（画布坐标 → 图层坐标）。不可见 / 图层外 = 全透明。
+    pub fn layer_pixel(&self, index: usize, x: i32, y: i32) -> [u8; 4] {
+        let Some(layer) = self.layers.get(index) else {
+            return [0, 0, 0, 0];
+        };
+        if !layer.visible || layer.opacity <= 0.0 {
+            return [0, 0, 0, 0];
+        }
+        let lx = x - layer.offset.0;
+        let ly = y - layer.offset.1;
+        if lx < 0 || ly < 0 || lx as u32 >= layer.image.width() || ly as u32 >= layer.image.height() {
+            return [0, 0, 0, 0];
+        }
+        let mut p = layer.image.get_pixel(lx as u32, ly as u32).0;
+        p[3] = (p[3] as f32 * layer.opacity).round().clamp(0.0, 255.0) as u8;
+        p
+    }
+
     pub fn flatten(&self) -> RgbaImage {
         let mut out = RgbaImage::new(self.canvas.width, self.canvas.height);
         for y in 0..self.canvas.height {

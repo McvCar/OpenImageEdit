@@ -77,6 +77,12 @@ Rectangle {
                 selected: host.selTool === "polygon"
                 onClicked: host.pickSelTool("polygon")
             }
+            IconButton {
+                glyph: "✦"
+                tip: "魔术棒 (W)：按颜色自动选取相连（或全图同色）区域"
+                selected: host.selTool === "wand"
+                onClicked: host.pickSelTool("wand")
+            }
         }
 
         Rectangle {
@@ -133,12 +139,80 @@ Rectangle {
             color: "#3c4043"
         }
 
+        // ---- 魔术棒参数（只在魔术棒工具下出现）----
+        // PS 的魔棒就三个关键项：容差、连续、取样范围。容差实时写回
+        // settings.ini，下次启动继续用同一组数。
+        Column {
+            id: wandBox
+            width: parent.width
+            spacing: 5
+            visible: host.selTool === "wand"
+
+            Row {
+                spacing: 6
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "容差"
+                    color: "#e9eaec"
+                    font.pixelSize: 11
+                }
+                SpinBox {
+                    id: wandTol
+                    width: 62
+                    from: 0
+                    to: 255
+                    step: 4
+                    value: host.wandTolerance
+                    onEdited: (v) => host.setWandTolerance(v)
+                }
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: host.wandTolerance === 0 ? "只选完全同色" : "越大吃得越宽"
+                    color: "#6b7076"
+                    font.pixelSize: 10
+                }
+            }
+            Row {
+                spacing: 4
+                Pill {
+                    label: "连续"
+                    checked: host.wandContiguous
+                    onClicked: host.setWandContiguous(true)
+                }
+                Pill {
+                    label: "全图同色"
+                    checked: !host.wandContiguous
+                    onClicked: host.setWandContiguous(false)
+                }
+            }
+            Row {
+                spacing: 4
+                Pill {
+                    label: "当前图层"
+                    checked: !host.wandSampleAll
+                    onClicked: host.setWandSampleAll(false)
+                }
+                Pill {
+                    label: "全部图层"
+                    checked: host.wandSampleAll
+                    onClicked: host.setWandSampleAll(true)
+                }
+            }
+        }
+
+        Rectangle {
+            width: parent.width
+            height: 1
+            color: "#3c4043"
+            visible: wandBox.visible
+        }
+
         // ---- 当前选区尺寸 / 操作提示 ----
         Text {
             width: parent.width
             text: host.selExists
                   ? ("选区 " + host.selImgW + " × " + host.selImgH)
-                  : "在画布上拖出选区"
+                  : (host.selTool === "wand" ? "在画布上点击取色" : "在画布上拖出选区")
             color: host.selExists ? "#e9eaec" : "#8b9096"
             font.pixelSize: 11
         }
@@ -149,9 +223,40 @@ Rectangle {
                   ? "单击加点 · 双击/回车闭合 · Esc 放弃"
                   : (host.selTool === "lasso"
                      ? "按住拖出不规则选区"
-                     : "Shift 加选 · Alt 减选 · Shift+Alt 交集")
+                     : (host.selTool === "wand"
+                        ? "点击取色选中一片 · Shift 加选 · Alt 减选"
+                        : "Shift 加选 · Alt 减选 · Shift+Alt 交集"))
             color: "#6b7076"
             font.pixelSize: 10
+        }
+    }
+
+    // 魔术棒参数用的两态小胶囊（连续/全图、当前层/全部层）。
+    component Pill: Rectangle {
+        property string label: ""
+        property bool checked: false
+        signal clicked()
+
+        width: labelText.implicitWidth + 16
+        height: 20
+        radius: 4
+        color: checked ? "#3d5a80" : (pillHover.containsMouse ? "#3a3d42" : "transparent")
+        border.color: checked ? "#5b9dff" : "#45484d"
+        border.width: 1
+
+        Text {
+            id: labelText
+            anchors.centerIn: parent
+            text: parent.label
+            color: parent.checked ? "#cfe4ff" : "#b9bec5"
+            font.pixelSize: 10
+        }
+        MouseArea {
+            id: pillHover
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: parent.clicked()
         }
     }
 }

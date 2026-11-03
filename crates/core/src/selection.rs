@@ -53,6 +53,25 @@ pub struct SelOps {
     pub feather: u32,
 }
 
+/// 魔术棒参数（PS 的「容差 / 连续」）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WandOptions {
+    /// 容差 0..=255：四个通道（含 alpha）的最大差值不超过它就算同色。
+    /// 0 = 只选颜色完全一样的像素。
+    pub tolerance: u8,
+    /// true = 只选与点击处相连的那一片（PS 的「连续」勾选）；false = 全图同色。
+    pub contiguous: bool,
+}
+
+impl Default for WandOptions {
+    fn default() -> Self {
+        Self {
+            tolerance: 32,
+            contiguous: true,
+        }
+    }
+}
+
 impl SelectionMask {
     pub fn empty() -> Self {
         Self::default()
@@ -215,6 +234,126 @@ impl SelectionMask {
             }
         }
         Self { bounds: b, alpha }
+    }
+
+    // ---- 魔术棒 ----------------------------------------------------------
+
+    /// 魔术棒（PS 的魔棒）：以 `seed` 处像素的颜色为基准，选出「容差内
+    /// 同色」的像素。
+    ///
+    /// `sample` 决定取哪张图（可见合成 / 单个图层 / 背景），坐标是**画布
+    /// 坐标**。用回调而不是传整幅位图：泛洪只访问它真正走到的像素，大图上
+    /// 省掉一次全画布合成。
+    pub fn magic_wand<F>(canvas: Size, seed: (i32, i32), opts: WandOptions, sample: F) -> Self
+    where
+        F: Fn(i32, i32) -> [u8; 4],
+    {
+        let (cw, ch) = (canvas.width as i32, canvas.height as i32);
+        if cw <= 0 || ch <= 0 {
+            return Self::empty();
+        }
+        let (sx, sy) = seed;
+        if sx < 0 || sy < 0 || sx >= cw || sy >= ch {
+            return Self::empty();
+        }
+        let target = sample(sx, sy);
+        let tol = opts.tolerance as i32;
+        // 两边都全透明时 RGB 没有意义：一律算同色。否则透明区域会按
+        // 残留的 RGB（预乘/清零不一致）被切成碎片。
+        let same = |p: [u8; 4]| -> bool {
+            if target[3] == 0 && p[3] == 0 {
+                return true;
+            }
+            (0..4).all(|i| (p[i] as i32 - target[i] as i32).abs() <= tol)
+        };
+
+        // 两个位图（visited / hit），2 bit/像素：8192² 也只要 17MB。
+        // 用 u8 数组会是它的 8 倍，大图上来就是几百 MB。
+        let stride = cw as usize;
+        let total = stride * ch as usize;
+        let words = (total + 63) / 64;
+        let mut visited = vec![0u64; words];
+        let mut hit = vec![0u64; words];
+
+        if opts.contiguous {
+            // 4 邻域泛洪。入栈前先判 visited 并按颜色过滤，栈的峰值等于
+            // 命中像素数（否则同一像素会被反复压栈，上千万像素会爆内存）。
+            let mut stack: Vec<(i32, i32)> = Vec::with_capacity(4096);
+            visited[(sy as usize * stride + sx as usize) / 64] |=
+                1u64 << ((sy as usize * stride + sx as usize) % 64);
+            if same(target) {
+                hit[(sy as usize * stride + sx as usize) / 64] |=
+                    1u64 << ((sy as usize * stride + sx as usize) % 64);
+                stack.push((sx, sy));
+            }
+            while let Some((x, y)) = stack.pop() {
+                let mut push = |nx: i32, ny: i32, stack: &mut Vec<(i32, i32)>| {
+                    let i = ny as usize * stride + nx as usize;
+                    if visited[i / 64] & (1u64 << (i % 64)) != 0 {
+                        return;
+                    }
+                    visited[i / 64] |= 1u64 << (i % 64);
+                    if same(sample(nx, ny)) {
+                        hit[i / 64] |= 1u64 << (i % 64);
+                        stack.push((nx, ny));
+                    }
+                };
+                if x > 0 {
+                    push(x - 1, y, &mut stack);
+                }
+                if x + 1 < cw {
+                    push(x + 1, y, &mut stack);
+                }
+                if y > 0 {
+                    push(x, y - 1, &mut stack);
+                }
+                if y + 1 < ch {
+                    push(x, y + 1, &mut stack);
+                }
+            }
+        } else {
+            // 非连续：全图扫一遍（PS 的「不连续」）。
+            for y in 0..ch {
+                for x in 0..cw {
+                    if same(sample(x, y)) {
+                        let i = y as usize * stride + x as usize;
+                        hit[i / 64] |= 1u64 << (i % 64);
+                    }
+                }
+            }
+        }
+
+        // 命中包围盒 → 只保留这一块（选区 mask 从不铺满全画布）。
+        let (mut x0, mut y0, mut x1, mut y1) = (cw, ch, -1, -1);
+        for y in 0..ch {
+            for x in 0..cw {
+                let i = y as usize * stride + x as usize;
+                if hit[i / 64] & (1u64 << (i % 64)) == 0 {
+                    continue;
+                }
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+        if x1 < x0 || y1 < y0 {
+            return Self::empty();
+        }
+        let bounds = Rect::new(x0, y0, (x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32);
+        let (bw, bh) = (bounds.width as usize, bounds.height as usize);
+        let mut alpha = vec![0u8; bw * bh];
+        for y in 0..bh {
+            for x in 0..bw {
+                let gx = x0 + x as i32;
+                let gy = y0 + y as i32;
+                let i = gy as usize * stride + gx as usize;
+                if hit[i / 64] & (1u64 << (i % 64)) != 0 {
+                    alpha[y * bw + x] = 255;
+                }
+            }
+        }
+        Self { bounds, alpha }
     }
 
     // ---- 集合运算 --------------------------------------------------------
@@ -1424,5 +1563,105 @@ mod tests {
         let inv = st.inverted(canvas);
         assert_eq!(inv.ops.feather, 6);
         assert!(inv.effective().alpha.iter().any(|&a| a > 0 && a < 255));
+    }
+
+    // ---- 魔术棒 ----------------------------------------------------------
+
+    /// 20×20 画布：左半红、右半蓝，另外在蓝区中间放一块 4×4 的红色孤岛。
+    fn wand_fixture() -> (Size, Vec<[u8; 4]>) {
+        let size = Size::new(20, 20);
+        let mut px = vec![[0u8, 0, 255, 255]; 400];
+        for y in 0..20 {
+            for x in 0..10 {
+                px[y * 20 + x] = [255, 0, 0, 255];
+            }
+        }
+        for y in 12..16 {
+            for x in 14..18 {
+                px[y * 20 + x] = [255, 0, 0, 255];
+            }
+        }
+        (size, px)
+    }
+
+    fn wand_of(
+        size: Size,
+        px: &[[u8; 4]],
+        seed: (i32, i32),
+        tol: u8,
+        contiguous: bool,
+    ) -> SelectionMask {
+        SelectionMask::magic_wand(
+            size,
+            seed,
+            WandOptions {
+                tolerance: tol,
+                contiguous,
+            },
+            |x, y| px[y as usize * size.width as usize + x as usize],
+        )
+    }
+
+    #[test]
+    fn wand_contiguous_stops_at_color_edge() {
+        let (size, px) = wand_fixture();
+        let mask = wand_of(size, &px, (2, 2), 0, true);
+        // 左半 10×20 全中，孤岛不连过来。
+        assert_eq!(mask.area(), 200);
+        assert_eq!(mask.bounds, Rect::new(0, 0, 10, 20));
+        assert_eq!(mask.coverage_at(15, 13), 0);
+    }
+
+    #[test]
+    fn wand_non_contiguous_collects_every_match() {
+        let (size, px) = wand_fixture();
+        let mask = wand_of(size, &px, (2, 2), 0, false);
+        // 左半 200 + 孤岛 16。
+        assert_eq!(mask.area(), 216);
+        assert_eq!(mask.coverage_at(15, 13), 255);
+        // 包围盒盖住两者。
+        assert_eq!(mask.bounds, Rect::new(0, 0, 18, 20));
+    }
+
+    #[test]
+    fn wand_tolerance_is_per_channel_max_diff() {
+        let size = Size::new(8, 4);
+        // 8 级灰度阶梯，从 0 起选：容差 40 应该只吃到 40。
+        let px: Vec<[u8; 4]> = (0..32)
+            .map(|i| {
+                let v = ((i % 8) * 40) as u8;
+                [v, v, v, 255]
+            })
+            .collect();
+        let m0 = wand_of(size, &px, (0, 0), 0, true);
+        assert_eq!(m0.bounds.width, 1);
+        let m1 = wand_of(size, &px, (0, 0), 40, true);
+        assert_eq!(m1.bounds.width, 2, "容差含边界（<=）");
+        let m2 = wand_of(size, &px, (0, 0), 255, true);
+        assert_eq!(m2.area(), 32);
+    }
+
+    #[test]
+    fn wand_transparent_seed_matches_all_transparent_pixels() {
+        let size = Size::new(6, 6);
+        // 一半全透明（RGB 残留不同），另一半不透明白。
+        let px: Vec<[u8; 4]> = (0..36)
+            .map(|i| {
+                if i % 6 < 3 {
+                    [i as u8, 7, 9, 0]
+                } else {
+                    [255, 255, 255, 255]
+                }
+            })
+            .collect();
+        let mask = wand_of(size, &px, (0, 0), 0, false);
+        assert_eq!(mask.area(), 18);
+    }
+
+    #[test]
+    fn wand_seed_outside_canvas_is_empty() {
+        let (size, px) = wand_fixture();
+        assert!(wand_of(size, &px, (-1, 3), 32, true).is_empty());
+        assert!(wand_of(size, &px, (20, 3), 32, true).is_empty());
     }
 }

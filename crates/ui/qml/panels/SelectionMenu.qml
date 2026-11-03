@@ -67,72 +67,48 @@ Rectangle {
         anchors.topMargin: 6
         spacing: 0
 
-        // ---- 选区类型（单选）----
+        // ---- 选区类型（单选，只显示图标；含义靠悬浮提示）----
         // 形状原本只能在标记栏的浮动面板里切：想改边界/平滑就得先关菜单、
-        // 开面板、再右键一次。这里放一组单选按钮就地切换；选完即收菜单
+        // 开面板、再右键一次。这里放一行单选按钮就地切换；选完即收菜单
         // （类型定了下一步就是画选区），不选则继续留在菜单里调数值。
+        // 图标不带文字，菜单能窄一圈；提示沿用 IconButton 的 500ms 悬浮框。
         Text {
             x: 12
             width: body.width - 24
-            height: 20
+            height: 18
             verticalAlignment: Text.AlignVCenter
             text: "选区类型"
             color: "#8b9096"
             font.pixelSize: 10
         }
-        Grid {
-            width: body.width
-            columns: 2
-            rowSpacing: 2
-            columnSpacing: 2
+        Row {
+            id: selTypeRow
+            // 居中：5 个 30px 图标 + 间距。
+            x: Math.max(4, (body.width - width) / 2)
+            spacing: 2
             bottomPadding: 4
+            // 提示框会盖住下面几行，必须比它们先画（Column 里按 z 排）。
+            z: 5
             Repeater {
                 model: [
                     { key: "rect", glyph: "▭", label: "矩形选框" },
                     { key: "ellipse", glyph: "◯", label: "椭圆选框" },
                     { key: "lasso", glyph: "∿", label: "套索" },
-                    { key: "polygon", glyph: "⬡", label: "多边形" }
+                    { key: "polygon", glyph: "⬡", label: "多边形套索" },
+                    { key: "wand", glyph: "✦", label: "魔术棒：按颜色自动选取" }
                 ]
-                delegate: Item {
-                    id: selTypeCell
+                delegate: IconButton {
                     required property var modelData
-                    readonly property bool picked: host.selTool === modelData.key
-                    width: (body.width - 8) / 2
-                    height: 26
-
-                    // 不做单选圆点：当前类型靠整格高亮表示（菜单里的其它项
-                    // 也都是"点了就生效"的样式，圆点在这反而多余）。
-                    Rectangle {
-                        x: 2
-                        width: parent.width - 2
-                        height: parent.height
-                        radius: 4
-                        color: selTypeCell.picked ? "#3d5a80"
-                                                   : (cellMa.containsMouse ? "#3a3d42" : "transparent")
-                    }
-                    Text {
-                        anchors.left: parent.left
-                        anchors.leftMargin: 10
-                        anchors.right: parent.right
-                        anchors.rightMargin: 4
-                        anchors.verticalCenter: parent.verticalCenter
-                        elide: Text.ElideRight
-                        text: selTypeCell.modelData.glyph + "  " + selTypeCell.modelData.label
-                        color: selTypeCell.picked ? "#cfe4ff" : "#e9eaec"
-                        font.pixelSize: 11
-                    }
-                    MouseArea {
-                        id: cellMa
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        // 选完就收菜单：类型定了下一步一定是去画选区，菜单留着
-                        // 只会挡住画布。不走 pickSelTool —— 那个会顺手把标记栏
-                        // 的浮动面板也收起来，两处一起消失显得像误触。
-                        onClicked: {
-                            host.setSelTool(selTypeCell.modelData.key)
-                            selMenu.close()
-                        }
+                    glyph: modelData.glyph
+                    tip: modelData.label
+                    // 不做单选圆点：当前类型靠整格高亮表示。
+                    selected: host.selTool === modelData.key
+                    // 选完就收菜单：类型定了下一步一定是去画选区，菜单留着
+                    // 只会挡住画布。不走 pickSelTool —— 那个会顺手把标记栏
+                    // 的浮动面板也收起来，两处一起消失显得像误触。
+                    onClicked: {
+                        host.setSelTool(modelData.key)
+                        selMenu.close()
                     }
                 }
             }

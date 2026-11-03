@@ -10,7 +10,7 @@ use cxx_qt_lib::{QString, QUrl};
 use decode::{decode_path, encode, format_from_path, DecodeOptions, Decoded, Format};
 use editcore::{
     adjust_json, Adjust, AdjustTarget, Document, Histogram, Layer, Mark, MarkKind, PickedColor, Rect,
-    SelOps, SelectionMask, SelectionState, Size, Transform,
+    SelOps, SelectionMask, SelectionState, Size, Transform, WandOptions,
 };
 use image::RgbaImage;
 
@@ -169,6 +169,8 @@ pub mod qobject {
         /// Last used selection tool (settings.ini). QML seeds its `selTool`
         /// from this so a restart keeps the marquee type the user was using.
         #[qproperty(QString, sel_tool_saved, cxx_name = "selToolSaved")]
+        /// 魔术棒参数（settings.ini）：`tol,contiguous,sample_all`。
+        #[qproperty(QString, sel_wand_saved, cxx_name = "selWandSaved")]
         #[namespace = "imageedit"]
         type Bridge = super::BridgeRust;
 
@@ -382,6 +384,25 @@ pub mod qobject {
         /// Quick mask (Q): dim outside the selection in the preview.
         #[qinvokable]
         fn sel_toggle_quick_mask(self: Pin<&mut Self>);
+
+        /// 魔术棒：按 (x, y) 处的颜色自动选出一片区域。
+        /// `tolerance` 0..=255，`contiguous` = PS 的「连续」，
+        /// `sample_all` = 取样全部图层（否则只取当前图层/背景）。
+        /// `mode` 同其它选区命令：0 替换 / 1 加选 / 2 减选 / 3 相交。
+        #[qinvokable]
+        fn sel_magic_wand(
+            self: Pin<&mut Self>,
+            x: f64,
+            y: f64,
+            tolerance: i32,
+            contiguous: bool,
+            sample_all: bool,
+            mode: i32,
+        );
+
+        /// 记住魔术棒参数并写盘：`tol,contiguous,sample_all`（如 "32,1,0"）。
+        #[qinvokable]
+        fn save_sel_wand(self: Pin<&mut Self>, spec: &QString);
 
         /// Remember the selection tool the user picked ("rect" / "ellipse" /
         /// "lasso" / "polygon") and write it to settings.ini, so the next
@@ -742,6 +763,7 @@ impl Default for AppConfig {
             sel_smooth: 0,
             sel_feather: 0,
             sel_tool: "rect".to_string(),
+            sel_wand: "32,1,1".to_string(),
         }
     }
 }
@@ -832,6 +854,8 @@ pub struct BridgeRust {
     quick_mask: bool,
     /// Last used selection tool, mirrored for QML (`selTool` seeds from it).
     sel_tool_saved: QString,
+    /// 魔术棒参数 `tol,contiguous,sample_all`（settings.ini 里的原样字符串）。
+    sel_wand_saved: QString,
     /// 边界 / 平滑 / 羽化 that a NEWLY drawn selection starts with. Kept on
     /// the bridge (not on the document) so it survives opening another file
     /// and is written to settings.ini on every change. `Cell` because
@@ -924,6 +948,7 @@ impl Default for BridgeRust {
             sel_feather: 0,
             quick_mask: false,
             sel_tool_saved: QString::from(cfg.sel_tool.as_str()),
+            sel_wand_saved: QString::from(cfg.sel_wand.as_str()),
             sel_ops_default: std::cell::Cell::new(SelOps {
                 border: cfg.sel_border,
                 smooth: cfg.sel_smooth,
@@ -961,6 +986,7 @@ impl qobject::Bridge {
             sel_smooth: self.sel_ops_default.get().smooth,
             sel_feather: self.sel_ops_default.get().feather,
             sel_tool: self.sel_tool_saved().to_string(),
+            sel_wand: self.sel_wand_saved().to_string(),
         }
         .save();
     }

@@ -38,20 +38,49 @@ $env:Path = (($paths + $env:Path) -join ';')
 # qmlcachegen's QSaveFile commit (atomic replace) gets "Access denied" from
 # security minifilters (e.g. 360) when OVERWRITING an existing
 # qmlcache_loader.cpp; creating it fresh always works. Same for
-# qmltyperegistrar's qmldir / plugin.qmltypes / .qrc outputs. Delete the
-# cached outputs before every build so the build script never needs to
-# overwrite. (.NET delete on purpose: Remove-Item goes through the local
-# safe-delete hook, which fails closed when the path is absent.)
-foreach ($cfg in @('debug', 'release')) {
-    $buildRoot = Join-Path $repoRoot "target\$cfg\build"
-    if (-not (Test-Path -LiteralPath $buildRoot)) { continue }
-    Get-ChildItem -LiteralPath $buildRoot -Directory -Filter 'imageedit-ui-*' -ErrorAction SilentlyContinue |
-        ForEach-Object {
-            foreach ($sub in @('qmlcachegen', 'qt-build-utils')) {
-                $p = Join-Path $_.FullName "out\$sub"
-                if (Test-Path -LiteralPath $p) {
-                    [System.IO.Directory]::Delete($p, $true)
+# qmltyperegistrar's qmldir / plugin.qmltypes / .qrc outputs. So those cached
+# outputs must be gone before qmlcachegen runs again.
+#
+# Only drop them when a .qml file is actually newer than the cache: cargo
+# re-runs the UI build script on every rust edit too, and deleting
+# unconditionally forced a full QML recompile (tens of seconds) on every single
+# Rust change -- which is what "the build hangs every day" usually was.
+# (.NET delete on purpose: Remove-Item goes through the local safe-delete hook,
+# which fails closed when the path is absent -- and a background/non-interactive
+# run then stalls forever instead of erroring.)
+$qmlRoot = Join-Path $repoRoot 'crates\ui\qml'
+$qmlNewest = $null
+if (Test-Path -LiteralPath $qmlRoot) {
+    $newest = Get-ChildItem -LiteralPath $qmlRoot -Recurse -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($newest) { $qmlNewest = $newest.LastWriteTime }
+}
+
+if ($qmlNewest) {
+    foreach ($cfg in @('debug', 'release')) {
+        $buildRoot = Join-Path $repoRoot "target\$cfg\build"
+        if (-not (Test-Path -LiteralPath $buildRoot)) { continue }
+        Get-ChildItem -LiteralPath $buildRoot -Directory -Filter 'imageedit-ui-*' -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $uiDir = $_.FullName
+                $cacheDir = Join-Path $uiDir 'out\qmlcachegen'
+                # Cache is stale when it is missing, empty, or older than the
+                # newest .qml source. qmlcachegen writes <hash>-<Name>.qml.o
+                # next to its loader, so those objects are the timestamp proxy.
+                $cacheNewest = $null
+                if (Test-Path -LiteralPath $cacheDir) {
+                    $c = Get-ChildItem -LiteralPath $cacheDir -Filter '*.qml.o' -ErrorAction SilentlyContinue |
+                        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                    if ($c) { $cacheNewest = $c.LastWriteTime }
+                }
+                if (-not $cacheNewest -or $qmlNewest -gt $cacheNewest) {
+                    foreach ($sub in @('qmlcachegen', 'qt-build-utils')) {
+                        $p = Join-Path $uiDir "out\$sub"
+                        if (Test-Path -LiteralPath $p) {
+                            [System.IO.Directory]::Delete($p, $true)
+                        }
+                    }
                 }
             }
-        }
+    }
 }
