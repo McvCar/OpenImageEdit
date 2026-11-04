@@ -47,7 +47,7 @@ Item {
     // --probe-screen：打印光标所在显示器、各屏几何/缩放、换算出的逻辑坐标，
     // 用来在多屏机器上核对"新窗口落在鼠标那块屏"。
     readonly property bool probeScreen: Qt.application.arguments.indexOf("--probe-screen") !== -1
-    readonly property bool windowAutoGeometry: !automationRun || probeWinFit
+    readonly property bool windowAutoGeometry: !automationRun || probeWinFit || probeScreen
     // 所属窗口（Window.window 这个附加属性在 EditorContent 里求值会抛异常，
     // 见 dpr 那段的注释；需要窗口对象的探针/逻辑用这个显式引用）。
     property var hostWindow: null
@@ -304,15 +304,8 @@ Item {
     // 夹进工作区。这样窗口一出现就是最终大小/位置，不会"先弹个空窗口、
     // 解码完再跳一下"。url 为空（空窗口启动）时只按默认尺寸摆位置。
     function presizeWindow(win, url) {
-        if (!win)
+        if (!win || !root.windowAutoGeometry)
             return false
-        // 自动化运行默认固定窗口几何（几何基线不乱）；--probe-screen 只做
-        // 换算并打印，不改窗口位置。
-        if (!root.windowAutoGeometry) {
-            if (root.probeScreen)
-                root.resolveCursor()
-            return false
-        }
         // 先解析光标在哪块屏：后面的量尺寸、夹边都要用那块屏的工作区。
         const haveCursor = root.resolveCursor()
         const s = url ? url.toString() : ""
