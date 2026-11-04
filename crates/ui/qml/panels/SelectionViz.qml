@@ -303,6 +303,83 @@ Item {
         }
     }
 
+    // ---- 选中图层的尺寸徽标（图层描边左下角）--------------------------
+    // 和选区尺寸徽标同一套视觉：灰底小圆角 chip，图片上任何内容都读得清。
+    // 位置贴图层框的左下角：框底还有余量就画在框外 4px，贴到画布底部时
+    // 翻到框内，避免被视口切掉。旋转过的框是倾斜四边形，取四角里最靠下
+    // 的那个角（并列取更靠左的），跟着内容走而不是跟着大包围盒走。
+    Rectangle {
+        id: layerBadge
+        // 拖八向手柄缩放时框每帧都在变，框下沿已经有蓝色的实时数字，
+        // 这里让位（否则两串数字叠在一起）；旋转中同理。
+        visible: host.selLayer !== null && host.scaleW === 0 && !host.rotating
+                 && !host.rulerOn && host.paintTool === "none"
+                 && layerBadge.anchor !== null
+        z: 8
+        readonly property var anchor: {
+            const b = host.selLayerBox
+            if (b === null)
+                return null
+            const s = host.toDispScale()
+            const q = selectionViz.layerQuad
+            if (q !== null && q.length === 8) {
+                // 取四个角里最靠下的那个（并列取更靠左的）：轴对齐时正好是
+                // 左下角，旋转后是内容的下尖角——视觉上始终贴着框的下沿。
+                let bx = q[0]
+                let by = q[1]
+                for (let i = 1; i < 4; ++i) {
+                    const x = q[i * 2]
+                    const y = q[i * 2 + 1]
+                    if (y > by + 0.5 || (Math.abs(y - by) <= 0.5 && x < bx)) {
+                        bx = x
+                        by = y
+                    }
+                }
+                return { x: bx, y: by }
+            }
+            return { x: b.x * s, y: (b.y + b.h) * s }
+        }
+        readonly property real anchorX: anchor !== null ? anchor.x : 0
+        readonly property real anchorY: anchor !== null ? anchor.y : 0
+        // 倾斜框时那个角是尖的，徽标以它为中心才不会压住半边框。
+        readonly property bool centered: selectionViz.layerQuad !== null
+        // 旋转提交后位图被扩成外接矩形（600×400 转 45° → 708×708），照 box
+        // 报会让人以为图案被放大了；这时报旋转前的真实尺寸（rotateFrame
+        // 记着那一份）。用字符串一次算清，免得多个 int 属性各自的更新时机
+        // 错开、文字停在旧值上。
+        readonly property string sizeText: {
+            const b = host.selLayerBox
+            if (b === null)
+                return ""
+            // 只有「框确实是那个旋转角对应的外接矩形」时才算数：缩放/撤销之后
+            // rotateFrame 可能还留着，但尺寸早变了，这时以实际 bounds 为准。
+            const f = host.layerFrameRotated ? host.rotateFrame : null
+            const w = f ? f.w : b.w
+            const h = f ? f.h : b.h
+            return "图层 " + Math.round(w) + " × " + Math.round(h)
+        }
+
+        x: previewImage.x + Math.max(0, Math.min(anchorX - (centered ? width / 2 : 0),
+                                                previewImage.width - width))
+        y: previewImage.y + (anchorY + 4 + height <= previewImage.height
+                             ? anchorY + 4
+                             : Math.max(0, anchorY - height - 4))
+        width: layerBadgeLabel.implicitWidth + 12
+        height: layerBadgeLabel.implicitHeight + 6
+        radius: 3
+        color: "#43474d"
+        border.color: "#6b7076"
+        border.width: 1
+
+        Text {
+            id: layerBadgeLabel
+            anchors.centerIn: parent
+            text: layerBadge.sizeText
+            color: "#d5d8dd"
+            font.pixelSize: 11
+        }
+    }
+
     // Selected layer outline (dashed) + blue-dot handles for scaling.
     DashedRect {
         id: layerBoxViz

@@ -61,6 +61,11 @@ def main():
     w, h = rect.right - rect.left, rect.bottom - rect.top
 
     from PIL import Image
+    # Qt 的 Quick 窗口走 GPU 合成，PrintWindow 抓的是最近一次合成的缓存，
+    # 状态刚变时可能还是上一帧（比如尺寸标签停在旧数字）。强制整棵子窗
+    # 树失效并立刻重绘一次，再抓就稳定了。
+    user32.RedrawWindow(hwnd, None, None, 0x0001 | 0x0080 | 0x0100)
+    time.sleep(0.25)
     hdc = user32.GetWindowDC(hwnd)
     gdi = ctypes.windll.gdi32
     mem = gdi.CreateCompatibleDC(hdc)

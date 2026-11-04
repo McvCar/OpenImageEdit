@@ -37,47 +37,12 @@ Rectangle {
         // 文件名与缩放控件之间至少留 90px 才值得显示状态文字。
         readonly property bool showStatus:
             width - (fileInfo.visible ? fileInfo.width + 12 : 0)
-            - (layerSize.visible ? layerSize.width + 10 : 0)
             - (modeHint.visible ? modeHint.width + 10 : 0) >= 90
     }
 
-    // ---- 选中图层时显示图层分辨率（图层自己的像素尺寸）----------------
-    // 数据源就是图层面板用的 layers_json（w/h 是图层的边界尺寸，不是画布），
-    // 未选中图层时整段隐藏 —— 状态栏左侧的「文件分辨率」始终说的是画布。
-    readonly property var selLayerRow: {
-        if (bridge.selected_layer < 0 || !bridge.layers_json)
-            return null
-        try {
-            const arr = JSON.parse(bridge.layers_json)
-            for (let i = 0; i < arr.length; i++) {
-                if (arr[i].i === bridge.selected_layer)
-                    return arr[i]
-            }
-        } catch (e) {
-            return null
-        }
-        return null
-    }
-    readonly property string layerSizeText:
-        selLayerRow && selLayerRow.w > 0
-        ? "图层 " + selLayerRow.w + " × " + selLayerRow.h
-        : ""
-
-    Text {
-        id: layerSize
-        parent: leftZone
-        anchors.verticalCenter: parent.verticalCenter
-        // 太窄就先牺牲它（文件信息优先）：180px 以下连「图层 800 × 600」都放不下。
-        visible: statusBar.layerSizeText.length > 0 && leftZone.width >= 240
-        x: fileInfo.visible ? fileInfo.x + fileInfo.width + 12 : 0
-        text: statusBar.layerSizeText
-        color: "#8c95a3"
-        font.pixelSize: 12
-        elide: Text.ElideRight
-        width: Math.min(implicitWidth,
-                        Math.max(0, leftZone.width - x - (modeHint.visible
-                                                          ? modeHint.width + 8 : 0)))
-    }
+    // 选中图层的尺寸不在这儿报：画布上图层描边的左下角有专门的徽标
+    //（SelectionViz 的 layerBadge），跟着框走、旋转后也贴合，比状态栏
+    // 里的静态数字直观。状态栏左侧的「文件分辨率」始终说的是画布。
 
     Text {
         id: modeHint
