@@ -313,7 +313,7 @@ Item {
         // 拖八向手柄缩放时框每帧都在变，框下沿已经有蓝色的实时数字，
         // 这里让位（否则两串数字叠在一起）；旋转中同理。
         visible: host.selLayer !== null && host.scaleW === 0 && !host.rotating
-                 && !host.rulerOn && host.paintTool === "none"
+                 && !host.rulerOn
                  && layerBadge.anchor !== null
         z: 8
         readonly property var anchor: {
@@ -384,7 +384,6 @@ Item {
     DashedRect {
         id: layerBoxViz
         visible: host.selLayer !== null && host.scaleW === 0
-                 && host.paintTool === "none"
         z: 6
         x: previewImage.x
         y: previewImage.y
@@ -404,14 +403,14 @@ Item {
         // 拾色器打开时隐藏（取色优先于缩放/移动）。
         // 旋转过之后框变成倾斜四边形，八向缩放手柄还是轴对齐的，两者一起
         // 显示会互相"打架"，这时只留倾斜框和旋柄。
-        // 快速选择 / 魔术棒激活时不显示：它们是「按住就涂」的手势，手柄压在
+        // 移动能力与工具**共存**：画笔 / 修补 / 油漆 / 选框激活时，只要图层
+        // 还选着，手柄就在（和改造前一致）。想收掉手柄就取消选择（Esc 或
+        // 移动模式下点空白）。
+        // 只有快速选择 / 魔术棒例外：它们是「按住就涂」的手势，手柄压在
         // 图层四角会抢走按下事件；PS 里这两个工具也没有变换框。
-        // （画布上的按下本身在 CanvasSurface.layerPickAt 里就不再拾取图层，
-        //  选区工具点空白不会冒出包围盒。）
         visible: host.selLayer !== null && host.selLayer.base !== true
                  && !host.selExists && bridge.image_width > 0
                  && !bridge.pickerOpen && !host.layerFrameRotated
-                 && host.paintTool === "none" && host.markTool === "none"
                  && host.selTool !== "quick" && host.selTool !== "wand"
                  && !host.rotating
         z: 8
@@ -446,10 +445,10 @@ Item {
     // 旋转期间位图是实时重采样的（Rust 侧每 60ms 一帧），松手才写历史。
     Item {
         id: rotateHandleBox
+        // 和缩放手柄一样与工具共存；快速选择 / 魔术棒下让位（同上）。
         visible: host.selLayer !== null && host.selLayer.base !== true
                  && !host.selExists && bridge.image_width > 0
                  && !bridge.pickerOpen && host.scaleW === 0
-                 && host.paintTool === "none" && host.markTool === "none"
                  && host.selTool !== "quick" && host.selTool !== "wand"
         z: 10
         readonly property real s: host.toDispScale()
