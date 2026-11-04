@@ -621,6 +621,25 @@ impl qobject::Bridge {
                         println!("{{\"phase\":\"ui\",\"event\":\"gradient\"}}");
                     }
                 }
+                // `move-layer:dx,dy` —— 走画布拖动图层那条真实链路
+                // （begin → update → end(true)），用来复现「框拖走了、图层没动」。
+                // 配合 `layer-info:` 前后各打一次就能看出 offset 有没有落地。
+                other if other.starts_with("move-layer:") => {
+                    let n = parse_nums(other);
+                    if n.len() >= 2 {
+                        let (dx, dy) = (n[0].round() as i32, n[1].round() as i32);
+                        self.as_mut().drag_translate_begin();
+                        self.as_mut().drag_translate_update(dx, dy);
+                        self.as_mut().drag_translate_end(true);
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"move-layer\",\"dx\":{dx},\"dy\":{dy}}}"
+                        );
+                    } else {
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        )
+                    }
+                }
                 // `layer-info:index[,tag]` —— 打印图层位图尺寸与 offset。
                 // 诊断"转一圈图层变大 / 放手后位置漂移"时直接读这几项，
                 // 别再从截图上量像素。

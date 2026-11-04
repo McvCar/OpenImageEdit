@@ -307,6 +307,12 @@ Item {
             if (hit !== null) {
                 if (bridge.selected_mark >= 0)
                     bridge.select_mark(-1)   // 标记/图层选中互斥
+                // 上一次拖动如果没收尾（切窗口、Alt+Tab、浮层抢焦点导致丢了
+                // release），这些标志会残留为真，把这一次拖动整段吃掉。
+                // 既然现在明确要拖图层，就地清干净。
+                moveSelActive = false
+                selOffX = 0
+                selOffY = 0
                 bridge.select_layer(hit.i)
                 pickDrag = true
                 pickMoved = false
@@ -400,6 +406,30 @@ Item {
         onPositionChanged: (mouse) => {
             if (host.rulerOn)
                 host.noteHover(mouse.x, mouse.y)
+            // ★图层拖动排在最前：它是唯一一条「按下就锁定了目标图层」的手势，
+            //   一旦 pickDrag 为真，别的分支都不能再抢这次移动。以前它在
+            //   moveSelActive / selPolyActive 之后 —— 那两个标志只要因为丢过
+            //   一次 release（切窗口、Alt+Tab、弹窗抢焦点）而残留为真，
+            //   后续每次拖动都会被它们吃掉：鼠标在动，只有选区框在跑，
+            //   图层一步不动（用户报的正是这个）。
+            if (pickDrag) {
+                curX = mouse.x
+                curY = mouse.y
+                if (!pickMoved
+                    && Math.abs(curX - startX) + Math.abs(curY - startY) > 3) {
+                    pickMoved = true
+                    lastDx = 0
+                    lastDy = 0
+                    bridge.drag_translate_begin()
+                    // Start ONCE and keep repeating: restarting the
+                    // timer on every mouse-move event would reset the
+                    // countdown faster than it can expire (mouse
+                    // events arrive at ~125Hz), so fast drags never
+                    // rendered live.
+                    liveTimer.start()
+                }
+                return
+            }
             // 修补工具：第一段收顶点，第二段拖动取样偏移。
             if (patchDrawing) {
                 const pp = toImage(mouse.x, mouse.y)
@@ -446,24 +476,6 @@ Item {
                 selOffY = mouse.y - moveFromY
                 return
             }
-            if (pickDrag) {
-                curX = mouse.x
-                curY = mouse.y
-                if (!pickMoved
-                    && Math.abs(curX - startX) + Math.abs(curY - startY) > 3) {
-                    pickMoved = true
-                    lastDx = 0
-                    lastDy = 0
-                    bridge.drag_translate_begin()
-                    // Start ONCE and keep repeating: restarting the
-                    // timer on every mouse-move event would reset the
-                    // countdown faster than it can expire (mouse
-                    // events arrive at ~125Hz), so fast drags never
-                    // rendered live.
-                    liveTimer.start()
-                }
-                return
-            }
             if (!dragging)
                 return
             curX = mouse.x
@@ -481,6 +493,25 @@ Item {
         }
 
         onReleased: (mouse) => {
+            // ★和 onPositionChanged 同一条铁律：图层拖动一进一出必须配对。
+            //   松手时先收它，别让残留的选区 / 画笔状态把提交吞掉 ——
+            //   吞掉的后果是图层停在旧位置，而框（来自文档 offset 的 JSON）
+            //   已经跟着鼠标走完了整段。
+            if (pickDrag) {
+                pickDrag = false
+                if (pickMoved) {
+                    pickMoved = false
+                    liveTimer.stop()
+                    const scale = host.toImageScale()
+                    bridge.drag_translate_update(
+                        Math.round((curX - startX) * scale),
+                        Math.round((curY - startY) * scale))
+                    bridge.drag_translate_end(true)
+                    if (host.pasteFloating)
+                        host.floatingOps += 1
+                }
+                return
+            }
             if (patchDrawing) {
                 patchDrawing = false
                 if (patchPts.length >= 3) {
@@ -538,16 +569,7 @@ Item {
             }
             if (pickDrag) {
                 pickDrag = false
-                if (pickMoved) {
-                    liveTimer.stop()
-                    const scale = host.toImageScale()
-                    bridge.drag_translate_update(
-                        Math.round((curX - startX) * scale),
-                        Math.round((curY - startY) * scale))
-                    bridge.drag_translate_end(true)
-                    if (host.pasteFloating)
-                        host.floatingOps += 1
-                }
+                pickMoved = false
                 return
             }
             if (!dragging)
@@ -589,6 +611,33 @@ Item {
             }
             lassoPts = []
             selPreview.requestPaint()
+        }
+
+        // 丢失鼠标捕获（Alt+Tab / 系统弹窗抢焦点 / 另一个 item 抢走手势）时
+        // 不会来 onReleased。不在这里复位，pickDrag / moveSelActive 就会一直
+        // 为真，下一次在画布上拖动会被它们整段吃掉 —— 用户看到的就是"框被
+        // 拖走了，图层一步没动"。图层位移这时按取消处理，回滚到拖之前。
+        onCanceled: {
+            if (pickDrag) {
+                pickDrag = false
+                pickMoved = false
+                liveTimer.stop()
+                bridge.drag_translate_end(false)
+            }
+            if (moveSelActive) {
+                moveSelActive = false
+                selOffX = 0
+                selOffY = 0
+            }
+            if (quickDrag)
+                cancelQuickSelect()
+            if (paintStroke)
+                cancelPaint()
+            if (dragging) {
+                dragging = false
+                lassoPts = []
+                selPreview.requestPaint()
+            }
         }
     }
 
