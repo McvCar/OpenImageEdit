@@ -5,9 +5,10 @@
 // 这样一次涂抹只会留下一条 Ctrl+Z，而不是每帧一条。
 use super::super::*;
 
-/// 旋转拖动中实时预览的长边上限（像素）。拖动期间合成是在预览尺度上做的，
-/// 这里只负责把 4K 屏上的超大预览再压一档；松手那一帧恢复满分辨率。
-const LIVE_ROTATE_EDGE: u32 = 1600;
+/// 旋转拖动中实时预览的长边上限（像素）。只在**远超屏幕分辨率**时兜底，
+/// 平时等于不压：压到 1600 再让 QML 拉回 1917 宽的窗口，整幅被放大 1.2 倍，
+/// 拖动时看着就是"转起来发糊"（曾经的实际问题）。
+const LIVE_ROTATE_EDGE: u32 = 4096;
 
 /// 目标位图左上角的画布坐标：位图坐标 = 画布坐标 - origin。
 fn target_origin(doc: &Document, target: AdjustTarget) -> (i32, i32) {
@@ -697,7 +698,10 @@ impl qobject::Bridge {
                     session.rotate_origin = None;
                 }
             } else {
-                let (image, delta) = editcore::rotate_image(&st.before.image, total, expand);
+                let commit_t0 = std::time::Instant::now();
+                // 双三次：整段拖拽只在这里真正重采样一次，用双线性转完会整层
+                // 发软（用户反馈的"转一下就变模糊"）。
+                let (image, delta) = editcore::rotate_image_hq(&st.before.image, total, expand);
                 let after = Layer {
                     name: st.before.name.clone(),
                     image,
@@ -724,6 +728,11 @@ impl qobject::Bridge {
                 } else {
                     session.rotate_origin = None;
                 }
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"rotate-commit\",\"ms\":{},\"degrees\":{:.2}}}",
+                    commit_t0.elapsed().as_millis(),
+                    total
+                );
             }
         }
         // 不管提交还是取消，都要重画一帧：拖动中看到的那张是临时合成出来的。

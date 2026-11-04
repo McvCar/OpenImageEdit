@@ -223,6 +223,11 @@ Flickable {
         x: Math.round((view.contentWidth - width) / 2)
         y: Math.round((view.contentHeight - height) / 2)
         cache: false
+        // ★异步解码。Image 默认是同步的：`source` 一变就在 setSource 里当场
+        // 解码整张 BMP（1917×1278 约 10ms），这笔开销直接叠在拖动帧耗上，
+        // 比合成+编码还贵。改成异步后解码走线程池，拖动帧只留下合成/编码。
+        // 迟到的旧帧由 Qt 自己丢弃（request id 不匹配），不会闪回上一角度。
+        asynchronous: true
         fillMode: Image.Stretch
         source: bridge.preview_url
         // 平滑只在"真的在缩放"时开：位图是 1:1 物理像素渲染的，此时贴图尺寸

@@ -499,6 +499,10 @@ Item {
     // ---- 图层旋转（画布手柄）----
     property bool rotating: false
     property real rotateAnglePreview: 0
+    // 拖动节流状态：上一帧算出的角度、上一帧真实耗时、上一帧的起算时刻。
+    property real rotateRenderedAngle: 0
+    property int rotateFrameCost: 0
+    property double rotateLastAt: 0
     readonly property var markList: Marks.parseMarks(bridge.marks_json)
     // ---- 调整颜色（macOS 预览风格）----
     // Mirrored parameters (slider positions) and the throttled live push.
@@ -1866,33 +1870,44 @@ function startLayerRotate() {
         return
     root.rotating = true
     root.rotateAnglePreview = 0
+    root.rotateRenderedAngle = 0
+    root.rotateFrameCost = 0
+    root.rotateLastAt = 0
     // keep_session = true：连续拖手柄时沿用上次留下的原图，避免一遍遍
     // 重新插值（否则越拖越糊）。
     bridge.rotate_layer_begin(bridge.selected_layer, true)
 }
 
 function applyRotateFrame() {
-    if (root.rotating)
-        bridge.rotate_layer_update(root.rotateAnglePreview, true)
+    if (!root.rotating)
+        return
+    // 角度没变就别重算（鼠标停在原地也会一直有 move 事件）。
+    if (root.rotateAnglePreview === root.rotateRenderedAngle)
+        return
+    // ★节流放在「定时器网格」上，而不是改 Timer.interval：
+    //   给运行中的 Timer 改 interval 会让它重启，帧间隔被抖成 16/24/33 的
+    //   随机值——看起来就是"一顿一顿"。这里定时器恒定 16ms 跑，慢帧用
+    //   「跳过若干格」来处理，出帧节拍始终是 16ms 的整数倍。
+    const now = Date.now()
+    if (root.rotateFrameCost > 0 && now - root.rotateLastAt < root.rotateFrameCost)
+        return
+    root.rotateLastAt = now
+    root.rotateRenderedAngle = root.rotateAnglePreview
+    const t0 = Date.now()
+    bridge.rotate_layer_update(root.rotateAnglePreview, true)
+    // 记下本帧真实耗时（含同步合成/编码/写盘），下一格据此决定跳不跳。
+    root.rotateFrameCost = Math.min(80, Date.now() - t0)
 }
 
 function previewLayerRotate(deg) {
     if (!root.rotating)
         return
     root.rotateAnglePreview = deg
-    // ★ 这里是「节流 + 首帧立即出」：
-    //   - 不能每次事件都 restart()，那是防抖 —— 拖的时候定时器一直被推迟，
-    //     一帧都不出，松手才跳一下，就是之前那种"卡住"的手感；
-    //   - 也不能每个事件都同步重采样，鼠标事件比帧率密得多，白算。
-    //   所以：没在跑就先立刻算一帧（跟手），再让定时器接管后续帧。
-    if (!rotateThrottle.running) {
-        applyRotateFrame()
-        rotateThrottle.start()
-    }
+    // 首帧立即出（跟着鼠标起手），之后的帧交给定时器。
+    root.applyRotateFrame()
 }
 
 function finishLayerRotate(apply) {
-    rotateThrottle.stop()
     if (!root.rotating)
         return
     root.rotating = false
@@ -1902,8 +1917,10 @@ function finishLayerRotate(apply) {
 
 Timer {
     id: rotateThrottle
-    interval: 33
+    interval: 16
     repeat: true
+    // 只在拖动期间走；起手/松手由 rotating 自己管，省掉散落的 start/stop。
+    running: root.rotating
     onTriggered: root.applyRotateFrame()
 }
 

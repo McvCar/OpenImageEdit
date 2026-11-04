@@ -613,7 +613,13 @@ impl PreviewComposer {
                 self.rotate_small = Some((token, pw, ph, Arc::new(small)));
             }
             let small = &self.rotate_small.as_ref().expect("just filled").3;
-            let (rotated, delta) = editcore::rotate_image(small, degrees, expand);
+            // ★固定输出尺寸（对角线正方形）：整段拖拽里它不变，采样网格和
+            // 偏移也就恒定，每帧只有角度在动。若按包围盒算尺寸，它会随角度
+            // 每帧 ±1px 缩放，格子跳半像素、偏移跳 1px —— 30fps 下就是"抖动"。
+            let (nw, nh) = editcore::rotated_box_size(pw, ph, expand);
+            let rad = degrees.to_radians();
+            let (rotated, delta) =
+                editcore::rotate_into(small, rad.sin(), rad.cos(), nw, nh);
             let ox = (offset.0 as f64 * sx).round() as i32 + delta.0;
             let oy = (offset.1 as f64 * sy).round() as i32 + delta.1;
             let src = match adjust {

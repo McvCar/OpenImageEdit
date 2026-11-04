@@ -658,7 +658,9 @@ impl Document {
             return Ok(());
         }
         let before = layer.clone();
-        let (image, delta) = rotate_image(&layer.image, degrees, expand);
+        // 落定用双三次：双线性转完一圈下来整层会明显发软（只此一次，代价
+        // 摊不进拖动帧，没有理由省）。
+        let (image, delta) = rotate_image_hq(&layer.image, degrees, expand);
         let mut after = before.clone();
         after.image = image;
         after.offset = (before.offset.0 + delta.0, before.offset.1 + delta.1);

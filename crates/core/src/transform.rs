@@ -121,6 +121,66 @@ pub fn rotate_image(img: &RgbaImage, degrees: f32, expand: bool) -> (RgbaImage, 
     } else {
         (img.width(), img.height())
     };
+    rotate_into(img, sin, cos, nw, nh)
+}
+
+/// 高质量旋转：Catmull-Rom（双三次）重采样，仍然预乘 alpha。
+///
+/// 只在「角度落定」时用（松手提交、角度对话框、一次性旋转图层）。双线性
+/// 只用 2×2 个 tap，等效于一次低通，转完照片/线条会明显发软——用户看到的
+/// "转一下就变模糊"就是它。双三次用 4×4 个 tap 并带负瓣，能把中高频补回来，
+/// 代价是 4 倍采样，但只算一次，摊不进拖动帧。
+pub fn rotate_image_hq(img: &RgbaImage, degrees: f32, expand: bool) -> (RgbaImage, (i32, i32)) {
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    if iw < 1 || ih < 1 || degrees.abs() < 0.001 {
+        return (img.clone(), (0, 0));
+    }
+    let (w, h) = (iw as f32, ih as f32);
+    let rad = degrees.to_radians();
+    let (sin, cos) = (rad.sin(), rad.cos());
+    let (nw, nh) = if expand {
+        (
+            (w * cos.abs() + h * sin.abs()).ceil().max(1.0) as u32,
+            (w * sin.abs() + h * cos.abs()).ceil().max(1.0) as u32,
+        )
+    } else {
+        (img.width(), img.height())
+    };
+    rotate_to(img, sin, cos, nw, nh, true)
+}
+
+/// 旋转到**指定尺寸**的输出画布（源图中心对齐画布中心）。
+///
+/// 拖动预览专用：整段拖拽里把输出尺寸钉死成一个常量（见 [`rotated_box_size`]），
+/// 采样网格 `dcx/dcy` 和返回的偏移就都是常量——每帧只有角度在变。
+/// 用 `rotate_image` 的话包围盒会随角度每帧 ±1px 变化，格子跟着跳半像素、
+/// 偏移也跟着跳 1px，30fps 下整层看起来就在抖。
+pub fn rotate_into(
+    img: &RgbaImage,
+    sin: f32,
+    cos: f32,
+    nw: u32,
+    nh: u32,
+) -> (RgbaImage, (i32, i32)) {
+    rotate_to(img, sin, cos, nw, nh, false)
+}
+
+/// 旋转的核心：`hq=false` 走双线性（拖动用），`true` 走双三次（落定用）。
+fn rotate_to(
+    img: &RgbaImage,
+    sin: f32,
+    cos: f32,
+    nw: u32,
+    nh: u32,
+    hq: bool,
+) -> (RgbaImage, (i32, i32)) {
+    let nw = nw.max(1);
+    let nh = nh.max(1);
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    if iw < 1 || ih < 1 {
+        return (RgbaImage::new(nw, nh), (0, 0));
+    }
+    let (w, h) = (iw as f32, ih as f32);
     let (scx, scy) = (w / 2.0, h / 2.0);
     let (dcx, dcy) = (nw as f32 / 2.0, nh as f32 / 2.0);
     let mut out = RgbaImage::new(nw, nh);
@@ -148,9 +208,18 @@ pub fn rotate_image(img: &RgbaImage, degrees: f32, expand: bool) -> (RgbaImage, 
             let cref = &ctx;
             std::thread::scope(|scope| {
                 for (ti, chunk) in dst.chunks_mut(rows * cref.nstride).enumerate() {
-                    scope.spawn(move || render_rows(chunk, ti * rows, src, cref));
+                    let dy0 = ti * rows;
+                    scope.spawn(move || {
+                        if hq {
+                            render_rows_hq(chunk, dy0, src, cref);
+                        } else {
+                            render_rows(chunk, dy0, src, cref);
+                        }
+                    });
                 }
             });
+        } else if hq {
+            render_rows_hq(dst, 0, src, &ctx);
         } else {
             render_rows(dst, 0, src, &ctx);
         }
@@ -160,6 +229,19 @@ pub fn rotate_image(img: &RgbaImage, degrees: f32, expand: bool) -> (RgbaImage, 
         ((h - nh as f32) / 2.0).round() as i32,
     );
     (out, delta)
+}
+
+/// 整段旋转手势里恒定不变的输出尺寸：取对角线长度的正方形——
+/// 任何角度下的包围盒都装得下，而尺寸与角度无关。`expand=false`（不扩边界）
+/// 时直接用原尺寸。
+pub fn rotated_box_size(w: u32, h: u32, expand: bool) -> (u32, u32) {
+    if !expand {
+        return (w.max(1), h.max(1));
+    }
+    let d = ((w as f32) * (w as f32) + (h as f32) * (h as f32))
+        .sqrt()
+        .ceil() as u32;
+    (d.max(1), d.max(1))
 }
 
 /// 一次旋转运算的常量参数（各线程共享只读）。
@@ -190,6 +272,80 @@ fn rot_threads(nh: u32) -> usize {
         1
     } else {
         n
+    }
+}
+
+/// Catmull-Rom 一维权重（a = -0.5）。带负瓣，正是它把双线性糊掉的
+/// 中高频补回来；四个权重之和恒为 1。
+#[inline]
+fn catmull(t: f32) -> [f32; 4] {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    [
+        -0.5 * t3 + t2 - 0.5 * t,
+        1.5 * t3 - 2.5 * t2 + 1.0,
+        -1.5 * t3 + 2.5 * t2 + 0.5 * t,
+        0.5 * t3 - 0.5 * t2,
+    ]
+}
+
+/// 双三次（Catmull-Rom）行渲染：4×4 个 tap，预乘 alpha 累加。
+///
+/// 负权会让累加出的 alpha 略微越界（负瓣），所以末了统一 clamp；alpha 接近
+/// 0 的像素直接判透明，避免 unpremultiply 放大噪点。
+fn render_rows_hq(dst: &mut [u8], dy0: usize, src: &[u8], c: &RotCtx) {
+    for (r, row) in dst.chunks_mut(c.nstride).enumerate() {
+        let ry = (dy0 + r) as f32 + 0.5 - c.dcy;
+        for dx in 0..c.nw as usize {
+            let rx = dx as f32 + 0.5 - c.dcx;
+            let sx = c.cos * rx + c.sin * ry + c.scx - 0.5;
+            let sy = -c.sin * rx + c.cos * ry + c.scy - 0.5;
+            let fx = sx.floor();
+            let fy = sy.floor();
+            let (x0, y0) = (fx as i32, fy as i32);
+            let wx = catmull(sx - fx);
+            let wy = catmull(sy - fy);
+            let mut acc = [0f32; 3];
+            let mut a_sum = 0f32;
+            for (j, wyv) in wy.iter().enumerate() {
+                let y = y0 - 1 + j as i32;
+                if y < 0 || y >= c.ih || *wyv == 0.0 {
+                    continue;
+                }
+                let base = y as usize * c.stride;
+                for (i, wxv) in wx.iter().enumerate() {
+                    let x = x0 - 1 + i as i32;
+                    if x < 0 || x >= c.iw {
+                        continue;
+                    }
+                    let w = wyv * wxv;
+                    if w == 0.0 {
+                        continue;
+                    }
+                    let p = base + x as usize * 4;
+                    let a = src[p + 3] as f32 * w;
+                    if a == 0.0 {
+                        continue;
+                    }
+                    acc[0] += src[p] as f32 * a;
+                    acc[1] += src[p + 1] as f32 * a;
+                    acc[2] += src[p + 2] as f32 * a;
+                    a_sum += a;
+                }
+            }
+            let pixel = if a_sum > 0.00255 {
+                let inv = 1.0 / a_sum;
+                [
+                    (acc[0] * inv).round().clamp(0.0, 255.0) as u8,
+                    (acc[1] * inv).round().clamp(0.0, 255.0) as u8,
+                    (acc[2] * inv).round().clamp(0.0, 255.0) as u8,
+                    a_sum.round().clamp(0.0, 255.0) as u8,
+                ]
+            } else {
+                [0, 0, 0, 0]
+            };
+            row[dx * 4..dx * 4 + 4].copy_from_slice(&pixel);
+        }
     }
 }
 

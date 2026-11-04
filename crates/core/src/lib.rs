@@ -25,7 +25,9 @@ pub use selection::{
 };
 pub use mark::{MarkKind, Mark};
 pub use layer::Layer;
-pub use transform::{rotate_image, Transform};
+pub use transform::{
+    rotate_image, rotate_image_hq, rotate_into, rotated_box_size, Transform,
+};
 pub use paint::{crop_region, flood_fill, gradient_fill, Patch};
 pub use retouch::{
     heal_clone, patch_fill, spot_heal, stroke_mask, BrushSpec, StrokeMask,
@@ -1479,6 +1481,36 @@ mod paint_tests {
     }
 
     #[test]
+    fn rotate_image_hq_matches_geometry_but_keeps_more_detail() {
+        // 4px 周期的高频条纹：双线性相当于一次低通，对比度必掉；双三次
+        // 带负瓣，掉的应该明显更少（这正是"转完发软"的量化形式）。
+        let mut img = RgbaImage::from_pixel(240, 240, image::Rgba([255, 255, 255, 255]));
+        for x in (0..240).step_by(4) {
+            for y in 0..240 {
+                img.put_pixel(x, y, image::Rgba([0, 0, 0, 255]));
+            }
+        }
+        let (bil, d1) = rotate_image(&img, 37.0, true);
+        let (hq, d2) = rotate_image_hq(&img, 37.0, true);
+        // 几何完全一致：尺寸与偏移不能变，否则图层会跳。
+        assert_eq!(bil.dimensions(), hq.dimensions());
+        assert_eq!(d1, d2);
+        let detail = |im: &RgbaImage| -> f64 {
+            // 取中间一条横带，算相邻像素差的平均绝对值（越高越锐）。
+            let y = im.height() / 2;
+            let mut sum = 0f64;
+            for x in 1..im.width() {
+                let a = im.get_pixel(x, y).0[0] as f64;
+                let b = im.get_pixel(x - 1, y).0[0] as f64;
+                sum += (a - b).abs();
+            }
+            sum / (im.width() - 1) as f64
+        };
+        let (db, dh) = (detail(&bil), detail(&hq));
+        assert!(dh > db * 1.05, "hq should be sharper: bilinear={db:.1} hq={dh:.1}");
+    }
+
+    #[test]
     fn rotate_image_expands_and_keeps_the_center() {
         let mut img = RgbaImage::from_pixel(10, 10, image::Rgba([255, 255, 255, 255]));
         img.put_pixel(5, 5, image::Rgba([0, 0, 0, 255]));
@@ -1504,6 +1536,40 @@ mod paint_tests {
         assert!((cy - out.height() as f32 / 2.0).abs() < 1.5, "cy={cy}");
         // 左上角向外扩，偏移为负。
         assert!(delta.0 <= 0 && delta.1 <= 0);
+    }
+
+    /// 拖动预览的稳定性契约：整段手势里输出尺寸与偏移必须**完全不变**，
+    /// 否则每帧 ±1px 的尺寸/偏移跳变就是肉眼看到的"抖动"。
+    #[test]
+    fn rotate_into_keeps_output_size_and_offset_stable() {
+        // 100×60 的实心块：扫一圈角度，输出尺寸与偏移都该是同一个值。
+        let img = RgbaImage::from_pixel(100, 60, image::Rgba([200, 120, 40, 255]));
+        let (nw, nh) = rotated_box_size(100, 60, true);
+        assert_eq!((nw, nh), (117, 117), "对角线正方形：ceil(hypot(100,60))");
+        let mut first: Option<(i32, i32)> = None;
+        for deg in [0.0f32, 3.25, 17.0, 45.0, 61.5, 89.9, 120.0, 180.0] {
+            let rad = deg.to_radians();
+            let (out, delta) = rotate_into(&img, rad.sin(), rad.cos(), nw, nh);
+            assert_eq!((out.width(), out.height()), (nw, nh), "size at {deg}");
+            match first {
+                None => first = Some(delta),
+                Some(d) => assert_eq!(d, delta, "offset drifted at {deg}°"),
+            }
+            // 内容仍居中：实心块的重心落在画布中心 ±1px。
+            let (mut sx, mut sy, mut n) = (0f64, 0f64, 0f64);
+            for y in 0..out.height() {
+                for x in 0..out.width() {
+                    if out.get_pixel(x, y).0[3] > 0 {
+                        sx += x as f64;
+                        sy += y as f64;
+                        n += 1.0;
+                    }
+                }
+            }
+            assert!(n > 0.0);
+            assert!((sx / n - nw as f64 / 2.0).abs() < 1.5, "cx off at {deg}°");
+            assert!((sy / n - nh as f64 / 2.0).abs() < 1.5, "cy off at {deg}°");
+        }
     }
 
     #[test]
