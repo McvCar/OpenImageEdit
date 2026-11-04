@@ -457,6 +457,9 @@ impl qobject::Bridge {
     ) {
         let p = (x as f32, y as f32);
         let r = radius.clamp(1.0, 400.0) as u32;
+        // 取样源跟随当前编辑目标：选中图层 → 该层；没选中 → 背景。和魔术棒
+        // 的「取样全部图层」开关互不影响（那个是显式勾选）。
+        let selected = *self.selected_layer();
 
         // 第一次调用：快照按下前的选区（撤销目标 + 加/减基准）。
         if self.quick_drag.borrow().is_none() {
@@ -501,8 +504,8 @@ impl qobject::Bridge {
             let Some(session) = guard.as_ref() else {
                 return;
             };
-            // None = 取样可见合成（PS 快速选择默认吃「所有图层」）。
-            session.doc.quick_select_selection(&seg, r, opts, None)
+            let target = super::paint::pick_target(&session.doc, selected);
+            session.doc.quick_select_selection(&seg, r, opts, target)
         };
 
         // 累积扩散结果，再按 mode 与按下前的选区合成。

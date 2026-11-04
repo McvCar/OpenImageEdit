@@ -61,8 +61,36 @@ impl qobject::Bridge {
         );
     }
 
-    pub fn picker_select(mut self: Pin<&mut Self>, index: i32) {
-        let picked = {
+    /// 画布上某点（图像坐标）的十六进制颜色，供画笔 / 修复画笔按住 Alt
+    /// 临时取样用。取样源跟随当前编辑目标（选中图层优先，否则背景），和
+    /// 修复、油漆桶这些"改像素"的工具保持同一套语义。
+    /// 越界钳制到最近像素；没有文档时返回空串。
+    pub fn canvas_color_at(self: Pin<&mut Self>, x: i32, y: i32) -> QString {
+        let selected = *self.selected_layer();
+        let guard = self.session.borrow();
+        let Some(session) = guard.as_ref() else {
+            return QString::from("");
+        };
+        let w = session.doc.canvas.width as i32;
+        let h = session.doc.canvas.height as i32;
+        if w <= 0 || h <= 0 {
+            return QString::from("");
+        }
+        let cx = x.clamp(0, w - 1);
+        let cy = y.clamp(0, h - 1);
+        let px = if selected >= 0 && (selected as usize) < session.doc.layers.len() {
+            session.doc.layer_pixel(selected as usize, cx, cy)
+        } else {
+            session.doc.base_pixel_at(cx, cy)
+        };
+        let hex = format!("#{:02x}{:02x}{:02x}", px[0], px[1], px[2]);
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"sample-color\",\"x\":{cx},\"y\":{cy},\"hex\":\"{hex}\"}}"
+        );
+        QString::from(hex.as_str())
+    }
+
+    pub fn picker_select(mut self: Pin<&mut Self>, index: i32) {        let picked = {
             let recent = self.picker_recent.borrow();
             if index < 0 {
                 None

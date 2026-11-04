@@ -18,7 +18,8 @@ use std::sync::{Mutex, OnceLock};
 
 impl qobject::Bridge {
     /// 0 = 交回 Qt（跟随 cursorShape），1 = 加选(+)，2 = 减选(−)，3 = 剪刀，
-    /// 4 = 图层旋转。QML 侧的 `cursorKind` 绑定变化时调用；重复值会被忽略。
+    /// 4 = 图层旋转，5 = 吸管（修复画笔 / 画笔按住 Alt 取样）。
+    /// QML 侧的 `cursorKind` 绑定变化时调用；重复值会被忽略。
     pub fn cursor_set_kind(self: Pin<&mut Self>, kind: i32) {
         set_kind(kind);
     }
@@ -45,13 +46,13 @@ static KIND: AtomicI32 = AtomicI32::new(0);
 static PREV_CURSOR: Mutex<isize> = Mutex::new(0);
 
 /// 已创建的光标句柄（下标 = 种类）。
-static CURSORS: OnceLock<[isize; 5]> = OnceLock::new();
+static CURSORS: OnceLock<[isize; 6]> = OnceLock::new();
 
 /// 已子类化的窗口：(hwnd, 原 WndProc)。
 static HOOKED: Mutex<Vec<(isize, isize)>> = Mutex::new(Vec::new());
 
 fn set_kind(kind: i32) {
-    let kind = kind.clamp(0, 4);
+    let kind = kind.clamp(0, 5);
     let prev = KIND.swap(kind, Ordering::Relaxed);
     if prev == kind {
         return;
@@ -191,10 +192,10 @@ const CURSOR_SIZE: usize = 32;
 #[cfg(windows)]
 type Pixels = [[f32; 4]; CURSOR_SIZE * CURSOR_SIZE];
 
-/// 四枚光标 + 一个空位（下标 0 不用）。建不出来就退化成「不接管」。
+/// 五枚光标 + 一个空位（下标 0 不用）。建不出来就退化成「不接管」。
 #[cfg(windows)]
-fn build_cursors() -> [isize; 5] {
-    let mut out = [0isize; 5];
+fn build_cursors() -> [isize; 6] {
+    let mut out = [0isize; 6];
     let mut buf: Pixels = [[0.0; 4]; CURSOR_SIZE * CURSOR_SIZE];
     // 加选：十字 + 右下角 "+"
     paint_crosshair(&mut buf);
@@ -213,6 +214,10 @@ fn build_cursors() -> [isize; 5] {
     reset(&mut buf);
     paint_rotate(&mut buf);
     out[4] = unsafe { create_cursor(&buf, 16, 16) }.unwrap_or(0);
+    // 吸管：热点在管尖（左下），取样时对准的是尖端点到的那个像素。
+    reset(&mut buf);
+    paint_dropper(&mut buf);
+    out[5] = unsafe { create_cursor(&buf, DROPPER_HOT.0, DROPPER_HOT.1) }.unwrap_or(0);
     out
 }
 
@@ -375,8 +380,42 @@ fn paint_rotate(buf: &mut Pixels) {
     }
 }
 
-/// 把 RGBA 缓冲做成一枚 Win32 光标（32bpp 颜色 + 1bpp 透明掩码）。
+/// 吸管（修复画笔 / 画笔按住 Alt 取样）：斜置的管身 + 右上角的球囊，
+/// 热点在左下管尖——按下时对准的就是尖端点到的那个像素。
 #[cfg(windows)]
+const DROPPER_HOT: (i32, i32) = (6, 27);
+
+#[cfg(windows)]
+fn paint_dropper(buf: &mut Pixels) {
+    // 管身：先白后黑（shadowed_line 先画右下 1px 白影，浅色照片上也看得见）。
+    shadowed_line(buf, 7.0, 26.0, 21.0, 12.0, 1.9);
+    // 管尖收窄：一小段更细的线，读起来像"针尖"。
+    shadowed_line(buf, 5.5, 27.5, 8.0, 25.0, 1.2);
+    // 球囊：白色外圈先铺，再压黑色实心圆。
+    fill_disc(buf, 24.5, 7.5, 5.4, HALO);
+    fill_disc(buf, 24.5, 7.5, 4.3, INK);
+    // 球囊高光（白线压在黑圆左上），32px 下也一眼能看出是吸管而不是圆点。
+    stroke_line(buf, 22.2, 6.6, 24.6, 4.6, 0.7, HALO);
+}
+
+/// 实心圆：抗锯齿边缘。
+#[cfg(windows)]
+fn fill_disc(buf: &mut Pixels, cx: f32, cy: f32, r: f32, rgb: (u8, u8, u8)) {
+    let xa = (cx - r - 1.0).floor().max(0.0) as i32;
+    let xb = (cx + r + 1.0).ceil().min(CURSOR_SIZE as f32) as i32;
+    let ya = (cy - r - 1.0).floor().max(0.0) as i32;
+    let yb = (cy + r + 1.0).ceil().min(CURSOR_SIZE as f32) as i32;
+    for y in ya..yb {
+        for x in xa..xb {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            let cov = (r + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
+            plot(buf, x, y, rgb, cov);
+        }
+    }
+}
+
+/// 把 RGBA 缓冲做成一枚 Win32 光标（32bpp 颜色 + 1bpp 透明掩码）。#[cfg(windows)]
 unsafe fn create_cursor(buf: &Pixels, hot_x: i32, hot_y: i32) -> Option<isize> {
     use std::ffi::c_void;
     use win::*;
@@ -463,7 +502,7 @@ unsafe fn create_cursor(buf: &Pixels, hot_x: i32, hot_y: i32) -> Option<isize> {
 #[cfg(windows)]
 pub fn dump_cursors(prefix: &str) {
     let mut buf: Pixels = [[0.0; 4]; CURSOR_SIZE * CURSOR_SIZE];
-    let jobs: [(&str, fn(&mut Pixels)); 3] = [
+    let jobs: [(&str, fn(&mut Pixels)); 4] = [
         ("add", |b| {
             paint_crosshair(b);
             paint_plus(b)
@@ -473,6 +512,7 @@ pub fn dump_cursors(prefix: &str) {
             paint_minus(b)
         }),
         ("cut", paint_scissors),
+        ("pick", paint_dropper),
     ];
     for (name, paint) in jobs {
         reset(&mut buf);

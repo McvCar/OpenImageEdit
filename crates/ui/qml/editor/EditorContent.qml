@@ -1261,6 +1261,7 @@ function snapDisplay(v) {
 //   2 = 减选(−)  按住 Alt
 //   3 = 剪刀     按住 Ctrl（按下即准备把选区内容剪走）
 //   4 = 旋转     悬停在图层旋转手柄上
+//   5 = 吸管     修复画笔 / 画笔按住 Alt（取样）
 property int cursorKindBase: 0
 // 手柄悬停时强行接管：别的逻辑（画布 hover）也会改 cursorKindBase，直接拼
 // 一个派生值最稳，不会互相覆盖。
@@ -1271,24 +1272,31 @@ property bool rotateKnobHover: false
 
 // 只在「有选区 + 鼠标在选区内」时才换光标：选区外按修饰键仍然是画新选区的
 // 十字，换光标反而误导（PS 也是进到选区里才变）。
+// 取样工具是例外：修复画笔 / 画笔只要按住 Alt 就整块画布都变吸管 —— 这两
+// 个工具的 Alt 语义就是"取样"，不看选区位不位置。
 function updateCursorKind(x, y) {
     let kind = 0
-    if (x >= 0 && y >= 0 && root.selExists && root.selTool !== "none"
-            && root.selTool !== "polygon" && root.markTool === "none"
-            && root.paintTool === "none"
-            && !bridge.pickerOpen
+    if (x >= 0 && y >= 0 && !bridge.pickerOpen
             && !view.canvasSurface.textPopup.visible) {
-        const ix = x - view.pad
-        const iy = y - view.pad
-        if (ix >= root.selX && ix <= root.selX + root.selW
-                && iy >= root.selY && iy <= root.selY + root.selH) {
-            const bits = bridge.modifier_bits()
-            if ((bits & 2) !== 0)
-                kind = 3      // Ctrl
-            else if ((bits & 1) !== 0)
-                kind = 1      // Shift
-            else if ((bits & 4) !== 0)
-                kind = 2      // Alt
+        const bits = bridge.modifier_bits()
+        if ((root.paintTool === "heal" || root.markTool === "brush")
+                && (bits & 4) !== 0) {
+            kind = 5      // Alt 取样
+        }
+        if (kind === 0 && root.selExists && root.selTool !== "none"
+                && root.selTool !== "polygon" && root.markTool === "none"
+                && root.paintTool === "none") {
+            const ix = x - view.pad
+            const iy = y - view.pad
+            if (ix >= root.selX && ix <= root.selX + root.selW
+                    && iy >= root.selY && iy <= root.selY + root.selH) {
+                if ((bits & 2) !== 0)
+                    kind = 3      // Ctrl
+                else if ((bits & 1) !== 0)
+                    kind = 1      // Shift
+                else if ((bits & 4) !== 0)
+                    kind = 2      // Alt
+            }
         }
     }
     root.cursorKindBase = kind
@@ -1326,7 +1334,9 @@ function canvasCursor(x, y) {
         if (c >= 0)
             return c
     }
-    if (!root.selExists && bridge.image_width > 0) {
+    // 图层"可拖动"光标只在没选区、且没有选区工具时给：选区工具下点画布
+    // 只动选区，显示 SizeAll 会让人以为能拖图层。
+    if (!root.selExists && root.selTool === "none" && bridge.image_width > 0) {
         const hit = topLayerAt(x, y)
         if (hit !== null && !Layers.isLocked(hit))
             return Qt.SizeAllCursor
@@ -2846,6 +2856,43 @@ Timer {
             return
         }
         root.openPaintPanelFor(root.paintProbeTool)
+        // --paint-color：顺带展开就地色板，截图核对"点颜色不关面板"。
+        if (Qt.application.arguments.indexOf("--paint-color") !== -1) {
+            if (root.paintProbeTool === "gradient")
+                paintPop.colorSlot = 2
+            else
+                paintPop.colorSlot = 1
+            healPop.colorSlot = paintPop.colorSlot
+        }
+        // --probe-patch：造一块已圈好的修补区域，核对轮廓虚线样式。
+        // setPaintTool 是切换语义，已经选上 patch 时不能再调（会取消掉）。
+        if (Qt.application.arguments.indexOf("--probe-patch") !== -1) {
+            if (root.paintTool !== "patch")
+                root.setPaintTool("patch")
+            const cs = view.canvasSurface
+            cs.patchRegion = [[600, 400], [1200, 400], [1200, 800], [600, 800]]
+            cs.patchViz.requestPaint()
+            bridge.mark("patch-probe: region=" + cs.patchRegion.length)
+        }
+    }
+}
+
+// Probe: --probe-selhit 验证「选区工具激活时点画布不拾取图层」这一条真实
+// 分支（CanvasSurface.layerPickAt 就是 onPressed 用的那个函数）。
+Timer {
+    id: selHitProbeTimer
+    interval: 1100
+    running: Qt.application.arguments.indexOf("--probe-selhit") !== -1
+    onTriggered: {
+        const cs = view.canvasSurface
+        const cx = view.previewImage.width / 2 + view.pad
+        const cy = view.previewImage.height / 2 + view.pad
+        const top = root.topLayerAt(cx, cy)
+        root.selTool = "rect"
+        const picked = cs.layerPickAt(cx, cy)
+        bridge.mark("selhit: top=" + (top === null ? "null" : top.i)
+                    + " picked=" + (picked === null ? "null" : picked.i)
+                    + " selTool=" + root.selTool)
     }
 }
 

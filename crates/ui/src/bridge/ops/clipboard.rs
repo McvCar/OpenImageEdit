@@ -1,18 +1,25 @@
 // 剪贴板。
 use super::super::*;
+// 「选中图层优先，否则背景」的唯一判定，和修复 / 油漆工具共用。
+use super::paint::{layer_locked, pick_target};
 
 impl qobject::Bridge {
     pub fn copy_selection_pixels(mut self: Pin<&mut Self>) {
+        let selected = *self.selected_layer();
         let result: Result<Layer, String> = {
             let guard = self.session.borrow();
             match guard.as_ref() {
                 None => Err("no document".into()),
                 Some(session) => match session.effective_selection() {
                     None => Err("没有选区".into()),
-                    Some(mask) => session
-                        .doc
-                        .selection_layer(&mask)
-                        .map_err(|e| e.to_string()),
+                    // 选中图层 → 只复制这一层；没选中 → 复制背景（PS 语义）。
+                    Some(mask) => match pick_target(&session.doc, selected) {
+                        None => Err("没有可复制的图层".into()),
+                        Some(target) => session
+                            .doc
+                            .selection_layer_on(target, &mask)
+                            .map_err(|e| e.to_string()),
+                    },
                 },
             }
         };
@@ -34,21 +41,28 @@ impl qobject::Bridge {
 
     pub fn cut_selection_pixels(mut self: Pin<&mut Self>) {
         let viewport = *self.viewport.borrow();
+        let selected = *self.selected_layer();
         let result: Result<Layer, String> = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
                 None => Err("no document".into()),
                 Some(session) => match session.effective_selection() {
                     None => Err("没有选区".into()),
-                    Some(mask) => match session.doc.selection_layer(&mask) {
-                        Err(e) => Err(e.to_string()),
-                        Ok(layer) => match session.doc.erase_selection(&mask) {
+                    Some(mask) => match pick_target(&session.doc, selected) {
+                        None => Err("没有可编辑的图层".into()),
+                        Some(target) if layer_locked(&session.doc, target) => {
+                            Err("图层已锁定".into())
+                        }
+                        Some(target) => match session.doc.selection_layer_on(target, &mask) {
                             Err(e) => Err(e.to_string()),
-                            Ok(()) => {
-                                session.refit_if_needed(viewport);
-                                session.dirty = true;
-                                Ok(layer)
-                            }
+                            Ok(layer) => match session.doc.erase_selection_on(target, &mask) {
+                                Err(e) => Err(e.to_string()),
+                                Ok(()) => {
+                                    session.refit_if_needed(viewport);
+                                    session.dirty = true;
+                                    Ok(layer)
+                                }
+                            },
                         },
                     },
                 },
@@ -73,6 +87,7 @@ impl qobject::Bridge {
 
     pub fn erase_selection_pixels(mut self: Pin<&mut Self>) {
         let viewport = *self.viewport.borrow();
+        let selected = *self.selected_layer();
         let result: Result<bool, String> = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
@@ -81,7 +96,13 @@ impl qobject::Bridge {
                     let Some(mask) = session.effective_selection() else {
                         return;
                     };
-                    match session.doc.erase_selection(&mask) {
+                    let Some(target) = pick_target(&session.doc, selected) else {
+                        return;
+                    };
+                    if layer_locked(&session.doc, target) {
+                        return;
+                    }
+                    match session.doc.erase_selection_on(target, &mask) {
                         Ok(()) => {
                             session.refit_if_needed(viewport);
                             session.dirty = true;
@@ -146,21 +167,28 @@ impl qobject::Bridge {
     /// 接着走「拖动图层」的手势。
     pub fn cut_selection_to_layer(mut self: Pin<&mut Self>) -> bool {
         let viewport = *self.viewport.borrow();
+        let selected = *self.selected_layer();
         let result: Result<usize, String> = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
                 None => Err("no document".into()),
                 Some(session) => match session.effective_selection() {
                     None => Err("没有选区".into()),
-                    Some(mask) => match session.doc.extract_selection(&mask) {
-                        Err(e) => Err(e.to_string()),
-                        Ok(index) => match session.doc.erase_selection(&mask) {
+                    Some(mask) => match pick_target(&session.doc, selected) {
+                        None => Err("没有可编辑的图层".into()),
+                        Some(target) if layer_locked(&session.doc, target) => {
+                            Err("图层已锁定".into())
+                        }
+                        Some(target) => match session.doc.extract_selection_on(target, &mask) {
                             Err(e) => Err(e.to_string()),
-                            Ok(()) => {
-                                session.refit_if_needed(viewport);
-                                session.dirty = true;
-                                Ok(index)
-                            }
+                            Ok(index) => match session.doc.erase_selection_on(target, &mask) {
+                                Err(e) => Err(e.to_string()),
+                                Ok(()) => {
+                                    session.refit_if_needed(viewport);
+                                    session.dirty = true;
+                                    Ok(index)
+                                }
+                            },
                         },
                     },
                 },

@@ -29,15 +29,29 @@ Rectangle {
     radius: 6
     z: 240
 
+    // 哪一路颜色正在就地调：0 = 收起，1 = 描边色（油漆桶 / 渐变起点），
+    // 2 = 填充色（渐变终点）。点颜色块在面板里展开色板，**不**关面板 ——
+    // 调完颜色可以接着调容差 / 不透明。
+    property int colorSlot: 0
+
     onVisibleChanged: {
-        if (!visible)
+        if (!visible) {
+            colorSlot = 0
             return
+        }
         if (mode === "context") {
             x = Math.max(4, Math.min(anchorX, host.width - width - 4))
             y = Math.max(4, Math.min(anchorY, host.height - height - 4))
         } else {
             host.placePopover(pop, group === "heal" ? markBar.healBtn : markBar.paintBtn)
         }
+    }
+
+    // 展开就地色板会把面板撑高：右键模式（跟着光标弹）要重新钳制，别让
+    // 色板顶出窗口下沿。
+    onHeightChanged: {
+        if (visible && mode === "context")
+            y = Math.max(4, Math.min(y, host.height - height - 4))
     }
 
     MouseArea {
@@ -227,12 +241,13 @@ Rectangle {
                 Rectangle {
                     width: 16; height: 16; radius: 3
                     color: host.markColor
-                    border.color: "#e9eaec"
+                    border.color: pop.colorSlot === 1 ? "#378add" : "#e9eaec"
                     border.width: 1
                     MouseArea {
                         anchors.fill: parent
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: host.openColorFor(false)
+                        // 就地展开色板；再点一次收起。面板保持打开。
+                        onClicked: pop.colorSlot = (pop.colorSlot === 1 ? 0 : 1)
                     }
                 }
                 Text {
@@ -285,12 +300,12 @@ Rectangle {
                 Rectangle {
                     width: 22; height: 16; radius: 3
                     color: host.markColor
-                    border.color: "#e9eaec"
+                    border.color: pop.colorSlot === 1 ? "#378add" : "#e9eaec"
                     border.width: 1
                     MouseArea {
                         anchors.fill: parent
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: host.openColorFor(false)
+                        onClicked: pop.colorSlot = (pop.colorSlot === 1 ? 0 : 1)
                     }
                 }
                 Text {
@@ -302,12 +317,12 @@ Rectangle {
                 Rectangle {
                     width: 22; height: 16; radius: 3
                     color: host.markFillColor
-                    border.color: "#e9eaec"
+                    border.color: pop.colorSlot === 2 ? "#378add" : "#e9eaec"
                     border.width: 1
                     MouseArea {
                         anchors.fill: parent
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: host.openColorFor(true)
+                        onClicked: pop.colorSlot = (pop.colorSlot === 2 ? 0 : 2)
                     }
                 }
             }
@@ -317,6 +332,41 @@ Rectangle {
                 text: "在画布上拖一条线：起点 → 终点。有选区时只铺在选区里"
                 color: "#6b7076"
                 font.pixelSize: 10
+            }
+        }
+        // ---- 就地色板（点颜色块展开，不关面板）----
+        Rectangle {
+            width: parent.width
+            height: 1
+            color: "#3c4043"
+            visible: pop.colorSlot !== 0
+        }
+
+        Column {
+            width: parent.width
+            spacing: 5
+            visible: pop.colorSlot !== 0
+
+            Text {
+                text: pop.colorSlot === 2
+                      ? "填充色（渐变终点）"
+                      : (host.paintTool === "gradient" ? "描边色（渐变起点）"
+                                                       : "油漆桶颜色")
+                color: "#8b9096"
+                font.pixelSize: 10
+            }
+            ColorPalette {
+                width: parent.width
+                current: pop.colorSlot === 2 ? host.markFillColor : host.markColor
+                onPicked: (c) => {
+                    if (pop.colorSlot === 2) {
+                        host.markFillColor = c
+                        host.markFill = true
+                    } else {
+                        host.markColor = c
+                    }
+                    pop.colorSlot = 0
+                }
             }
         }
     }

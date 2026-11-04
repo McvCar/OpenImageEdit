@@ -44,6 +44,7 @@ fn main() {
                 "qml/panels/ZoomMenu.qml",
                 "qml/widgets/AdjustRow.qml",
                 "qml/widgets/CheckRow.qml",
+                "qml/widgets/ColorPalette.qml",
                 "qml/widgets/DashedRect.qml",
                 "qml/widgets/EdgeGrab.qml",
                 "qml/widgets/EdgeHandles.qml",

@@ -272,17 +272,22 @@ session
 
     pub fn extract_selection(mut self: Pin<&mut Self>) {
         let viewport = *self.viewport.borrow();
+        let selected = *self.selected_layer();
         let result: Result<i32, String> = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
                 None => Err("no document".into()),
                 Some(session) => match session.effective_selection() {
                     None => Err("没有选区".into()),
-                    Some(mask) => session
-                        .doc
-                        .extract_selection(&mask)
-                        .map(|ix| ix as i32)
-                        .map_err(|e| e.to_string()),
+                    // 选中图层 → 抠这一层；没选中 → 抠背景（PS 语义）。
+                    Some(mask) => match super::paint::pick_target(&session.doc, selected) {
+                        None => Err("没有可编辑的图层".into()),
+                        Some(target) => session
+                            .doc
+                            .extract_selection_on(target, &mask)
+                            .map(|ix| ix as i32)
+                            .map_err(|e| e.to_string()),
+                    },
                 },
             }
         };

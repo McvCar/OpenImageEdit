@@ -26,8 +26,9 @@ fn target_image<'a>(doc: &'a Document, target: AdjustTarget) -> Option<&'a RgbaI
     }
 }
 
-/// 选中图层优先，否则改背景（PS 语义）。
-fn pick_target(doc: &Document, selected: i32) -> Option<AdjustTarget> {
+/// 选中图层优先，否则改背景（PS 语义）。选区 / 剪贴板这些"改像素"的
+/// 操作共用同一个判定，保证工具之间的作用对象一致。
+pub(super) fn pick_target(doc: &Document, selected: i32) -> Option<AdjustTarget> {
     if selected >= 0 && (selected as usize) < doc.layers.len() {
         Some(AdjustTarget::Layer(selected as usize))
     } else if doc.canvas.width > 0 && doc.canvas.height > 0 {
@@ -37,7 +38,7 @@ fn pick_target(doc: &Document, selected: i32) -> Option<AdjustTarget> {
     }
 }
 
-fn layer_locked(doc: &Document, target: AdjustTarget) -> bool {
+pub(super) fn layer_locked(doc: &Document, target: AdjustTarget) -> bool {
     match target {
         AdjustTarget::Base => false,
         AdjustTarget::Layer(i) => doc.layers.get(i).map(|l| l.locked).unwrap_or(true),

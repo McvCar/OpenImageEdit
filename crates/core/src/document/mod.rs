@@ -542,6 +542,140 @@ impl Document {
         })
     }
 
+    /// 选区像素的取样源由 `target` 决定：`Base` = 背景，`Layer(i)` = 第 i 层。
+    ///
+    /// 和 [`Document::selection_layer`] 的区别：那个从**可见合成**里抠（合并
+    /// 拷贝），这里只取单层像素。PS 的复制 / 剪切 / 提取默认只作用于当前
+    /// 图层 —— 否则选区一抠就把上层的内容也带进来。图层可能只覆盖画布的
+    /// 一部分，所以产出范围 = 选区包围盒 ∩ 图层矩形。
+    pub fn selection_layer_on(
+        &self,
+        target: AdjustTarget,
+        selection: &SelectionMask,
+    ) -> Result<Layer, EditError> {
+        let canvas_rect = Rect::new(0, 0, self.canvas.width, self.canvas.height);
+        let mut bounds = selection
+            .bounds
+            .intersect(canvas_rect)
+            .ok_or(EditError::EmptySelection)?;
+        if let AdjustTarget::Layer(index) = target {
+            let layer = self.layers.get(index).ok_or(EditError::LayerIndex(index))?;
+            let layer_rect = Rect::new(
+                layer.offset.0,
+                layer.offset.1,
+                layer.image.width(),
+                layer.image.height(),
+            );
+            bounds = bounds
+                .intersect(layer_rect)
+                .ok_or(EditError::EmptySelection)?;
+        }
+        if bounds.is_empty() || selection.area() == 0 {
+            return Err(EditError::EmptySelection);
+        }
+        let mut image = RgbaImage::new(bounds.width, bounds.height);
+        let mut any = false;
+        for y in 0..bounds.height {
+            for x in 0..bounds.width {
+                let sx = bounds.x + x as i32;
+                let sy = bounds.y + y as i32;
+                let cov = selection.coverage_at(sx, sy);
+                if cov == 0 {
+                    continue;
+                }
+                let mut px = match target {
+                    AdjustTarget::Base => self.base_pixel_at(sx, sy),
+                    AdjustTarget::Layer(index) => self.layer_pixel(index, sx, sy),
+                };
+                // 图层在这个位置本来就是透明的：留透明，别把一个"看得见空
+                // 洞"的图层抠出来。
+                if px[3] == 0 {
+                    continue;
+                }
+                any = true;
+                px[3] = ((px[3] as u32 * cov as u32 + 127) / 255) as u8;
+                image.put_pixel(x, y, image::Rgba(px));
+            }
+        }
+        if !any {
+            return Err(EditError::EmptySelection);
+        }
+        let mut layer = Layer::new("Selection", image);
+        layer.offset = (bounds.x, bounds.y);
+        Ok(layer)
+    }
+
+    /// 把选区像素抠成新图层，取样源见 [`Document::selection_layer_on`]。
+    pub fn extract_selection_on(
+        &mut self,
+        target: AdjustTarget,
+        selection: &SelectionMask,
+    ) -> Result<usize, EditError> {
+        let mut layer = self.selection_layer_on(target, selection)?;
+        layer.name = self.next_layer_name();
+        let index = self.layers.len();
+        self.execute(EditOp::AddLayer { layer, index })?;
+        Ok(index)
+    }
+
+    /// 「删除选区像素」，只挖 `target` 那一层：base 走整份快照的
+    /// `EraseBasePixels`，图层走一块像素补丁（前后两份位图各留一份，
+    /// 撤销/重做都不必复制整层），覆盖率缩放 alpha，羽化边自然淡化。
+    /// 锁定图层不动（调用方负责提示）。
+    pub fn erase_selection_on(
+        &mut self,
+        target: AdjustTarget,
+        selection: &SelectionMask,
+    ) -> Result<(), EditError> {
+        let AdjustTarget::Layer(index) = target else {
+            return self.erase_selection(selection);
+        };
+        let layer = self.layers.get(index).ok_or(EditError::LayerIndex(index))?;
+        if layer.locked {
+            return Err(EditError::LayerIndex(index));
+        }
+        let canvas_rect = Rect::new(0, 0, self.canvas.width, self.canvas.height);
+        let layer_rect = Rect::new(
+            layer.offset.0,
+            layer.offset.1,
+            layer.image.width(),
+            layer.image.height(),
+        );
+        let area = selection
+            .bounds
+            .intersect(canvas_rect)
+            .and_then(|r| r.intersect(layer_rect))
+            .ok_or(EditError::EmptySelection)?;
+        if area.is_empty() || selection.area() == 0 {
+            return Err(EditError::EmptySelection);
+        }
+        let lx = area.x - layer.offset.0;
+        let ly = area.y - layer.offset.1;
+        let (rect, before) = crop_region(
+            &layer.image,
+            Rect::new(lx, ly, area.width, area.height),
+        );
+        if rect.is_empty() {
+            return Err(EditError::EmptySelection);
+        }
+        let mut after = before.clone();
+        for y in 0..rect.height {
+            for x in 0..rect.width {
+                let cov = selection.coverage_at(area.x + x as i32, area.y + y as i32);
+                if cov == 0 {
+                    continue;
+                }
+                let px = after.get_pixel_mut(x, y);
+                px.0[3] = ((px.0[3] as u32 * (255 - cov as u32) + 127) / 255) as u8;
+                if px.0[3] == 0 {
+                    px.0 = [0, 0, 0, 0];
+                }
+            }
+        }
+        self.commit_patch(target, rect, before, after)
+    }
+
+
     /// Pixels a color adjustment would touch (histogram source / live scope).
     pub fn scope_image(&self, target: AdjustTarget) -> Option<&RgbaImage> {
         match target {

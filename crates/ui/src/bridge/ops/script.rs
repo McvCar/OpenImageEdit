@@ -642,6 +642,30 @@ impl qobject::Bridge {
                         }
                     }
                 }
+                // `layer-alpha:index` —— 图层 alpha 总和 / 不透明像素数。
+                // 验证「选区擦除到底挖的哪一层」：擦图层时总和会掉，擦背景
+                // 时图层总和不变。
+                other if other.starts_with("layer-alpha:") => {
+                    let n = parse_nums(other);
+                    let ix = n.first().copied().unwrap_or(0.0) as i32;
+                    let guard = self.session.borrow();
+                    if let Some(session) = guard.as_ref() {
+                        if let Some(layer) = session.doc.layers.get(ix.max(0) as usize) {
+                            let mut sum: u64 = 0;
+                            let mut opaque: u64 = 0;
+                            for px in layer.image.pixels() {
+                                sum += px.0[3] as u64;
+                                if px.0[3] > 0 {
+                                    opaque += 1;
+                                }
+                            }
+                            println!(
+                                "{{\"phase\":\"ui\",\"event\":\"layer-alpha\",\"index\":{ix},\
+                                 \"sum\":{sum},\"opaque\":{opaque}}}"
+                            );
+                        }
+                    }
+                }
                 // `rotate-handle:index,degrees[,expand]` —— 模拟拖一次画布旋柄
                 // （begin keep_session → update → finish apply）。连写两条就等于
                 // 用户来回拖两次，用来验证「不会越拖越糊」。

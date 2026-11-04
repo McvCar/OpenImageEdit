@@ -797,6 +797,11 @@ pub mod qobject {
         #[qinvokable]
         fn picker_clear(self: Pin<&mut Self>);
 
+        /// Hex color at image coordinates `(x, y)` for the Alt-sampling of the
+        /// brush / healing brush. Empty string when no document is open.
+        #[qinvokable]
+        fn canvas_color_at(self: Pin<&mut Self>, x: i32, y: i32) -> QString;
+
         // ---- 剪贴板（跨文档） ----
 
         #[qinvokable]

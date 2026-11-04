@@ -63,6 +63,18 @@ Item {
         return s > 0 ? [(mx - view.pad) / s, (my - view.pad) / s] : [0, 0]
     }
 
+    // 按下时命中的图层（null = 不拾取）。
+    //
+    // 选区工具激活时不拾取图层：PS 里选框/套索/魔棒点击画布只动选区，
+    // 不会顺手选中图层（否则点空白就冒出一个 8 点包围盒，把手柄压在正要
+    // 涂抹的像素上）。选中的图层由图层面板决定。已有选区 / 绘画工具同理。
+    // 抽成函数是为了让探针直接验证这一条真实分支，而不是复制一份判断。
+    function layerPickAt(mx, my) {
+        if (host.selExists || host.paintTool !== "none" || host.selTool !== "none")
+            return null
+        return host.topLayerAt(mx, my)
+    }
+
     function cancelPolygon() {
         if (!selPolyActive && polyPts.length === 0)
             return
@@ -278,8 +290,8 @@ Item {
                 }
                 return
             }
-            const hit = (host.selExists || host.paintTool !== "none")
-                        ? null : host.topLayerAt(mouse.x, mouse.y)
+            // 选区工具激活时不拾取图层（见 layerPickAt）。
+            const hit = layerPickAt(mouse.x, mouse.y)
             if (hit !== null) {
                 if (bridge.selected_mark >= 0)
                     bridge.select_mark(-1)   // 标记/图层选中互斥
@@ -554,10 +566,9 @@ Item {
                 }
             } else if (host.selTool === "rect" || host.selTool === "ellipse") {
                 if (dx < 0.5 || dy < 0.5) {
-                    // 点击（没拖出面积）= 取消选区 + 取消图层选中。
+                    // 点击（没拖出面积）= 取消选区。图层选中不动：选区工具
+                    // 只操作选区，取消图层选中会让"选区作用于当前图层"断掉。
                     bridge.sel_clear()
-                    if (bridge.selected_layer >= 0)
-                        bridge.select_layer(-1)
                 } else if (host.selTool === "rect") {
                     bridge.sel_set_rect(a[0], a[1], b[0], b[1], selMode)
                 } else {
@@ -822,6 +833,16 @@ Item {
             // 正在就地编辑文本：点击别处先提交编辑。
             if (textPopup.visible) {
                 textPopup.close(true)
+                return
+            }
+            // 画笔按住 Alt = 临时吸管（PS 惯例）：取画布颜色作为下一笔的颜色，
+            // 不落笔。光标已经由 EditorContent 换成吸管（cursorKind 5）。
+            if (host.markTool === "brush"
+                    && (mouse.modifiers & Qt.AltModifier) !== 0) {
+                const hex = bridge.canvas_color_at(Math.floor(imgX(mouse.x)),
+                                                   Math.floor(imgY(mouse.y)))
+                if (hex !== "")
+                    host.markColor = hex
                 return
             }
             // 1) 选中标记的缩放手柄（任何工具下都优先）。
@@ -1273,6 +1294,8 @@ Item {
     }
 
     // 修补工具的轮廓：第一段画正在圈的折线，第二段画跟着拖动偏移的区域。
+    // 虚线样式与选区完全一致（白实线打底 + 黑虚线 + 相位流动的蚂蚁线）：
+    // 浅色照片上看得出边界，深色照片上也不会糊成一片。
     Canvas {
         id: patchViz
         anchors.fill: parent
@@ -1281,6 +1304,22 @@ Item {
                  && (patchDrawing || patchRegion.length >= 3)
         renderStrategy: Canvas.Immediate
         antialiasing: true
+        // 蚂蚁线相位：由 patchAntTimer 推进，虚线看起来在流动。
+        property real antPhase: 0
+
+        function strokeAnts(ctx) {
+            ctx.lineWidth = 1
+            ctx.setLineDash([])
+            ctx.strokeStyle = "#ffffff"
+            ctx.stroke()
+            ctx.setLineDash([4, 4])
+            ctx.lineDashOffset = -antPhase
+            ctx.strokeStyle = "rgba(0,0,0,0.9)"
+            ctx.stroke()
+            ctx.setLineDash([])
+            ctx.lineDashOffset = 0
+        }
+
         onPaint: {
             const ctx = getContext("2d")
             ctx.clearRect(0, 0, width, height)
@@ -1290,17 +1329,25 @@ Item {
                 return
             const ox = view.pad + (patchDrawing ? 0 : patchDx)
             const oy = view.pad + (patchDrawing ? 0 : patchDy)
-            ctx.lineWidth = 1.5
-            ctx.setLineDash([5, 3])
-            ctx.strokeStyle = "#f5e14a"
             ctx.beginPath()
             ctx.moveTo(pts[0][0] * s + ox, pts[0][1] * s + oy)
             for (let i = 1; i < pts.length; i++)
                 ctx.lineTo(pts[i][0] * s + ox, pts[i][1] * s + oy)
             if (!patchDrawing)
                 ctx.closePath()
-            ctx.stroke()
-            ctx.setLineDash([])
+            strokeAnts(ctx)
+        }
+    }
+
+    Timer {
+        id: patchAntTimer
+        interval: 16
+        repeat: true
+        running: host.paintTool === "patch"
+                 && (patchDrawing || patchRegion.length >= 3)
+        onTriggered: {
+            patchViz.antPhase = (patchViz.antPhase + 0.25) % 8
+            patchViz.requestPaint()
         }
     }
 
