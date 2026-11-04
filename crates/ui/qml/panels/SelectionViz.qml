@@ -492,24 +492,12 @@ Item {
         readonly property real by: host.selLayerBox !== null ? host.selLayerBox.y * s : 0
         readonly property real bw: host.selLayerBox !== null ? host.selLayerBox.w * s : 0
         readonly property real bh: host.selLayerBox !== null ? host.selLayerBox.h * s : 0
-        // 旋柄挂在框的顶边中点。旋转过之后顶边是斜的，用「中心 + 旋转后的
-        // (0,-h/2)」算，旋柄才会跟着内容走，而不是钉在大包围盒的顶上。
-        readonly property real knobX: {
-            if (!host.layerFrameRotated || host.selLayerBox === null)
-                return bx + bw / 2
-            const b = host.selLayerBox
-            const hh = host.layerFrameH * s / 2
-            const a = host.layerFrameAngle * Math.PI / 180
-            return (b.x + b.w / 2) * s + hh * Math.sin(a)
-        }
-        readonly property real knobY: {
-            if (!host.layerFrameRotated || host.selLayerBox === null)
-                return by
-            const b = host.selLayerBox
-            const hh = host.layerFrameH * s / 2
-            const a = host.layerFrameAngle * Math.PI / 180
-            return (b.y + b.h / 2) * s - hh * Math.cos(a)
-        }
+        // 旋柄**固定**挂在包围盒顶边中点，不跟着倾斜的内容走。
+        // 之前试过让它贴着旋转后的顶边（中心 + 旋转后的 (0,-h/2)），结果
+        // 转过之后旋柄会飘到斜边上、离手柄组越来越远，抓起来反而别扭；
+        // 而且旋转过程中角度一变它就挪位置，手感发飘。回到固定上方。
+        readonly property real knobX: bx + bw / 2
+        readonly property real knobY: by
         x: previewImage.x + knobX
         y: previewImage.y + knobY - 22
 
