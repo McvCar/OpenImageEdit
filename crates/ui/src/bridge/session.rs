@@ -440,13 +440,19 @@ impl Session {
         // drag tick (tens of ms); BMP keeps the preview path real-time. The
         // URL keeps changing (forces Qt to re-read) while temp files stay
         // bounded; the session id keeps concurrent windows separate.
+        //
+        // ★环形文件数是 4 而不是 2：QML 侧用两张 Image 交替显示（一张解码
+        // 时另一张继续显示上一帧，避免换源瞬间画面空白）。槽位按帧的奇偶
+        // 轮换，若只有 2 个文件名，某个槽位下次拿到的又会是它当前持有的那个
+        // URL——`Image.source` 赋同一个值时 Qt 不会重新加载，画面就卡住。
+        // 4 个名字保证每个槽位相邻两次拿到的 URL 必然不同。
         let bytes = encode(&image, Format::Bmp, 90).map_err(|e| e.to_string())?;
         let encode_ms = prof_t0.elapsed().as_millis();
         self.render_count = self.render_count.wrapping_add(1);
         let path = std::env::temp_dir().join(format!(
             "imageedit-preview-{}-{}.bmp",
             self.id,
-            self.render_count % 2
+            self.render_count % 4
         ));
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
         println!(

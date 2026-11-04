@@ -211,7 +211,17 @@ Flickable {
         source: bridge.checkerTileUrl
     }
 
-    Image {
+    // 预览画布：**双缓冲**。
+    //
+    // 拖动/旋转时每一帧都换 `source`，而 Image 换源的瞬间会把当前贴图丢掉
+    // （status 变 Loading、cache:false 直接清图）——异步解码没完成之前画面
+    // 是空白的。表现就是"一动图层整窗图片消失、松手才回来"。
+    //
+    // 所以放两个 Image 交替用：后台那张跟着 bridge.preview_url 预加载下一帧，
+    // 前台那张继续显示已经解好的上一帧；后台 Ready 时才"换台"（只翻一个
+    // bool，两张的 source 绑定随之对调）。全程纯声明式绑定，不需要额外的
+    // 变更信号，也不会出现空白帧。
+    Item {
         id: previewImage
 
         width: view.shownWidth
@@ -222,34 +232,129 @@ Flickable {
         // 比例看着模糊"的根因。居中偏移一律取整。
         x: Math.round((view.contentWidth - width) / 2)
         y: Math.round((view.contentHeight - height) / 2)
-        cache: false
-        // ★异步解码。Image 默认是同步的：`source` 一变就在 setSource 里当场
-        // 解码整张 BMP（1917×1278 约 10ms），这笔开销直接叠在拖动帧耗上，
-        // 比合成+编码还贵。改成异步后解码走线程池，拖动帧只留下合成/编码。
-        // 迟到的旧帧由 Qt 自己丢弃（request id 不匹配），不会闪回上一角度。
-        asynchronous: true
-        fillMode: Image.Stretch
-        source: bridge.preview_url
-        // 平滑只在"真的在缩放"时开：位图是 1:1 物理像素渲染的，此时贴图尺寸
-        // 与设备像素尺寸完全相等（如 360×318 位图 → 360×318 设备像素）。但
-        // 逻辑坐标取整后乘 dpr（如 1.25）不一定是整数，x/y 常落半像素；开
-        // 着 smooth 就会双线性插值，整幅均匀发糊。1:1 时关掉平滑即精确取样。
-        smooth: Math.abs(implicitWidth - width * dpr) > 0.5
-                || Math.abs(implicitHeight - height * dpr) > 0.5
+
+        // 当前正在显示的那一帧的 URL。
+        property string shownUrl: ""
+        // false = previewA 在前台（显示 shownUrl），true = previewB 在前台。
+        property bool frontIsB: bool
+        // 「上一帧还在解码」的起始时刻（见 previewBusy）。
+        property double pendingSince: 0
+        // 还没派给后台 Image 的最新一帧。
+        property string pendingUrl: ""
+
+        // 新的一帧到了：记下来交给后台那张去解（同一时刻只有一次解码在跑）。
+        function pushUrl(url) {
+            if (url.length === 0) {
+                // 没有图了（新空窗口 / 关闭文档）：两张都清掉，别留着旧帧。
+                previewA.source = ""
+                previewB.source = ""
+                shownUrl = ""
+                pendingUrl = ""
+                return
+            }
+            pendingUrl = url
+            pumpPreview()
+        }
+
+        // 把待播的那一帧交给后台 Image。★后台还在解码就先不动它：换 source
+        // 会取消上一次解码，改到最后谁也不上屏（实测不设这道闸时 115 次渲染
+        // 只有 35 帧真正上屏）。等这次解码完（换台时再调一次）补上最新帧。
+        function pumpPreview() {
+            if (pendingUrl.length === 0 || pendingUrl === shownUrl)
+                return
+            const back = frontIsB ? previewA : previewB
+            if (back.status === Image.Loading)
+                return
+            if (back.source.toString() === pendingUrl)
+                return
+            back.source = pendingUrl
+            pendingSince = Date.now()
+        }
+
+        // 上一帧还没上屏（后台仍在解码）时返回 true。
+        //
+        // 拖动类手势用它限流：帧还没显示出来就再算一帧，只会把后台那次加载
+        // 取消掉重来——预览反而一直停在上一帧，看着像"卡住不动"。给解码留
+        // 150ms 的宽限，超时就不再等（万一某次加载失败，别把拖动拖死）。
+        function previewBusy() {
+            const back = frontIsB ? previewA : previewB
+            if (back.status !== Image.Loading)
+                return false
+            // 卡太久（文件被占用/解码失败）就不再等，让上层照常出帧。
+            return pendingSince === 0 || Date.now() - pendingSince < 400
+        }
 
         // 显示比例一变（缩放手势的预测拉伸也算）就重映射选区。
         onWidthChanged: host.remapSelectionToScale()
 
-        onStatusChanged: {
-            if (status === Image.Ready) {
-                host.imageRendered = true;
-                bridge.image_shown();
-            } else if (status === Image.Error) {
+        // 后台那张解码完成后换台。前台自己的 Ready（角色对调时的重载）忽略。
+        function frameReady(img) {
+            if (img.status === Image.Error) {
                 console.log("ImageEdit: preview load error");
                 if (bridge.auto_quit)
                     Qt.quit();
+                return
+            }
+            if (img.status !== Image.Ready)
+                return
+            const isFront = img === (frontIsB ? previewB : previewA)
+            if (isFront)
+                return
+            const url = img.source.toString()
+            if (url.length === 0 || url === shownUrl)
+                return
+            shownUrl = url
+            frontIsB = !frontIsB
+            if (!host.imageRendered)
+                host.imageRendered = true
+            bridge.image_shown()
+            // 换台后后台空出来了：如果期间又来了新帧，接着派。
+            pumpPreview()
+        }
+
+        Image {
+            id: previewA
+            width: parent.width
+            height: parent.height
+            visible: !previewImage.frontIsB
+            cache: false
+            // ★异步解码。Image 默认是同步的：`source` 一变就在 setSource 里
+            // 当场解码整张 BMP（1917×1278 约 10ms），这笔开销直接叠在拖动
+            // 帧耗上，比合成+编码还贵。异步后解码走线程池，拖动帧只剩合成/
+            // 编码；迟到的旧帧由 Qt 自己丢弃（request id 不匹配）。
+            asynchronous: true
+            fillMode: Image.Stretch
+            // 平滑只在"真的在缩放"时开（两张同规则，换台时不会突然变糊）。
+            smooth: Math.abs(implicitWidth - width * dpr) > 0.5
+                    || Math.abs(implicitHeight - height * dpr) > 0.5
+            onStatusChanged: previewImage.frameReady(previewA)
+        }
+
+        Image {
+            id: previewB
+            width: parent.width
+            height: parent.height
+            visible: previewImage.frontIsB
+            cache: false
+            asynchronous: true
+            fillMode: Image.Stretch
+            smooth: Math.abs(implicitWidth - width * dpr) > 0.5
+                    || Math.abs(implicitHeight - height * dpr) > 0.5
+            onStatusChanged: previewImage.frameReady(previewB)
+        }
+
+        // 新帧到达 → 派给后台那张。用属性变更信号而不是把 source 绑到
+        // bridge.preview_url：绑定会在换台时把刚显示的帧重新加载一遍
+        // （一次解码变成两次，还会互相取消）。
+        Connections {
+            target: bridge
+            function onPreview_advanced() {
+                previewImage.pushUrl(bridge.preview_url)
             }
         }
+
+        // 打开文件时 url 在 Connections 建立之前就设好了，补一次。
+        Component.onCompleted: previewImage.pushUrl(bridge.preview_url)
     }
 
     // ---- Persistent-selection interaction stack ----------------------

@@ -1884,6 +1884,10 @@ function applyRotateFrame() {
     // 角度没变就别重算（鼠标停在原地也会一直有 move 事件）。
     if (root.rotateAnglePreview === root.rotateRenderedAngle)
         return
+    // 上一帧还没上屏就等等：否则每帧都去换 source，把后台解码取消掉重来，
+    // 画面反而一直停在上一帧（见 CanvasView.previewBusy）。
+    if (view.previewImage.previewBusy())
+        return
     // ★节流放在「定时器网格」上，而不是改 Timer.interval：
     //   给运行中的 Timer 改 interval 会让它重启，帧间隔被抖成 16/24/33 的
     //   随机值——看起来就是"一顿一顿"。这里定时器恒定 16ms 跑，慢帧用
@@ -2813,6 +2817,39 @@ Timer {
     }
 }
 
+// Probe: --probe-dragchurn 用 30ms 的节奏连续出预览帧（模拟拖动），跑 40 帧
+// 后自己退出。用来核对两件事：① 拖动期间每帧都真的上屏了（日志里
+// `shown_ms` 行的条数 ≈ 帧数）；② 外部截图时画面不是空白。
+Timer {
+    id: dragChurnTimer
+    interval: 30
+    repeat: true
+    property real angle: 0
+    property int sent: 0
+    property bool started: false
+    onTriggered: {
+        if (!started) {
+            if (bridge.selected_layer < 0 && bridge.layer_count > 0)
+                bridge.select_layer(0)
+            if (bridge.selected_layer < 0) {
+                bridge.mark("dragchurn:no-layer")
+                Qt.quit()
+                return
+            }
+            bridge.rotate_layer_begin(bridge.selected_layer, true)
+            started = true
+        }
+        angle += 2
+        sent += 1
+        bridge.rotate_layer_update(angle, true)
+        if (sent >= 40) {
+            bridge.rotate_layer_finish(false, 0, true)
+            bridge.mark("dragchurn:" + sent + " frames")
+            Qt.quit()
+        }
+    }
+}
+
 // Probe: --probe-rotate-bench 连着跑 N 帧「整层重采样 + 预览刷新」，量每次
 // 耗时（手柄拖动的跟手程度直接由它决定），跑完自己退出。
 Timer {
@@ -2882,6 +2919,8 @@ Component.onCompleted: {
             rotateProbeTimer.start();
         if (Qt.application.arguments.indexOf("--probe-rotate-bench") !== -1)
             rotateBenchTimer.start();
+        if (Qt.application.arguments.indexOf("--probe-dragchurn") !== -1)
+            dragChurnTimer.start();
         if (Qt.application.arguments.indexOf("--probe-adjustdrag") !== -1)
             adjustDragProbeTimer.start();
         if (root.probeRuler)

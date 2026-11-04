@@ -1211,6 +1211,10 @@ Item {
         onTriggered: {
             if (!selDragMouse.pickMoved)
                 return
+            // 上一帧还没上屏就先等：连续换 source 会把后台解码取消重来，
+            // 预览会一直停在旧帧（表现为"拖动时画面不动/闪没"）。
+            if (previewImage.previewBusy())
+                return
             const scale = host.toImageScale()
             const dx = Math.round((selDragMouse.curX - selDragMouse.startX) * scale)
             const dy = Math.round((selDragMouse.curY - selDragMouse.startY) * scale)

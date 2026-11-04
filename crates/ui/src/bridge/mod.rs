@@ -182,6 +182,14 @@ pub mod qobject {
         #[qinvokable]
         fn image_shown(self: Pin<&mut Self>);
 
+        /// 新的一帧预览已经写好盘（`preview_url` 刚更新）。
+        ///
+        /// QML 靠它把「后台那张 Image 去加载新帧」这件事从声明式绑定里拆
+        /// 出来：绑定会在换台时把刚显示的帧再加载一遍，两次解码互相取消，
+        /// 画面就一直停在旧帧。信号名由我们自己定，不依赖属性名的推导规则。
+        #[qsignal]
+        fn preview_advanced(self: Pin<&mut Self>);
+
         #[qinvokable]
         fn mark(self: Pin<&mut Self>, name: &QString);
 
@@ -1668,6 +1676,8 @@ impl qobject::Bridge {
                 // Last: updating preview_url triggers Image loading, which may
                 // complete synchronously and re-enter `image_shown`.
                 self.as_mut().set_preview_url(QString::from(url.as_str()));
+                // 告诉 QML「有新帧了」，由它派给后台那张 Image 去解码。
+                self.as_mut().preview_advanced();
             }
             Refresh::Err(err) => {
                 let status = format!("render-error: {err}");
