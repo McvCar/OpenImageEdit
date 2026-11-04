@@ -79,13 +79,8 @@ Item {
         }
     }
 
-    // 换了图层就不要沿用上一张的旋转角（尺寸凑巧一样时会画错框）。
-    Connections {
-        target: bridge
-        function onSelected_layerChanged() {
-            root.clearRotateFrame()
-        }
-    }
+    // 旋转框状态按图层索引分开记（见 rotateFrames），切换图层不再清空——
+    // 切走再切回来，倾斜框还在。尺寸对不上时 layerFrameRotated 会自己失效。
 
     // 把 win 调成"刚好装下这张图"：宽高 = 图片 100% 显示尺寸（逻辑像素）
     // + 画布以外的 chrome；装不下时图片按同一比例缩到屏幕内（保宽高比），
@@ -464,10 +459,21 @@ Item {
     // 直接把这个矩形画成虚线框，看上去就是"每转一次框就大一圈"（900×700
     // 转 45° 变 1132×1132）。这里记住旋转前的框尺寸和累计角度，由
     // SelectionViz 画成贴合内容的倾斜四边形。
-    property var rotateFrame: null          // { w, h } 图像像素
-    property real rotateFrameAngle: 0       // 度，顺时针为正
+    //
+    // ★按图层分别记（index -> { w, h, angle }）：以前是单份全局状态，
+    //   一切换图层就清空，切回来时框退回轴对齐的扩边矩形 —— 像素还转着，
+    //   框却正了，就是用户说的"放手角度会复位"。
+    property var rotateFrames: ({})
+    readonly property var rotateFrame: {
+        const f = bridge.selected_layer >= 0 ? root.rotateFrames[bridge.selected_layer] : null
+        return f ? ({ w: f.w, h: f.h }) : null
+    }
+    readonly property real rotateFrameAngle: {
+        const f = bridge.selected_layer >= 0 ? root.rotateFrames[bridge.selected_layer] : null
+        return f ? f.angle : 0
+    }
     // 只在「当前位图尺寸 == 这个角度应有的外接矩形」时才画倾斜框。
-    // 缩放、撤销、切换图层之后尺寸对不上，自动退回普通的轴对齐框——
+    // 缩放、撤销、在别处编辑之后尺寸对不上，自动退回普通的轴对齐框——
     // 不用在每个编辑入口手动清状态，也就不会漏。
     readonly property bool layerFrameRotated: {
         if (rotateFrame === null || Math.abs(rotateFrameAngle) <= 0.01)
@@ -487,9 +493,19 @@ Item {
     // SelectionViz 统一用 layer* 前缀读这三个值（这里只是别名）。
     readonly property real layerFrameAngle: rotateFrameAngle
 
+    function setRotateFrame(ix, w, h, angle) {
+        if (ix < 0)
+            return
+        const m = Object.assign({}, root.rotateFrames)
+        if (!(w > 0) || !(h > 0))
+            delete m[ix]
+        else
+            m[ix] = { w: w, h: h, angle: angle }
+        root.rotateFrames = m
+    }
+
     function clearRotateFrame() {
-        root.rotateFrame = null
-        root.rotateFrameAngle = 0
+        root.setRotateFrame(bridge.selected_layer, 0, 0, 0)
     }
     // ---- 标记工具栏（markup toolbar）----
     property bool markBarVisible: false
@@ -1963,6 +1979,10 @@ function applyPaintSpec(spec) {
 function openRotateLayer(index) {
     if (index < 0)
         return
+    // 对话框是「一次性从当前样子再转」的一次性操作（keep_session = false），
+    // 原来那份"旋转前框 + 累计角"的记性作废，否则关掉对话框后可能拿旧角度
+    // 去画一个对不上的倾斜框。
+    root.setRotateFrame(index, 0, 0, 0)
     rotateOverlay.open(index)
 }
 
@@ -1982,13 +2002,17 @@ function startLayerRotate() {
     // 转时框要接着上次的角度画，不能从 0 重新开始。
     const base = bridge.rotate_layer_begin(bridge.selected_layer, true)
     root.rotateBase = base
-    if (Math.abs(base) < 0.001 || root.rotateFrame === null) {
+    const ix = bridge.selected_layer
+    const prev = root.rotateFrames[ix]
+    if (Math.abs(base) < 0.001 || prev === undefined) {
         // 新起一轮：记下"还没转"的框，之后的倾斜框以它为准。
         const b = root.selLayerBox
         if (b !== null && b.w > 0 && b.h > 0)
-            root.rotateFrame = { w: b.w, h: b.h }
+            root.setRotateFrame(ix, b.w, b.h, base)
+    } else {
+        // 接着上一轮转：沿用当初那张"没转过"的框，只更新角度。
+        root.setRotateFrame(ix, prev.w, prev.h, base)
     }
-    root.rotateFrameAngle = base
 }
 
 function applyRotateFrame() {
@@ -2030,15 +2054,22 @@ function finishLayerRotate(apply) {
     root.rotating = false
     // 松手时可能还有一帧没算：把最终角度交给 finish，由它决定复用还是重算。
     bridge.rotate_layer_finish(apply, root.rotateAnglePreview, true)
+    const ix = bridge.selected_layer
+    const f = root.rotateFrames[ix]
+    // 框的宽高始终沿用"旋转前"那一份，只在角度上累加；这里绝不能用
+    // selLayerBox —— 提交后它已经是扩过边的外接矩形了。
+    const w = f !== undefined ? f.w : 0
+    const h = f !== undefined ? f.h : 0
     if (!apply) {
-        root.rotateFrameAngle = root.rotateBase
+        root.setRotateFrame(ix, w, h, root.rotateBase)
         return
     }
     let a = root.rotateBase + root.rotateAnglePreview
     // 归一化到 (-180, 180]，转一整圈后框不该"看起来转了 360°"。
     while (a > 180) a -= 360
     while (a <= -180) a += 360
-    root.rotateFrameAngle = a
+    if (w > 0 && h > 0)
+        root.setRotateFrame(ix, w, h, a)
 }
 
 Timer {
@@ -2944,9 +2975,14 @@ Timer {
         const cy = view.previewImage.height / 2 + view.pad
         const top = root.topLayerAt(cx, cy)
         root.selTool = "rect"
-        const picked = cs.layerPickAt(cx, cy)
+        // 不带修饰键：移动工具开着时应当**拾取**（移动优先）。
+        // 带 Shift：明确要加选，交回选区手势，picked 应当是 null。
+        const picked = cs.layerPickAt(cx, cy, 0)
+        const pickedShift = cs.layerPickAt(cx, cy, Qt.ShiftModifier)
         bridge.mark("selhit: top=" + (top === null ? "null" : top.i)
                     + " picked=" + (picked === null ? "null" : picked.i)
+                    + " pickedShift=" + (pickedShift === null ? "null" : pickedShift.i)
+                    + " moveMode=" + root.moveMode
                     + " selTool=" + root.selTool)
     }
 }
@@ -3011,7 +3047,19 @@ Timer {
                         + " rotated=" + root.layerFrameRotated
                         + " fw=" + root.layerFrameW + "x" + root.layerFrameH
                         + " box=" + (root.selLayerBox
-                                     ? root.selLayerBox.w + "x" + root.selLayerBox.h : "null"))
+                                     ? root.selLayerBox.w + "x" + root.selLayerBox.h : "null")
+                        + " handles=" + view.selectionViz.layerHandles.visible)
+            // --probe-frame-keep：转完切到别的图层再切回来，核对倾斜框
+            // 记忆还在（以前切一次就退回轴对齐，看着像角度复位）。
+            if (args.indexOf("--probe-frame-keep") !== -1) {
+                const keep = bridge.selected_layer
+                bridge.select_layer(-1)
+                bridge.select_layer(keep)
+                bridge.mark("frame-keep: back=" + bridge.selected_layer
+                            + " angle=" + root.layerFrameAngle
+                            + " rotated=" + root.layerFrameRotated
+                            + " fw=" + root.layerFrameW + "x" + root.layerFrameH)
+            }
         }
     }
 }
@@ -3062,9 +3110,11 @@ Timer {
             if (args[i].indexOf("--probe-rotate-frame=") === 0)
                 spec = args[i].substring("--probe-rotate-frame=".length)
         const p = spec.split(",")
-        root.rotateFrame = { w: parseInt(p[0], 10) || 900,
-                             h: parseInt(p[1], 10) || 700 }
-        root.rotateFrameAngle = parseFloat(p[2]) || 45
+        const ix = bridge.selected_layer >= 0 ? bridge.selected_layer : 0
+        root.setRotateFrame(ix,
+                            parseInt(p[0], 10) || 900,
+                            parseInt(p[1], 10) || 700,
+                            parseFloat(p[2]) || 45)
         bridge.mark("rotate-frame:" + JSON.stringify(root.rotateFrame)
                     + " angle=" + root.rotateFrameAngle
                     + " rotated=" + root.layerFrameRotated)

@@ -594,7 +594,6 @@ impl qobject::Bridge {
         if layer.locked {
             return 0.0;
         }
-        let history_len = session.doc.history_len();
         session.rotate_token = session.rotate_token.wrapping_add(1);
         let token = session.rotate_token;
         if !keep_session {
@@ -612,14 +611,17 @@ impl qobject::Bridge {
             });
             return 0.0;
         }
-        // 锚点还新鲜才复用（同图层 + 之后没人改过文档 + 真的转出过角度）。
+        // 锚点还新鲜才复用：同一个图层 + 真的转出过角度 + 图层内容还是
+        // 提交后的那一版。最后一条以前用 history_len 代替，别的图层动一下
+        // 锚点就废了，于是"再转一次"变成从已烘焙的位图重新起算，框也跟着
+        // 退回轴对齐——用户看到的就是角度"复位"。
         let reusable = session
             .rotate_origin
             .as_ref()
             .map(|o| {
                 o.index == ix
-                    && o.history_len == history_len
                     && o.degrees.abs() > 0.001
+                    && session.doc.layers[ix] == *o.committed
             })
             .unwrap_or(false);
         let (before, start, base) = if reusable {
@@ -719,12 +721,14 @@ impl qobject::Bridge {
                 }
                 if st.keep {
                     // 锚点推进到最新角度：手柄下一次拖动还是从没被插值过的
-                    // 原图出发，角度累加。
+                    // 原图出发，角度累加。committed 记下"这一版内容"，下一
+                    // 次 begin 用它判断图层有没有被别人改过。
+                    let committed = std::rc::Rc::new(session.doc.layers[st.index].clone());
                     session.rotate_origin = Some(RotateOrigin {
                         index: st.index,
                         layer: st.before,
                         degrees: total,
-                        history_len: session.doc.history_len(),
+                        committed,
                     });
                 } else {
                     session.rotate_origin = None;

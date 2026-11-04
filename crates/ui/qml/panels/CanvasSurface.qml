@@ -65,32 +65,26 @@ Item {
 
     // 按下时命中的图层（null = 不拾取）。
     //
-    // 选区工具激活时不拾取图层：PS 里选框/套索/魔棒点击画布只动选区，
-    // 不会顺手选中图层（否则点空白就冒出一个 8 点包围盒，把手柄压在正要
-    // 涂抹的像素上）。选中的图层由图层面板决定。已有选区 / 绘画工具同理。
-    // 抽成函数是为了让探针直接验证这一条真实分支，而不是复制一份判断。
-    // 画布按下时要不要顺手选中图层（PS 里只有移动工具才这么做）。
-    // 移动工具关掉时一律不碰图层（纯查看 / 绘制）。
-    // 选区工具（矩形 / 椭圆 / 套索 / 多边形）激活时也可以直接点图层选中 ——
-    // 和移动工具共存的语义就在这里。
-    // 只有快速选择 / 魔术棒例外：它们是「按住就涂」的手势，顺手选中图层会
-    // 冒出 8 点包围盒，把涂抹吃掉。
-    function layerPickAt(mx, my) {
+    // ★优先级：移动工具（V）> 选区手势。移动开着时，在图层上按下就是选中
+    // 并拖动图层，不会莫名其妙拉出一个选框 —— 之前这里有一条「点在已选中的
+    // 图层上就交给选区」的例外，结果就是用户说的「移动工具开着还是被选区
+    // 优先占用」。
+    //
+    // 想拉选框有三条路：① 按 V 关掉移动工具；② 从图层外起手；③ 按住
+    // Shift / Alt 拖（加选 / 减选，本来就必须走选区手势）。
+    // 快速选择 / 魔术棒仍然不拾取：它们是"按住就涂"，冒出来的包围盒会吃掉
+    // 涂抹。绘画 / 标记工具同理（它们自己接管按下的手势）。
+    function layerPickAt(mx, my, mods) {
         if (!host.moveMode)
             return null
         if (host.selTool === "quick" || host.selTool === "wand")
             return null
         if (host.paintTool !== "none" || host.markTool !== "none")
             return null
-        const hit = host.topLayerAt(mx, my)
-        if (hit === null)
+        if (host.selTool !== "none"
+                && ((mods | 0) & (Qt.ShiftModifier | Qt.AltModifier)) !== 0)
             return null
-        // 选区工具激活时：点在「当前已选中的那个图层」上就交给选区手势
-        // （否则选框工具在图层上永远拉不出选区）；点在别的图层上则切换
-        // 选中 —— 这就是"选区工具开着也能直接点图层选中"。
-        if (host.selTool !== "none" && hit.i === bridge.selected_layer)
-            return null
-        return hit
+        return host.topLayerAt(mx, my)
     }
 
     function cancelPolygon() {
@@ -309,7 +303,7 @@ Item {
                 return
             }
             // 选区工具激活时不拾取图层（见 layerPickAt）。
-            const hit = layerPickAt(mouse.x, mouse.y)
+            const hit = layerPickAt(mouse.x, mouse.y, mouse.modifiers)
             if (hit !== null) {
                 if (bridge.selected_mark >= 0)
                     bridge.select_mark(-1)   // 标记/图层选中互斥

@@ -201,7 +201,7 @@ pub(in crate::bridge) struct LiveRotate {
     pub(in crate::bridge) token: u64,
 }
 
-/// 连续旋转会话的「锚」：原图 + 已累计角度 + 提交当时的历史条数。
+/// 连续旋转会话的「锚」：原图 + 已累计角度 + 提交当时那一版的图层内容。
 ///
 /// 手柄拖完一次就会提交一条 `RotateLayer`，图层里的像素已经被重采样过一
 /// 遍；如果下一次拖拽还从这份像素出发，来回拖几下画面就糊了。所以提交时
@@ -212,8 +212,11 @@ pub(in crate::bridge) struct RotateOrigin {
     /// `Rc` 是为了每次起手都不必再复制一份十几 MB 的位图。
     pub(in crate::bridge) layer: std::rc::Rc<Layer>,
     pub(in crate::bridge) degrees: f32,
-    /// 提交后文档的历史条数：对不上说明图层被别的操作改过，锚点作废。
-    pub(in crate::bridge) history_len: usize,
+    /// 提交后那一版图层内容。锚点是否还能用，看的是**这个图层自己有没有被
+    /// 改过**，而不是文档历史条数——以前用 history_len，结果在别的图层上
+    /// 画一笔、或者随手撤销一下，锚点就废了：base 归零，框退回轴对齐的扩边
+    /// 矩形，看着就像"放手角度复位"。
+    pub(in crate::bridge) committed: std::rc::Rc<Layer>,
 }
 
 pub(in crate::bridge) struct Rendered {

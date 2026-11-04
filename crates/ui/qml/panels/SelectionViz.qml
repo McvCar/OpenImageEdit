@@ -380,6 +380,38 @@ Item {
         }
     }
 
+    // 旋转过之后位图被烘焙成「最小外接矩形」，四个角是透明像素。八向手柄
+    // 贴的正是这个外接矩形（拖它缩放的也是它），所以这里再画一圈**细实线**
+    // 把手柄"接住"——用实线是为了和上面那条虚线的内容四边区分开，否则两个
+    // 虚线框叠在一起会看不出哪个是哪个。
+    Rectangle {
+        id: layerBBoxViz
+        visible: host.selLayer !== null && host.scaleW === 0 && host.moveMode
+                 && host.layerFrameRotated
+        z: 5
+        x: previewImage.x
+        y: previewImage.y
+        width: previewImage.width
+        height: previewImage.height
+        color: "transparent"
+        border.width: 0
+        readonly property real bx: host.selLayerBox !== null ? host.selLayerBox.x * host.toDispScale() : 0
+        readonly property real by: host.selLayerBox !== null ? host.selLayerBox.y * host.toDispScale() : 0
+        readonly property real bw: host.selLayerBox !== null ? host.selLayerBox.w * host.toDispScale() : 0
+        readonly property real bh: host.selLayerBox !== null ? host.selLayerBox.h * host.toDispScale() : 0
+
+        // 边框画在手柄位置上：用一个内缩 0.5 的矩形描边。
+        Rectangle {
+            x: layerBBoxViz.bx
+            y: layerBBoxViz.by
+            width: Math.max(0, layerBBoxViz.bw)
+            height: Math.max(0, layerBBoxViz.bh)
+            color: "transparent"
+            border.color: "#5b9dff66"
+            border.width: 1
+        }
+    }
+
     // Selected layer outline (dashed) + blue-dot handles for scaling.
     DashedRect {
         id: layerBoxViz
@@ -401,8 +433,10 @@ Item {
     EdgeHandles {
         id: layerHandles
         // 拾色器打开时隐藏（取色优先于缩放/移动）。
-        // 旋转过之后框变成倾斜四边形，八向缩放手柄还是轴对齐的，两者一起
-        // 显示会互相"打架"，这时只留倾斜框和旋柄。
+        // ★旋转过之后手柄**照样在**（以前这里挂了 !layerFrameRotated，
+        //   结果转一下 8 个圆点就全没了，用户以为工具坏了）。旋转后位图
+        //   已经烘焙成外接矩形，手柄贴的就是那个矩形，上面那条淡框负责
+        //   把手柄接住；倾斜虚线框仍然标出内容的真实四边。
         // 移动能力与工具**共存**：画笔 / 修补 / 油漆 / 选框激活时，只要图层
         // 还选着，手柄就在（和改造前一致）。想收掉手柄就按 V 关掉移动工具，
         // 或者取消选择（Esc / 移动模式下点空白）。
@@ -411,7 +445,7 @@ Item {
         visible: host.selLayer !== null && host.selLayer.base !== true
                  && host.moveMode
                  && !host.selExists && bridge.image_width > 0
-                 && !bridge.pickerOpen && !host.layerFrameRotated
+                 && !bridge.pickerOpen
                  && host.selTool !== "quick" && host.selTool !== "wand"
                  && !host.rotating
         z: 8
