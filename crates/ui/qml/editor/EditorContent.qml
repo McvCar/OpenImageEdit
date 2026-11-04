@@ -44,6 +44,9 @@ Item {
     // --probe-winfit：自动化里也允许"按图片调窗口尺寸/位置"，专门验证预置
     // 尺寸、居中保持这些行为（其余探针仍然固定窗口，避免打乱几何基线）。
     readonly property bool probeWinFit: Qt.application.arguments.indexOf("--probe-winfit") !== -1
+    // --probe-screen：打印光标所在显示器、各屏几何/缩放、换算出的逻辑坐标，
+    // 用来在多屏机器上核对"新窗口落在鼠标那块屏"。
+    readonly property bool probeScreen: Qt.application.arguments.indexOf("--probe-screen") !== -1
     readonly property bool windowAutoGeometry: !automationRun || probeWinFit
     // 所属窗口（Window.window 这个附加属性在 EditorContent 里求值会抛异常，
     // 见 dpr 那段的注释；需要窗口对象的探针/逻辑用这个显式引用）。
@@ -101,7 +104,7 @@ Item {
     function fitSizeFor(win, imgWpx, imgHpx) {
         if (!win || imgWpx <= 0 || imgHpx <= 0)
             return null
-        const dpr = root.dpr > 0 ? root.dpr : 1
+        const dpr = root.sizeDpr()
         const imgW = Math.max(1, imgWpx / dpr)
         const imgH = Math.max(1, imgHpx / dpr)
         // 图层面板浮在画布右侧，扣掉它之后才是图片可用的宽度。
@@ -136,14 +139,121 @@ Item {
     // 当前屏的可用工作区（逻辑像素）——desktopAvailable* 已经扣掉任务栏。
     // **不能**用 Screen.availableWidth/Height：那是 Qt 5 的名字，Qt 6 上取到
     // undefined（旧代码于是静默 fallback 成整屏，大图窗口底边压在任务栏上）。
-    function workArea() {
-        const sw = root.Screen.width
-        const sh = root.Screen.height
-        const w = Math.min(root.Screen.desktopAvailableWidth || sw, sw)
-        const h = Math.min(root.Screen.desktopAvailableHeight || sh, sh)
+    //
+    // 多屏：一律以 targetScreen（光标所在屏）为准。用 root.Screen 的话，窗口
+    // 还没显示时它报的是主屏，新窗口就会被按主屏的工作区夹回第一块屏。
+    function screenWorkArea(s) {
+        if (!s)
+            return null
+        const sw = s.width
+        const sh = s.height
+        const w = Math.min(s.desktopAvailableWidth || sw, sw)
+        const h = Math.min(s.desktopAvailableHeight || sh, sh)
         if (!(w > 0) || !(h > 0))
             return null
-        return { x: root.Screen.virtualX, y: root.Screen.virtualY, w: w, h: h }
+        return { x: s.virtualX, y: s.virtualY, w: w, h: h }
+    }
+    function workArea() {
+        // 已显示的窗口以它**现在**所在的屏为准（用户可能把窗口拖到了另一块屏）；
+        // 还没显示时 root.Screen 报的是主屏，必须用光标所在屏。
+        const host = root.hostWindow
+        const shown = host && host.visible
+        return screenWorkArea(shown ? root.Screen
+                                    : (root.targetScreen || root.Screen))
+    }
+
+    // 光标所在的那块屏 + 光标在该屏内的位置（已换算成 Qt 逻辑坐标）。
+    // 由 presizeWindow 在量尺寸之前调用一次（Rust 侧的"启动光标快照"只能
+    // 取一次，所以整轮摆位共用这一次结果）。
+    property var targetScreen: null
+    property real cursorLogicalX: -1
+    property real cursorLogicalY: -1
+
+    // 图片像素 → 逻辑像素时该用的 dpr：窗口要落在哪块屏，就用哪块屏的缩放。
+    function sizeDpr() {
+        const s = root.targetScreen
+        if (s && s.devicePixelRatio > 0)
+            return s.devicePixelRatio
+        return root.dpr > 0 ? root.dpr : 1
+    }
+
+    // 把"全局物理坐标"换算成 Qt 逻辑坐标。★必须按**那块屏**分段换算：
+    // 屏 A 1920 宽@100%、屏 B 3440 宽@125% 时，Qt 逻辑上 B 的原点是 1920，
+    // 而不是 3440/1.25=2752。全局除一个 dpr 必然错位到别的屏。
+    function resolveCursor() {
+        root.targetScreen = null
+        root.cursorLogicalX = -1
+        root.cursorLogicalY = -1
+        const info = bridge.cursor_monitor()
+        if (!info || info.length === 0)
+            return false
+        const f = info.split("\t")
+        if (f.length < 8)
+            return false
+        const screens = Qt.application.screens
+        const friendly = f[0]          // 显示器友好名，如 S342-DP（Qt 的 QScreen.name）
+        const gdi = f[1]               // \\.\DISPLAY1（有些环境 Qt 用这个）
+        const offX = parseInt(f[2], 10) || 0
+        const offY = parseInt(f[3], 10) || 0
+        const monW = parseInt(f[4], 10) || 0
+        const monH = parseInt(f[5], 10) || 0
+        const monX = parseInt(f[6], 10) || 0
+        const monY = parseInt(f[7], 10) || 0
+        // ① 快速路径：名字能对上就直接用（有些环境下 QScreen.name 就是 GDI 名
+        //    或显示器友好名；对不上也没关系，走 ② 的几何判据）。
+        let s = null
+        for (let i = 0; i < screens.length; ++i) {
+            const n = screens[i].name
+            if (n === friendly || n === gdi) {
+                s = screens[i]
+                break
+            }
+        }
+        // ② 几何判据：Qt 的逻辑原点 = 该屏物理原点 / 该屏 dpr，所以
+        //    「virtualX×dpr ≈ 显示器物理原点」就是同一块屏。用尺寸先筛候选，
+        //    再用原点距离取最优。两台同型号显示器靠这也分得开。
+        if (!s) {
+            let best = null
+            let bestScore = 0
+            for (let i = 0; i < screens.length; ++i) {
+                const c = screens[i]
+                const d = c.devicePixelRatio > 0 ? c.devicePixelRatio : 1
+                const sizeOk = monW > 0 && monH > 0
+                    && Math.abs(Math.round(c.width * d) - monW) <= 2
+                    && Math.abs(Math.round(c.height * d) - monH) <= 2
+                const score = Math.abs(Math.round(c.virtualX * d) - monX)
+                              + Math.abs(Math.round(c.virtualY * d) - monY)
+                // 尺寸对得上的优先（score 减 1 做轻量加权，不改变量级）。
+                const rank = sizeOk ? score : score + 100000
+                if (!best || rank < bestScore) {
+                    best = c
+                    bestScore = rank
+                }
+            }
+            s = best
+        }
+        if (!s)
+            return false
+        root.targetScreen = s
+        const dpr = s.devicePixelRatio > 0 ? s.devicePixelRatio : 1
+        root.cursorLogicalX = s.virtualX + offX / dpr
+        root.cursorLogicalY = s.virtualY + offY / dpr
+        if (root.probeScreen) {
+            let dump = ""
+            for (let i = 0; i < screens.length; ++i) {
+                const c = screens[i]
+                dump += (i > 0 ? " | " : "") + c.name + " v=" + c.virtualX + "," + c.virtualY
+                        + " " + c.width + "x" + c.height
+                        + " dpr=" + c.devicePixelRatio
+                        + " avail=" + c.desktopAvailableWidth + "x" + c.desktopAvailableHeight
+            }
+            bridge.mark("cursor-monitor:" + info.replace(/\t/g, "|")
+                        + " => logical " + Math.round(root.cursorLogicalX) + ","
+                        + Math.round(root.cursorLogicalY)
+                        + " on " + s.name
+                        + " || screens: " + dump)
+        }
+        return true
     }
 
     // 把 (x, y, w, h) 夹进工作区：窗口永远整块留在屏幕上，不压任务栏。
@@ -194,8 +304,17 @@ Item {
     // 夹进工作区。这样窗口一出现就是最终大小/位置，不会"先弹个空窗口、
     // 解码完再跳一下"。url 为空（空窗口启动）时只按默认尺寸摆位置。
     function presizeWindow(win, url) {
-        if (!win || !root.windowAutoGeometry)
+        if (!win)
             return false
+        // 自动化运行默认固定窗口几何（几何基线不乱）；--probe-screen 只做
+        // 换算并打印，不改窗口位置。
+        if (!root.windowAutoGeometry) {
+            if (root.probeScreen)
+                root.resolveCursor()
+            return false
+        }
+        // 先解析光标在哪块屏：后面的量尺寸、夹边都要用那块屏的工作区。
+        const haveCursor = root.resolveCursor()
         const s = url ? url.toString() : ""
         if (s.length > 0) {
             const probed = bridge.probe_image_size(s)
@@ -209,8 +328,13 @@ Item {
                 }
             }
         }
-        if (root.placeAtCursor(win))
+        if (haveCursor && root.placeAtCursor(win)) {
+            if (root.probeScreen)
+                bridge.mark("window-placed:" + win.x + "," + win.y + " "
+                            + win.width + "x" + win.height
+                            + " on " + (root.targetScreen ? root.targetScreen.name : "?"))
             return true
+        }
         // 光标接口不可用（非 Windows）：至少居中到工作区。
         const area = root.workArea()
         if (area) {
@@ -221,19 +345,22 @@ Item {
         return false
     }
 
-    // 以鼠标光标为中心摆窗口。Rust 侧算的是物理像素，这里除以 dpr 换成 Qt
-    // 的逻辑坐标。★所有窗口都精确居中，不做级联错开：错开 28px 会让第二张
-    // 以后的图看起来"没对准鼠标"。
+    // 以鼠标光标为中心摆窗口（坐标由 resolveCursor 算好，是 Qt 逻辑坐标）。
+    // ★所有窗口都精确居中，不做级联错开：错开 28px 会让第二张以后的图看起来
+    // "没对准鼠标"。
     function placeAtCursor(win) {
-        const dpr = root.dpr > 0 ? root.dpr : 1
-        const res = bridge.place_window_at_cursor(Math.round(win.width * dpr),
-                                                  Math.round(win.height * dpr))
-        if (res.length === 0)
+        if (!win || root.cursorLogicalX < 0)
             return false
-        const parts = res.split(",")
+        const area = root.workArea()
+        let x = root.cursorLogicalX - win.width / 2
+        let y = root.cursorLogicalY - win.height / 2
+        if (area) {
+            x = Math.min(Math.max(x, area.x), Math.max(area.x, area.x + area.w - win.width))
+            y = Math.min(Math.max(y, area.y), Math.max(area.y, area.y + area.h - win.height))
+        }
         root.adjustingWindow = true
-        win.x = Math.round((parseInt(parts[0], 10) || 0) / dpr)
-        win.y = Math.round((parseInt(parts[1], 10) || 0) / dpr)
+        win.x = Math.round(x)
+        win.y = Math.round(y)
         root.adjustingWindow = false
         root.syncWindowCenter(win)
         return true

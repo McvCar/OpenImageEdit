@@ -199,13 +199,15 @@ pub mod qobject {
         #[qinvokable]
         fn probe_image_size(self: Pin<&mut Self>, target: &QString) -> QString;
 
-        /// 以鼠标光标为中心算窗口左上角，夹进光标所在显示器的**工作区**
-        /// （扣掉任务栏）。返回 "x,y"，**物理像素**（QML 除以 dpr 换成 Qt 的
-        /// 逻辑坐标）。失败返回空串，调用方回落到自己居中。
-        /// 不做级联错开：每个新窗口都精确居中光标（用户要求"打开就摆在鼠标
-        /// 中间"，错开 28px 会让第二张以后的图看起来没居中）。
+        /// 光标所在显示器的信息，格式 `设备名\t光标屏内偏移X\t偏移Y\t物理宽\t物理高`
+        /// （偏移是**物理**像素，相对该显示器左上角）。失败返回空串。
+        ///
+        /// ★这里只报事实、不做换算：Qt 的逻辑坐标系是按每块屏各自的 dpr 分段的，
+        /// "全局物理坐标 ÷ dpr" 在多屏（尤其混合缩放）下会算到别的屏上去。QML
+        /// 侧必须先用设备名（Windows 上是 `\\.\DISPLAYn`）匹配到那块 QScreen，
+        /// 再用**那块屏**的 dpr 和 virtualX/virtualY 换算。
         #[qinvokable]
-        fn place_window_at_cursor(self: Pin<&mut Self>, width: i32, height: i32) -> QString;
+        fn cursor_monitor(self: Pin<&mut Self>) -> QString;
 
         /// Register the app in the Windows "Open with" list and open the
         /// system default-apps settings page (the user picks the default).
