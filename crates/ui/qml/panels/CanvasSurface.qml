@@ -71,16 +71,26 @@ Item {
     // 抽成函数是为了让探针直接验证这一条真实分支，而不是复制一份判断。
     // 画布按下时要不要顺手选中图层（PS 里只有移动工具才这么做）。
     // 移动工具关掉时一律不碰图层（纯查看 / 绘制）。
-    // 三种工具族任意一个激活时也返回 null：选框 / 快速选择 / 魔术棒点画布
-    // 只该动选区。以前这里不看 selTool，于是"快速选择"第一笔就被判成
-    // "选中图层并拖动" —— 8 个蓝点包围盒冒出来，涂抹根本不生效。
+    // 选区工具（矩形 / 椭圆 / 套索 / 多边形）激活时也可以直接点图层选中 ——
+    // 和移动工具共存的语义就在这里。
+    // 只有快速选择 / 魔术棒例外：它们是「按住就涂」的手势，顺手选中图层会
+    // 冒出 8 点包围盒，把涂抹吃掉。
     function layerPickAt(mx, my) {
         if (!host.moveMode)
             return null
-        if (host.selTool !== "none" || host.paintTool !== "none"
-                || host.markTool !== "none")
+        if (host.selTool === "quick" || host.selTool === "wand")
             return null
-        return host.topLayerAt(mx, my)
+        if (host.paintTool !== "none" || host.markTool !== "none")
+            return null
+        const hit = host.topLayerAt(mx, my)
+        if (hit === null)
+            return null
+        // 选区工具激活时：点在「当前已选中的那个图层」上就交给选区手势
+        // （否则选框工具在图层上永远拉不出选区）；点在别的图层上则切换
+        // 选中 —— 这就是"选区工具开着也能直接点图层选中"。
+        if (host.selTool !== "none" && hit.i === bridge.selected_layer)
+            return null
+        return hit
     }
 
     function cancelPolygon() {

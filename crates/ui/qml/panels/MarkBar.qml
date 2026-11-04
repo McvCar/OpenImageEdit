@@ -121,7 +121,8 @@ Rectangle {
             active: bridge.image_width > 0
             selected: markShapePopover.visible
                       || host.markTool === "rect" || host.markTool === "ellipse"
-                      || host.markTool === "arrow" || host.markTool === "mosaic"
+                      || host.markTool === "arrow" || host.markTool === "brush"
+                      || host.markTool === "mosaic"
             onClicked: {
                 fontPopover.visible = false
                 widthPopover.visible = false
@@ -135,6 +136,7 @@ Rectangle {
                 property color ink: markShapeBtn.selected ? "#ffffff" : "#e9eaec"
                 property string kind: (host.markTool === "ellipse"
                                        || host.markTool === "arrow"
+                                       || host.markTool === "brush"
                                        || host.markTool === "mosaic")
                                       ? host.markTool : "rect"
                 onInkChanged: requestPaint()
@@ -156,6 +158,11 @@ Rectangle {
                         c.beginPath()
                         c.moveTo(17, 5); c.lineTo(11.5, 6.5); c.lineTo(15.5, 10.5)
                         c.closePath(); c.fill()
+                    } else if (kind === "brush") {
+                        c.beginPath()
+                        c.moveTo(4.5, 16.5)
+                        c.bezierCurveTo(8, 5.5, 14, 17.5, 18.5, 6.5)
+                        c.stroke()
                     } else if (kind === "mosaic") {
                         for (let y = 0; y < 3; ++y)
                             for (let x = 0; x < 3; ++x) {
@@ -167,12 +174,6 @@ Rectangle {
                     }
                 }
             }
-        }
-        IconButton {
-            glyph: "✏"
-            tip: "自由画笔（再点一次取消）"
-            selected: host.markTool === "brush"
-            onClicked: host.setMarkTool("brush")
         }
         IconButton {
             glyph: "T"

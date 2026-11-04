@@ -11,7 +11,7 @@ Rectangle {
     required property var markBar
     visible: false
     z: 221
-    width: 4 * 46 + 14
+    width: 5 * 46 + 14
     height: 66
     color: "#2a2d31"
     border.color: "#3c4043"
@@ -45,6 +45,12 @@ Rectangle {
                 c.beginPath()
                 c.moveTo(17, 5); c.lineTo(11.5, 6.5); c.lineTo(15.5, 10.5)
                 c.closePath(); c.fill()
+            } else if (kind === "brush") {
+                // 自由画笔：一条手绘 S 形曲线 + 笔尖。
+                c.beginPath()
+                c.moveTo(4.5, 16.5)
+                c.bezierCurveTo(8, 5.5, 14, 17.5, 18.5, 6.5)
+                c.stroke()
             } else if (kind === "mosaic") {
                 for (let y = 0; y < 3; ++y)
                     for (let x = 0; x < 3; ++x) {
@@ -66,6 +72,7 @@ Rectangle {
                 { tool: "rect",    label: "矩形" },
                 { tool: "ellipse", label: "椭圆" },
                 { tool: "arrow",   label: "箭头" },
+                { tool: "brush",   label: "画笔" },
                 { tool: "mosaic",  label: "马赛克" }
             ]
 

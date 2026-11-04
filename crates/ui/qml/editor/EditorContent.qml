@@ -1045,6 +1045,18 @@ MosaicPopover {
     markBar: markBar
 }
 
+// 形状面板的"点外部收起"：面板打开时铺一层透明遮罩盖住画布，点一下先收
+// 面板（不把手势透给画布）。z 压在标记栏（59）之下，所以工具栏上的按钮
+// 仍然优先响应。
+MouseArea {
+    id: markShapeDismiss
+    anchors.fill: parent
+    visible: markShapePopover.visible
+    z: 58
+    acceptedButtons: Qt.LeftButton | Qt.RightButton
+    onClicked: markShapePopover.visible = false
+}
+
 // 矩形 / 椭圆 / 箭头 / 马赛克 的合并面板（标记栏只留一个按钮）。
 MarkShapePopover {
     id: markShapePopover
@@ -2767,6 +2779,9 @@ Timer {
     onTriggered: {
         root.markBarVisible = true
         root.markTool = "ellipse"
+        // `--probe-shape`：顺带把形状面板打开，核对 5 格布局和图标。
+        if (Qt.application.arguments.indexOf("--probe-shape") !== -1)
+            markShapePopover.visible = true
     }
 }
 
