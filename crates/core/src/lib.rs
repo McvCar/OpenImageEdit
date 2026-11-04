@@ -1572,6 +1572,71 @@ mod paint_tests {
         }
     }
 
+    /// 直角旋转必须是**精确**的：尺寸交换、偏移正好是半差、像素不插值。
+    ///
+    /// 这条曾经是 bug：`sin(90°)` 是 6.1e-17 而不是 0，`800*|cos| + 600*|sin|`
+    /// 算出 600.00000000000006，`ceil` 直接进到 601 —— 每转一次图层长 1px。
+    #[test]
+    fn quarter_turn_is_exact_not_grown_by_rounding() {
+        let mut img = RgbaImage::from_pixel(800, 600, image::Rgba([30, 40, 50, 255]));
+        for y in 0..20 {
+            for x in 0..20 {
+                img.put_pixel(x, y, image::Rgba([255, 0, 0, 255]));
+            }
+        }
+        for (deg, want) in [
+            (90.0f32, (600u32, 800u32)),
+            (180.0, (800, 600)),
+            (270.0, (600, 800)),
+            (360.0, (800, 600)),
+        ] {
+            let (out, delta) = rotate_image_hq(&img, deg, true);
+            assert_eq!(
+                out.dimensions(),
+                want,
+                "{deg}° 后尺寸应正好是 {want:?}，多 1px 就是累积膨胀"
+            );
+            // 偏移 = (旧尺寸 - 新尺寸) / 2，直角下必然整除。
+            assert_eq!(
+                delta,
+                (
+                    (800 - want.0 as i32) / 2,
+                    (600 - want.1 as i32) / 2
+                ),
+                "{deg}° 的偏移不能有半像素误差"
+            );
+        }
+    }
+
+    /// 用户"转一圈"：四次松手提交，每次都以未插值的原图 + 累计角度重算
+    /// （`rotate_layer_finish` 的 keep 分支就是这样推进 `RotateOrigin` 的）。
+    /// 一圈之后尺寸、偏移、像素都必须回到出发点。
+    #[test]
+    fn full_turn_over_origin_returns_to_start() {
+        let mut base = RgbaImage::from_pixel(640, 480, image::Rgba([200, 160, 90, 255]));
+        for y in 0..40 {
+            for x in 0..40 {
+                base.put_pixel(x, y, image::Rgba([10, 220, 10, 255]));
+            }
+        }
+        let mut last = base.clone();
+        for step in 1..=4 {
+            let deg = 90.0 * step as f32;
+            let (out, delta) = rotate_image_hq(&base, deg, true);
+            // 每次提交后 offset = 原始 offset + delta（不是逐次累加）。
+            assert_eq!(delta, ((640 - out.width() as i32) / 2, (480 - out.height() as i32) / 2));
+            last = out;
+        }
+        assert_eq!(last.dimensions(), (640, 480), "转满一圈尺寸必须回到原值");
+        let mut worst = 0i32;
+        for (a, b) in last.pixels().zip(base.pixels()) {
+            for c in 0..4 {
+                worst = worst.max((a.0[c] as i32 - b.0[c] as i32).abs());
+            }
+        }
+        assert!(worst <= 1, "转满一圈像素误差 {worst} 过大，说明在反复重采样");
+    }
+
     #[test]
     fn rotate_layer_angle_is_undoable() {
         let mut doc = Document::from_image(RgbaImage::from_pixel(

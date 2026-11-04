@@ -621,6 +621,27 @@ impl qobject::Bridge {
                         println!("{{\"phase\":\"ui\",\"event\":\"gradient\"}}");
                     }
                 }
+                // `layer-info:index[,tag]` —— 打印图层位图尺寸与 offset。
+                // 诊断"转一圈图层变大 / 放手后位置漂移"时直接读这几项，
+                // 别再从截图上量像素。
+                other if other.starts_with("layer-info:") => {
+                    let n = parse_nums(other);
+                    let ix = n.first().copied().unwrap_or(0.0) as i32;
+                    let guard = self.session.borrow();
+                    if let Some(session) = guard.as_ref() {
+                        if let Some(layer) = session.doc.layers.get(ix.max(0) as usize) {
+                            println!(
+                                "{{\"phase\":\"ui\",\"event\":\"layer-info\",\"index\":{ix},\
+                                 \"w\":{},\"h\":{},\"ox\":{},\"oy\":{},\"history\":{}}}",
+                                layer.image.width(),
+                                layer.image.height(),
+                                layer.offset.0,
+                                layer.offset.1,
+                                session.doc.history_len()
+                            );
+                        }
+                    }
+                }
                 // `rotate-handle:index,degrees[,expand]` —— 模拟拖一次画布旋柄
                 // （begin keep_session → update → finish apply）。连写两条就等于
                 // 用户来回拖两次，用来验证「不会越拖越糊」。

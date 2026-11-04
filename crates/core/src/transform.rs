@@ -96,6 +96,21 @@ pub(crate) fn transform_document(doc: &mut Document, transform: Transform) {
     }
 }
 
+/// 旋转后的包围盒尺寸（向上取整，不裁切内容）。
+///
+/// ★必须先吸掉浮点残差再 ceil：`sin(180°)` 是 1.22e-16 而不是 0，
+/// `800*1 + 600*1.2e-16` 算出来是 800.0000000000001，直接 ceil 就是 **801**。
+/// 于是每转 90°/180°/360°，图层就长 1px —— 用户把图层转一圈，四边都胖了
+/// 好几像素（"旋转一圈后四边越来越大"）。减去 1‰ 像素只影响远小于一像素的
+/// 残差，真正需要裁切的角度（如 37.0001°）仍然照样进一位。
+fn expanded_size(w: f32, h: f32, sin: f32, cos: f32) -> (u32, u32) {
+    let cell = |v: f32| ((v - 1e-3).ceil() as i64).max(1) as u32;
+    (
+        cell(w * cos.abs() + h * sin.abs()),
+        cell(w * sin.abs() + h * cos.abs()),
+    )
+}
+
 /// 任意角度旋转一张位图（双线性重采样，预乘 alpha，避免边缘发黑）。
 ///
 /// `expand` = true 时按旋转后的包围盒扩大位图（内容不裁切）；false 时
@@ -114,10 +129,7 @@ pub fn rotate_image(img: &RgbaImage, degrees: f32, expand: bool) -> (RgbaImage, 
     let rad = degrees.to_radians();
     let (sin, cos) = (rad.sin(), rad.cos());
     let (nw, nh) = if expand {
-        (
-            (w * cos.abs() + h * sin.abs()).ceil().max(1.0) as u32,
-            (w * sin.abs() + h * cos.abs()).ceil().max(1.0) as u32,
-        )
+        expanded_size(w, h, sin, cos)
     } else {
         (img.width(), img.height())
     };
@@ -139,10 +151,7 @@ pub fn rotate_image_hq(img: &RgbaImage, degrees: f32, expand: bool) -> (RgbaImag
     let rad = degrees.to_radians();
     let (sin, cos) = (rad.sin(), rad.cos());
     let (nw, nh) = if expand {
-        (
-            (w * cos.abs() + h * sin.abs()).ceil().max(1.0) as u32,
-            (w * sin.abs() + h * cos.abs()).ceil().max(1.0) as u32,
-        )
+        expanded_size(w, h, sin, cos)
     } else {
         (img.width(), img.height())
     };
@@ -181,8 +190,19 @@ fn rotate_to(
         return (RgbaImage::new(nw, nh), (0, 0));
     }
     let (w, h) = (iw as f32, ih as f32);
+    // 新左上角相对旧左上角的位移（调用方拿它平移图层 offset）。offset 只能
+    // 取整，所以这里先 round 定死，再让采样中心跟着它走。
+    let delta = (
+        ((w - nw as f32) / 2.0).round() as i32,
+        ((h - nh as f32) / 2.0).round() as i32,
+    );
     let (scx, scy) = (w / 2.0, h / 2.0);
-    let (dcx, dcy) = (nw as f32 / 2.0, nh as f32 / 2.0);
+    // ★中心用 `scx - delta` 反推，**不能**用 `nw / 2`。两者只在 (w-nw) 为
+    // 偶数时相等；奇数时差半个像素，原本该精确映射的 90°/180° 会整体偏
+    // 0.5px 并触发插值——叠加到 offset 的取整误差上，就是用户看到的
+    // "放手后位置有微小偏移"，以及转几次就发软。用 delta 反推后，源图中
+    // 心恰好落在「旧位置 + delta」上，和图层的整数 offset 严格一致。
+    let (dcx, dcy) = (scx - delta.0 as f32, scy - delta.1 as f32);
     let mut out = RgbaImage::new(nw, nh);
     let ctx = RotCtx {
         iw,
@@ -224,10 +244,6 @@ fn rotate_to(
             render_rows(dst, 0, src, &ctx);
         }
     }
-    let delta = (
-        ((w - nw as f32) / 2.0).round() as i32,
-        ((h - nh as f32) / 2.0).round() as i32,
-    );
     (out, delta)
 }
 
@@ -238,9 +254,7 @@ pub fn rotated_box_size(w: u32, h: u32, expand: bool) -> (u32, u32) {
     if !expand {
         return (w.max(1), h.max(1));
     }
-    let d = ((w as f32) * (w as f32) + (h as f32) * (h as f32))
-        .sqrt()
-        .ceil() as u32;
+    let d = (((w as f32) * (w as f32) + (h as f32) * (h as f32)).sqrt() - 1e-3).ceil() as u32;
     (d.max(1), d.max(1))
 }
 
