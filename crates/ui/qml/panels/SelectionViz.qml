@@ -404,13 +404,16 @@ Item {
         // 拾色器打开时隐藏（取色优先于缩放/移动）。
         // 旋转过之后框变成倾斜四边形，八向缩放手柄还是轴对齐的，两者一起
         // 显示会互相"打架"，这时只留倾斜框和旋柄。
-        // 注意：不能按 selTool 隐藏 —— selTool 默认就是上次用过的选区工具，
-        // 隐藏等于永久关掉图层缩放（画布上根本没有"无选区工具"入口）。
-        // 「点空白冒手柄」的根因是按下时不该拾取图层，见 CanvasSurface.layerPickAt。
+        // 快速选择 / 魔术棒激活时不显示：它们是「按住就涂」的手势，手柄压在
+        // 图层四角会抢走按下事件；PS 里这两个工具也没有变换框。
+        // （画布上的按下本身在 CanvasSurface.layerPickAt 里就不再拾取图层，
+        //  选区工具点空白不会冒出包围盒。）
         visible: host.selLayer !== null && host.selLayer.base !== true
                  && !host.selExists && bridge.image_width > 0
                  && !bridge.pickerOpen && !host.layerFrameRotated
-                 && host.paintTool === "none" && !host.rotating
+                 && host.paintTool === "none" && host.markTool === "none"
+                 && host.selTool !== "quick" && host.selTool !== "wand"
+                 && !host.rotating
         z: 8
         x: previewImage.x
         y: previewImage.y
@@ -446,7 +449,8 @@ Item {
         visible: host.selLayer !== null && host.selLayer.base !== true
                  && !host.selExists && bridge.image_width > 0
                  && !bridge.pickerOpen && host.scaleW === 0
-                 && host.paintTool === "none"
+                 && host.paintTool === "none" && host.markTool === "none"
+                 && host.selTool !== "quick" && host.selTool !== "wand"
         z: 10
         readonly property real s: host.toDispScale()
         readonly property real bx: host.selLayerBox !== null ? host.selLayerBox.x * s : 0

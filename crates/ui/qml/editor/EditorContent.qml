@@ -861,6 +861,9 @@ Shortcut { sequence: "Ctrl+A"
                     && !root.selFieldEditing
            onActivated: selectAllCanvas() }
 // ---- 选区（PS 快捷键）----
+// V = 移动工具（退出所有工具，回到「点图层即选中并拖动」+ 八向手柄）。
+Shortcut { sequence: "V"; enabled: root.canUseToolKeys()
+           onActivated: root.setMoveTool() }
 // M / Shift+M = 矩形 / 椭圆选框；L / Shift+L = 套索 / 多边形套索。
 Shortcut { sequence: "M"; enabled: root.canUseToolKeys()
            onActivated: root.setSelToolByShortcut("rect") }
@@ -1511,6 +1514,28 @@ function setSelToolByShortcut(tool) {
     setSelTool(tool)
 }
 
+// 移动工具（PS 的 V）：三种工具族全关掉，画布回到「点图层即选中并拖动」。
+// 只有这个状态才显示八向手柄 / 旋柄 —— 和 PS 一致，选框、快速选择、画笔、
+// 修复工具激活时画布只做那一件事，不会顺手选中图层（否则点空白就冒出一个
+// 8 点包围盒，正好压在要涂抹的像素上）。
+function setMoveTool() {
+    if (root.markTool !== "none") {
+        root.markTool = "none"
+        widthPopover.visible = false
+        mosaicPopover.visible = false
+    }
+    if (root.paintTool !== "none") {
+        view.canvasSurface.cancelPaint()
+        root.paintTool = "none"
+        root.closePaintPopovers()
+        root.savePaintSpec()
+    }
+    root.selTool = "none"
+    root.selPopoverOpen = false
+    view.canvasSurface.cancelPolygon()
+    view.canvasSurface.cancelQuickSelect()
+}
+
 // 标记栏「选区」按钮：开/关浮动面板。首次打开时顺手激活矩形选框，
 // 关掉面板时不动已经选好的工具（用户还在画选区）。
 function toggleSelPopover() {
@@ -1821,8 +1846,9 @@ function closePaintMenu() {
     root.paintMenuOpen = false
 }
 
-// 打开颜色面板并把目标切到「描边」或「填充」：油漆桶用描边色，
-// 渐变的终点色用填充色（顺手复用已有的两个颜色通道）。
+// 打开顶部工具栏的颜色面板（描边 / 填充）。
+// 修复 / 油漆的参数面板里点颜色**不**走这里：那边在面板内就地展开色板
+//（PaintPopover.colorSlot / ColorPalette），这条路径会收起参数面板。
 function openColorFor(fill) {
     root.closePaintPopovers()
     colorPopover.editingFill = fill
@@ -2893,6 +2919,25 @@ Timer {
         bridge.mark("selhit: top=" + (top === null ? "null" : top.i)
                     + " picked=" + (picked === null ? "null" : picked.i)
                     + " selTool=" + root.selTool)
+    }
+}
+
+// Probe: --probe-move 验证「移动模式（V / 移动按钮）」：切过去之后画布
+// 重新拾取图层，八向手柄和旋柄都回来。配合 --script=extract:…;select-layer:0。
+Timer {
+    id: moveProbeTimer
+    interval: 1300
+    running: Qt.application.arguments.indexOf("--probe-move") !== -1
+    onTriggered: {
+        root.setMoveTool()
+        const cs = view.canvasSurface
+        const cx = view.previewImage.width / 2 + view.pad
+        const cy = view.previewImage.height / 2 + view.pad
+        const picked = cs.layerPickAt(cx, cy)
+        bridge.mark("move-probe: selTool=" + root.selTool
+                    + " picked=" + (picked === null ? "null" : picked.i)
+                    + " handles=" + view.selectionViz.layerHandles.visible
+                    + " knob=" + view.selectionViz.rotateHandleBox.visible)
     }
 }
 

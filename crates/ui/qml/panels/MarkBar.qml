@@ -40,6 +40,46 @@ Rectangle {
         anchors.verticalCenter: parent.verticalCenter
         spacing: 2
 
+        // 移动工具（PS 的 V）：画布回到「点图层即选中并拖动」，八向手柄 /
+        // 旋柄只在它激活时出现。没有它的话，图层只能靠方向键挪 —— 选区工具
+        // 激活时画布按下不再拾取图层（否则点空白就冒包围盒）。
+        IconButton {
+            id: moveBtn
+            tip: "移动工具：拖动图层 / 缩放手柄 (V)"
+            active: bridge.image_width > 0
+            selected: host.selTool === "none" && host.markTool === "none"
+                      && host.paintTool === "none"
+            onClicked: host.setMoveTool()
+            // 四向箭头：画一个细十字 + 四个实心三角。
+            Canvas {
+                width: 22
+                height: 22
+                anchors.centerIn: parent
+                property color ink: moveBtn.selected ? "#ffffff" : "#e9eaec"
+                onInkChanged: requestPaint()
+                onPaint: {
+                    const c = getContext("2d")
+                    c.clearRect(0, 0, width, height)
+                    c.strokeStyle = ink
+                    c.fillStyle = ink
+                    c.lineWidth = 1.3
+                    c.beginPath()
+                    c.moveTo(11, 5.5); c.lineTo(11, 16.5)
+                    c.moveTo(5.5, 11); c.lineTo(16.5, 11)
+                    c.stroke()
+                    const tri = function (x1, y1, x2, y2, x3, y3) {
+                        c.beginPath()
+                        c.moveTo(x1, y1); c.lineTo(x2, y2); c.lineTo(x3, y3)
+                        c.closePath(); c.fill()
+                    }
+                    tri(11, 2.6, 8.4, 6.4, 13.6, 6.4)
+                    tri(11, 19.4, 8.4, 15.6, 13.6, 15.6)
+                    tri(2.6, 11, 6.4, 8.4, 6.4, 13.6)
+                    tri(19.4, 11, 15.6, 8.4, 15.6, 13.6)
+                }
+            }
+        }
+
         // 选区（PS 的选框工具）：点开浮动面板选矩形 / 椭圆 / 套索 /
         // 多边形。以前的整行固定选区工具条已经取消。
         IconButton {
@@ -469,8 +509,20 @@ Rectangle {
               ? "点击填色 · 有选区时只填选区里 · 右键调参数"
               : host.paintTool === "gradient"
               ? "拖一条线定义渐变方向 · 右键调参数"
+              // 选区工具：顺带说清「作用在哪一层」——选中图层时像素操作只动
+              // 那一层，没选中才动背景（PS 的语义）。
+              : host.selTool === "quick"
+              ? (bridge.selected_layer >= 0
+                 ? "按住涂抹吸附相近颜色 · 只作用选中图层 · Alt 减选"
+                 : "按住涂抹吸附相近颜色 · 未选图层时作用背景 · Alt 减选")
+              : host.selTool === "wand"
+              ? (bridge.selected_layer >= 0
+                 ? "点一下取相近颜色 · 只取选中图层 · Shift 加选 / Alt 减选"
+                 : "点一下取相近颜色 · 未选图层时取背景 · Shift 加选 / Alt 减选")
               : (host.markTool === "none"
-                 ? "选择工具绘制 · 点击标记可移动，双击文本可编辑"
+                 ? (host.selTool === "none" && bridge.selected_layer >= 0
+                    ? "拖动图层移动 · 四角缩放 · 顶部圆点旋转 · 方向键微调"
+                    : "选择工具绘制 · 点击标记可移动，双击文本可编辑")
                  : (host.markTool === "brush"
                     ? "按住拖拽绘制笔画"
                     : host.markTool === "mosaic"

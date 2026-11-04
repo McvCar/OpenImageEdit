@@ -69,8 +69,13 @@ Item {
     // 不会顺手选中图层（否则点空白就冒出一个 8 点包围盒，把手柄压在正要
     // 涂抹的像素上）。选中的图层由图层面板决定。已有选区 / 绘画工具同理。
     // 抽成函数是为了让探针直接验证这一条真实分支，而不是复制一份判断。
+    // 画布按下时要不要顺手选中图层（PS 里只有移动工具才这么做）。
+    // 三种工具族任意一个激活时都返回 null：选框 / 快速选择 / 魔术棒点画布
+    // 只该动选区。以前这里不看 selTool，于是"快速选择"第一笔就被判成
+    // "选中图层并拖动" —— 8 个蓝点包围盒冒出来，涂抹根本不生效。
     function layerPickAt(mx, my) {
-        if (host.selExists || host.paintTool !== "none" || host.selTool !== "none")
+        if (host.selTool !== "none" || host.paintTool !== "none"
+                || host.markTool !== "none")
             return null
         return host.topLayerAt(mx, my)
     }
