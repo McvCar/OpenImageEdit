@@ -194,6 +194,13 @@ pub(in crate::bridge) struct RotateLive {
 pub(in crate::bridge) struct LiveRotate {
     pub(in crate::bridge) index: usize,
     pub(in crate::bridge) snapshot: std::rc::Rc<Layer>,
+    /// 预览用的图层原点，必须取**当前**图层的 offset。
+    ///
+    /// ★不能用 `snapshot.offset`：`snapshot` 在连续旋转时会复用「没被插值过
+    ///   的原图」，那是第一次旋转前的状态，它的 offset 也比当前的小一圈（扩张
+    ///   过的外接矩形会往左上顶）。拿它出图，拖动时内容就画在旧位置上，松手
+    ///   提交（用当前 offset + delta）才"跳"进框里 —— 用户报的正是这个。
+    pub(in crate::bridge) offset: (i32, i32),
     pub(in crate::bridge) degrees: f32,
     pub(in crate::bridge) expand: bool,
     /// 会话编号：合成器用它判定「缩到预览尺寸的那张快照」还能不能复用。
@@ -498,7 +505,7 @@ impl Session {
                 target,
                 lr.index,
                 &lr.snapshot.image,
-                lr.snapshot.offset,
+                lr.offset,
                 lr.degrees,
                 lr.expand,
                 lr.token,

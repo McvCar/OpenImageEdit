@@ -666,6 +666,27 @@ impl qobject::Bridge {
                         }
                     }
                 }
+                // `rotate-hold:index,degrees[,expand]` —— 只 begin + update，
+                // **不 finish**：把拖动中的那一帧留在屏幕上，用来截图核对
+                // 「拖动中的内容位置」和松手后是否一致（以前预览用的是锚点的
+                // offset，拖动时内容停在旧位置，松手才跳进框里）。
+                other if other.starts_with("rotate-hold:") => {
+                    let n = parse_nums(other);
+                    if n.len() >= 2 {
+                        let (ix, deg) = (n[0] as i32, n[1]);
+                        let expand = n.get(2).copied().unwrap_or(1.0) > 0.5;
+                        let base = self.as_mut().rotate_layer_begin(ix, true);
+                        self.as_mut().rotate_layer_update(deg, expand);
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"rotate-hold\",\"base\":{base:.2},\
+                             \"degrees\":{deg:.2}}}"
+                        );
+                    } else {
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        )
+                    }
+                }
                 // `rotate-handle:index,degrees[,expand]` —— 模拟拖一次画布旋柄
                 // （begin keep_session → update → finish apply）。连写两条就等于
                 // 用户来回拖两次，用来验证「不会越拖越糊」。

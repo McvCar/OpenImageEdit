@@ -678,10 +678,28 @@ impl qobject::Bridge {
             session.live_cap = Some(LIVE_ROTATE_EDGE);
             let index = st.index;
             let snapshot = st.before.clone();
+            // ★预览的摆放基准 = **当前图层的中心**，和 finish 里的提交算法一致。
+            //
+            // 合成器画的是「snapshot 按 angle 转完、落在 offset+delta」的位置，
+            // 也就是以 snapshot.center 为转轴。但锚点 snapshot 不一定是图层现在
+            // 的样子（连续旋转时它是没被插值过的原图，尺寸更小、offset 也更早），
+            // 直接传 st.start.offset 会让「小图 + 大 offset」凑出一个错中心。
+            // 所以这里把 offset 折算成「让 snapshot 中心落在当前图层中心」的值。
+            let snap_w = snapshot.image.width() as f64;
+            let snap_h = snapshot.image.height() as f64;
+            let offset = (
+                (st.start.offset.0 as f64 + st.start.image.width() as f64 / 2.0
+                    - snap_w / 2.0)
+                    .round() as i32,
+                (st.start.offset.1 as f64 + st.start.image.height() as f64 / 2.0
+                    - snap_h / 2.0)
+                    .round() as i32,
+            );
             let token = st.token;
             session.live_rotate = Some(LiveRotate {
                 index,
                 snapshot,
+                offset,
                 degrees: total,
                 expand,
                 token,
@@ -714,13 +732,35 @@ impl qobject::Bridge {
                 let commit_t0 = std::time::Instant::now();
                 // 双三次：整段拖拽只在这里真正重采样一次，用双线性转完会整层
                 // 发软（用户反馈的"转一下就变模糊"）。
-                let (image, delta) = editcore::rotate_image_hq(&st.before.image, total, expand);
+                let (image, _delta) = editcore::rotate_image_hq(&st.before.image, total, expand);
+                // ★摆放必须按「当前图层的中心」算，不能用 `start.offset + delta`。
+                //
+                // `delta` 是相对 `before`（锚点原图）那张位图的位移，而 offset
+                // 取的是 `start`（当前图层，可能是上一次旋转烘焙出的更大位图）。
+                // 两者基准不同：80×80 第一次转 45° 变成 114×114，offset 减 17，
+                // 中心不变；再转 90° 时 delta=0，`start.offset + 0` 就少了这 17
+                // —— 松手瞬间图层往左上"跳"，而拖动中的预览（按中心转）是对的。
+                // 以中心摆放则是几何上唯一自洽的：转轴就是中心，尺寸怎么变，
+                // 中心都不动。
+                let cx = st.start.offset.0 as f64 + st.start.image.width() as f64 / 2.0;
+                let cy = st.start.offset.1 as f64 + st.start.image.height() as f64 / 2.0;
+                let offset = (
+                    (cx - image.width() as f64 / 2.0).round() as i32,
+                    (cy - image.height() as f64 / 2.0).round() as i32,
+                );
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"rotate-place\",\"start\":[{},{}],\"start_size\":[{}x{}],\
+                     \"new_size\":[{}x{}],\"placed\":[{},{}]}}",
+                    st.start.offset.0, st.start.offset.1,
+                    st.start.image.width(), st.start.image.height(),
+                    image.width(), image.height(), offset.0, offset.1
+                );
                 // 除像素之外的一切都取**当前**状态（st.start），而不是锚点那份：
                 // 两次旋转之间用户可能挪过图层、改过透明度/名字，这些都得留着。
                 let after = Layer {
                     name: st.start.name.clone(),
                     image,
-                    offset: (st.start.offset.0 + delta.0, st.start.offset.1 + delta.1),
+                    offset,
                     opacity: st.start.opacity,
                     visible: st.start.visible,
                     locked: st.start.locked,
