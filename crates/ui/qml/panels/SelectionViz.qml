@@ -313,7 +313,7 @@ Item {
         // 拖八向手柄缩放时框每帧都在变，框下沿已经有蓝色的实时数字，
         // 这里让位（否则两串数字叠在一起）；旋转中同理。
         visible: host.selLayer !== null && host.scaleW === 0 && !host.rotating
-                 && !host.rulerOn
+                 && host.moveMode && !host.rulerOn
                  && layerBadge.anchor !== null
         z: 8
         readonly property var anchor: {
@@ -383,7 +383,7 @@ Item {
     // Selected layer outline (dashed) + blue-dot handles for scaling.
     DashedRect {
         id: layerBoxViz
-        visible: host.selLayer !== null && host.scaleW === 0
+        visible: host.selLayer !== null && host.scaleW === 0 && host.moveMode
         z: 6
         x: previewImage.x
         y: previewImage.y
@@ -404,11 +404,12 @@ Item {
         // 旋转过之后框变成倾斜四边形，八向缩放手柄还是轴对齐的，两者一起
         // 显示会互相"打架"，这时只留倾斜框和旋柄。
         // 移动能力与工具**共存**：画笔 / 修补 / 油漆 / 选框激活时，只要图层
-        // 还选着，手柄就在（和改造前一致）。想收掉手柄就取消选择（Esc 或
-        // 移动模式下点空白）。
+        // 还选着，手柄就在（和改造前一致）。想收掉手柄就按 V 关掉移动工具，
+        // 或者取消选择（Esc / 移动模式下点空白）。
         // 只有快速选择 / 魔术棒例外：它们是「按住就涂」的手势，手柄压在
         // 图层四角会抢走按下事件；PS 里这两个工具也没有变换框。
         visible: host.selLayer !== null && host.selLayer.base !== true
+                 && host.moveMode
                  && !host.selExists && bridge.image_width > 0
                  && !bridge.pickerOpen && !host.layerFrameRotated
                  && host.selTool !== "quick" && host.selTool !== "wand"
@@ -447,6 +448,7 @@ Item {
         id: rotateHandleBox
         // 和缩放手柄一样与工具共存；快速选择 / 魔术棒下让位（同上）。
         visible: host.selLayer !== null && host.selLayer.base !== true
+                 && host.moveMode
                  && !host.selExists && bridge.image_width > 0
                  && !bridge.pickerOpen && host.scaleW === 0
                  && host.selTool !== "quick" && host.selTool !== "wand"

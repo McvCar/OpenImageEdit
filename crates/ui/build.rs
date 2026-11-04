@@ -26,6 +26,7 @@ fn main() {
                 "qml/panels/FontPopover.qml",
                 "qml/panels/LayerPanel.qml",
                 "qml/panels/MarkBar.qml",
+                "qml/panels/MarkShapePopover.qml",
                 "qml/panels/MosaicPopover.qml",
                 "qml/panels/OverflowMenu.qml",
                 "qml/panels/PaintPopover.qml",

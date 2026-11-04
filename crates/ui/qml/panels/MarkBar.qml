@@ -13,6 +13,8 @@ Rectangle {
     // 暴露给 4 个 Popover：placePopover 需要按钮作锚点（块内 id 跨文件不可达）。
     readonly property alias fontBtn: fontBtn
     readonly property alias mosaicBtn: mosaicBtn
+    // 形状 / 马赛克组的合并按钮（MarkShapePopover 贴它下面弹）。
+    readonly property alias markShapeBtn: markShapeBtn
     readonly property alias widthBtn: widthBtn
     readonly property alias colorBtn: colorBtn
     // 选区面板的锚点（选区工具已从独立工具条搬到这里）。
@@ -40,16 +42,14 @@ Rectangle {
         anchors.verticalCenter: parent.verticalCenter
         spacing: 2
 
-        // 移动工具（PS 的 V）：画布回到「点图层即选中并拖动」，八向手柄 /
-        // 旋柄只在它激活时出现。没有它的话，图层只能靠方向键挪 —— 选区工具
-        // 激活时画布按下不再拾取图层（否则点空白就冒包围盒）。
+        // 移动工具（PS 的 V）：一个**开关**，默认开。开着时图层可拖动/缩放，
+        // 并且和选区、画笔、标记工具并存；再点一次（或按 V）收起手柄。
         IconButton {
             id: moveBtn
-            tip: "移动工具：拖动图层 / 缩放手柄 (V)"
+            tip: "移动工具：拖动图层 / 缩放手柄（V 开关）"
             active: bridge.image_width > 0
-            selected: host.selTool === "none" && host.markTool === "none"
-                      && host.paintTool === "none"
-            onClicked: host.setMoveTool()
+            selected: host.moveMode
+            onClicked: host.toggleMoveTool()
             // 四向箭头：画一个细十字 + 四个实心三角。
             Canvas {
                 width: 22
@@ -112,23 +112,61 @@ Rectangle {
         Rectangle { width: 9; height: 18; color: "transparent"
             Rectangle { anchors.centerIn: parent; width: 1; height: 18; color: "#3c4043" } }
 
+        // 形状工具组合并成一个按钮：矩形 / 椭圆 / 箭头 / 马赛克 全收进
+        // 悬浮面板（点开选，和选区、油漆的做法一致），工具栏少三个按钮。
+        // 按钮图标跟着当前工具变，选着哪个一眼能看出来。
         IconButton {
-            glyph: "▭"
-            tip: "矩形标记（再点一次取消）"
-            selected: host.markTool === "rect"
-            onClicked: host.setMarkTool("rect")
-        }
-        IconButton {
-            glyph: "◯"
-            tip: "椭圆标记（再点一次取消）"
-            selected: host.markTool === "ellipse"
-            onClicked: host.setMarkTool("ellipse")
-        }
-        IconButton {
-            glyph: "↗"
-            tip: "箭头标记（再点一次取消）"
-            selected: host.markTool === "arrow"
-            onClicked: host.setMarkTool("arrow")
+            id: markShapeBtn
+            tip: "形状与马赛克（矩形 / 椭圆 / 箭头 / 马赛克）"
+            active: bridge.image_width > 0
+            selected: markShapePopover.visible
+                      || host.markTool === "rect" || host.markTool === "ellipse"
+                      || host.markTool === "arrow" || host.markTool === "mosaic"
+            onClicked: {
+                fontPopover.visible = false
+                widthPopover.visible = false
+                mosaicPopover.visible = false
+                markShapePopover.visible = !markShapePopover.visible
+            }
+            Canvas {
+                width: 22
+                height: 22
+                anchors.centerIn: parent
+                property color ink: markShapeBtn.selected ? "#ffffff" : "#e9eaec"
+                property string kind: (host.markTool === "ellipse"
+                                       || host.markTool === "arrow"
+                                       || host.markTool === "mosaic")
+                                      ? host.markTool : "rect"
+                onInkChanged: requestPaint()
+                onKindChanged: requestPaint()
+                onPaint: {
+                    const c = getContext("2d")
+                    c.clearRect(0, 0, width, height)
+                    c.strokeStyle = ink
+                    c.fillStyle = ink
+                    c.lineWidth = 1.5
+                    if (kind === "ellipse") {
+                        c.beginPath()
+                        c.ellipse(11, 11, 7.5, 5.5, 0, 0, Math.PI * 2)
+                        c.stroke()
+                    } else if (kind === "arrow") {
+                        c.beginPath()
+                        c.moveTo(5, 17); c.lineTo(16.5, 5.5)
+                        c.stroke()
+                        c.beginPath()
+                        c.moveTo(17, 5); c.lineTo(11.5, 6.5); c.lineTo(15.5, 10.5)
+                        c.closePath(); c.fill()
+                    } else if (kind === "mosaic") {
+                        for (let y = 0; y < 3; ++y)
+                            for (let x = 0; x < 3; ++x) {
+                                c.fillStyle = (x + y) % 2 === 0 ? ink : "#8a8f96"
+                                c.fillRect(4 + x * 5, 4 + y * 5, 4.4, 4.4)
+                            }
+                    } else {
+                        c.strokeRect(4, 6, 14, 10)
+                    }
+                }
+            }
         }
         IconButton {
             glyph: "✏"
@@ -149,33 +187,13 @@ Rectangle {
                 host.markTool = "none"
                 widthPopover.visible = false
                 mosaicPopover.visible = false
+                markShapePopover.visible = false
                 colorPopover.visible = false
                 bridge.add_text_mark(
                     bridge.image_width / 2 - 40, bridge.image_height / 2,
                     "文字", host.markFont, host.markFontSize,
                     host.markBold, host.markItalic, host.markColor)
                 fontPopover.visible = true
-            }
-        }
-        IconButton {
-            tip: "马赛克（划选区打码，再点一次取消）"
-            selected: host.markTool === "mosaic"
-            onClicked: host.setMarkTool("mosaic")
-            // 像素块图标：3x3 深浅交错的小方块，比 ▦ 更直观。
-            Grid {
-                anchors.centerIn: parent
-                columns: 3
-                spacing: 1
-                Repeater {
-                    model: 9
-                    Rectangle {
-                        required property int index
-                        width: 4
-                        height: 4
-                        radius: 1
-                        color: index % 2 === 0 ? "#e9eaec" : "#8a8f96"
-                    }
-                }
             }
         }
 
@@ -191,6 +209,7 @@ Rectangle {
             selected: fontPopover.visible
             onClicked: {
                 mosaicPopover.visible = false
+                markShapePopover.visible = false
                 fontPopover.visible = !fontPopover.visible
             }
             Text {
@@ -248,6 +267,7 @@ Rectangle {
                 colorPopover.visible = false
                 fontPopover.visible = false
                 mosaicPopover.visible = false
+                markShapePopover.visible = false
                 widthPopover.visible = !widthPopover.visible
             }
             Text {
@@ -268,6 +288,7 @@ Rectangle {
                 widthPopover.visible = false
                 fontPopover.visible = false
                 mosaicPopover.visible = false
+                markShapePopover.visible = false
                 colorPopover.visible = !colorPopover.visible
             }
             Rectangle {

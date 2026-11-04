@@ -493,6 +493,10 @@ Item {
     }
     // ---- 标记工具栏（markup toolbar）----
     property bool markBarVisible: false
+    // 移动工具（PS 的 V）：一个**开关**，不是互斥工具。开着时选中图层的
+    // 八向手柄 / 旋柄 / 描边 / 尺寸徽标都可用，并且能和选区、画笔、标记
+    // 和平共处；关掉就纯查看/绘制，碰不到图层几何。默认开。
+    property bool moveMode: true
     // Active drawing tool: "none" | "rect" | "ellipse" | "arrow"
     //                   | "brush" | "text" | "mosaic"
     property string markTool: "none"
@@ -861,9 +865,9 @@ Shortcut { sequence: "Ctrl+A"
                     && !root.selFieldEditing
            onActivated: selectAllCanvas() }
 // ---- 选区（PS 快捷键）----
-// V = 移动工具（退出所有工具，回到「点图层即选中并拖动」+ 八向手柄）。
+// V = 移动工具开关（开：图层可拖可缩放；关：手柄收起，碰不到图层）。
 Shortcut { sequence: "V"; enabled: root.canUseToolKeys()
-           onActivated: root.setMoveTool() }
+           onActivated: root.toggleMoveTool() }
 // M / Shift+M = 矩形 / 椭圆选框；L / Shift+L = 套索 / 多边形套索。
 Shortcut { sequence: "M"; enabled: root.canUseToolKeys()
            onActivated: root.setSelToolByShortcut("rect") }
@@ -1035,6 +1039,15 @@ WidthPopover {
 
 MosaicPopover {
     id: mosaicPopover
+    host: root
+    bridge: bridge
+    toolbar: toolbar
+    markBar: markBar
+}
+
+// 矩形 / 椭圆 / 箭头 / 马赛克 的合并面板（标记栏只留一个按钮）。
+MarkShapePopover {
+    id: markShapePopover
     host: root
     bridge: bridge
     toolbar: toolbar
@@ -1514,24 +1527,17 @@ function setSelToolByShortcut(tool) {
     setSelTool(tool)
 }
 
-// 移动工具（PS 的 V）：三种工具族全关掉，画布回到「点图层即选中并拖动」。
-// 只有这个状态才显示八向手柄 / 旋柄 —— 和 PS 一致，选框、快速选择、画笔、
-// 修复工具激活时画布只做那一件事，不会顺手选中图层（否则点空白就冒出一个
-// 8 点包围盒，正好压在要涂抹的像素上）。
-function setMoveTool() {
-    if (root.markTool !== "none") {
-        root.markTool = "none"
-        widthPopover.visible = false
-        mosaicPopover.visible = false
+// 移动工具（PS 的 V）：**开关**，不是工具族。开着时图层可拖可缩放，并且
+// 和选区 / 画笔 / 标记工具并存 —— 点手柄缩放的同时照样能画选区、能涂。
+// 关掉只影响「能不能碰图层几何」：手柄、描边、尺寸徽标一起收起，画布按下
+// 也不再拾取图层。默认开（见 moveMode）。
+function toggleMoveTool() {
+    root.moveMode = !root.moveMode
+    if (root.moveMode) {
+        // 重新打开时顺手取消正在画的多边形/快选预览，避免半截状态。
+        return
     }
-    if (root.paintTool !== "none") {
-        view.canvasSurface.cancelPaint()
-        root.paintTool = "none"
-        root.closePaintPopovers()
-        root.savePaintSpec()
-    }
-    root.selTool = "none"
-    root.selPopoverOpen = false
+    view.canvasSurface.cancelPaint()
     view.canvasSurface.cancelPolygon()
     view.canvasSurface.cancelQuickSelect()
 }
@@ -1743,6 +1749,7 @@ function setMarkTool(tool) {
     if (root.markTool === "none") {
         widthPopover.visible = false
         mosaicPopover.visible = false
+        markShapePopover.visible = false
     } else if (root.paintTool !== "none") {
         // 标记工具与修复 / 油漆工具互斥。
         view.canvasSurface.cancelPaint()
@@ -1750,6 +1757,13 @@ function setMarkTool(tool) {
         root.closePaintPopovers()
         root.savePaintSpec()
     }
+}
+
+// 从形状面板里**选中**某个工具（不是开关语义）：已经选着就保持不动，
+// 免得在面板里点自己反而把工具取消了。
+function chooseMarkTool(tool) {
+    if (root.markTool !== tool)
+        root.setMarkTool(tool)
 }
 
 // ---- 修复 / 油漆工具族 -------------------------------------------------
@@ -2929,12 +2943,13 @@ Timer {
     interval: 1300
     running: Qt.application.arguments.indexOf("--probe-move") !== -1
     onTriggered: {
-        root.setMoveTool()
+        root.moveMode = true
         const cs = view.canvasSurface
         const cx = view.previewImage.width / 2 + view.pad
         const cy = view.previewImage.height / 2 + view.pad
         const picked = cs.layerPickAt(cx, cy)
-        bridge.mark("move-probe: selTool=" + root.selTool
+        bridge.mark("move-probe: moveMode=" + root.moveMode
+                    + " selTool=" + root.selTool
                     + " picked=" + (picked === null ? "null" : picked.i)
                     + " handles=" + view.selectionViz.layerHandles.visible
                     + " knob=" + view.selectionViz.rotateHandleBox.visible)
