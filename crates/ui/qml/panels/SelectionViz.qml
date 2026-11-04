@@ -17,6 +17,37 @@ Item {
     property bool resizingSel: false
     property rect liveSelBox: Qt.rect(0, 0, 0, 0)
 
+    // ---- 旋转后的图层框（倾斜四边形）----
+    // 提交旋转时位图被扩成最小外接矩形，四角是透明像素；画轴对齐矩形就会
+    // 显得"框一下变大了"（900×700 转 45° → 1132×1132）。这里按"旋转前的
+    // 尺寸 + 累计角度"算出四个角，虚线框正好贴着旋转后的内容边走。
+    readonly property var layerQuad: {
+        if (!host.layerFrameRotated || host.selLayerBox === null)
+            return null
+        const w = host.layerFrameW
+        const h = host.layerFrameH
+        if (!(w > 0) || !(h > 0))
+            return null
+        const s = host.toDispScale()
+        const b = host.selLayerBox
+        const cx = (b.x + b.w / 2) * s
+        const cy = (b.y + b.h / 2) * s
+        const hw = w * s / 2
+        const hh = h * s / 2
+        const a = host.layerFrameAngle * Math.PI / 180
+        const ca = Math.cos(a)
+        const sa = Math.sin(a)
+        const out = []
+        const px = [-hw, hw, hw, -hw]
+        const py = [-hh, -hh, hh, hh]
+        for (let i = 0; i < 4; ++i) {
+            out.push(cx + px[i] * ca - py[i] * sa)
+            out.push(cy + px[i] * sa + py[i] * ca)
+        }
+        return out
+        return out
+    }
+
     // 角色（nw/n/ne/e/se/s/sw/w）→ 新包围盒（显示坐标，钳在画布内）。
     // 手柄拖过对边时（负宽高）的方向标记：liveSelBox 始终是正尺寸的框，
     // 松开时用它把「镜像」告诉 Rust。
@@ -282,6 +313,8 @@ Item {
         y: previewImage.y
         width: previewImage.width
         height: previewImage.height
+        // 旋转过就画倾斜四边形（贴合内容），否则画普通的轴对齐框。
+        quad: selectionViz.layerQuad
         rx: host.selLayerBox !== null ? host.selLayerBox.x * host.toDispScale() : 0
         ry: host.selLayerBox !== null ? host.selLayerBox.y * host.toDispScale() : 0
         rw: host.selLayerBox !== null ? host.selLayerBox.w * host.toDispScale() : 0
@@ -292,9 +325,11 @@ Item {
     EdgeHandles {
         id: layerHandles
         // 拾色器打开时隐藏（取色优先于缩放/移动）。
+        // 旋转过之后框变成倾斜四边形，八向缩放手柄还是轴对齐的，两者一起
+        // 显示会互相"打架"，这时只留倾斜框和旋柄。
         visible: host.selLayer !== null && host.selLayer.base !== true
                  && !host.selExists && bridge.image_width > 0
-                 && !bridge.pickerOpen
+                 && !bridge.pickerOpen && !host.layerFrameRotated
                  && host.paintTool === "none" && !host.rotating
         z: 8
         x: previewImage.x
@@ -338,8 +373,26 @@ Item {
         readonly property real by: host.selLayerBox !== null ? host.selLayerBox.y * s : 0
         readonly property real bw: host.selLayerBox !== null ? host.selLayerBox.w * s : 0
         readonly property real bh: host.selLayerBox !== null ? host.selLayerBox.h * s : 0
-        x: previewImage.x + bx + bw / 2
-        y: previewImage.y + by - 22
+        // 旋柄挂在框的顶边中点。旋转过之后顶边是斜的，用「中心 + 旋转后的
+        // (0,-h/2)」算，旋柄才会跟着内容走，而不是钉在大包围盒的顶上。
+        readonly property real knobX: {
+            if (!host.layerFrameRotated || host.selLayerBox === null)
+                return bx + bw / 2
+            const b = host.selLayerBox
+            const hh = host.layerFrameH * s / 2
+            const a = host.layerFrameAngle * Math.PI / 180
+            return (b.x + b.w / 2) * s + hh * Math.sin(a)
+        }
+        readonly property real knobY: {
+            if (!host.layerFrameRotated || host.selLayerBox === null)
+                return by
+            const b = host.selLayerBox
+            const hh = host.layerFrameH * s / 2
+            const a = host.layerFrameAngle * Math.PI / 180
+            return (b.y + b.h / 2) * s - hh * Math.cos(a)
+        }
+        x: previewImage.x + knobX
+        y: previewImage.y + knobY - 22
 
         // 连到框顶的细线
         Rectangle {

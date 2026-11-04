@@ -79,6 +79,14 @@ Item {
         }
     }
 
+    // 换了图层就不要沿用上一张的旋转角（尺寸凑巧一样时会画错框）。
+    Connections {
+        target: bridge
+        function onSelected_layerChanged() {
+            root.clearRotateFrame()
+        }
+    }
+
     // 把 win 调成"刚好装下这张图"：宽高 = 图片 100% 显示尺寸（逻辑像素）
     // + 画布以外的 chrome；装不下时图片按同一比例缩到屏幕内（保宽高比），
     // 不小于窗口最小尺寸；最大化/全屏不动。
@@ -451,6 +459,38 @@ Item {
     onLayerPanelSigChanged: layerPanelList = layerList
     readonly property var selLayer: findSelLayer()
     readonly property var selLayerBox: findLayerBox()
+    // ---- 旋转后的图层框 ----
+    // 松手提交时位图被扩成旋转后的**最小外接矩形**，四个角全是透明像素。
+    // 直接把这个矩形画成虚线框，看上去就是"每转一次框就大一圈"（900×700
+    // 转 45° 变 1132×1132）。这里记住旋转前的框尺寸和累计角度，由
+    // SelectionViz 画成贴合内容的倾斜四边形。
+    property var rotateFrame: null          // { w, h } 图像像素
+    property real rotateFrameAngle: 0       // 度，顺时针为正
+    // 只在「当前位图尺寸 == 这个角度应有的外接矩形」时才画倾斜框。
+    // 缩放、撤销、切换图层之后尺寸对不上，自动退回普通的轴对齐框——
+    // 不用在每个编辑入口手动清状态，也就不会漏。
+    readonly property bool layerFrameRotated: {
+        if (rotateFrame === null || Math.abs(rotateFrameAngle) <= 0.01)
+            return false
+        const b = selLayerBox
+        if (b === null || b.w <= 0 || b.h <= 0)
+            return false
+        const a = rotateFrameAngle * Math.PI / 180
+        const c = Math.abs(Math.cos(a))
+        const s = Math.abs(Math.sin(a))
+        const ew = Math.ceil(rotateFrame.w * c + rotateFrame.h * s - 0.001)
+        const eh = Math.ceil(rotateFrame.w * s + rotateFrame.h * c - 0.001)
+        return Math.abs(b.w - ew) <= 2 && Math.abs(b.h - eh) <= 2
+    }
+    readonly property real layerFrameW: rotateFrame !== null ? rotateFrame.w : 0
+    readonly property real layerFrameH: rotateFrame !== null ? rotateFrame.h : 0
+    // SelectionViz 统一用 layer* 前缀读这三个值（这里只是别名）。
+    readonly property real layerFrameAngle: rotateFrameAngle
+
+    function clearRotateFrame() {
+        root.rotateFrame = null
+        root.rotateFrameAngle = 0
+    }
     // ---- 标记工具栏（markup toolbar）----
     property bool markBarVisible: false
     // Active drawing tool: "none" | "rect" | "ellipse" | "arrow"
@@ -499,6 +539,8 @@ Item {
     // ---- 图层旋转（画布手柄）----
     property bool rotating: false
     property real rotateAnglePreview: 0
+    // 本轮旋转会话开始前已经累计的角度（连续拖手柄时非 0）。
+    property real rotateBase: 0
     // 拖动节流状态：上一帧算出的角度、上一帧真实耗时、上一帧的起算时刻。
     property real rotateRenderedAngle: 0
     property int rotateFrameCost: 0
@@ -1874,8 +1916,17 @@ function startLayerRotate() {
     root.rotateFrameCost = 0
     root.rotateLastAt = 0
     // keep_session = true：连续拖手柄时沿用上次留下的原图，避免一遍遍
-    // 重新插值（否则越拖越糊）。
-    bridge.rotate_layer_begin(bridge.selected_layer, true)
+    // 重新插值（否则越拖越糊）。返回值是本会话已经累计的角度：连续拖着
+    // 转时框要接着上次的角度画，不能从 0 重新开始。
+    const base = bridge.rotate_layer_begin(bridge.selected_layer, true)
+    root.rotateBase = base
+    if (Math.abs(base) < 0.001 || root.rotateFrame === null) {
+        // 新起一轮：记下"还没转"的框，之后的倾斜框以它为准。
+        const b = root.selLayerBox
+        if (b !== null && b.w > 0 && b.h > 0)
+            root.rotateFrame = { w: b.w, h: b.h }
+    }
+    root.rotateFrameAngle = base
 }
 
 function applyRotateFrame() {
@@ -1917,6 +1968,15 @@ function finishLayerRotate(apply) {
     root.rotating = false
     // 松手时可能还有一帧没算：把最终角度交给 finish，由它决定复用还是重算。
     bridge.rotate_layer_finish(apply, root.rotateAnglePreview, true)
+    if (!apply) {
+        root.rotateFrameAngle = root.rotateBase
+        return
+    }
+    let a = root.rotateBase + root.rotateAnglePreview
+    // 归一化到 (-180, 180]，转一整圈后框不该"看起来转了 360°"。
+    while (a > 180) a -= 360
+    while (a <= -180) a += 360
+    root.rotateFrameAngle = a
 }
 
 Timer {
@@ -2814,6 +2874,23 @@ Timer {
                     + " canvas=" + bridge.image_width + "x" + bridge.image_height
                     + " scaleW=" + Math.round(root.scaleW) + "," + Math.round(root.scaleH)
                     + " rotating=" + root.rotating)
+        // --probe-hand-rotate=deg：走**真实**的 QML 手势路径
+        //（start → preview → finish），验证旋转框状态机；直接调 Rust 的
+        // `rotate-handle:` 脚本不会经过这里。
+        const args = Qt.application.arguments
+        for (let i = 0; i < args.length; ++i) {
+            if (args[i].indexOf("--probe-hand-rotate=") !== 0)
+                continue
+            const deg = parseFloat(args[i].substring("--probe-hand-rotate=".length)) || 45
+            root.startLayerRotate()
+            root.previewLayerRotate(deg)
+            root.finishLayerRotate(true)
+            bridge.mark("hand-rotate: deg=" + deg + " angle=" + root.layerFrameAngle
+                        + " rotated=" + root.layerFrameRotated
+                        + " fw=" + root.layerFrameW + "x" + root.layerFrameH
+                        + " box=" + (root.selLayerBox
+                                     ? root.selLayerBox.w + "x" + root.selLayerBox.h : "null"))
+        }
     }
 }
 
@@ -2847,6 +2924,28 @@ Timer {
             bridge.mark("dragchurn:" + sent + " frames")
             Qt.quit()
         }
+    }
+}
+
+// Probe: --probe-rotate-frame 在脚本转完之后补上「旋转框」状态，用来截图
+// 核对倾斜虚线框。参数：--probe-rotate-frame=w,h,deg（默认 900,700,45）。
+Timer {
+    id: rotateFrameProbe
+    interval: 1200
+    repeat: false
+    onTriggered: {
+        let spec = "900,700,45"
+        const args = Qt.application.arguments
+        for (let i = 0; i < args.length; ++i)
+            if (args[i].indexOf("--probe-rotate-frame=") === 0)
+                spec = args[i].substring("--probe-rotate-frame=".length)
+        const p = spec.split(",")
+        root.rotateFrame = { w: parseInt(p[0], 10) || 900,
+                             h: parseInt(p[1], 10) || 700 }
+        root.rotateFrameAngle = parseFloat(p[2]) || 45
+        bridge.mark("rotate-frame:" + JSON.stringify(root.rotateFrame)
+                    + " angle=" + root.rotateFrameAngle
+                    + " rotated=" + root.layerFrameRotated)
     }
 }
 
@@ -2919,6 +3018,8 @@ Component.onCompleted: {
             rotateProbeTimer.start();
         if (Qt.application.arguments.indexOf("--probe-rotate-bench") !== -1)
             rotateBenchTimer.start();
+        if (Qt.application.arguments.indexOf("--probe-rotate-frame") !== -1)
+            rotateFrameProbe.start();
         if (Qt.application.arguments.indexOf("--probe-dragchurn") !== -1)
             dragChurnTimer.start();
         if (Qt.application.arguments.indexOf("--probe-adjustdrag") !== -1)
