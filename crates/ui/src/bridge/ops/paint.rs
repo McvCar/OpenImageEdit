@@ -611,17 +611,21 @@ impl qobject::Bridge {
             });
             return 0.0;
         }
-        // 锚点还新鲜才复用：同一个图层 + 真的转出过角度 + 图层内容还是
-        // 提交后的那一版。最后一条以前用 history_len 代替，别的图层动一下
-        // 锚点就废了，于是"再转一次"变成从已烘焙的位图重新起算，框也跟着
-        // 退回轴对齐——用户看到的就是角度"复位"。
+        // 锚点还新鲜才复用：同一个图层 + 真的转出过角度 + **像素内容**还是
+        // 提交后的那一版。
+        //
+        // ★这里只比 image，不比整个 Layer：以前比整个结构，于是图层只要被
+        //   挪动过 1px（offset 变了）锚点就废，base 归零，下一次旋转从已经
+        //   放大过的位图再转一遍 —— 转几次 45°，包围盒就 150→213→301 一路
+        //   长大。位移/透明度/名字跟"原图能不能接着转"无关，提交时都从
+        //   `st.start`（当前状态）取，所以挪过也能接着转。
         let reusable = session
             .rotate_origin
             .as_ref()
             .map(|o| {
                 o.index == ix
                     && o.degrees.abs() > 0.001
-                    && session.doc.layers[ix] == *o.committed
+                    && session.doc.layers[ix].image == o.committed.image
             })
             .unwrap_or(false);
         let (before, start, base) = if reusable {
@@ -636,6 +640,12 @@ impl qobject::Bridge {
             let one = std::rc::Rc::new(session.doc.layers[ix].clone());
             (one.clone(), one, 0.0)
         };
+        // 诊断：锚点有没有接上。base=0 且图层其实已经转过时，说明这次又从
+        // 烘焙过的位图重算 —— 包围盒就会一路长大。
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"rotate-anchor\",\"reuse\":{},\"base\":{:.2}}}",
+            reusable, base
+        );
         session.rotate_live = Some(RotateLive {
             index: ix,
             before,
@@ -705,13 +715,15 @@ impl qobject::Bridge {
                 // 双三次：整段拖拽只在这里真正重采样一次，用双线性转完会整层
                 // 发软（用户反馈的"转一下就变模糊"）。
                 let (image, delta) = editcore::rotate_image_hq(&st.before.image, total, expand);
+                // 除像素之外的一切都取**当前**状态（st.start），而不是锚点那份：
+                // 两次旋转之间用户可能挪过图层、改过透明度/名字，这些都得留着。
                 let after = Layer {
-                    name: st.before.name.clone(),
+                    name: st.start.name.clone(),
                     image,
-                    offset: (st.before.offset.0 + delta.0, st.before.offset.1 + delta.1),
-                    opacity: st.before.opacity,
-                    visible: st.before.visible,
-                    locked: st.before.locked,
+                    offset: (st.start.offset.0 + delta.0, st.start.offset.1 + delta.1),
+                    opacity: st.start.opacity,
+                    visible: st.start.visible,
+                    locked: st.start.locked,
                 };
                 // 像素其实没变（拖一圈又回原位）：别再记一条空历史。
                 if *st.start != after {

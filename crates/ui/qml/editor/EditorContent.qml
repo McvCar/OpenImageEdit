@@ -3036,14 +3036,21 @@ Timer {
         //（start → preview → finish），验证旋转框状态机；直接调 Rust 的
         // `rotate-handle:` 脚本不会经过这里。
         const args = Qt.application.arguments
+        let rotFirst = true
         for (let i = 0; i < args.length; ++i) {
             if (args[i].indexOf("--probe-hand-rotate=") !== 0)
                 continue
+            // --probe-frame-move：两次旋转之间把图层挪一下，核对锚点还接得上
+            // （以前挪动会让 base 归零，包围盒转一次大一圈）。
+            if (!rotFirst && args.indexOf("--probe-frame-move") !== -1)
+                bridge.translate_selected(7, 3)
+            rotFirst = false
             const deg = parseFloat(args[i].substring("--probe-hand-rotate=".length)) || 45
             root.startLayerRotate()
             root.previewLayerRotate(deg)
             root.finishLayerRotate(true)
-            bridge.mark("hand-rotate: deg=" + deg + " angle=" + root.layerFrameAngle
+            bridge.mark("hand-rotate: deg=" + deg + " base=" + root.rotateBase
+                        + " angle=" + root.layerFrameAngle
                         + " rotated=" + root.layerFrameRotated
                         + " fw=" + root.layerFrameW + "x" + root.layerFrameH
                         + " box=" + (root.selLayerBox
