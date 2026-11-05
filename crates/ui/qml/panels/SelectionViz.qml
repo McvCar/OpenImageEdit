@@ -297,20 +297,15 @@ Item {
         }
         readonly property real anchorX: anchor !== null ? anchor.x : 0
         readonly property real anchorY: anchor !== null ? anchor.y : 0
-        // 旋转提交后位图被扩成外接矩形（600×400 转 45° → 708×708），照 box
-        // 报会让人以为图案被放大了；这时报旋转前的真实尺寸（rotateFrame
-        // 记着那一份）。用字符串一次算清，免得多个 int 属性各自的更新时机
-        // 错开、文字停在旧值上。
+        // 徽标报的就是眼前这圈包围盒的真实尺寸。旋转 / 拉伸之后位图是外接
+        // 矩形，以前这里回退到 rotateFrame 记的「旋转前尺寸」，结果框明明
+        // 大了一圈、文字却还是老数字，看起来像程序算错了。用字符串一次算
+        // 清，免得多个 int 属性各自的更新时机错开、文字停在旧值上。
         readonly property string sizeText: {
             const b = host.selLayerBox
             if (b === null)
                 return ""
-            // 只有「框确实是那个旋转角对应的外接矩形」时才算数：缩放/撤销之后
-            // rotateFrame 可能还留着，但尺寸早变了，这时以实际 bounds 为准。
-            const f = host.layerFrameRotated ? host.rotateFrame : null
-            const w = f ? f.w : b.w
-            const h = f ? f.h : b.h
-            return "图层 " + Math.round(w) + " × " + Math.round(h)
+            return "图层 " + Math.round(b.w) + " × " + Math.round(b.h)
         }
 
         // 不钳画布：超出 previewImage 也照常画（PAD 区域里看得见）。

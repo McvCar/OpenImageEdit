@@ -110,6 +110,69 @@ impl Session {
         before
     }
 
+    /// 拉伸图层之后，把「连续旋转」的原图锚点同步到新尺寸。
+    ///
+    /// 旋转提交会把位图烘焙成**最小外接矩形**（四角是透明像素），锚点里
+    /// 留着未插值的原图 + 累计角度，这样接着转不会一遍遍重采样。但 `rotate_
+    /// origin` 的复用判据是「当前图层 image == 上次提交那一版」：用户一拖
+    /// 八向手柄，位图变了，锚点立刻作废。下一次旋转只能拿这张**已经烘焙过
+    /// 一次的外接矩形**当原图再转 —— 100 → 142(45°) → 拉伸 180 → 再转
+    /// 45° 变成 255，框越转越大（用户反馈的「描边变得很大」）。
+    ///
+    /// 这里按本次缩放的同一比例把锚点里的原图也缩放一份，并把 `committed`
+    /// 更新成缩放后的图层，让判据继续命中。外接矩形尺寸对原图尺寸是一次
+    /// 齐次的（`bbox_w = w|cos| + h|sin|`），所以同比例缩放原图后按同角度
+    /// 转回来，外接矩形仍是用户拉出来的那个尺寸；下一次旋转则从这个原图
+    /// 按**累计角度**重算，不再叠加一层透明角。
+    ///
+    /// 不重新烘焙当前位图：拉伸的所见即所得，也不会多一条历史 / 一次插值。
+    /// 镜像翻转与旋转的顺序不可交换，遇到翻转就放弃锚点（宁可退化一次）。
+    pub(in crate::bridge) fn sync_rotate_origin_after_scale(
+        &mut self,
+        ix: usize,
+        before_image: &RgbaImage,
+        to: Size,
+        flip: (bool, bool),
+    ) {
+        let (degrees, mut origin_layer) = {
+            let Some(o) = self.rotate_origin.as_ref() else {
+                return;
+            };
+            if o.index != ix
+                || o.degrees.abs() < 0.001
+                || o.committed.image != *before_image
+            {
+                return;
+            }
+            (o.degrees, (*o.layer).clone())
+        };
+        if flip.0 || flip.1 {
+            self.rotate_origin = None;
+            return;
+        }
+        let sx = to.width as f64 / before_image.width().max(1) as f64;
+        let sy = to.height as f64 / before_image.height().max(1) as f64;
+        let ow = (origin_layer.image.width() as f64 * sx).round().max(1.0) as u32;
+        let oh = (origin_layer.image.height() as f64 * sy).round().max(1.0) as u32;
+        let old = (origin_layer.image.width(), origin_layer.image.height());
+        origin_layer.image = render::resize_to(&origin_layer.image, Size::new(ow, oh));
+        let committed = match self.doc.layers.get(ix) {
+            Some(layer) => std::rc::Rc::new(layer.clone()),
+            None => return,
+        };
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"rotate-origin-scaled\",\"origin\":[{}x{}],\
+             \"scaled\":[{}x{}],\"degrees\":{:.2}}}",
+            old.0, old.1, ow, oh, degrees
+        );
+        self.rotate_origin = Some(RotateOrigin {
+            index: ix,
+            layer: std::rc::Rc::new(origin_layer),
+            degrees,
+            committed,
+        });
+    }
+
     pub(in crate::bridge) fn clear_selection(&mut self) {
         // 走文档的历史（选区是可撤销的文档状态）：Ctrl+Z 能把选区拿回来。
         let _ = self.doc.set_selection(None);

@@ -485,13 +485,21 @@ impl qobject::Bridge {
                 // modified during the gesture, so a cancel needs no rollback.
                 match session.live_scale.take() {
                     Some(ls) if ls.index == ix && commit => {
-                        match session.doc.scale_layer_flipped(
-                            ix,
-                            Size::new(w.max(1) as u32, h.max(1) as u32),
-                            (ox, oy),
-                            (flip_x, flip_y),
-                        ) {
+                        let to = Size::new(w.max(1) as u32, h.max(1) as u32);
+                        match session
+                            .doc
+                            .scale_layer_flipped(ix, to, (ox, oy), (flip_x, flip_y))
+                        {
                             Ok(()) => {
+                                // 旋转过的图层：拉伸会把连续旋转的原图锚点判据
+                                // 打废，下一次旋转只能拿已经烘焙过的外接矩形
+                                // 再转一遍（框平白再大 1.41 倍）。同步锚点尺寸。
+                                session.sync_rotate_origin_after_scale(
+                                    ix,
+                                    &ls.snapshot,
+                                    to,
+                                    (flip_x, flip_y),
+                                );
                                 session.dirty = true;
                                 outcome = Ok(true);
                             }

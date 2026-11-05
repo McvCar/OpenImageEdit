@@ -640,6 +640,45 @@ impl qobject::Bridge {
                         )
                     }
                 }
+                // `scale-layer:w,h` —— 模拟拖 8 点手柄把图层缩放到 w×h
+                // （保持中心不变），走真实 begin → update → end 链路。用来
+                // 复现「旋转 → 拉伸 → 再旋转」时外接矩形被二次烘焙、框越来
+                // 越大。配合 layer-info 前后各打一次读尺寸。
+                other if other.starts_with("scale-layer:") => {
+                    let n = parse_nums(other);
+                    if n.len() >= 2 {
+                        let w = n[0].round().max(1.0) as i32;
+                        let h = n[1].round().max(1.0) as i32;
+                        let ix = (*self.selected_layer()).max(0) as usize;
+                        let center = {
+                            let guard = self.session.borrow();
+                            guard.as_ref().and_then(|s| s.doc.layers.get(ix)).map(|l| {
+                                (
+                                    l.offset.0 as f64 + l.image.width() as f64 / 2.0,
+                                    l.offset.1 as f64 + l.image.height() as f64 / 2.0,
+                                )
+                            })
+                        };
+                        let (ox, oy) = match center {
+                            Some((cx, cy)) => (
+                                (cx - w as f64 / 2.0).round() as i32,
+                                (cy - h as f64 / 2.0).round() as i32,
+                            ),
+                            None => (0, 0),
+                        };
+                        self.as_mut().scale_layer_begin();
+                        self.as_mut().scale_layer_update(w, h, ox, oy, false, false);
+                        self.as_mut().scale_layer_end(true, w, h, ox, oy, false, false);
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"scale-layer\",\"w\":{w},\"h\":{h},\
+                             \"ox\":{ox},\"oy\":{oy}}}"
+                        );
+                    } else {
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        )
+                    }
+                }
                 // `layer-info:index[,tag]` —— 打印图层位图尺寸与 offset。
                 // 诊断"转一圈图层变大 / 放手后位置漂移"时直接读这几项，
                 // 别再从截图上量像素。
