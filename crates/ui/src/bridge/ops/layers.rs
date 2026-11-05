@@ -416,6 +416,9 @@ impl qobject::Bridge {
         }
         let mut guard = self.session.borrow_mut();
         if let Some(session) = guard.as_mut() {
+            // 合成器的 special 分支里 live_rotate 优先于 live_scale：上一次
+            // 没收尾的旋转会整个吞掉这次缩放预览。起手先清干净。
+            session.clear_live_gestures();
             if let Some(layer) = session.doc.layers.get(ix) {
                 session.live_scale = Some(LiveScaleState {
                     index: ix,
@@ -625,12 +628,32 @@ impl qobject::Bridge {
         }
     }
 
-    pub fn drag_translate_begin(self: Pin<&mut Self>) {
+    pub fn drag_translate_begin(mut self: Pin<&mut Self>) {
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
             return;
         };
         if self.layer_locked(ix) {
             return;
+        }
+        // ★起手先把可能残留的旋转 / 缩放临时预览态清干净。合成器只要还停在
+        //   special 分支，画的就是「旧快照 + 旧 offset」，而 layers_json 报的
+        //   是当前文档的新 offset —— 框跟着鼠标走、内容钉在原地。旋转 45°
+        //   之后拖图层最容易撞上（只有旋转会设置 live_rotate）。
+        let stale = {
+            let mut guard = self.session.borrow_mut();
+            guard
+                .as_mut()
+                .map(|s| s.clear_live_gestures())
+                .unwrap_or((false, false, false, false))
+        };
+        if stale.0 || stale.1 || stale.2 || stale.3 {
+            println!(
+                "{{\"phase\":\"ui\",\"event\":\"live-stale\",\"where\":\"drag-begin\",\
+                 \"rotate_live\":{},\"live_rotate\":{},\"live_scale\":{},\"cap\":{}}}",
+                stale.0, stale.1, stale.2, stale.3
+            );
+            // 立刻按真实文档重画一帧，把残留的临时合成帧换掉。
+            self.as_mut().refresh_preview();
         }
         let guard = self.session.borrow();
         if let Some(session) = guard.as_ref() {

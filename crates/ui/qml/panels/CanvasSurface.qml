@@ -306,6 +306,11 @@ Item {
             // 选区工具激活时不拾取图层（见 layerPickAt）。
             const hit = layerPickAt(mouse.x, mouse.y, mouse.modifiers)
             if (hit !== null) {
+                // 旋转手势万一没收尾（QML 丢了 released / canceled），先把角度
+                // 提交掉再起拖；Rust 的 drag_translate_begin 还会再兜一次底，
+                // 把残留的临时预览态清干净，避免「框拖走了、内容没动」。
+                if (host.rotating)
+                    host.finishLayerRotate(true)
                 if (bridge.selected_mark >= 0)
                     bridge.select_mark(-1)   // 标记/图层选中互斥
                 // 上一次拖动如果没收尾（切窗口、Alt+Tab、浮层抢焦点导致丢了

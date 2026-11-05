@@ -715,6 +715,19 @@ impl qobject::Bridge {
             let mut guard = self.session.borrow_mut();
             let Some(session) = guard.as_mut() else { return };
             let Some(st) = session.rotate_live.take() else {
+                // 迟到 / 重复的收尾（onReleased 之后又来一次 onCanceled，或
+                // QML 补的清理调用）：会话已经结束了，但临时预览态可能因为
+                // 更早漏发过 finish 而残留。清掉并按真实文档重画一帧。
+                let stale = session.clear_live_gestures();
+                if stale.0 || stale.1 || stale.2 || stale.3 {
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"live-stale\",\"where\":\"rotate-finish\",\
+                         \"rotate_live\":{},\"live_rotate\":{},\"live_scale\":{},\"cap\":{}}}",
+                        stale.0, stale.1, stale.2, stale.3
+                    );
+                }
+                drop(guard);
+                self.as_mut().refresh_preview();
                 return;
             };
             // 会话结束：撤销预览上限，丢掉临时旋转态（文档像素本来就还没动）。
@@ -791,6 +804,15 @@ impl qobject::Bridge {
                     commit_t0.elapsed().as_millis(),
                     total
                 );
+            }
+        }
+        // 收尾保险：不管走哪条分支，临时预览态都不许留到下一次手势。
+        // 上面只显式清了 live_cap / live_rotate，rotate_live 靠 take()，
+        // live_scale 则可能来自上一次没收到 released 的缩放手势。
+        {
+            let mut guard = self.session.borrow_mut();
+            if let Some(session) = guard.as_mut() {
+                session.clear_live_gestures();
             }
         }
         // 不管提交还是取消，都要重画一帧：拖动中看到的那张是临时合成出来的。

@@ -84,6 +84,32 @@ pub(in crate::bridge) struct Session {
 }
 
 impl Session {
+    /// 丢弃所有「手势进行中」的临时预览态。
+    ///
+    /// 旋转 / 缩放拖动期间合成器走 special 分支：用拖动起手的快照 + 固定
+    /// 的 offset / 角度临时画一帧，文档像素不动。正常由 `*_finish` 收尾清掉；
+    /// 一旦 QML 丢了 release / canceled（浮层抢焦点、切窗口、手柄在拖动中
+    /// 被隐藏），这些状态会**残留**。之后拖图层时 `layers_json` 照常报新
+    /// offset（框跟着鼠标走），预览却还在用旧快照和旧 offset（内容钉在原
+    /// 地）—— 就是「旋转 45° 后拖选框，框被拖走、图层不动」。旋转后特别
+    /// 容易撞上，因为只有旋转会设置 `live_rotate`。
+    ///
+    /// 不动 `rotate_origin`：它只决定下一次旋转从哪张原图起手，不参与合成。
+    /// 返回清理前的状态给调用方打诊断日志。
+    pub(in crate::bridge) fn clear_live_gestures(&mut self) -> (bool, bool, bool, bool) {
+        let before = (
+            self.rotate_live.is_some(),
+            self.live_rotate.is_some(),
+            self.live_scale.is_some(),
+            self.live_cap.is_some(),
+        );
+        self.rotate_live = None;
+        self.live_rotate = None;
+        self.live_scale = None;
+        self.live_cap = None;
+        before
+    }
+
     pub(in crate::bridge) fn clear_selection(&mut self) {
         // 走文档的历史（选区是可撤销的文档状态）：Ctrl+Z 能把选区拿回来。
         let _ = self.doc.set_selection(None);
