@@ -30,6 +30,14 @@ impl qobject::Bridge {
         install();
     }
 
+    /// 按当前 KIND 再 SetCursor 一次（不改状态）。
+    /// 用途：Qt 在 HoverHandler / MouseArea 的 cursorShape 变化时会自己
+    /// SetCursor，把刚设好的旋转光标盖掉（WM_SETCURSOR 要等鼠标移动才能
+    /// 改回来）。QML 在悬停进入的下一帧调这里，把光标钉回去。
+    pub fn cursor_refresh(self: Pin<&mut Self>) {
+        refresh();
+    }
+
     /// 修饰键状态：bit0 Shift / bit1 Ctrl / bit2 Alt。
     /// QML 拿不到「只按下修饰键、鼠标没动」的事件，只能靠悬停期间轮询这里。
     pub fn modifier_bits(self: Pin<&mut Self>) -> i32 {
@@ -79,6 +87,21 @@ fn set_kind(kind: i32) {
     }
     #[cfg(not(windows))]
     let _ = prev;
+}
+
+/// 按当前 KIND 再设置一次系统光标（kind=0 时不动）。
+fn refresh() {
+    #[cfg(windows)]
+    unsafe {
+        let kind = KIND.load(Ordering::Relaxed);
+        if kind > 0 {
+            if let Some(&cursor) = CURSORS.get().map(|list| &list[kind as usize]) {
+                if cursor != 0 {
+                    win::SetCursor(cursor);
+                }
+            }
+        }
+    }
 }
 
 fn modifier_bits() -> i32 {

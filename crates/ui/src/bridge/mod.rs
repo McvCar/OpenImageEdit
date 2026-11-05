@@ -844,6 +844,11 @@ pub mod qobject {
         #[qinvokable]
         fn cursor_install(self: Pin<&mut Self>);
 
+        /// 再 SetCursor 一次当前种类的光标。Qt 在 cursorShape 变化时会自己
+        /// 刷光标，把我们的盖掉；QML 在悬停进入的下一帧调这个钉回去。
+        #[qinvokable]
+        fn cursor_refresh(self: Pin<&mut Self>);
+
         /// 修饰键状态位：bit0 Shift / bit1 Ctrl / bit2 Alt（QML 轮询用）。
         #[qinvokable]
         fn modifier_bits(self: Pin<&mut Self>) -> i32;

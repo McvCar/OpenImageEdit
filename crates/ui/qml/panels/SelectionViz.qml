@@ -17,36 +17,11 @@ Item {
     property bool resizingSel: false
     property rect liveSelBox: Qt.rect(0, 0, 0, 0)
 
-    // ---- 旋转后的图层框（倾斜四边形）----
-    // 提交旋转时位图被扩成最小外接矩形，四角是透明像素；画轴对齐矩形就会
-    // 显得"框一下变大了"（900×700 转 45° → 1132×1132）。这里按"旋转前的
-    // 尺寸 + 累计角度"算出四个角，虚线框正好贴着旋转后的内容边走。
-    readonly property var layerQuad: {
-        if (!host.layerFrameRotated || host.selLayerBox === null)
-            return null
-        const w = host.layerFrameW
-        const h = host.layerFrameH
-        if (!(w > 0) || !(h > 0))
-            return null
-        const s = host.toDispScale()
-        const b = host.selLayerBox
-        const cx = (b.x + b.w / 2) * s
-        const cy = (b.y + b.h / 2) * s
-        const hw = w * s / 2
-        const hh = h * s / 2
-        const a = host.layerFrameAngle * Math.PI / 180
-        const ca = Math.cos(a)
-        const sa = Math.sin(a)
-        const out = []
-        const px = [-hw, hw, hw, -hw]
-        const py = [-hh, -hh, hh, hh]
-        for (let i = 0; i < 4; ++i) {
-            out.push(cx + px[i] * ca - py[i] * sa)
-            out.push(cy + px[i] * sa + py[i] * ca)
-        }
-        return out
-        return out
-    }
+    // ---- 拖动图层期间的显示偏移 --------------------------------------
+    // 文档 offset 松手才更新，框 / 蓝点 / 旋柄 / 徽标都加这两个值，才能
+    // 和正在拖的图层一起走（以前它们钉在旧位置，看起来像"框被拖走了"）。
+    readonly property real layerDx: host.layerOffX || 0
+    readonly property real layerDy: host.layerOffY || 0
 
     // 角色（nw/n/ne/e/se/s/sw/w）→ 新包围盒（显示坐标，钳在画布内）。
     // 手柄拖过对边时（负宽高）的方向标记：liveSelBox 始终是正尺寸的框，
@@ -212,8 +187,12 @@ Item {
         y: previewImage.y
         width: previewImage.width
         height: previewImage.height
-        bx: selectionViz.resizingSel ? selectionViz.liveSelBox.x : host.selX
-        by: selectionViz.resizingSel ? selectionViz.liveSelBox.y : host.selY
+        // 拖动选区时手柄要跟着**本地偏移**一起走（bridge 里的 selX 还没变），
+        // 否则只有蚂蚁线在跑，8 个圆点留在原地。
+        bx: selectionViz.resizingSel ? selectionViz.liveSelBox.x
+                                     : host.selX + (host.selOffX || 0)
+        by: selectionViz.resizingSel ? selectionViz.liveSelBox.y
+                                     : host.selY + (host.selOffY || 0)
         bw: selectionViz.resizingSel ? selectionViz.liveSelBox.width : host.selW
         bh: selectionViz.resizingSel ? selectionViz.liveSelBox.height : host.selH
         moveEnabled: false
@@ -271,17 +250,14 @@ Item {
             : ({ x: host.selX + (host.selOffX || 0),
                  y: host.selY + (host.selOffY || 0),
                  width: host.selW, height: host.selH })
-        x: previewImage.x
-           + Math.max(0, Math.min(selBadge.curBox.x,
-               previewImage.width - selBadge.width))
-        y: previewImage.y
-           + Math.min(previewImage.height - selBadge.height,
-                      selBadge.curBox.y + selBadge.curBox.height + 4)
+        // 同样不钳画布：选区贴边/出画布时徽标跟着它走，别横向滑到别处。
+        x: previewImage.x + selBadge.curBox.x
+        y: previewImage.y + selBadge.curBox.y + selBadge.curBox.height + 4
         width: selBadgeLabel.implicitWidth + 12
         height: selBadgeLabel.implicitHeight + 6
         radius: 3
-        color: "#43474d"
-        border.color: "#6b7076"
+        color: "#31363ccc"
+        border.color: "#ffffff33"
         border.width: 1
 
         Text {
@@ -303,11 +279,10 @@ Item {
         }
     }
 
-    // ---- 选中图层的尺寸徽标（图层描边左下角）--------------------------
-    // 和选区尺寸徽标同一套视觉：灰底小圆角 chip，图片上任何内容都读得清。
-    // 位置贴图层框的左下角：框底还有余量就画在框外 4px，贴到画布底部时
-    // 翻到框内，避免被视口切掉。旋转过的框是倾斜四边形，取四角里最靠下
-    // 的那个角（并列取更靠左的），跟着内容走而不是跟着大包围盒走。
+    // ---- 选中图层的尺寸徽标（图层框左下角）--------------------------
+    // 位置贴包围盒左下角，**允许画到画布外**（画布四周还有 PAD 的空白区）：
+    // 以前被钳在 previewImage 里，框一贴边徽标就横着滑走，看着像是跳到了
+    // 别的地方。背景也改成半透明，压在图案上不会糊成一块死黑。
     Rectangle {
         id: layerBadge
         // 拖八向手柄缩放时框每帧都在变，框下沿已经有蓝色的实时数字，
@@ -321,28 +296,13 @@ Item {
             if (b === null)
                 return null
             const s = host.toDispScale()
-            const q = selectionViz.layerQuad
-            if (q !== null && q.length === 8) {
-                // 取四个角里最靠下的那个（并列取更靠左的）：轴对齐时正好是
-                // 左下角，旋转后是内容的下尖角——视觉上始终贴着框的下沿。
-                let bx = q[0]
-                let by = q[1]
-                for (let i = 1; i < 4; ++i) {
-                    const x = q[i * 2]
-                    const y = q[i * 2 + 1]
-                    if (y > by + 0.5 || (Math.abs(y - by) <= 0.5 && x < bx)) {
-                        bx = x
-                        by = y
-                    }
-                }
-                return { x: bx, y: by }
-            }
-            return { x: b.x * s, y: (b.y + b.h) * s }
+            // 轴对齐包围盒的左下角（不再跟旋转后的斜边，框本身也已经是
+            // 唯一那圈虚线了，徽标贴着它才不显得游离）。
+            return { x: b.x * s + selectionViz.layerDx,
+                     y: (b.y + b.h) * s + selectionViz.layerDy }
         }
         readonly property real anchorX: anchor !== null ? anchor.x : 0
         readonly property real anchorY: anchor !== null ? anchor.y : 0
-        // 倾斜框时那个角是尖的，徽标以它为中心才不会压住半边框。
-        readonly property bool centered: selectionViz.layerQuad !== null
         // 旋转提交后位图被扩成外接矩形（600×400 转 45° → 708×708），照 box
         // 报会让人以为图案被放大了；这时报旋转前的真实尺寸（rotateFrame
         // 记着那一份）。用字符串一次算清，免得多个 int 属性各自的更新时机
@@ -356,63 +316,36 @@ Item {
             const f = host.layerFrameRotated ? host.rotateFrame : null
             const w = f ? f.w : b.w
             const h = f ? f.h : b.h
+            // 带着角度一起报：只剩轴对齐外接框之后，「框比图层大一圈」需要
+            // 一个解释，否则看起来像图被放大了。
+            const deg = f ? Math.round(Math.abs(host.layerFrameAngle)) : 0
             return "图层 " + Math.round(w) + " × " + Math.round(h)
+                   + (deg > 0 ? " · " + deg + "°" : "")
         }
 
-        x: previewImage.x + Math.max(0, Math.min(anchorX - (centered ? width / 2 : 0),
-                                                previewImage.width - width))
-        y: previewImage.y + (anchorY + 4 + height <= previewImage.height
-                             ? anchorY + 4
-                             : Math.max(0, anchorY - height - 4))
+        // 不钳画布：超出 previewImage 也照常画（PAD 区域里看得见）。
+        x: previewImage.x + anchorX
+        y: previewImage.y + anchorY + 4
         width: layerBadgeLabel.implicitWidth + 12
         height: layerBadgeLabel.implicitHeight + 6
         radius: 3
-        color: "#43474d"
-        border.color: "#6b7076"
+        color: "#31363ccc"
+        border.color: "#ffffff33"
         border.width: 1
 
         Text {
             id: layerBadgeLabel
             anchors.centerIn: parent
             text: layerBadge.sizeText
-            color: "#d5d8dd"
+            color: "#e6e9ed"
             font.pixelSize: 11
         }
     }
 
-    // 旋转过之后位图被烘焙成「最小外接矩形」，四个角是透明像素。八向手柄
-    // 贴的正是这个外接矩形（拖它缩放的也是它），所以这里再画一圈**细实线**
-    // 把手柄"接住"——用实线是为了和上面那条虚线的内容四边区分开，否则两个
-    // 虚线框叠在一起会看不出哪个是哪个。
-    Rectangle {
-        id: layerBBoxViz
-        visible: host.selLayer !== null && host.scaleW === 0 && host.moveMode
-                 && host.layerFrameRotated
-        z: 5
-        x: previewImage.x
-        y: previewImage.y
-        width: previewImage.width
-        height: previewImage.height
-        color: "transparent"
-        border.width: 0
-        readonly property real bx: host.selLayerBox !== null ? host.selLayerBox.x * host.toDispScale() : 0
-        readonly property real by: host.selLayerBox !== null ? host.selLayerBox.y * host.toDispScale() : 0
-        readonly property real bw: host.selLayerBox !== null ? host.selLayerBox.w * host.toDispScale() : 0
-        readonly property real bh: host.selLayerBox !== null ? host.selLayerBox.h * host.toDispScale() : 0
-
-        // 边框画在手柄位置上：用一个内缩 0.5 的矩形描边。
-        Rectangle {
-            x: layerBBoxViz.bx
-            y: layerBBoxViz.by
-            width: Math.max(0, layerBBoxViz.bw)
-            height: Math.max(0, layerBBoxViz.bh)
-            color: "transparent"
-            border.color: "#5b9dff66"
-            border.width: 1
-        }
-    }
-
-    // Selected layer outline (dashed) + blue-dot handles for scaling.
+    // Selected layer outline (dashed, axis-aligned bounding box) + handles.
+    // ★只留这一圈框：旋转过之后也只是包围盒（虚线），不再叠一层"跟着
+    //   内容倾斜的四边形"——两层框 + 一套圆点挤在一起，根本分不清哪个
+    //   能拖、哪个只是参考线。
     DashedRect {
         id: layerBoxViz
         visible: host.selLayer !== null && host.scaleW === 0 && host.moveMode
@@ -421,13 +354,14 @@ Item {
         y: previewImage.y
         width: previewImage.width
         height: previewImage.height
-        // 旋转过就画倾斜四边形（贴合内容），否则画普通的轴对齐框。
-        quad: selectionViz.layerQuad
-        rx: host.selLayerBox !== null ? host.selLayerBox.x * host.toDispScale() : 0
-        ry: host.selLayerBox !== null ? host.selLayerBox.y * host.toDispScale() : 0
+        rx: (host.selLayerBox !== null ? host.selLayerBox.x * host.toDispScale() : 0)
+            + selectionViz.layerDx
+        ry: (host.selLayerBox !== null ? host.selLayerBox.y * host.toDispScale() : 0)
+            + selectionViz.layerDy
         rw: host.selLayerBox !== null ? host.selLayerBox.w * host.toDispScale() : 0
         rh: host.selLayerBox !== null ? host.selLayerBox.h * host.toDispScale() : 0
-        dashColor: "#5b9dff99"
+        dashColor: "#6fb0ff"
+        halo: true
     }
 
     EdgeHandles {
@@ -454,9 +388,13 @@ Item {
         width: previewImage.width
         height: previewImage.height
         bx: host.scaleW > 0 ? host.scaleX
-                            : (host.selLayerBox !== null ? host.selLayerBox.x * host.toDispScale() : 0)
+                            : (host.selLayerBox !== null
+                               ? host.selLayerBox.x * host.toDispScale() + selectionViz.layerDx
+                               : selectionViz.layerDx)
         by: host.scaleW > 0 ? host.scaleY
-                            : (host.selLayerBox !== null ? host.selLayerBox.y * host.toDispScale() : 0)
+                            : (host.selLayerBox !== null
+                               ? host.selLayerBox.y * host.toDispScale() + selectionViz.layerDy
+                               : selectionViz.layerDy)
         bw: host.scaleW > 0 ? host.scaleW
                             : (host.selLayerBox !== null ? host.selLayerBox.w * host.toDispScale() : 0)
         bh: host.scaleW > 0 ? host.scaleH
@@ -487,9 +425,14 @@ Item {
                  && !bridge.pickerOpen && host.scaleW === 0
                  && host.selTool !== "quick" && host.selTool !== "wand"
         z: 10
+        // 手柄被藏起来时鼠标不会再发 onExited（它已经不接收 hover 了），
+        // rotateKnobHover 会卡在 true，光标就永远停在旋转图标上。
+        onVisibleChanged: if (!visible) host.rotateKnobHover = false
         readonly property real s: host.toDispScale()
-        readonly property real bx: host.selLayerBox !== null ? host.selLayerBox.x * s : 0
-        readonly property real by: host.selLayerBox !== null ? host.selLayerBox.y * s : 0
+        readonly property real bx: (host.selLayerBox !== null ? host.selLayerBox.x * s : 0)
+                                   + selectionViz.layerDx
+        readonly property real by: (host.selLayerBox !== null ? host.selLayerBox.y * s : 0)
+                                   + selectionViz.layerDy
         readonly property real bw: host.selLayerBox !== null ? host.selLayerBox.w * s : 0
         readonly property real bh: host.selLayerBox !== null ? host.selLayerBox.h * s : 0
         // 旋柄**固定**挂在包围盒顶边中点，不跟着倾斜的内容走。
@@ -525,8 +468,13 @@ Item {
                 // 命中范围比圆点大一圈，不然很难点中。
                 anchors.fill: parent
                 anchors.margins: -5
-                // Qt 没有旋转光标，这里让 Rust 侧的 Win32 光标接管（kind 4）。
-                cursorShape: Qt.CrossCursor
+                // ★cursorShape 必须是 undefined：这个 MouseArea 一旦写上
+                //   Qt.CrossCursor，Qt 会在鼠标进入时用 SetCursor 把它刷上去，
+                //   正好盖掉 Rust 侧刚设好的旋转光标（WM_SETCURSOR 只在鼠标
+                //   移动时才能改回来）—— 表现就是"第一次悬停不显示，动一下
+                //   或者转过一次之后才显示"。光标统一由 canvasCursor 的
+                //   Win32 通道接管，这里不参与。
+                cursorShape: undefined
                 hoverEnabled: true
                 preventStealing: true
                 property real startAngle: 0
@@ -535,7 +483,15 @@ Item {
                 property real pivotX: 0
                 property real pivotY: 0
                 // 悬停 → 旋转光标；拖动中即使滑出圆点也保持住。
-                onEntered: host.rotateKnobHover = true
+                onEntered: {
+                    host.rotateKnobHover = true
+                    // Qt 的 HoverHandler 可能在同一帧里更新 cursorShape 并把
+                    // 光标刷成十字，把我们的覆盖掉。next tick 再钉一次。
+                    Qt.callLater(function() {
+                        if (rotateMa.containsMouse)
+                            bridge.cursor_refresh()
+                    })
+                }
                 onExited: if (!pressed) host.rotateKnobHover = false
                 onPressed: (mouse) => {
                     host.rotateKnobHover = true

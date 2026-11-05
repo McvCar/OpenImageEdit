@@ -57,6 +57,13 @@ Item {
     property real selOffX: 0
     property real selOffY: 0
 
+    // ---- 拖动图层（pick-and-move）期间的临时显示偏移 ----
+    // 文档里的图层 offset 要等松手才提交（拖动中没有历史记录、也不重采样），
+    // 所以选框 / 8 个蓝点 / 旋柄 / 尺寸徽标都得靠这个偏移先跟着鼠标走。
+    // 以前它们直接读文档 offset：鼠标一动，只有图层在动，框钉在原地。
+    property real layerOffX: 0
+    property real layerOffY: 0
+
     // 把画布坐标换算成图像坐标（可能越界，交给 Rust 裁剪）。
     function toImage(mx, my) {
         const s = host.toDispScale()
@@ -307,12 +314,19 @@ Item {
             if (hit !== null) {
                 if (bridge.selected_mark >= 0)
                     bridge.select_mark(-1)   // 标记/图层选中互斥
+                // 点图层 = 选区退休（用户明确要求的 PS 手感）：不这么做的话
+                // 蚂蚁线会一直挂着，8 个图层点又被 `!selExists` 藏起来，画面上
+                // 只剩一套选区手柄 —— 拖着拖着就变成在拖选区，图层纹丝不动。
+                if (host.selExists)
+                    bridge.sel_clear()
                 // 上一次拖动如果没收尾（切窗口、Alt+Tab、浮层抢焦点导致丢了
                 // release），这些标志会残留为真，把这一次拖动整段吃掉。
                 // 既然现在明确要拖图层，就地清干净。
                 moveSelActive = false
                 selOffX = 0
                 selOffY = 0
+                layerOffX = 0
+                layerOffY = 0
                 bridge.select_layer(hit.i)
                 pickDrag = true
                 pickMoved = false
@@ -428,6 +442,12 @@ Item {
                     // rendered live.
                     liveTimer.start()
                 }
+                // 框 / 蓝点 / 旋柄 / 徽标都靠这两个偏移跟着走；没过阈值时
+                // 保持 0，免得手一抖框就先跳一下。
+                if (pickMoved) {
+                    layerOffX = curX - startX
+                    layerOffY = curY - startY
+                }
                 return
             }
             // 修补工具：第一段收顶点，第二段拖动取样偏移。
@@ -503,6 +523,11 @@ Item {
                     pickMoved = false
                     liveTimer.stop()
                     const scale = host.toImageScale()
+                    // 先归零再提交（和选区同一个套路）：文档 offset 更新和
+                    // 本地偏移叠加在同一帧里，框不会出现「新位置 + 旧偏移」
+                    // 的双倍位移闪一下。
+                    layerOffX = 0
+                    layerOffY = 0
                     bridge.drag_translate_update(
                         Math.round((curX - startX) * scale),
                         Math.round((curY - startY) * scale))
@@ -510,6 +535,8 @@ Item {
                     if (host.pasteFloating)
                         host.floatingOps += 1
                 }
+                layerOffX = 0
+                layerOffY = 0
                 return
             }
             if (patchDrawing) {
@@ -622,6 +649,8 @@ Item {
                 pickDrag = false
                 pickMoved = false
                 liveTimer.stop()
+                layerOffX = 0
+                layerOffY = 0
                 bridge.drag_translate_end(false)
             }
             if (moveSelActive) {
