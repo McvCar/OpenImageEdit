@@ -398,9 +398,6 @@ Item {
     // 拖动选区时的临时显示偏移（真值仍由 Rust 在松手时平移）。
     readonly property real selOffX: view.canvasSurface ? view.canvasSurface.selOffX : 0
     readonly property real selOffY: view.canvasSurface ? view.canvasSurface.selOffY : 0
-    // 拖动图层时的临时显示偏移（同上，松手才写文档 offset）。
-    readonly property real layerOffX: view.canvasSurface ? view.canvasSurface.layerOffX : 0
-    readonly property real layerOffY: view.canvasSurface ? view.canvasSurface.layerOffY : 0
     // 当前选区工具："rect" | "ellipse" | "lasso" | "polygon" | "wand"
     // | "quick" | "none"
     // 初值来自 settings.ini（上次用的那个），切工具时再写回去。
@@ -1382,8 +1379,7 @@ function canvasCursor(x, y) {
             return c
     }
     // 图层"可拖动"光标：移动工具开着、没有选区、鼠标落在未锁定图层上。
-    // ★不再额外要求 selTool === "none"：现在点图层就会清掉选区并直接开始拖
-    //   图层（即使选区工具还开着），光标继续显示十字会让人以为拖不动。
+    // 有选区时让位给下面的选区框光标（选区优先，不误导成"能拖图层"）。
     if (root.moveMode && !root.selExists && bridge.image_width > 0) {
         const hit = topLayerAt(x, y)
         if (hit !== null && !Layers.isLocked(hit))

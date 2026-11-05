@@ -24,9 +24,12 @@ Item {
         targetIndex = index
         angle = 0
         expand = true
-        // keep_session = false：对话框是从「图层当前的样子」出发的一次性
-        // 操作，0 度永远等于现状（不会因为之前用手柄转过而跳回去）。
-        bridge.rotate_layer_begin(index, false)
+        // ★keep_session = true：连续多次打开对话框输入不同角度时，沿用上一次
+        //   留下的**未插值原图**累加角度。以前用 false，每次都拿「已经烘焙成
+        //   外接矩形的位图」再转一遍 —— 转几次随机角度，四角透明区域反复
+        //   叠外接矩形，框就一路变大、图也越来越糊。
+        //   角度 0 仍然等于现状（total = base + 0，重采样结果与当前相同）。
+        bridge.rotate_layer_begin(index, true)
         visible = true
         previewTimer.restart()
     }

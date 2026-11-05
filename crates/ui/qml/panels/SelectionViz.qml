@@ -17,13 +17,7 @@ Item {
     property bool resizingSel: false
     property rect liveSelBox: Qt.rect(0, 0, 0, 0)
 
-    // ---- 拖动图层期间的显示偏移 --------------------------------------
-    // 文档 offset 松手才更新，框 / 蓝点 / 旋柄 / 徽标都加这两个值，才能
-    // 和正在拖的图层一起走（以前它们钉在旧位置，看起来像"框被拖走了"）。
-    readonly property real layerDx: host.layerOffX || 0
-    readonly property real layerDy: host.layerOffY || 0
-
-    // 角色（nw/n/ne/e/se/s/sw/w）→ 新包围盒（显示坐标，钳在画布内）。
+    // ---- 角色（nw/n/ne/e/se/s/sw/w）→ 新包围盒 ----
     // 手柄拖过对边时（负宽高）的方向标记：liveSelBox 始终是正尺寸的框，
     // 松开时用它把「镜像」告诉 Rust。
     property bool liveFlipX: false
@@ -256,8 +250,8 @@ Item {
         width: selBadgeLabel.implicitWidth + 12
         height: selBadgeLabel.implicitHeight + 6
         radius: 3
-        color: "#31363ccc"
-        border.color: "#ffffff33"
+        color: "#cc43474d"
+        border.color: "#6b7076"
         border.width: 1
 
         Text {
@@ -296,10 +290,10 @@ Item {
             if (b === null)
                 return null
             const s = host.toDispScale()
-            // 轴对齐包围盒的左下角（不再跟旋转后的斜边，框本身也已经是
-            // 唯一那圈虚线了，徽标贴着它才不显得游离）。
-            return { x: b.x * s + selectionViz.layerDx,
-                     y: (b.y + b.h) * s + selectionViz.layerDy }
+            // 轴对齐包围盒的左下角。位置真值就是文档里的图层 offset，
+            // 拖动时 Rust 会实时刷新 layers_json，这里不需要（也不能）
+            // 再叠一份鼠标位移。
+            return { x: b.x * s, y: (b.y + b.h) * s }
         }
         readonly property real anchorX: anchor !== null ? anchor.x : 0
         readonly property real anchorY: anchor !== null ? anchor.y : 0
@@ -316,11 +310,7 @@ Item {
             const f = host.layerFrameRotated ? host.rotateFrame : null
             const w = f ? f.w : b.w
             const h = f ? f.h : b.h
-            // 带着角度一起报：只剩轴对齐外接框之后，「框比图层大一圈」需要
-            // 一个解释，否则看起来像图被放大了。
-            const deg = f ? Math.round(Math.abs(host.layerFrameAngle)) : 0
             return "图层 " + Math.round(w) + " × " + Math.round(h)
-                   + (deg > 0 ? " · " + deg + "°" : "")
         }
 
         // 不钳画布：超出 previewImage 也照常画（PAD 区域里看得见）。
@@ -329,15 +319,15 @@ Item {
         width: layerBadgeLabel.implicitWidth + 12
         height: layerBadgeLabel.implicitHeight + 6
         radius: 3
-        color: "#31363ccc"
-        border.color: "#ffffff33"
+        color: "#cc43474d"
+        border.color: "#6b7076"
         border.width: 1
 
         Text {
             id: layerBadgeLabel
             anchors.centerIn: parent
             text: layerBadge.sizeText
-            color: "#e6e9ed"
+            color: "#d5d8dd"
             font.pixelSize: 11
         }
     }
@@ -354,14 +344,12 @@ Item {
         y: previewImage.y
         width: previewImage.width
         height: previewImage.height
-        rx: (host.selLayerBox !== null ? host.selLayerBox.x * host.toDispScale() : 0)
-            + selectionViz.layerDx
-        ry: (host.selLayerBox !== null ? host.selLayerBox.y * host.toDispScale() : 0)
-            + selectionViz.layerDy
+        rx: host.selLayerBox !== null ? host.selLayerBox.x * host.toDispScale() : 0
+        ry: host.selLayerBox !== null ? host.selLayerBox.y * host.toDispScale() : 0
         rw: host.selLayerBox !== null ? host.selLayerBox.w * host.toDispScale() : 0
         rh: host.selLayerBox !== null ? host.selLayerBox.h * host.toDispScale() : 0
-        dashColor: "#6fb0ff"
-        halo: true
+        dashColor: "#5b9dff99"
+        animated: false
     }
 
     EdgeHandles {
@@ -388,13 +376,9 @@ Item {
         width: previewImage.width
         height: previewImage.height
         bx: host.scaleW > 0 ? host.scaleX
-                            : (host.selLayerBox !== null
-                               ? host.selLayerBox.x * host.toDispScale() + selectionViz.layerDx
-                               : selectionViz.layerDx)
+                            : (host.selLayerBox !== null ? host.selLayerBox.x * host.toDispScale() : 0)
         by: host.scaleW > 0 ? host.scaleY
-                            : (host.selLayerBox !== null
-                               ? host.selLayerBox.y * host.toDispScale() + selectionViz.layerDy
-                               : selectionViz.layerDy)
+                            : (host.selLayerBox !== null ? host.selLayerBox.y * host.toDispScale() : 0)
         bw: host.scaleW > 0 ? host.scaleW
                             : (host.selLayerBox !== null ? host.selLayerBox.w * host.toDispScale() : 0)
         bh: host.scaleW > 0 ? host.scaleH
@@ -429,10 +413,8 @@ Item {
         // rotateKnobHover 会卡在 true，光标就永远停在旋转图标上。
         onVisibleChanged: if (!visible) host.rotateKnobHover = false
         readonly property real s: host.toDispScale()
-        readonly property real bx: (host.selLayerBox !== null ? host.selLayerBox.x * s : 0)
-                                   + selectionViz.layerDx
-        readonly property real by: (host.selLayerBox !== null ? host.selLayerBox.y * s : 0)
-                                   + selectionViz.layerDy
+        readonly property real bx: host.selLayerBox !== null ? host.selLayerBox.x * s : 0
+        readonly property real by: host.selLayerBox !== null ? host.selLayerBox.y * s : 0
         readonly property real bw: host.selLayerBox !== null ? host.selLayerBox.w * s : 0
         readonly property real bh: host.selLayerBox !== null ? host.selLayerBox.h * s : 0
         // 旋柄**固定**挂在包围盒顶边中点，不跟着倾斜的内容走。
@@ -517,7 +499,14 @@ Item {
                     host.rotateKnobHover = containsMouse
                 }
                 onCanceled: {
-                    host.finishLayerRotate(false)
+                    // ★丢失鼠标捕获（滑出窗口 / 焦点被抢 / 触控板丢帧）时 Qt
+                    //   只发 canceled，不会发 released。以前这里按「取消」处理：
+                    //   用户已经转好的角度被回滚（"放手后复位"），Rust 还会顺手
+                    //   丢掉 rotate_origin 锚点 —— 下一次旋转只能从已经烘焙过
+                    //   的外接矩形位图起手，框就越转越大、图越转越糊。
+                    //   现在按「提交当前角度」处理：真没动过就是 neutral，
+                    //   不会产生历史，也不会清锚点。
+                    host.finishLayerRotate(true)
                     host.rotateKnobHover = false
                 }
             }

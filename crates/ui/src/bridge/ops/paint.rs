@@ -723,12 +723,13 @@ impl qobject::Bridge {
             let total = st.base_degrees + degrees as f32;
             // 这次拖拽的净效果为零（含「压根没动」）：文档没被改过，什么都不用做。
             let neutral = !apply || (total - st.base_degrees).abs() < 0.001;
-            if neutral {
-                if !apply {
-                    // 取消 = 丢掉连续会话的锚点，下次从头开始。
-                    session.rotate_origin = None;
-                }
-            } else {
+            // 本次没产生净变化（含「压根没动」）：文档没被改过，什么都不用做。
+            // ★取消也不要丢连续会话的锚点：文档像素和提交时完全一致，锚点
+            //   依然有效，下一次 begin 的判据会照常命中。以前一取消就清掉，
+            //   下一轮只能拿「已经烘焙成外接矩形的位图」当原图起手 —— 用户
+            //   取消过一次之后再转，框就会平白大一圈。
+            //   （对话框 / Esc 的取消同样落在这里。）
+            if !neutral {
                 let commit_t0 = std::time::Instant::now();
                 // 双三次：整段拖拽只在这里真正重采样一次，用双线性转完会整层
                 // 发软（用户反馈的"转一下就变模糊"）。
