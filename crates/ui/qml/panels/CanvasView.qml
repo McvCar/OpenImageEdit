@@ -239,10 +239,12 @@ Flickable {
         property string shownUrl: ""
         // false = previewA 在前台（显示 shownUrl），true = previewB 在前台。
         property bool frontIsB: bool
-        // 「上一帧还在解码」的起始时刻（见 previewBusy）。
+        // 「上一帧还在解码」的起始时刻（见 previewBusy / pulse）。
         property double pendingSince: 0
         // 还没派给后台 Image 的最新一帧。
         property string pendingUrl: ""
+        // 同一帧连续重派次数（pulse 里用；3 次以后改同步解码兜底）。
+        property int retries: 0
 
         // 新的一帧到了：记下来交给后台那张去解（同一时刻只有一次解码在跑）。
         function pushUrl(url) {
@@ -255,22 +257,54 @@ Flickable {
                 return
             }
             pendingUrl = url
+            retries = 0
             pumpPreview()
         }
 
-        // 把待播的那一帧交给后台 Image。★后台还在解码就先不动它：换 source
-        // 会取消上一次解码，改到最后谁也不上屏（实测不设这道闸时 115 次渲染
-        // 只有 35 帧真正上屏）。等这次解码完（换台时再调一次）补上最新帧。
+        // 把待播的那一帧交给后台 Image。
+        //
+        // ★不能再「后台还在 Loading 就一直等」：帧是异步解码的，只要有一次
+        //   加载没回来（环形临时文件正好在这一刻被删、解码线程被取消、或者
+        //   后台那张当时不可见而没建纹理），`back.source === pendingUrl` 就
+        //   永远成立，pumpPreview 每次都提前 return，`frameReady` 又不会再来
+        //   ——画面冻在拖动前那一帧，松手也不更新，要再动一下图层才恢复
+        //   （用户 11-08 报的「拖的时候图层被背景挡住、松手没变大」）。
+        //   所以只在「刚派下去 200ms 内」等，超时由 pulse() 强制重开。
         function pumpPreview() {
             if (pendingUrl.length === 0 || pendingUrl === shownUrl)
                 return
             const back = frontIsB ? previewA : previewB
-            if (back.status === Image.Loading)
+            const backUrl = back.source.toString()
+            if (backUrl === pendingUrl) {
+                // 已经派下去了：要么等 Ready（frameReady 换台），要么等 pulse 重开。
                 return
-            if (back.source.toString() === pendingUrl)
+            }
+            if (back.status === Image.Loading && Date.now() - pendingSince < 200)
                 return
-            back.source = pendingUrl
+            dispatch(back, pendingUrl)
+        }
+
+        // 真正换 source。上一次兜底可能把这张改成同步解码，这里恢复异步。
+        function dispatch(img, url) {
+            if (!img.asynchronous)
+                img.asynchronous = true
+            img.source = url
             pendingSince = Date.now()
+        }
+
+        // 换台：后台那张已经是待播帧，直接翻到前台。
+        function adopt(img) {
+            const url = img.source.toString()
+            if (url.length === 0 || url === shownUrl)
+                return
+            shownUrl = url
+            frontIsB = !frontIsB
+            retries = 0
+            if (!host.imageRendered)
+                host.imageRendered = true
+            bridge.image_shown()
+            // 换台后后台空出来了：如果期间又来了新帧，接着派。
+            pumpPreview()
         }
 
         // 上一帧还没上屏（后台仍在解码）时返回 true。
@@ -284,6 +318,43 @@ Flickable {
                 return false
             // 卡太久（文件被占用/解码失败）就不再等，让上层照常出帧。
             return pendingSince === 0 || Date.now() - pendingSince < 400
+        }
+
+        // 定时推进（16ms）：保证「有帧待播」这件事最终一定会被处理掉。
+        //
+        // 三种情况：
+        //  1) 后台已经解好但信号没接上（Ready 后 source 变了下一次又对不上）
+        //     → 直接 adopt；
+        //  2) 后台停在 Loading 超过 200ms → 清源重开（同名 URL Qt 不会自己
+        //     重试，必须置空再设才会重新读文件）；
+        //  3) 连试 3 次还不行 → 这张改同步解码（拖动帧都不大，宁可掉一帧
+        //     也不能把画面冻死），下一帧派发时再恢复异步。
+        function pulse() {
+            if (pendingUrl.length === 0 || pendingUrl === shownUrl)
+                return
+            const back = frontIsB ? previewA : previewB
+            const backUrl = back.source.toString()
+            if (backUrl !== pendingUrl) {
+                if (back.status !== Image.Loading)
+                    pumpPreview()
+                return
+            }
+            if (back.status === Image.Ready) {
+                adopt(back)
+                return
+            }
+            if (Date.now() - pendingSince < 200)
+                return
+            retries += 1
+            if (retries >= 3) {
+                back.asynchronous = false
+                back.source = ""
+                back.source = pendingUrl
+            } else {
+                back.source = ""
+                back.source = pendingUrl
+            }
+            pendingSince = Date.now()
         }
 
         // 显示比例一变（缩放手势的预测拉伸也算）就重映射选区。
@@ -316,23 +387,22 @@ Flickable {
             const isFront = img === (frontIsB ? previewB : previewA)
             if (isFront)
                 return
-            const url = img.source.toString()
-            if (url.length === 0 || url === shownUrl)
-                return
-            shownUrl = url
-            frontIsB = !frontIsB
-            if (!host.imageRendered)
-                host.imageRendered = true
-            bridge.image_shown()
-            // 换台后后台空出来了：如果期间又来了新帧，接着派。
-            pumpPreview()
+            adopt(img)
         }
 
         Image {
             id: previewA
             width: parent.width
             height: parent.height
-            visible: !previewImage.frontIsB
+            // ★用 opacity 分前后台，**不要**用 visible 隐藏后台那张：
+            //   cache:false 的 Image 一旦不可见，Qt 会把它的 pixmap 卸掉
+            //   （QQuickImageBase 在 ItemVisibleHasChanged 时 unload），
+            //   正在进行的那次异步解码就此没了下文 —— status 永远停在
+            //   Loading，frameReady 不触发，双缓冲再也换不了台。表现就是
+            //   「拖动时画面冻住、松手也不更新」。opacity:0 的 item 仍然
+            //   参与渲染，纹理和解码都照常。
+            visible: true
+            opacity: previewImage.frontIsB ? 0 : 1
             cache: false
             // ★异步解码。Image 默认是同步的：`source` 一变就在 setSource 里
             // 当场解码整张 BMP（1917×1278 约 10ms），这笔开销直接叠在拖动
@@ -350,7 +420,8 @@ Flickable {
             id: previewB
             width: parent.width
             height: parent.height
-            visible: previewImage.frontIsB
+            visible: true
+            opacity: previewImage.frontIsB ? 1 : 0
             cache: false
             asynchronous: true
             fillMode: Image.Stretch
@@ -369,18 +440,18 @@ Flickable {
             }
         }
 
-        // 看门狗：待播帧迟迟没上屏就强制重派一次。
+        // 看门狗：待播帧迟迟没上屏就推动一次（见 pulse 的三种处理）。
         //
         // `pushUrl` 只在**来了新帧**时才被调用，所以「最后一帧丢了」没有任何
         // 后续事件能补救：解码失败（临时文件被环形删除）、后台那张被取消、
-        // 或者松开手后不再有渲染 —— 画面就永远停在上一帧，只有再动一下
-        // 图层（触发新渲染）才恢复。定时重试把这条链子接上。
+        // 或者松开手后不再有渲染 —— 画面会停在上一帧，只有再动一下图层
+        // （触发新渲染）才恢复。16ms 推进 + 200ms 超时重开把这条链子接上。
         Timer {
-            interval: 250
+            interval: 16
             repeat: true
             running: previewImage.pendingUrl.length > 0
                      && previewImage.pendingUrl !== previewImage.shownUrl
-            onTriggered: previewImage.pumpPreview()
+            onTriggered: previewImage.pulse()
         }
 
         // 打开文件时 url 在 Connections 建立之前就设好了，补一次。

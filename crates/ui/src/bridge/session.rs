@@ -764,12 +764,24 @@ impl Session {
             "imageedit-preview-{}-{}.bmp",
             self.id, self.render_count
         ));
+        let frame_bytes = bytes.len();
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
-        // 环形保留 12 帧再删 —— 双缓冲最多引用最近两帧，但 Qt 的异步解码是
+        // 环形保留 N 帧再删 —— 双缓冲最多引用最近两帧，但 Qt 的异步解码是
         // 「先拿 URL、稍后才打开文件」：拖动帧密集（60ms/帧）时删到 3 帧前
         // 只剩 ~180ms 余量，赶上一次慢解码就会 decode-failed，那一侧槽位
-        // 从此卡死（画面停在旧帧）。多留 12 帧（≈0.7s）把这个竞态压掉。
-        if let Some(old) = self.render_count.checked_sub(12) {
+        // 从此卡死（画面停在旧帧）。
+        //
+        // ★11-08：原来固定 12 帧，大预览（4K 全幅 BMP 每张 30MB+）与拖动
+        //   帧率一起会把「解码比删除慢」的窗口放大。改成按体积取帧数：
+        //   总占用压在 ~96MB 以内，小帧（360p ≈ 450KB）能留 32 帧 ≈ 2s，
+        //   大帧至少留 3 帧（够双缓冲 + 一次在途解码）。同步解码兜底
+        //   （CanvasView.pulse）可能比预取更晚才去开文件，这个余量要留够。
+        let keep = if frame_bytes == 0 {
+            3
+        } else {
+            (96 * 1024 * 1024 / frame_bytes).clamp(3, 32)
+        };
+        if let Some(old) = self.render_count.checked_sub(keep as u32) {
             let stale = std::env::temp_dir().join(format!(
                 "imageedit-preview-{}-{}.bmp",
                 self.id, old

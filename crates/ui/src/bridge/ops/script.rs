@@ -1072,6 +1072,55 @@ impl qobject::Bridge {
                         }
                     }
                 }
+                // `layer-dump:index:path` —— 把图层位图原样存成 PNG。
+                // 诊断「拖动帧里图层那一块是空的」时，先确认图层位图本身有
+                // 没有内容（别把「合成没画」当成「位图透明」）。
+                other if other.starts_with("layer-dump:") => {
+                    let body = other.trim_start_matches("layer-dump:");
+                    if let Some((ix, path)) = body.split_once(':') {
+                        let ix: usize = ix.trim().parse().unwrap_or(0);
+                        let guard = self.session.borrow();
+                        if let Some(session) = guard.as_ref() {
+                            if let Some(layer) = session.doc.layers.get(ix) {
+                                let ok = layer.image.save(path.trim()).is_ok();
+                                println!(
+                                    "{{\"phase\":\"ui\",\"event\":\"layer-dump\",\"index\":{ix},\
+                                     \"ok\":{ok},\"w\":{},\"h\":{}}}",
+                                    layer.image.width(),
+                                    layer.image.height()
+                                );
+                            }
+                        }
+                    }
+                }
+                // `snap-dump:path` —— 存缩放手势起手快照（live 合成用的那张）。
+                other if other.starts_with("snap-dump:") => {
+                    let path = other.trim_start_matches("snap-dump:").trim().to_string();
+                    let guard = self.session.borrow();
+                    if let Some(session) = guard.as_ref() {
+                        let snap = match &session.transform {
+                            Some(crate::bridge::session::TransformSession::Scale(ls)) => {
+                                Some(&ls.snapshot)
+                            }
+                            _ => None,
+                        };
+                        match snap {
+                            Some(img) => {
+                                let ok = img.save(&path).is_ok();
+                                println!(
+                                    "{{\"phase\":\"ui\",\"event\":\"snap-dump\",\"ok\":{ok},\
+                                     \"w\":{},\"h\":{}}}",
+                                    img.width(),
+                                    img.height()
+                                );
+                            }
+                            None => println!(
+                                "{{\"phase\":\"ui\",\"event\":\"snap-dump\",\"ok\":false,\
+                                 \"reason\":\"no-live-scale\"}}"
+                            ),
+                        }
+                    }
+                }
                 // `rotate-hold:index,degrees[,expand]` —— 只 begin + update，
                 // **不 finish**：把拖动中的那一帧留在屏幕上，用来截图核对
                 // 「拖动中的内容位置」和松手后是否一致（以前预览用的是锚点的

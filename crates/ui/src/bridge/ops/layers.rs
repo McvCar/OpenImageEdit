@@ -468,14 +468,31 @@ impl qobject::Bridge {
                 }
                 _ => return,
             }
-            // 诊断（拖动帧专用）：实时帧用的是哪套数字。用户报「拖的时候
-            // 图层被背景挡住 / 松手不长大」时，靠这几行判断是「框没传进来」
-            // 「落点到了画布外」还是「图层本身不可见」。
+            // 诊断（拖动帧专用）：实时帧用的是哪套数字，以及文档里每一层
+            // 现在的真实位置/尺寸。用户报「拖的时候出现两份副本」时，靠
+            // boxes 一眼看出实时框画的是不是被拖的那一层。
+            let boxes = session
+                .doc
+                .layers
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    format!(
+                        "{}:{},{},{},{}",
+                        i,
+                        l.offset.0,
+                        l.offset.1,
+                        l.image.width(),
+                        l.image.height()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("|");
             println!(
                 "{{\"phase\":\"ui\",\"event\":\"scale-live\",\"ix\":{ix},\"w\":{w},\"h\":{h},\
                  \"ox\":{ox},\"oy\":{oy},\"fx\":{flip_x},\"fy\":{flip_y},\
                  \"kx\":{skew_x:.4},\"ky\":{skew_y:.4},\"layers\":{},\"opacity\":{:.3},\
-                 \"visible\":{},\"canvas\":\"{}x{}\"}}",
+                 \"visible\":{},\"canvas\":\"{}x{}\",\"boxes\":\"{boxes}\"}}",
                 session.doc.layers.len(),
                 session.doc.layers.get(ix).map(|l| l.opacity).unwrap_or(0.0),
                 session.doc.layers.get(ix).map(|l| l.visible).unwrap_or(false),

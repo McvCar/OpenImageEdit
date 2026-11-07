@@ -133,6 +133,32 @@ def main():
     r, n = blue_ratio(img, (bx + 2, by + 2, x1 - 2, y1 - 2))
     check("落定后：文件里图层已是新尺寸", n and r > 0.9, "blue=%.2f n=%d" % (r, n))
 
+    # ---- 3. 用户 11-08 的实际流程：剪切 → 粘贴 → 移动 → 拖动放大 -------
+    # 剪切会在**背景**上留一个透明洞，粘贴出来的图层正好盖住它。之后无论
+    # 怎么移动 / 放大，只要实时帧把图层画出来了，洞就该被盖住（alpha 全 255）。
+    # 反过来，如果实时帧没画活动层（层级被背景压住 / 帧是拖前的旧帧），
+    # 洞里就是 alpha 0 —— 屏幕上显示成棋盘格，用户说的「拖的时候图层没了、
+    # 被背景挡住」就是它。
+    ops = ("sel-rect:%d,%d,%d,%d;cut:%d,%d,%d,%d;paste;gpu-gesture:-20,10;"
+           "scale-hold:400,320,100,60" % (
+               BOX[0], BOX[1], BOX[2], BOX[3],
+               BOX[0], BOX[1], BOX[2] - BOX[0], BOX[3] - BOX[1]))
+    ev, _ = run("cutpaste", ops)
+    holds = [e for e in ev if e.get("event") == "scale-hold"]
+    check("剪切粘贴流程：拖动帧探针跑通", bool(holds), holds[-1] if holds else None)
+    if holds:
+        url = holds[-1].get("url", "")
+        path = url[len("file:///"):] if url.startswith("file:///") else url
+        if os.path.isfile(path):
+            frame = Image.open(path).convert("RGBA")
+            alpha = frame.getchannel("A")
+            holes = alpha.histogram()[0]
+            check("剪切粘贴流程：拖动帧里没有透明洞（图层压住背景）",
+                  holes == 0, "alpha=0 像素 %d" % holes)
+            ratio, n3 = blue_ratio(frame.convert("RGB"), (110, 70, 490, 370))
+            check("剪切粘贴流程：放大框内是图层内容", n3 and ratio > 0.9,
+                  "blue=%.2f n=%d" % (ratio, n3))
+
     print()
     if FAILED:
         print("FAILED: %d 项：%s" % (len(FAILED), "; ".join(FAILED)))
