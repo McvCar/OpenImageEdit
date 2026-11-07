@@ -180,8 +180,31 @@ impl qobject::Bridge {
         }
         // 旧 API 负责建立 live 预览态（文档像素不动），三件套只统一状态层。
         match gesture {
-            GESTURE_SCALE => self.as_mut().scale_layer_begin(),
+            GESTURE_SCALE => {
+                // ★缩放 / 旋转必须**先撤掉 Tier 1 的两纹理**：`gpuLive` 期间
+                //   QML 把 CPU 预览整层设成 opacity 0，屏幕上只剩 static（活动
+                //   层是隐藏的 = 纯背景）+ 停在旧矩形的 active 纹理。上一次移动
+                //   手势若没干净收尾（释放丢了 / 只走了 drag_translate_end），
+                //   这两个纹理就会盖住实时缩放帧：用户看到的是「拖的时候图层被
+                //   背景挡住、松手也不变大」，再移动一次（gpu_begin 重建纹理）
+                //   才恢复正常。这里无条件清掉，缩放永远走 CPU 合成。
+                {
+                    let mut guard = self.session.borrow_mut();
+                    if let Some(session) = guard.as_mut() {
+                        session.gpu_end();
+                    }
+                }
+                self.as_mut().set_gpu_live(false);
+                self.as_mut().scale_layer_begin();
+            }
             GESTURE_ROTATE => {
+                {
+                    let mut guard = self.session.borrow_mut();
+                    if let Some(session) = guard.as_mut() {
+                        session.gpu_end();
+                    }
+                }
+                self.as_mut().set_gpu_live(false);
                 self.as_mut().rotate_layer_begin(index, true);
             }
             GESTURE_MOVE => {

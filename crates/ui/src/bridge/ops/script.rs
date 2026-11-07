@@ -799,6 +799,59 @@ impl qobject::Bridge {
                         )
                     }
                 }
+                // `scale-hold:w,h[,ox,oy]` —— 只 begin + update、**不 end**：把
+                // 拖动中的那一帧留在屏幕上（和 `rotate-hold` 同一个用途），用来
+                // 核对「拖动过程中活动层是否画在自己该在的位置、且压在其他层
+                // 之上」。落帧 URL 打进日志，测试直接读那张 BMP 做像素断言。
+                other if other.starts_with("scale-hold:") => {
+                    let n = parse_nums(other);
+                    if n.len() >= 2 {
+                        let w = n[0].round().max(1.0) as i32;
+                        let h = n[1].round().max(1.0) as i32;
+                        let ix = (*self.selected_layer()).max(0) as usize;
+                        let (ox, oy) = if n.len() >= 4 {
+                            (n[2].round() as i32, n[3].round() as i32)
+                        } else {
+                            let cur = {
+                                let guard = self.session.borrow();
+                                guard.as_ref().and_then(|s| s.doc.layers.get(ix)).map(|l| {
+                                    (
+                                        l.offset.0 as f64 + l.image.width() as f64 / 2.0,
+                                        l.offset.1 as f64 + l.image.height() as f64 / 2.0,
+                                    )
+                                })
+                            };
+                            match cur {
+                                Some((cx, cy)) => (
+                                    (cx - w as f64 / 2.0).round() as i32,
+                                    (cy - h as f64 / 2.0).round() as i32,
+                                ),
+                                None => (0, 0),
+                            }
+                        };
+                        self.as_mut().scale_layer_begin();
+                        self.as_mut().scale_layer_update(
+                            w, h, ox, oy, false, false, 0.0, 0.0, 0.0, 0.0,
+                        );
+                        let url = {
+                            let guard = self.session.borrow();
+                            guard
+                                .as_ref()
+                                .and_then(|s| s.last_render.as_ref())
+                                .map(|c| c.url.clone())
+                                .unwrap_or_default()
+                        };
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"scale-hold\",\"w\":{w},\"h\":{h},\
+                             \"ox\":{ox},\"oy\":{oy},\"url\":\"{}\"}}",
+                            url.replace('\\', "/")
+                        );
+                    } else {
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        );
+                    }
+                }
                 // `gpu-gesture[:dx,dy]` —— 走一次真实移动手势
                 // （transform_begin → 5×transform_update → transform_end），
                 // 用来验证 Tier 1「静态层 + 活动层」两纹理快路径：日志必须

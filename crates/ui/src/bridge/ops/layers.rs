@@ -468,6 +468,20 @@ impl qobject::Bridge {
                 }
                 _ => return,
             }
+            // 诊断（拖动帧专用）：实时帧用的是哪套数字。用户报「拖的时候
+            // 图层被背景挡住 / 松手不长大」时，靠这几行判断是「框没传进来」
+            // 「落点到了画布外」还是「图层本身不可见」。
+            println!(
+                "{{\"phase\":\"ui\",\"event\":\"scale-live\",\"ix\":{ix},\"w\":{w},\"h\":{h},\
+                 \"ox\":{ox},\"oy\":{oy},\"fx\":{flip_x},\"fy\":{flip_y},\
+                 \"kx\":{skew_x:.4},\"ky\":{skew_y:.4},\"layers\":{},\"opacity\":{:.3},\
+                 \"visible\":{},\"canvas\":\"{}x{}\"}}",
+                session.doc.layers.len(),
+                session.doc.layers.get(ix).map(|l| l.opacity).unwrap_or(0.0),
+                session.doc.layers.get(ix).map(|l| l.visible).unwrap_or(false),
+                session.doc.canvas.width,
+                session.doc.canvas.height
+            );
         }
         self.refresh_preview();
     }
@@ -571,10 +585,38 @@ impl qobject::Bridge {
             Ok(true) => {
                 self.as_mut().refresh_preview();
                 self.as_mut().set_dirty(true);
-                println!("{{\"phase\":\"ui\",\"event\":\"layer-scaled\",\"index\":{ix}}}");
+                // 诊断：落定后图层真正变成多大、放在哪里（real = 显示位图 /
+                // offset）。用户报「拖完没变大」时，这里能区分「没落定」和
+                // 「落定了但预览没跟上」。
+                let (rw, rh, rox, roy) = {
+                    let guard = self.session.borrow();
+                    guard
+                        .as_ref()
+                        .and_then(|s| s.doc.layers.get(ix))
+                        .map(|l| {
+                            (
+                                l.image.width() as i32,
+                                l.image.height() as i32,
+                                l.offset.0,
+                                l.offset.1,
+                            )
+                        })
+                        .unwrap_or((0, 0, 0, 0))
+                };
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"layer-scaled\",\"index\":{ix},\
+                     \"real\":\"{rw}x{rh}@{rox},{roy}\"}}"
+                );
             }
             Ok(false) => self.as_mut().refresh_preview(),
-            Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
+            Err(message) => {
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"layer-scale-failed\",\"index\":{ix},\
+                     \"reason\":\"{}\"}}",
+                    message.replace('"', "'")
+                );
+                self.as_mut().set_status(QString::from(message.as_str()));
+            }
         }
     }
 

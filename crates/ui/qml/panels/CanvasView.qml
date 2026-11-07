@@ -295,6 +295,20 @@ Flickable {
                 console.log("ImageEdit: preview load error");
                 if (bridge.auto_quit)
                     Qt.quit();
+                // ★解码失败的帧必须交出槽位。BMP 是环形临时文件，拖动帧密集
+                //   （60ms 一帧）时上一帧可能刚被删掉——Qt 的异步解码这时报
+                //   Error。以前这里直接 return：那张 Image 永远停在 Error，
+                //   pendingUrl 里最新的一帧**再也不会被派下去**，画面停在旧帧，
+                //   直到下一次渲染（用户说的「松手后画面没变大，再动一下才好」
+                //   就是这个）。这里清掉源、把待播帧重新派一次；同一帧连续
+                //   失败就放弃它（等下一帧），避免卡在重试循环里。
+                const failed = img.source.toString()
+                img.source = ""
+                pendingSince = 0
+                if (pendingUrl.length > 0 && pendingUrl === failed)
+                    pendingUrl = ""
+                else
+                    pumpPreview()
                 return
             }
             if (img.status !== Image.Ready)
@@ -353,6 +367,20 @@ Flickable {
             function onPreview_advanced() {
                 previewImage.pushUrl(bridge.preview_url)
             }
+        }
+
+        // 看门狗：待播帧迟迟没上屏就强制重派一次。
+        //
+        // `pushUrl` 只在**来了新帧**时才被调用，所以「最后一帧丢了」没有任何
+        // 后续事件能补救：解码失败（临时文件被环形删除）、后台那张被取消、
+        // 或者松开手后不再有渲染 —— 画面就永远停在上一帧，只有再动一下
+        // 图层（触发新渲染）才恢复。定时重试把这条链子接上。
+        Timer {
+            interval: 250
+            repeat: true
+            running: previewImage.pendingUrl.length > 0
+                     && previewImage.pendingUrl !== previewImage.shownUrl
+            onTriggered: previewImage.pumpPreview()
         }
 
         // 打开文件时 url 在 Connections 建立之前就设好了，补一次。

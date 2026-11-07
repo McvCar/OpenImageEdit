@@ -756,8 +756,7 @@ impl Session {
         //   pumpPreview 的防重派发守卫把它拒掉：拖动提交后**画面停在旧帧**，
         //   而选框（layers_json）实时跟进 → 「图层和选框位置不一致」，直到
         //   改尺寸等连续两次非 GPU 渲染打破循环。步长随 GPU 次数可取任意
-        //   值，只有唯一文件名对一切步长稳健；旧文件延迟三帧删除（双缓冲
-        //   最多引用最近两帧）。
+        //   值，只有唯一文件名对一切步长稳健；旧文件延迟多帧删除（见下）。
         let bytes = encode(&image, Format::Bmp, 90).map_err(|e| e.to_string())?;
         let encode_ms = prof_t0.elapsed().as_millis();
         self.render_count = self.render_count.wrapping_add(1);
@@ -766,7 +765,11 @@ impl Session {
             self.id, self.render_count
         ));
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
-        if let Some(old) = self.render_count.checked_sub(3) {
+        // 环形保留 12 帧再删 —— 双缓冲最多引用最近两帧，但 Qt 的异步解码是
+        // 「先拿 URL、稍后才打开文件」：拖动帧密集（60ms/帧）时删到 3 帧前
+        // 只剩 ~180ms 余量，赶上一次慢解码就会 decode-failed，那一侧槽位
+        // 从此卡死（画面停在旧帧）。多留 12 帧（≈0.7s）把这个竞态压掉。
+        if let Some(old) = self.render_count.checked_sub(12) {
             let stale = std::env::temp_dir().join(format!(
                 "imageedit-preview-{}-{}.bmp",
                 self.id, old

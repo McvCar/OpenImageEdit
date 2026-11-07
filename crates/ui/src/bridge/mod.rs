@@ -1838,6 +1838,10 @@ impl qobject::Bridge {
             }
             Refresh::Err(err) => {
                 let status = format!("render-error: {err}");
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"render-error\",\"detail\":\"{}\"}}",
+                    err.replace('"', "'")
+                );
                 self.as_mut().set_status(QString::from(status.as_str()));
             }
         }
