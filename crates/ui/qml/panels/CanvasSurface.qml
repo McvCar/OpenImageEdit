@@ -68,8 +68,10 @@ Item {
     // ★优先级：有选区且按在选区内部 → 选区手势优先（移动选区 / 拖手柄）。
     //   选区之外、图层之上仍然是「选中并拖动图层」；Shift/Alt 永远走选区
     //   加选 / 减选；快速选择 / 魔术棒、绘画 / 标记工具各自接管手势。
-    //   曾经试过「点图层就清空选区」，用户明确否掉了：选区压在图层上是
-    //   常见工作状态，点一下就没了很打断操作。
+    //   ★11-07 复测修正：这里只保证「选区内部」让位；只要本函数真的
+    //   返回了图层（选区之外，或移动工具模式），onPressed 就会清掉残留
+    //   框选。之前完全不清会让 Delete 被选区截胡，用户看到「选中图层按
+    //   Del 没反应」。选区压在图层上时，点在选区内部依然不清、不打断。
     function layerPickAt(mx, my, mods) {
         if (!host.moveMode)
             return null
@@ -319,6 +321,13 @@ Item {
                 moveSelActive = false
                 selOffX = 0
                 selOffY = 0
+                // 明确点中图层 = 放弃残留的框选选区。layerPickAt 已经保证
+                // 「按在选区内部」不会走到这里，所以选区与图层重叠时选区
+                // 手势仍然优先。顺带修好 Delete：选区残留会被 onDeleteKey
+                // 抢先当成「删除选区像素」，图层怎么按都删不掉。
+                // 放在 select_layer 之前，避免 sel_clear 的重绘/信号影响选中态。
+                if (host.selExists)
+                    bridge.sel_clear()
                 bridge.select_layer(hit.i)
                 pickDrag = true
                 pickMoved = false

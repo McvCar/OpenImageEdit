@@ -32,13 +32,8 @@ fn scale_down_then_up_samples_the_original_pixels() {
     doc.scale_layer(0, Size::new(80, 80), (0, 0)).unwrap();
     assert_eq!(doc.layers[0].image.dimensions(), (80, 80));
 
-    // 第二次缩放直接从「未插值原图」取样，不是从第一次的 40x40 结果再放大。
-    let from_original = image::imageops::resize(
-        &src,
-        80,
-        80,
-        image::imageops::FilterType::Lanczos3,
-    );
+    // P0-2a：回到原始尺寸走 1:1 索引拷贝，连「从原图做一次 80→80 的
+    // Lanczos3」都不做 —— 后者带负旁瓣，会把单像素细线 / 文字笔画抹软。
     let destructive = image::imageops::resize(
         &image::imageops::resize(&src, 40, 40, image::imageops::FilterType::Lanczos3),
         80,
@@ -47,8 +42,16 @@ fn scale_down_then_up_samples_the_original_pixels() {
     );
     assert_eq!(
         doc.layers[0].image.as_raw(),
-        from_original.as_raw(),
-        "缩放→放大必须与从原图一次重采样一致"
+        src.as_raw(),
+        "缩放→放大回原尺寸必须逐像素等于原图"
+    );
+    assert!(
+        doc.layers[0]
+            .transform
+            .as_ref()
+            .unwrap()
+            .is_identity_fast_path(),
+        "回到原尺寸后变换状态应是 identity"
     );
     assert_ne!(
         doc.layers[0].image.as_raw(),
@@ -60,6 +63,35 @@ fn scale_down_then_up_samples_the_original_pixels() {
         doc.layers[0].transform.as_ref().unwrap().source.dimensions(),
         (80, 80)
     );
+}
+
+#[test]
+fn near_original_size_snaps_back_but_real_resizes_do_not() {
+    let src = checker(80, 80);
+    let mut doc = doc_with_layer(src.clone());
+    doc.scale_layer(0, Size::new(40, 40), (0, 0)).unwrap();
+    // QML 手柄把显示像素换算回图像像素后的典型 ±1~2px 误差。
+    doc.scale_layer(0, Size::new(79, 78), (0, 0)).unwrap();
+    assert_eq!(doc.layers[0].image.dimensions(), (80, 80));
+    assert_eq!(doc.layers[0].image.as_raw(), src.as_raw());
+
+    // redo 复用同一个 op，吸附必须幂等。
+    let committed = doc.layers[0].clone();
+    doc.undo().unwrap();
+    doc.redo().unwrap();
+    assert_eq!(doc.layers[0], committed, "吸附后的 undo/redo 必须一致");
+
+    // 真的想缩到 77×77 时不能把它强行吸回 80×80。
+    let mut doc2 = doc_with_layer(src.clone());
+    doc2.scale_layer(0, Size::new(77, 77), (0, 0)).unwrap();
+    assert_eq!(doc2.layers[0].image.dimensions(), (77, 77));
+    assert_ne!(doc2.layers[0].image.as_raw(), src.as_raw());
+
+    // 带镜像时不吸附（1:1 拷贝会丢掉翻转）。
+    let mut doc3 = doc_with_layer(src.clone());
+    doc3.scale_layer_flipped(0, Size::new(80, 80), (0, 0), (true, false))
+        .unwrap();
+    assert_ne!(doc3.layers[0].image.as_raw(), src.as_raw());
 }
 
 #[test]

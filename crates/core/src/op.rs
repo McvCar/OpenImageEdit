@@ -290,23 +290,44 @@ impl EditOp {
                 // image 当输入，否则第二次缩放会把翻转丢掉。
                 let cumulative = (t.flip.0 ^ flip.0, t.flip.1 ^ flip.1);
                 let source = t.source.clone();
-                let mut image = image::imageops::resize(
-                    source.as_ref(),
-                    to.width,
-                    to.height,
-                    image::imageops::FilterType::Lanczos3,
-                );
+                let (sw, sh) = t.source_size();
+                // 回到原始尺寸时走 1:1 索引拷贝。两个原因：
+                //  ① image::imageops::resize 即使 80→80 也会跑一遍 Lanczos3，
+                //    负旁瓣会把文字笔画 / 单像素细线抹软（11-07 复测：像素
+                //    块能还原、文字还原不了，根因就在这里）；
+                //  ② QML 手柄把显示像素换算回图像像素时有 ±1~2px 误差，
+                //    不吸附就永远差一点，用户拖回"100%"仍要吃一次插值。
+                // 只吸附无翻转、且两轴都接近原尺寸的情况；redo 复用同一
+                // 个 op，吸附结果幂等。
+                let snap_back = !cumulative.0
+                    && !cumulative.1
+                    && (to.width as f64 - sw).abs() <= 2.0
+                    && (to.height as f64 - sh).abs() <= 2.0;
+                let (final_w, final_h) = if snap_back {
+                    (sw as u32, sh as u32)
+                } else {
+                    (to.width, to.height)
+                };
+                let mut image = if snap_back {
+                    (*source).clone()
+                } else {
+                    image::imageops::resize(
+                        source.as_ref(),
+                        final_w,
+                        final_h,
+                        image::imageops::FilterType::Lanczos3,
+                    )
+                };
                 if cumulative.0 {
                     image = image::imageops::flip_horizontal(&image);
                 }
                 if cumulative.1 {
                     image = image::imageops::flip_vertical(&image);
                 }
-                let (sw, sh) = t.source_size();
-                t.scale = (to.width as f64 / sw, to.height as f64 / sh);
+                t.scale = (final_w as f64 / sw, final_h as f64 / sh);
                 t.center = (
-                    offset.0 as f64 + to.width as f64 / 2.0,
-                    offset.1 as f64 + to.height as f64 / 2.0,
+                    offset.0 as f64 + final_w as f64 / 2.0,
+                    offset.1 as f64 + final_h as f64 / 2.0,
                 );
                 t.flip = cumulative;
                 let layer = doc
