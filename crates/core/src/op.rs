@@ -260,37 +260,9 @@ impl EditOp {
                 let mut t = prev.transform.clone().unwrap_or_else(|| {
                     LayerTransform::from_offset(prev.image.clone(), prev.offset.0, prev.offset.1)
                 });
-                // 旋转 / 斜切后的外接框不能用目标宽高简单反解 scale，这部分
-                // 仍走旧路径（从当前位图重采样），保持既有几何数值不变。
-                let pure_axis_aligned = t.rotation.abs() < 1e-9
-                    && t.skew == (0.0, 0.0)
-                    && t.perspective.is_none();
-                if !pure_axis_aligned {
-                    let layer = doc
-                        .layers
-                        .get_mut(*index)
-                        .ok_or(EditError::LayerIndex(*index))?;
-                    let mut image = image::imageops::resize(
-                        &prev.image,
-                        to.width,
-                        to.height,
-                        image::imageops::FilterType::Lanczos3,
-                    );
-                    if flip.0 {
-                        image = image::imageops::flip_horizontal(&image);
-                    }
-                    if flip.1 {
-                        image = image::imageops::flip_vertical(&image);
-                    }
-                    layer.image = image;
-                    layer.offset = *offset;
-                    layer.ensure_baked();
-                    return Ok(());
-                }
                 // 累计翻转一次生成：从原始像素出发，不能把之前已翻过的
                 // image 当输入，否则第二次缩放会把翻转丢掉。
                 let cumulative = (t.flip.0 ^ flip.0, t.flip.1 ^ flip.1);
-                let source = t.source.clone();
                 let (sw, sh) = t.source_size();
                 // 回到原始尺寸时走 1:1 索引拷贝。两个原因：
                 //  ① image::imageops::resize 即使 80→80 也会跑一遍 Lanczos3，
@@ -298,44 +270,37 @@ impl EditOp {
                 //    块能还原、文字还原不了，根因就在这里）；
                 //  ② QML 手柄把显示像素换算回图像像素时有 ±1~2px 误差，
                 //    不吸附就永远差一点，用户拖回"100%"仍要吃一次插值。
-                // 只吸附无翻转、且两轴都接近原尺寸的情况；redo 复用同一
-                // 个 op，吸附结果幂等。
+                // 只吸附无翻转、无旋转、且两轴都接近原尺寸的情况；redo 复用
+                // 同一个 op，吸附结果幂等。
                 let snap_back = !cumulative.0
                     && !cumulative.1
+                    && t.rotation.abs() < 1e-9
                     && (to.width as f64 - sw).abs() <= 2.0
                     && (to.height as f64 - sh).abs() <= 2.0;
                 let (final_w, final_h) = if snap_back {
-                    (sw as u32, sh as u32)
+                    (sw, sh)
                 } else {
-                    (to.width, to.height)
+                    (to.width as f64, to.height as f64)
                 };
-                let mut image = if snap_back {
-                    (*source).clone()
-                } else {
-                    image::imageops::resize(
-                        source.as_ref(),
-                        final_w,
-                        final_h,
-                        image::imageops::FilterType::Lanczos3,
-                    )
-                };
-                if cumulative.0 {
-                    image = image::imageops::flip_horizontal(&image);
-                }
-                if cumulative.1 {
-                    image = image::imageops::flip_vertical(&image);
-                }
-                t.scale = (final_w as f64 / sw, final_h as f64 / sh);
-                t.center = (
-                    offset.0 as f64 + final_w as f64 / 2.0,
-                    offset.1 as f64 + final_h as f64 / 2.0,
-                );
                 t.flip = cumulative;
+                // ★旋转 / 斜切过的图层不再退回「从当前位图再采一次」的老路
+                //（那会让「拉伸 → 旋转 → 再拉伸」每轮多一次插值：框越拉越大、
+                // 图越拉越糊）。统一按目标外接框反解 scale，source 恒为原图。
+                let target = RectF::new(
+                    offset.0 as f64,
+                    offset.1 as f64,
+                    final_w,
+                    final_h,
+                );
+                if !t.set_bounds_rect(target, 0) {
+                    return Err(EditError::InvalidCanvasSize);
+                }
+                let (image, placed) = t.render_compatible();
                 let layer = doc
                     .layers
                     .get_mut(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
-                layer.set_transform_pixels(image, *offset, t);
+                layer.set_transform_pixels(image, placed, t);
                 Ok(())
             }
             EditOp::TransformLayer { index, transform } => {

@@ -613,7 +613,21 @@ impl qobject::Bridge {
         let before = match current.transform.as_ref() {
             Some(t) => {
                 let mut pristine = (*start).clone();
-                pristine.image = (*t.source).clone();
+                // ★预览的快照必须是「**当前尺寸**的未插值图」，不是裸原图：
+                //   拉伸过（scale ≠ 1）的图层如果拿 source 起手，拖动期间
+                //   合成器画出来的是原尺寸，框却还是拉伸后的外接框 —— 又是
+                //   「框和内容不一致」。这里先把 scale/flip 烘焙到预览快照
+                //   （一次 Lanczos），旋转本身仍然交给合成器实时转。
+                let no_scale = (t.scale.0 - 1.0).abs() < 1e-9
+                    && (t.scale.1 - 1.0).abs() < 1e-9;
+                if no_scale {
+                    pristine.image = (*t.source).clone();
+                } else {
+                    let mut flat = t.clone();
+                    flat.rotation = 0.0;
+                    let (image, _) = flat.render_compatible();
+                    pristine.image = image;
+                }
                 std::rc::Rc::new(pristine)
             }
             None => start.clone(),

@@ -132,7 +132,17 @@ Rectangle {
                 { l: "适应窗口 (Ctrl+9)", ok: bridge.image_width > 0,
                   run: function () { bridge.zoom_fit() } },
                 { l: "100% 实际大小 (Ctrl+0)", ok: bridge.image_width > 0,
-                  run: function () { bridge.zoom_actual() } }
+                  run: function () { bridge.zoom_actual() } },
+                { l: "", sep: true },
+                // 吸附 / 参考线开关从「变换数值」面板移到这里（用户要求）：
+                // 它们是全局视图偏好，不属于某个图层的数值。菜单每次打开都
+                // 重建，勾选状态反映的是点击那一刻的真实值。
+                { l: (bridge.snapEnabled ? "✓ " : "　 ") + "智能吸附",
+                  ok: true,
+                  run: function () { bridge.update_snap_enabled(!bridge.snapEnabled) } },
+                { l: (bridge.showGuides ? "✓ " : "　 ") + "显示参考线",
+                  ok: true,
+                  run: function () { bridge.update_show_guides(!bridge.showGuides) } }
             ] },
             { l: "", sep: true },
             { l: "设置…", ok: true,

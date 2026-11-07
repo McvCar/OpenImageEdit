@@ -668,7 +668,7 @@ impl qobject::Bridge {
                         };
                         self.as_mut().scale_layer_begin();
                         self.as_mut().scale_layer_update(w, h, ox, oy, false, false);
-                        self.as_mut().scale_layer_end(true, w, h, ox, oy, false, false);
+                        self.as_mut().scale_layer_end(true, w, h, ox, oy, false, false, 0);
                         println!(
                             "{{\"phase\":\"ui\",\"event\":\"scale-layer\",\"w\":{w},\"h\":{h},\
                              \"ox\":{ox},\"oy\":{oy}}}"
@@ -716,6 +716,74 @@ impl qobject::Bridge {
                             "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
                         ),
                     }
+                }
+                // `move-gesture:dx,dy[,mods]` —— 走完整的「移动」三件套
+                //（transform_begin → 5×transform_update → transform_end），
+                // 用来验证修饰键（Ctrl 临时关吸附）与二次拖动的一致性。
+                other if other.starts_with("move-gesture") => {
+                    let n = parse_nums(other);
+                    let (dx, dy) = (
+                        n.first().copied().unwrap_or(40.0),
+                        n.get(1).copied().unwrap_or(30.0),
+                    );
+                    let mods = n.get(2).copied().unwrap_or(0.0) as i32;
+                    let ix = (*self.selected_layer()).max(0) as i32;
+                    let start = {
+                        let guard = self.session.borrow();
+                        guard.as_ref().and_then(|s| s.doc.layers.get(ix.max(0) as usize)).map(|l| {
+                            (l.offset.0 as f64 + l.image.width() as f64 / 2.0,
+                             l.offset.1 as f64 + l.image.height() as f64 / 2.0)
+                        })
+                    };
+                    if let Some((cx, cy)) = start {
+                        let began = self.as_mut().transform_begin(0, ix, cx, cy, mods, 1.0);
+                        for i in 1..=5 {
+                            let t = i as f64 / 5.0;
+                            self.as_mut()
+                                .transform_update(0, cx + dx * t, cy + dy * t, mods, 1.0);
+                        }
+                        self.as_mut().drag_translate_end(true);
+                        let landed = self.as_mut().transform_end(true, mods);
+                        let (off, guides) = {
+                            let guard = self.session.borrow();
+                            match guard.as_ref() {
+                                Some(s) => (
+                                    s.doc
+                                        .layers
+                                        .get(ix.max(0) as usize)
+                                        .map(|l| l.offset)
+                                        .unwrap_or((0, 0)),
+                                    s.snap.guides.len(),
+                                ),
+                                None => ((0, 0), 0),
+                            }
+                        };
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"move-gesture\",\"began\":{began},\
+                             \"landed\":{landed},\"mods\":{mods},\"ox\":{},\"oy\":{},\
+                             \"guides\":{guides}}}",
+                            off.0, off.1
+                        );
+                    } else {
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        );
+                    }
+                }
+                // `sel-state` —— 当前选区是否还在（裁剪 / 提取 / 剪切后必须消失）。
+                "sel-state" => {
+                    let guard = self.session.borrow();
+                    let text = match guard.as_ref().and_then(|s| s.doc.selection.as_ref()) {
+                        None => r#"{"active":false}"#.to_string(),
+                        Some(st) => {
+                            let b = st.base.bounds;
+                            format!(
+                                r#"{{"active":true,"x":{},"y":{},"w":{},"h":{}}}"#,
+                                b.x, b.y, b.width, b.height
+                            )
+                        }
+                    };
+                    println!("{{\"phase\":\"ui\",\"event\":\"sel-state\",\"state\":{text}}}");
                 }
                 // `transform-state` —— P0-2b1 统一会话诊断：打印 kind / index /
                 // special / cap。手势落定后必须是 active=false（无残留）。
@@ -781,9 +849,23 @@ impl qobject::Bridge {
                     let guard = self.session.borrow();
                     if let Some(session) = guard.as_ref() {
                         if let Some(layer) = session.doc.layers.get(ix.max(0) as usize) {
+                            let (rot, cx, cy, sx, sy, sw, sh) = match layer.transform.as_ref() {
+                                Some(t) => (
+                                    t.rotation,
+                                    t.center.0,
+                                    t.center.1,
+                                    t.scale.0,
+                                    t.scale.1,
+                                    t.source.width(),
+                                    t.source.height(),
+                                ),
+                                None => (0.0, 0.0, 0.0, 0.0, 0.0, 0, 0),
+                            };
                             println!(
                                 "{{\"phase\":\"ui\",\"event\":\"layer-info\",\"index\":{ix},\
-                                 \"w\":{},\"h\":{},\"ox\":{},\"oy\":{},\"history\":{}}}",
+                                 \"w\":{},\"h\":{},\"ox\":{},\"oy\":{},\"history\":{},\
+                                 \"rot\":{rot:.4},\"cx\":{cx:.3},\"cy\":{cy:.3},\
+                                 \"sx\":{sx:.6},\"sy\":{sy:.6},\"sw\":{sw},\"sh\":{sh}}}",
                                 layer.image.width(),
                                 layer.image.height(),
                                 layer.offset.0,

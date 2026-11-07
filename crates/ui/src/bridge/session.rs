@@ -128,9 +128,13 @@ impl Session {
     }
 
     /// 取走移动会话的起点并结束会话。不是移动会话就原样放回，避免误删。
-    pub(in crate::bridge) fn take_move_start(&mut self) -> Option<(usize, (i32, i32))> {
+    pub(in crate::bridge) fn take_move_start(
+        &mut self,
+    ) -> Option<(usize, (i32, i32), Option<(f64, f64)>)> {
         match self.transform.take() {
-            Some(TransformSession::Move { index, start, .. }) => Some((index, start)),
+            Some(TransformSession::Move { index, start, start_center, .. }) => {
+                Some((index, start, start_center))
+            }
             other => {
                 self.transform = other;
                 None
@@ -314,9 +318,16 @@ pub(in crate::bridge) const DOWNSAMPLE_EDGE: u32 = 8192;
 /// 落定也统一成一条 `SetLayerTransform`。
 pub(in crate::bridge) enum TransformSession {
     /// 拖动图层内容：文档 offset 实时改（不记历史），松手补一条历史。
+    ///
+    /// ★`start_center` 是起手时 `Layer::transform.center`（没有参数层时为
+    /// `None`）。拖动期间 offset 每帧都变，参数层如果不同步，渲染仍然按
+    /// 旧的 center 取样 —— 框（来自 offset）跟着鼠标走、内容钉在原地。
+    /// 用户报的「第二次拖图层框和内容分家、调一下大小又好了」就是这个：
+    /// 第一次拖动把图层变成参数层（center 已提交），第二次只改 offset。
     Move {
         index: usize,
         start: (i32, i32),
+        start_center: Option<(f64, f64)>,
         last: (i32, i32),
     },
     /// 八向手柄缩放：文档像素不动，合成器拉伸 snapshot。

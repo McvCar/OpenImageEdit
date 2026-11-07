@@ -5,6 +5,9 @@ import com.imageedit
 // * 首次默认隐藏，由工具栏按钮切换；显示状态在 settings.ini 里跨启动记忆。
 // * X/Y/W/H 都是「变换后轴对齐外接框」语义，可为负、可超出画布。
 // * 一次提交 = 一条 SetLayerTransform 历史；不逐键写文档。
+// * 11-07 复测改版：X/Y 同一行、W/H 同一行（原来一行一个太占地方），
+//   水平/垂直翻转按钮去掉（画布手柄拖过对边就能镜像；菜单里也有整幅翻转），
+//   吸附 / 参考线开关移到右上角「⋯」总菜单（视图 → 智能吸附 / 显示参考线）。
 Rectangle {
     id: panel
     required property var bridge
@@ -14,8 +17,8 @@ Rectangle {
     }
 
     visible: bridge.transformPanelVisible && vals.has === true
-    width: 236
-    height: 266
+    width: 222
+    height: 160
     radius: 6
     color: "#f21d2024"
     border.color: "#5a6068"
@@ -24,8 +27,6 @@ Rectangle {
 
     property bool lockRatio: true
     property int refPoint: 0
-    property bool flipX: false
-    property bool flipY: false
     property bool suppress: false
 
     // 文档状态变化时回显；用户正在输入时不抢输入框。
@@ -41,16 +42,16 @@ Rectangle {
         pw.value = Math.round(vals.w)
         ph.value = Math.round(vals.h)
         rot.value = Math.round(vals.rot)
-        flipX = vals.fx === true
-        flipY = vals.fy === true
         suppress = false
     }
 
     function apply() {
         if (suppress || !vals.has)
             return
+        // 翻转一律保持当前值：按钮已经去掉，翻转过一次之后改数值不能把它清掉。
         bridge.transform_set_params(px.value, py.value, pw.value, ph.value,
-                                    rot.value, flipX, flipY, lockRatio, refPoint)
+                                    rot.value, vals.fx === true, vals.fy === true,
+                                    lockRatio, refPoint)
     }
 
     // 标题栏
@@ -97,6 +98,7 @@ Rectangle {
         anchors.topMargin: 10
         spacing: 6
 
+        // X / Y 同一行
         Row {
             spacing: 6
             height: 22
@@ -105,18 +107,15 @@ Rectangle {
                 verticalAlignment: Text.AlignVCenter
                 color: "#c8cdd4"; font.pixelSize: 11
             }
-            SpinBox { id: px; width: 92; height: 22; from: -99999; to: 99999; onEdited: panel.apply() }
-        }
-        Row {
-            spacing: 6
-            height: 22
+            SpinBox { id: px; width: 78; height: 22; from: -99999; to: 99999; onEdited: panel.apply() }
             Text {
                 text: "Y"; width: 14; height: 22
                 verticalAlignment: Text.AlignVCenter
                 color: "#c8cdd4"; font.pixelSize: 11
             }
-            SpinBox { id: py; width: 92; height: 22; from: -99999; to: 99999; onEdited: panel.apply() }
+            SpinBox { id: py; width: 78; height: 22; from: -99999; to: 99999; onEdited: panel.apply() }
         }
+        // W / H 同一行
         Row {
             spacing: 6
             height: 22
@@ -125,17 +124,13 @@ Rectangle {
                 verticalAlignment: Text.AlignVCenter
                 color: "#c8cdd4"; font.pixelSize: 11
             }
-            SpinBox { id: pw; width: 92; height: 22; from: 1; to: 99999; onEdited: panel.apply() }
-        }
-        Row {
-            spacing: 6
-            height: 22
+            SpinBox { id: pw; width: 78; height: 22; from: 1; to: 99999; onEdited: panel.apply() }
             Text {
                 text: "H"; width: 14; height: 22
                 verticalAlignment: Text.AlignVCenter
                 color: "#c8cdd4"; font.pixelSize: 11
             }
-            SpinBox { id: ph; width: 92; height: 22; from: 1; to: 99999; onEdited: panel.apply() }
+            SpinBox { id: ph; width: 78; height: 22; from: 1; to: 99999; onEdited: panel.apply() }
         }
         Row {
             spacing: 6
@@ -145,7 +140,7 @@ Rectangle {
                 verticalAlignment: Text.AlignVCenter
                 color: "#c8cdd4"; font.pixelSize: 11
             }
-            SpinBox { id: rot; width: 92; height: 22; from: -3600; to: 3600; onEdited: panel.apply() }
+            SpinBox { id: rot; width: 78; height: 22; from: -3600; to: 3600; onEdited: panel.apply() }
         }
     }
 
@@ -201,74 +196,5 @@ Rectangle {
                 }
             }
         }
-    }
-    Text {
-        anchors.right: refGrid.right
-        anchors.top: refGrid.bottom
-        anchors.topMargin: 2
-        text: "参考点"
-        color: "#8b929b"
-        font.pixelSize: 10
-    }
-
-    // 翻转 + 参考线开关
-    Row {
-        id: toggles
-        anchors.left: parent.left
-        anchors.leftMargin: 10
-        anchors.top: lockBox.bottom
-        anchors.topMargin: 12
-        spacing: 6
-        Repeater {
-            model: [
-                {t: "水平翻转", v: panel.flipX, k: 0},
-                {t: "垂直翻转", v: panel.flipY, k: 1}
-            ]
-            Rectangle {
-                width: 66; height: 20; radius: 3
-                color: modelData.v ? "#3b5c8f" : "#2c3036"
-                border.color: "#5a6068"; border.width: 1
-                Text { anchors.centerIn: parent; text: modelData.t; color: "#dfe3e9"; font.pixelSize: 10 }
-                MouseArea {
-                    anchors.fill: parent
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: {
-                        if (modelData.k === 0) panel.flipX = !panel.flipX
-                        else panel.flipY = !panel.flipY
-                        panel.apply()
-                    }
-                }
-            }
-        }
-    }
-
-    Row {
-        anchors.left: parent.left
-        anchors.leftMargin: 10
-        anchors.top: toggles.bottom
-        anchors.topMargin: 10
-        spacing: 10
-        Repeater {
-            model: [
-                {t: "显示参考线", v: bridge.showGuides, k: 0},
-                {t: "智能吸附", v: bridge.snapEnabled, k: 1}
-            ]
-            Rectangle {
-                width: 12; height: 12; radius: 2
-                color: modelData.v ? "#5b9dff" : "#202328"
-                border.color: "#6b7076"; border.width: 1
-                Text { anchors.centerIn: parent; text: modelData.v ? "✓" : ""; color: "white"; font.pixelSize: 9 }
-                MouseArea {
-                    anchors.fill: parent
-                    anchors.margins: -4
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: modelData.k === 0
-                        ? bridge.update_show_guides(!bridge.showGuides)
-                        : bridge.update_snap_enabled(!bridge.snapEnabled)
-                }
-            }
-        }
-        Text { text: "参考线"; color: "#8b929b"; font.pixelSize: 10; anchors.verticalCenter: parent.verticalCenter }
-        Text { text: "吸附"; color: "#8b929b"; font.pixelSize: 10; anchors.verticalCenter: parent.verticalCenter }
     }
 }

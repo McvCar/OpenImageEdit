@@ -473,6 +473,7 @@ impl qobject::Bridge {
         oy: i32,
         flip_x: bool,
         flip_y: bool,
+        edges: i32,
     ) {
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
             return;
@@ -486,53 +487,49 @@ impl qobject::Bridge {
                 match session.take_scale_state() {
                     Some(ls) if ls.index == ix && commit => {
                         let to = Size::new(w.max(1) as u32, h.max(1) as u32);
-                        // ★P0-2b2：轴对齐缩放落定统一成一条 SetLayerTransform
-                        //（params 真值 + 原图重采样），与移动 / 旋转共用历史。
-                        // 已旋转 / 斜切的图层仍走旧 Lanczos3 回退，保持既有
-                        // 几何数值不变（等 P1-A 透视接入后再统一）。
-                        let layer = &session.doc.layers[ix];
-                        let mut t = layer.transform.clone().unwrap_or_else(|| {
-                            LayerTransform::from_offset(
-                                layer.image.clone(),
-                                layer.offset.0,
-                                layer.offset.1,
-                            )
-                        });
-                        let axis_aligned = t.rotation.abs() < 1e-9
-                            && t.skew == (0.0, 0.0)
-                            && t.perspective.is_none();
-                        let result = if axis_aligned {
+                        // ★P0-2b2 / 11-07 复测：**所有**图层都走参数化落定
+                        //（一条 SetLayerTransform）。以前旋转 / 斜切过的图层
+                        // 走 Lanczos3 烘焙回退，于是「拉伸 → 旋转 → 再拉伸」
+                        // 每轮多一次插值，框越转越大、图越拉越糊；现在从
+                        // 未插值原图按目标外接框反解 scale，永不累积。
+                        let (mut t, sw, sh) = {
+                            let layer = &session.doc.layers[ix];
+                            let t = layer.transform.clone().unwrap_or_else(|| {
+                                LayerTransform::from_offset(
+                                    layer.image.clone(),
+                                    layer.offset.0,
+                                    layer.offset.1,
+                                )
+                            });
                             let (sw, sh) = t.source_size();
-                            let cumulative = (t.flip.0 ^ flip_x, t.flip.1 ^ flip_y);
-                            let snap_back = !cumulative.0
-                                && !cumulative.1
-                                && (to.width as f64 - sw).abs() <= 2.0
-                                && (to.height as f64 - sh).abs() <= 2.0;
-                            let (fw, fh) = if snap_back {
-                                (sw, sh)
-                            } else {
-                                (to.width as f64, to.height as f64)
-                            };
-                            t.scale = (fw / sw, fh / sh);
-                            t.center = (ox as f64 + fw / 2.0, oy as f64 + fh / 2.0);
-                            t.flip = cumulative;
+                            (t, sw, sh)
+                        };
+                        let cumulative = (t.flip.0 ^ flip_x, t.flip.1 ^ flip_y);
+                        // 回到原始尺寸（±2px 手柄误差吸附）时 1:1 回到原图，
+                        // 与 P0-2a 的「拖回来不糊」保持逐像素一致。
+                        let snap_back = !cumulative.0
+                            && !cumulative.1
+                            && t.rotation.abs() < 1e-9
+                            && (to.width as f64 - sw).abs() <= 2.0
+                            && (to.height as f64 - sh).abs() <= 2.0;
+                        let (fw, fh) = if snap_back {
+                            (sw, sh)
+                        } else {
+                            (to.width as f64, to.height as f64)
+                        };
+                        t.flip = cumulative;
+                        // edges 位掩码与 core 的 EDGE_* 一致：被拖的边贴目标，
+                        // 对侧锚点不动（八向手柄的手感）。
+                        let result = if t.set_bounds_rect(
+                            editcore::RectF::new(ox as f64, oy as f64, fw, fh),
+                            (edges.max(0) as u8) & 0x2d,
+                        ) {
                             session.doc.set_layer_transform(ix, Some(t))
                         } else {
-                            session
-                                .doc
-                                .scale_layer_flipped(ix, to, (ox, oy), (flip_x, flip_y))
+                            Err(editcore::EditError::InvalidCanvasSize)
                         };
                         match result {
                             Ok(()) => {
-                                // 旋转过的图层：拉伸会把连续旋转的原图锚点判据
-                                // 打废，下一次旋转只能拿已经烘焙过的外接矩形
-                                // 再转一遍（框平白再大 1.41 倍）。同步锚点尺寸。
-                                session.sync_rotate_origin_after_scale(
-                                    ix,
-                                    &ls.snapshot,
-                                    to,
-                                    (flip_x, flip_y),
-                                );
                                 session.dirty = true;
                                 outcome = Ok(true);
                             }
@@ -703,9 +700,11 @@ impl qobject::Bridge {
         if let Some(session) = guard.as_mut() {
             if let Some(layer) = session.doc.layers.get(ix) {
                 let start = layer.offset;
+                let start_center = layer.transform.as_ref().map(|t| t.center);
                 session.transform = Some(TransformSession::Move {
                     index: ix,
                     start,
+                    start_center,
                     last: start,
                 });
             }
@@ -713,9 +712,11 @@ impl qobject::Bridge {
     }
 
     pub fn drag_translate_update(self: Pin<&mut Self>, dx: i32, dy: i32) {
-        let Some(start) = self.session.borrow().as_ref().and_then(|s| {
+        let Some((start, start_center)) = self.session.borrow().as_ref().and_then(|s| {
             match s.transform.as_ref() {
-                Some(TransformSession::Move { start, .. }) => Some(*start),
+                Some(TransformSession::Move { start, start_center, .. }) => {
+                    Some((*start, *start_center))
+                }
                 _ => None,
             }
         }) else {
@@ -748,6 +749,11 @@ impl qobject::Bridge {
                 if let Some(layer) = session.doc.layers.get_mut(ix) {
                     // Live preview only: no history entry until commit.
                     layer.offset = next;
+                    // ★参数层与 offset 同步（见 TransformSession::Move 的注释）：
+                    // 渲染走 transform.center，不跟着动就会「框走、内容不动」。
+                    if let (Some(c), Some(t)) = (start_center, layer.transform.as_mut()) {
+                        t.center = (c.0 + dx as f64, c.1 + dy as f64);
+                    }
                 }
                 if let Some(TransformSession::Move { last, .. }) = session.transform.as_mut() {
                     *last = next;
@@ -759,11 +765,11 @@ impl qobject::Bridge {
 
     pub fn drag_translate_end(self: Pin<&mut Self>, commit: bool) {
         let viewport = *self.viewport.borrow();
-        let Some(start) = self
+        let Some((_, start, start_center)) = self
             .session
             .borrow_mut()
             .as_mut()
-            .and_then(|s| s.take_move_start().map(|(_, start)| start))
+            .and_then(|s| s.take_move_start())
         else {
             return;
         };
@@ -781,16 +787,26 @@ impl qobject::Bridge {
                         .get(ix)
                         .map(|l| l.offset)
                         .unwrap_or(start);
+                    // 参数层的 center 也回到起手时的值：提交走 translate_layer
+                    // （它按 center 加位移），不回滚就会把拖动量算两遍。
                     if !commit || cur == start {
                         // Roll back the live (history-free) offset.
                         if let Some(layer) = session.doc.layers.get_mut(ix) {
                             layer.offset = start;
+                            if let (Some(c), Some(t)) = (start_center, layer.transform.as_mut()) {
+                                t.center = c;
+                            }
                         }
                         Ok(true)
                     } else {
                         // Reset to the drag start, then translate once so the
                         // history op records from=start to=cur.
-                        session.doc.layers[ix].offset = start;
+                        if let Some(layer) = session.doc.layers.get_mut(ix) {
+                            layer.offset = start;
+                            if let (Some(c), Some(t)) = (start_center, layer.transform.as_mut()) {
+                                t.center = c;
+                            }
+                        }
                         match session
                             .doc
                             .translate_layer(ix, cur.0 - start.0, cur.1 - start.1)

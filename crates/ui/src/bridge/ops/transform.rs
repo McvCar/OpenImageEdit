@@ -99,9 +99,14 @@ impl qobject::Bridge {
             let Some(ts) = session.transform.take() else {
                 return false;
             };
-            if let TransformSession::Move { index, start, .. } = ts {
+            if let TransformSession::Move { index, start, start_center, .. } = ts {
                 if let Some(layer) = session.doc.layers.get_mut(index) {
                     layer.offset = start;
+                    // 与 drag_translate_update 配对的回滚：手势期间 center 也跟着
+                    // 位移了，只还原 offset 会让框和内容错开。
+                    if let (Some(c), Some(t)) = (start_center, layer.transform.as_mut()) {
+                        t.center = c;
+                    }
                 }
             }
             session.snap = SnapResult::default();

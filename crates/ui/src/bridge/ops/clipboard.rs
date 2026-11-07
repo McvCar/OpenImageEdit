@@ -78,6 +78,17 @@ impl qobject::Bridge {
                 *clipboard().lock().unwrap() = Some(layer);
                 *self.paste_counter.borrow_mut() = 0;
                 self.as_mut().set_status(QString::from(text.as_str()));
+                // 剪切 = 像素已经搬进剪贴板并从画布挖走。再把选区留在原地，
+                // 用户会以为「剪完还能接着拖这块」—— 直接取消选择（PS 的
+                // 剪切也是剪完即取消）。复制**不**动选区。
+                {
+                    let mut guard = self.session.borrow_mut();
+                    if let Some(s) = guard.as_mut() {
+                        s.clear_selection();
+                    }
+                }
+                self.touch_selection();
+                self.as_mut().publish_selection();
                 self.as_mut().refresh_preview();
                 println!("{{\"phase\":\"ui\",\"event\":\"cut\"}}");
             }
@@ -197,6 +208,16 @@ impl qobject::Bridge {
         match result {
             Ok(index) => {
                 self.as_mut().set_selected_layer(index as i32);
+                // 像素已经搬到新图层上了，选区（尤其是羽化边）留在原地只会
+                // 让人以为还能继续剪同一块地方。PS 的剪刀手势也是剪完即取消。
+                {
+                    let mut guard = self.session.borrow_mut();
+                    if let Some(s) = guard.as_mut() {
+                        s.clear_selection();
+                    }
+                }
+                self.touch_selection();
+                self.as_mut().publish_selection();
                 self.as_mut().refresh_preview();
                 self.as_mut()
                     .set_status(QString::from("已剪出为独立图层：拖动定位，可撤销"));

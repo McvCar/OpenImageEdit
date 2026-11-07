@@ -151,6 +151,13 @@ impl RectF {
     }
 }
 
+/// `set_bounds_rect` 的边位掩码（与 UI 的八向手柄一致）：
+/// 被标出来的边是**本次被拖动**的边，剩下的边保持原位（锚定）。
+pub const EDGE_LEFT: u8 = 1;
+pub const EDGE_RIGHT: u8 = 4;
+pub const EDGE_TOP: u8 = 8;
+pub const EDGE_BOTTOM: u8 = 32;
+
 /// 3×3 参考点，数值面板改尺寸时决定哪个角/边不动。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReferencePoint {
@@ -538,6 +545,128 @@ impl LayerTransform {
         } else {
             self.scale.1 *= r;
         }
+        true
+    }
+
+    /// 「把轴对齐外接框变成 `target`」——八向手柄 / 数值面板的统一缩放入口。
+    ///
+    /// 为什么不能用「目标宽高 ÷ 当前宽高」直接乘 scale：图层一旦转过角度，
+    /// 外接框是 `|cos|·W + |sin|·H`，目标宽高和两个方向的 scale 不是一一对应
+    /// 的。这里按矩阵列长解 2×2 线性系统：
+    ///
+    /// ```text
+    /// |c|·W + |s|·H = target.width
+    /// |s|·W + |c|·H = target.height      (c = |cos r|, s = |sin r|)
+    /// ```
+    ///
+    /// 45°/135°（`c == s`）时系统奇异，退化成等比缩放（此时外接框本来也
+    /// 区分不出两个方向，等比最稳）。
+    ///
+    /// `edges` 标注本次被拖动的边：**没被拖的边保持不动**（对侧锚点恒定），
+    /// 这正是八向手柄的手感；传 `0`/`EDGE_ALL` 之外的组合也可当「整体摆到
+    /// 目标框」用（数值面板）。
+    ///
+    /// 关键收益：旋转过的图层再拉伸也不再需要烘焙成位图（旧实现走
+    /// `imageops::resize` 后 `ensure_baked()`，于是「拉伸 → 旋转 → 再拉伸」
+    /// 每轮都多一次插值：框越转越大、图越拉越糊）。
+    pub fn set_bounds_rect(&mut self, target: RectF, edges: u8) -> bool {
+        if !self.is_affine() || self.skew != (0.0, 0.0) {
+            return false;
+        }
+        if !(target.width.is_finite() && target.height.is_finite())
+            || target.width <= 0.0
+            || target.height <= 0.0
+        {
+            return false;
+        }
+        let (sw, sh) = self.source_size();
+        if sw <= 0.0 || sh <= 0.0 {
+            return false;
+        }
+        let old = self.bounds();
+        if old.width <= 1e-9 || old.height <= 1e-9 {
+            return false;
+        }
+        let r = self.rotation.to_radians();
+        let (c, s) = (r.cos().abs(), r.sin().abs());
+        // 当前显示尺寸（不含旋转的作用量）：W = |sx|·sw，H = |sy|·sh。
+        let cur_w = self.scale.0.abs() * sw;
+        let cur_h = self.scale.1.abs() * sh;
+        // ★两个分支的分界：外接框的轴是否与图层自身的轴重合。
+        //
+        // * 0/90/180/270°：外接框就是图层本身（90° 只是两轴互换），目标宽高
+        //   能精确反解出 W/H，按边锚定即可 —— 这就是八向手柄原来的手感。
+        // * 其它角度：外接框是「旋转后的包围盒」，宽高和两个方向的 scale 是
+        //   `c·W + s·H` / `s·W + c·H` 的耦合关系。硬解虽然能凑出目标框，但
+        //   代价是把图压成一条（30° 时拖右边，H 会被压到 10px 量级）：像素
+        //   看着完全变形。这里改用**等比缩放**，让内容和框保持同一比例，
+        //   松手后 layers_json 会重新报出真实外接框，框自动贴合内容 —— 用户
+        //   报的「框中内容不跟着走」不会再出现，同时图片不会扭曲。
+        let quarter = (self.rotation / 90.0).fract().abs();
+        let quarter_turn = quarter < 1e-6 || (1.0 - quarter) < 1e-6;
+        let (mut w, mut h);
+        if quarter_turn {
+            let (u1, u2) = (
+                c * target.width + s * target.height,
+                s * target.width + c * target.height,
+            );
+            let det2 = (c * c - s * s) * (c * c - s * s);
+            if det2 > 1e-9 {
+                w = (u1 - 2.0 * c * s * u2) / det2;
+                h = (u2 - 2.0 * c * s * u1) / det2;
+            } else {
+                w = u1;
+                h = u2;
+            }
+        } else {
+            // 只拖一条边时按那条边的倍率；两条边都拖取几何平均。
+            let drag_x = edges & (EDGE_LEFT | EDGE_RIGHT) != 0;
+            let drag_y = edges & (EDGE_TOP | EDGE_BOTTOM) != 0;
+            let kx = target.width / old.width.max(1e-9);
+            let ky = target.height / old.height.max(1e-9);
+            let k = if drag_x && drag_y {
+                (kx * ky).sqrt()
+            } else if drag_x {
+                kx
+            } else if drag_y {
+                ky
+            } else {
+                (kx * ky).sqrt()
+            };
+            w = cur_w * k;
+            h = cur_h * k;
+        }
+        // 兜底：任何非有限 / 过小的解都退回等比（拖过对边由 flip 表达，
+        // 不靠负 scale）。
+        if !(w.is_finite() && h.is_finite()) || w <= 1e-6 || h <= 1e-6 {
+            let k = ((target.width / old.width + target.height / old.height) * 0.5).max(1e-6);
+            w = (cur_w * k).max(1e-6);
+            h = (cur_h * k).max(1e-6);
+        }
+        self.scale = (w / sw, h / sh);
+        // 位置：只对齐实际发生变化的轴向；被拖的那条边贴目标，另一条保持
+        // 原来的边（八向手柄）或整体居中（两条都拖 / 都没拖）。
+        let new = self.bounds();
+        let drag_l = edges & EDGE_LEFT != 0;
+        let drag_r = edges & EDGE_RIGHT != 0;
+        let drag_t = edges & EDGE_TOP != 0;
+        let drag_b = edges & EDGE_BOTTOM != 0;
+        let dx = if drag_l && !drag_r {
+            old.right() - new.right()
+        } else if drag_r && !drag_l {
+            old.x - new.x
+        } else {
+            target.center().0 - new.center().0
+        };
+        let dy = if drag_t && !drag_b {
+            old.bottom() - new.bottom()
+        } else if drag_b && !drag_t {
+            old.y - new.y
+        } else {
+            target.center().1 - new.center().1
+        };
+        self.center.0 += dx;
+        self.center.1 += dy;
         true
     }
 
@@ -1118,6 +1247,89 @@ mod tests {
         let mut nan = t.params();
         nan.rotation = f64::NAN;
         assert!(TransformParams::from_bytes(&nan.to_bytes()).is_none());
+    }
+
+    #[test]
+    fn set_bounds_rect_matches_target_for_quarter_turns() {
+        // 0/90/180/270° 时外接框与图层同轴：任意目标框都能精确命中，且
+        // 未被拖的两条边不动（八向手柄的锚点语义）。
+        for deg in [0.0, 90.0, 180.0, 270.0] {
+            let mut t = LayerTransform::from_offset(src(), 40, 25);
+            t.rotation = deg;
+            t.scale = (1.4, 0.7);
+            let before = t.bounds();
+            let target = RectF::new(
+                before.x - 15.0,
+                before.y + 9.0,
+                before.width * 1.3,
+                before.height * 0.8,
+            );
+            assert!(
+                t.set_bounds_rect(target, EDGE_RIGHT | EDGE_BOTTOM),
+                "deg={deg}"
+            );
+            let after = t.bounds();
+            assert!((after.width - target.width).abs() < 1e-6, "deg={deg} w");
+            assert!((after.height - target.height).abs() < 1e-6, "deg={deg} h");
+            // 左上角（未被拖的边）保持不动。
+            assert!((after.x - before.x).abs() < 1e-6, "deg={deg} x");
+            assert!((after.y - before.y).abs() < 1e-6, "deg={deg} y");
+            assert_eq!((t.source.width(), t.source.height()), (100, 80));
+            assert!((t.rotation - deg).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn set_bounds_rect_scales_rotated_layers_uniformly() {
+        // 斜着转过的图层按等比缩放：内容和外接框保持同一比例（把图压成
+        // 一条才是真正的错误），且框随比例一起长大。
+        for deg in [17.0, 30.0, 45.0, 137.0] {
+            let mut t = LayerTransform::from_offset(src(), 40, 25);
+            t.rotation = deg;
+            t.scale = (1.2, 0.9);
+            let before = t.bounds();
+            let (sx, sy) = t.scale;
+            let target = RectF::new(
+                before.x,
+                before.y,
+                before.width * 1.5,
+                before.height * 1.5,
+            );
+            assert!(t.set_bounds_rect(target, EDGE_RIGHT | EDGE_BOTTOM), "deg={deg}");
+            let after = t.bounds();
+            assert!((after.width / before.width - 1.5).abs() < 1e-6, "deg={deg} w");
+            assert!((after.height / before.height - 1.5).abs() < 1e-6, "deg={deg} h");
+            // 比例保持不变 = 没有把图压扁。
+            let ratio_before = sx / sy;
+            assert!((t.scale.0 / t.scale.1 - ratio_before).abs() < 1e-9, "deg={deg}");
+            assert!((after.x - before.x).abs() < 1e-6);
+            assert!((after.y - before.y).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn set_bounds_rect_stretch_then_shrink_returns_to_source() {
+        let mut t = LayerTransform::from_offset(src(), 20, 10);
+        let before = t.bounds();
+        let stretched = RectF::new(before.x, before.y, 260.0, 190.0);
+        assert!(t.set_bounds_rect(stretched, EDGE_RIGHT | EDGE_BOTTOM));
+        // 再拉回原始尺寸：scale 必须回到 1.0，1:1 索引快路径重新成立。
+        assert!(t.set_bounds_rect(before, EDGE_RIGHT | EDGE_BOTTOM));
+        assert!(t.is_identity_fast_path(), "scale={:?}", t.scale);
+        assert_eq!(t.bounds(), before);
+    }
+
+    #[test]
+    fn set_bounds_rect_at_45_degrees_stays_finite() {
+        let mut t = LayerTransform::new(src());
+        t.rotation = 45.0;
+        let b = t.bounds();
+        assert!(t.set_bounds_rect(
+            RectF::new(b.x, b.y, b.width * 1.5, b.height * 1.5),
+            EDGE_RIGHT | EDGE_BOTTOM
+        ));
+        assert!(t.scale.0.is_finite() && t.scale.0 > 0.0);
+        assert!(t.scale.1.is_finite() && t.scale.1 > 0.0);
     }
 
     #[test]

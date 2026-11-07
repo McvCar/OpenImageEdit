@@ -115,6 +115,11 @@ impl qobject::Bridge {
                         s.clear_selection();
                     }
                 }
+                // ★只改文档不发布，QML 的 selExists 就还停在 true：蚂蚁线、
+                //   手柄、尺寸徽标全留在原地 —— 用户看到的「裁剪成功但选框
+                //   没消失」。选区状态必须显式 publish 一次。
+                self.touch_selection();
+                self.as_mut().publish_selection();
                 self.as_mut().refresh_preview();
                 println!(
                     "{{\"phase\":\"ui\",\"event\":\"cropped\",\"rect\":\"{x},{y},{w},{h}\"}}"
@@ -166,6 +171,8 @@ session
                         s.clear_selection();
                     }
                 }
+                self.touch_selection();
+                self.as_mut().publish_selection();
                 self.as_mut().refresh_preview();
             }
             Ok(false) => {}
@@ -214,6 +221,8 @@ session
                         s.clear_selection();
                     }
                 }
+                self.touch_selection();
+                self.as_mut().publish_selection();
                 self.as_mut().refresh_preview();
             }
             Ok(false) => {}
@@ -261,6 +270,8 @@ session
                         s.clear_selection();
                     }
                 }
+                self.touch_selection();
+                self.as_mut().publish_selection();
                 self.as_mut().refresh_preview();
                 self.as_mut()
                     .set_status(QString::from("crop reset"));
@@ -299,8 +310,14 @@ session
                     if let Some(s) = guard.as_mut() {
                         s.refit_if_needed(viewport);
                         s.dirty = true;
+                        // ★抠出来的像素已经是独立图层了，画布上再留一圈蚂蚁线
+                        //   只会让人以为「还能拖这块选区」—— 用户报的「提取 /
+                        //   剪切成功后选区应该消失」。用户显式要选区的话再框一次。
+                        s.clear_selection();
                     }
                 }
+                self.touch_selection();
+                self.as_mut().publish_selection();
                 self.as_mut().refresh_preview();
                 println!(
                     "{{\"phase\":\"ui\",\"event\":\"layer-extracted\",\"index\":{ix}}}"

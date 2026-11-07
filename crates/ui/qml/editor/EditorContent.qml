@@ -441,6 +441,9 @@ Item {
     // 图层手柄被拖过对边（负宽高）：松手时按这两个标记镜像图层位图。
     property bool scaleFlipX: false
     property bool scaleFlipY: false
+    // 本次缩放拖的是哪几条边（1 左 / 4 右 / 8 上 / 32 下）。落定时交给
+    // Rust：被拖的边贴目标、对侧锚点不动；旋转过的图层靠它反解 scale。
+    property int scaleEdges: 0
     property int renamingIndex: -1
     readonly property var layerList: Layers.parseLayers(bridge.layers_json)
     // The layer PANEL rebuilds its Repeater whenever the model array is
@@ -1486,12 +1489,13 @@ function resizeLayerFrom(startRect, role, dx, dy, free) {
     // P0-4：八向缩放吸附。只让「被拖的那条边 / 角」参与求解，对侧锚点
     // 坐标恒定（D16）；求解在 Rust（图像坐标是唯一真值），这里只把修正量
     // 换算回显示像素并叠加到被拖边上。
+    let edges = 0
+    if (role.indexOf("w") >= 0) edges |= 1
+    if (role.indexOf("e") >= 0) edges |= 4
+    if (role.indexOf("n") >= 0) edges |= 8
+    if (role.indexOf("s") >= 0) edges |= 32
+    root.scaleEdges = edges
     if (bridge.snapEnabled) {
-        let edges = 0
-        if (role.indexOf("w") >= 0) edges |= 1
-        if (role.indexOf("e") >= 0) edges |= 4
-        if (role.indexOf("n") >= 0) edges |= 8
-        if (role.indexOf("s") >= 0) edges |= 32
         let adj = {dx: 0, dy: 0}
         try {
             adj = JSON.parse(bridge.transform_snap_rect(
@@ -1537,18 +1541,20 @@ function commitLayerScale() {
             Math.max(1, Math.round(root.scaleW / s)),
             Math.max(1, Math.round(root.scaleH / s)),
             Math.round(root.scaleX / s), Math.round(root.scaleY / s),
-            root.scaleFlipX, root.scaleFlipY)
+            root.scaleFlipX, root.scaleFlipY, root.scaleEdges)
     }
     root.scaleX = 0; root.scaleY = 0; root.scaleW = 0; root.scaleH = 0
     root.scaleFlipX = false; root.scaleFlipY = false
+    root.scaleEdges = 0
 }
 
 function cancelLayerScale() {
     view.canvasSurface.scaleTimer.stop()
     if (root.scaleW > 0)
-        bridge.scale_layer_end(false, 0, 0, 0, 0, false, false)
+        bridge.scale_layer_end(false, 0, 0, 0, 0, false, false, 0)
     root.scaleX = 0; root.scaleY = 0; root.scaleW = 0; root.scaleH = 0
     root.scaleFlipX = false; root.scaleFlipY = false
+    root.scaleEdges = 0
 }
 
 // ---- 选区工具 -------------------------------------------------------

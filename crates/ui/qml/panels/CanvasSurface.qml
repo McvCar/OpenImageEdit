@@ -56,8 +56,13 @@ Item {
     // 显示坐标下的临时偏移（SelectionViz 绘制时叠加）。
     property real selOffX: 0
     property real selOffY: 0
-    // P0-2b2：手势起手时锁存的修饰键位掩码，整段拖拽原样透传给 Rust。
+    // P0-2b2：手势起手时锁存的修饰键位掩码，整段拖拽原样透传。起手值只用于
+    // 「起手那一刻」的判定（要不要预生成吸附候选）。
     property int gestureMods: 0
+    // ★拖动过程中的**实时**修饰键：按 Ctrl 想临时关掉吸附时，按下瞬间的
+    //   掩码里还没有 Ctrl。Qt 只在鼠标事件里带 modifiers，所以每次
+    //   onPositionChanged 都刷新一次，手感上等于「按住 Ctrl 立刻生效」。
+    property int liveMods: 0
 
     // 把画布坐标换算成图像坐标（可能越界，交给 Rust 裁剪）。
     function toImage(mx, my) {
@@ -332,6 +337,7 @@ Item {
                     bridge.sel_clear()
                 bridge.select_layer(hit.i)
                 gestureMods = mouse.modifiers
+                liveMods = mouse.modifiers
                 pickDrag = true
                 pickMoved = false
                 startX = mouse.x
@@ -375,6 +381,7 @@ Item {
                             && bridge.cut_selection_to_layer()) {
                         bridge.sel_clear()
                         gestureMods = mouse.modifiers
+                        liveMods = mouse.modifiers
                         pickDrag = true
                         pickMoved = false
                         startX = mouse.x
@@ -432,6 +439,9 @@ Item {
             //   后续每次拖动都会被它们吃掉：鼠标在动，只有选区框在跑，
             //   图层一步不动（用户报的正是这个）。
             if (pickDrag) {
+                // 修饰键实时刷新（见 liveMods 注释）：吸附的临时关闭要在
+                // 「按住 Ctrl」这一刻就生效，而不是等下一次按下。
+                liveMods = mouse.modifiers
                 curX = mouse.x
                 curY = mouse.y
                 if (!pickMoved
@@ -534,9 +544,9 @@ Item {
                     // P0-2b2：最终帧也走统一会话，保证吸附修正量带进落定。
                     const pf = toImage(curX, curY)
                     bridge.transform_update(0, pf[0], pf[1],
-                                            gestureMods, host.toDispScale())
+                                            liveMods, host.toDispScale())
                     bridge.drag_translate_end(true)
-                    bridge.transform_end(true, gestureMods)
+                    bridge.transform_end(true, liveMods)
                     if (host.pasteFloating)
                         host.floatingOps += 1
                 }
@@ -1338,7 +1348,7 @@ Item {
             selDragMouse.lastDy = dy
             const p = toImage(selDragMouse.curX, selDragMouse.curY)
             bridge.transform_update(0, p[0], p[1],
-                                    selDragMouse.gestureMods, host.toDispScale())
+                                    selDragMouse.liveMods, host.toDispScale())
         }
     }
 

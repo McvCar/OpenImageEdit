@@ -961,6 +961,10 @@ pub mod qobject {
             flip_y: bool,
         );
 
+        /// `w` / `h` are always positive; `flip_x` / `flip_y` say the handle
+        /// was dragged past the opposite edge, so the bitmap mirrors.
+        /// `edges` 是本次被拖动的边位掩码（1 左 / 4 右 / 8 上 / 32 下），
+        /// 未列出的边在对侧锚定 —— 旋转过的图层靠它反解 scale（不再烘焙）。
         #[qinvokable]
         fn scale_layer_end(
             self: Pin<&mut Self>,
@@ -971,6 +975,7 @@ pub mod qobject {
             oy: i32,
             flip_x: bool,
             flip_y: bool,
+            edges: i32,
         );
     }
 }
