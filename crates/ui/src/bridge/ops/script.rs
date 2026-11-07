@@ -679,6 +679,29 @@ impl qobject::Bridge {
                         )
                     }
                 }
+                // `transform-state` —— P0-2b1 统一会话诊断：打印 kind / index /
+                // special / cap。手势落定后必须是 active=false（无残留）。
+                "transform-state" => {
+                    let state = self
+                        .session
+                        .borrow()
+                        .as_ref()
+                        .map(|s| s.transform_state_json())
+                        .unwrap_or_else(|| {
+                            r#"{"active":false,"no_document":true}"#.to_string()
+                        });
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"transform-state\",\"state\":{state}}}"
+                    );
+                }
+                // `transform-abort` —— 统一取消。`rotate-hold` 故意不 finish，
+                // 用它验证会话能被一次 take 清干净、不留临时合成帧。
+                "transform-abort" => {
+                    let had = self.as_mut().transform_abort();
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"transform-abort\",\"had\":{had}}}"
+                    );
+                }
                 // `layer-info:index[,tag]` —— 打印图层位图尺寸与 offset。
                 // 诊断"转一圈图层变大 / 放手后位置漂移"时直接读这几项，
                 // 别再从截图上量像素。

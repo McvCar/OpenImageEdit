@@ -17,11 +17,15 @@ pub(in crate::bridge) struct Session {
     /// Mark index hidden from the PREVIEW only while its text is being
     /// edited inline in QML (the TextInput overlays the real mark). -1 = none.
     pub(in crate::bridge) preview_hidden_mark: i32,
-    /// In-flight handle-driven layer resize. The document bitmap is NOT
-    /// touched during the gesture: the preview stretches `snapshot` to
-    /// `to`/`offset` via `PreviewComposer::composite_live_scale`, and
-    /// `scale_layer_end` applies the real (undoable) resize exactly once.
-    pub(in crate::bridge) live_scale: Option<LiveScaleState>,
+    /// ★ P0-2b1：移动 / 八向缩放 / 旋转三种手势的**唯一**进行中会话。
+    ///
+    /// 旧实现把 live 预览态拆成 4 个独立 Option（外加 BridgeRust 里的
+    /// `drag_start_offset`），每个 begin/update/end 各清各的；只要有一处
+    /// 漏了收尾，合成器就一直画「旧快照 + 旧 offset」，而 `layers_json`
+    /// 已经报出新框 —— 用户看到的「框被拖走、内容钉在原地」「放手角度
+    /// 复位」都出在这里。改成枚举变体后三种手势在类型层面互斥，会话
+    /// 结束就是整体消失，清理点只剩一个。
+    pub(in crate::bridge) transform: Option<TransformSession>,
     /// 选区缩放手柄的「当前是否已越过对边」。负宽高拖拽一帧一帧地进来，
     /// 只在符号翻转的那一帧真正镜像 mask（每帧都翻会让拖动中的内容来回抖）。
     /// `sel_resize_begin` 在按下手柄时清零。
@@ -69,17 +73,11 @@ pub(in crate::bridge) struct Session {
     pub(in crate::bridge) patch_region: Option<SelectionMask>,
     /// 修复画笔的取样锚点（画布坐标），Alt + 点击设置。
     pub(in crate::bridge) heal_source: Option<(f32, f32)>,
-    /// 图层旋转的进行中手势（手柄拖动 / 角度对话框预览共用）。
-    pub(in crate::bridge) rotate_live: Option<RotateLive>,
-    /// 旋转拖动期间的实时预览状态：文档不动，合成时按预览尺寸临时转。
-    pub(in crate::bridge) live_rotate: Option<LiveRotate>,
-    /// 连续旋转会话的原图锚点（见 `RotateOrigin`）。
+    /// 连续旋转会话的原图锚点（见 `RotateOrigin`）。**跨手势**存在：一次
+    /// 拖拽结束后下一次还要从没插值过的原图接着转，所以不能放进
+    /// `TransformSession`（会话一结束就被 take 掉）。
     pub(in crate::bridge) rotate_origin: Option<RotateOrigin>,
-    /// 拖动中的实时预览上限（长边像素）。旋转这类「每帧都要重算整层」的
-    /// 手势用它把合成/编码/写盘都压到小图上；松手立刻恢复原分辨率。
-    /// None = 不限（普通渲染）。
-    pub(in crate::bridge) live_cap: Option<u32>,
-    /// 旋转会话自增号（见 `LiveRotate::token`）。
+    /// 旋转会话自增号（见 `LiveRotate::token`）。同样是跨会话的缓存版本号。
     pub(in crate::bridge) rotate_token: u64,
 }
 
@@ -97,17 +95,84 @@ impl Session {
     /// 不动 `rotate_origin`：它只决定下一次旋转从哪张原图起手，不参与合成。
     /// 返回清理前的状态给调用方打诊断日志。
     pub(in crate::bridge) fn clear_live_gestures(&mut self) -> (bool, bool, bool, bool) {
-        let before = (
-            self.rotate_live.is_some(),
-            self.live_rotate.is_some(),
-            self.live_scale.is_some(),
-            self.live_cap.is_some(),
-        );
-        self.rotate_live = None;
-        self.live_rotate = None;
-        self.live_scale = None;
-        self.live_cap = None;
-        before
+        // ★统一会话后只剩一个 take：不可能再出现「清了缩放却漏了旋转帧」
+        // 这种半截状态。返回值仍按旧四元组报，live-stale 日志不变。
+        match self.transform.take() {
+            Some(ts) => ts.stale_flags(),
+            None => (false, false, false, false),
+        }
+    }
+
+    /// 取走移动会话的起点并结束会话。不是移动会话就原样放回，避免误删。
+    pub(in crate::bridge) fn take_move_start(&mut self) -> Option<(usize, (i32, i32))> {
+        match self.transform.take() {
+            Some(TransformSession::Move { index, start, .. }) => Some((index, start)),
+            other => {
+                self.transform = other;
+                None
+            }
+        }
+    }
+
+    /// 取走缩放会话（同时结束它），返回起手快照供落定使用。
+    pub(in crate::bridge) fn take_scale_state(&mut self) -> Option<LiveScaleState> {
+        match self.transform.take() {
+            Some(TransformSession::Scale(ls)) => Some(ls),
+            other => {
+                self.transform = other;
+                None
+            }
+        }
+    }
+
+    /// 取走旋转会话（连同拖动帧与预览上限一起结束）。
+    pub(in crate::bridge) fn take_rotate_live(&mut self) -> Option<RotateLive> {
+        match self.transform.take() {
+            Some(TransformSession::Rotate { live, .. }) => Some(live),
+            other => {
+                self.transform = other;
+                None
+            }
+        }
+    }
+
+    /// 旋转对话框用的「当前累计角度 + 是否扩张」。
+    pub(in crate::bridge) fn rotate_state(&self) -> Option<(f32, bool)> {
+        match self.transform.as_ref() {
+            Some(TransformSession::Rotate { live, .. }) => {
+                Some((live.base_degrees + live.last_delta, live.expand))
+            }
+            _ => None,
+        }
+    }
+
+    /// 统一会话的诊断快照（给 `transform_state` 探针 / `--probe-session`）。
+    pub(in crate::bridge) fn transform_state_json(&self) -> String {
+        match self.transform.as_ref() {
+            None => r#"{"active":false}"#.to_string(),
+            Some(ts) => {
+                let extra = match ts {
+                    TransformSession::Move { start, last, .. } => format!(
+                        r#""start":[{},{}],"last":[{},{}]"#,
+                        start.0, start.1, last.0, last.1
+                    ),
+                    TransformSession::Scale(ls) => format!(
+                        r#""to":[{},{}],"offset":[{},{}],"flip":[{},{}]"#,
+                        ls.to.width, ls.to.height, ls.offset.0, ls.offset.1,
+                        ls.flip.0, ls.flip.1
+                    ),
+                    TransformSession::Rotate { live, frame, .. } => format!(
+                        r#""base":{:.2},"delta":{:.2},"frame":{},"token":{}"#,
+                        live.base_degrees, live.last_delta,
+                        frame.is_some(), live.token
+                    ),
+                };
+                format!(
+                    "{{\"active\":true,\"kind\":\"{}\",\"index\":{},\"special\":{},\"cap\":{},{}}}",
+                    ts.kind(), ts.index(), ts.special(), ts.cap().unwrap_or(0), extra
+                )
+            }
+        }
     }
 
     /// 拉伸图层之后，把「连续旋转」的原图锚点同步到新尺寸。
@@ -208,6 +273,72 @@ pub(in crate::bridge) struct DecodeMsg {
 
 /// Longest-edge cap applied when the user enables downsampling-first open.
 pub(in crate::bridge) const DOWNSAMPLE_EDGE: u32 = 8192;
+
+/// P0-2b1 统一变换会话：三种手势互斥，一个字段管住全部 live 预览态。
+///
+/// 本阶段是**行为等价的结构收口**：变体里仍携带旧预览链路需要的数据，
+/// `composite_for_preview` 仍复用三个 `composite_live_*`。P0-2b2 接上
+/// `LayerTransform` params 与 GPU 快路径后，这些临时数据会整体删除，
+/// 落定也统一成一条 `SetLayerTransform`。
+pub(in crate::bridge) enum TransformSession {
+    /// 拖动图层内容：文档 offset 实时改（不记历史），松手补一条历史。
+    Move {
+        index: usize,
+        start: (i32, i32),
+        last: (i32, i32),
+    },
+    /// 八向手柄缩放：文档像素不动，合成器拉伸 snapshot。
+    Scale(LiveScaleState),
+    /// 旋柄 / 角度对话框：文档像素不动，合成器按预览尺寸临时转。
+    Rotate {
+        live: RotateLive,
+        frame: Option<LiveRotate>,
+        cap: Option<u32>,
+    },
+}
+
+impl TransformSession {
+    pub(in crate::bridge) fn kind(&self) -> &'static str {
+        match self {
+            Self::Move { .. } => "move",
+            Self::Scale(_) => "scale",
+            Self::Rotate { .. } => "rotate",
+        }
+    }
+
+    pub(in crate::bridge) fn index(&self) -> usize {
+        match self {
+            Self::Move { index, .. } => *index,
+            Self::Scale(ls) => ls.index,
+            Self::Rotate { live, .. } => live.index,
+        }
+    }
+
+    pub(in crate::bridge) fn cap(&self) -> Option<u32> {
+        match self {
+            Self::Rotate { cap, .. } => *cap,
+            _ => None,
+        }
+    }
+
+    /// 该会话是否需要走「special 合成分支」（不能用上一帧的 BMP 复用）。
+    pub(in crate::bridge) fn special(&self) -> bool {
+        match self {
+            Self::Scale(_) => true,
+            Self::Rotate { frame, .. } => frame.is_some(),
+            Self::Move { .. } => false,
+        }
+    }
+
+    /// 兼容旧的 `live-stale` 四元组日志：(rotate_live, live_rotate, live_scale, cap)。
+    pub(in crate::bridge) fn stale_flags(&self) -> (bool, bool, bool, bool) {
+        match self {
+            Self::Move { .. } => (false, false, false, false),
+            Self::Scale(_) => (false, false, true, false),
+            Self::Rotate { frame, cap, .. } => (true, frame.is_some(), false, cap.is_some()),
+        }
+    }
+}
 
 /// Session-side state for a live layer resize gesture.
 pub(in crate::bridge) struct LiveScaleState {
@@ -395,7 +526,7 @@ impl Session {
                 base_locked: true,
                 save_quality,
                 preview_hidden_mark: -1,
-                live_scale: None,
+                transform: None,
                 sel_flip_sign: (false, false),
                 composer: render::PreviewComposer::new(),
                 last_display: Size::new(0, 0),
@@ -411,10 +542,7 @@ impl Session {
                 patch_live: None,
                 patch_region: None,
                 heal_source: None,
-                rotate_live: None,
-                live_rotate: None,
                 rotate_origin: None,
-                live_cap: None,
                 rotate_token: 0,
             },
             ms,
@@ -469,7 +597,7 @@ impl Session {
         // 拖动中的实时预览可以先用小图顶上：QML 会把它拉到 display 尺寸，
         // 松手那一帧再按原分辨率重画。合成/编码/写盘的开销都随像素数线性
         // 下降，这是让旋转跟手最划算的一刀。
-        let target = match self.live_cap {
+        let target = match self.transform.as_ref().and_then(|t| t.cap()) {
             Some(cap) => capped(target, cap),
             None => target,
         };
@@ -479,8 +607,7 @@ impl Session {
         self.last_display = display;
         let special = self.adjust.is_some()
             || self.preview_hidden_mark >= 0
-            || self.live_scale.is_some()
-            || self.live_rotate.is_some();
+            || self.transform.as_ref().is_some_and(|t| t.special());
         if zoom_only && !special {
             let reusable = self.last_render.as_ref().is_some_and(|c| {
                 !c.special && size_close(c.target, target) && c.epoch == self.doc.edit_epoch
@@ -581,30 +708,35 @@ impl Session {
         })
     }
 
-    /// Composite one preview frame, honoring an in-flight live resize and the
-    /// optional color adjustment.
+    /// Composite one preview frame. ★P0-2b1：三种手势共用一个分派点。
+    ///
+    /// 旧实现是「先看 live_rotate、再看 live_scale」的两段式优先级；注释
+    /// 写「缩放 > 旋转」、代码却是旋转先返回，谁残留谁就吞掉另一边的预览。
+    /// 统一会话后变体互斥，不再存在优先级歧义。移动手势直接改文档
+    /// offset，走普通合成即可。
     pub(in crate::bridge) fn composite_for_preview(
         &mut self,
         target: Size,
         adjust: Option<(AdjustTarget, Adjust)>,
     ) -> RgbaImage {
-        // 手势优先级：缩放拖动 > 旋转拖动 > 普通合成。两者都不会改文档
-        // 像素，松手才落地（所以拖动期间撤销栈、缓存 epoch 都不动）。
-        if let Some(lr) = self.live_rotate.as_ref() {
-            return self.composer.composite_live_rotate_adjusted(
-                &self.doc,
-                target,
-                lr.index,
-                &lr.snapshot.image,
-                lr.offset,
-                lr.degrees,
-                lr.expand,
-                lr.token,
-                adjust,
-            );
-        }
-        match self.live_scale.as_ref() {
-            Some(ls) => self.composer.composite_live_scale_adjusted(
+        let Some(ts) = self.transform.as_ref() else {
+            return self.composer.composite_adjusted(&self.doc, target, adjust);
+        };
+        match ts {
+            TransformSession::Rotate { frame: Some(lr), .. } => {
+                self.composer.composite_live_rotate_adjusted(
+                    &self.doc,
+                    target,
+                    lr.index,
+                    &lr.snapshot.image,
+                    lr.offset,
+                    lr.degrees,
+                    lr.expand,
+                    lr.token,
+                    adjust,
+                )
+            }
+            TransformSession::Scale(ls) => self.composer.composite_live_scale_adjusted(
                 &self.doc,
                 target,
                 ls.index,
@@ -614,7 +746,8 @@ impl Session {
                 adjust,
                 ls.flip,
             ),
-            None => self.composer.composite_adjusted(&self.doc, target, adjust),
+            // Move，或 Rotate 还没出第一帧：文档已是最新状态。
+            _ => self.composer.composite_adjusted(&self.doc, target, adjust),
         }
     }
 
@@ -823,7 +956,7 @@ impl Session {
                         &adjust.map(|state| state.params).unwrap_or_default(),
                     ),
                     adjust_histogram: rendered.histogram.unwrap_or_default(),
-                    live: self.live_cap.is_some(),
+                    live: self.transform.as_ref().and_then(|t| t.cap()).is_some(),
                 }
             }
             Err(err) => Refresh::Err(err),

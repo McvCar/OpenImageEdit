@@ -564,6 +564,14 @@ pub mod qobject {
         #[qinvokable]
         fn rotate_layer_state(self: Pin<&mut Self>) -> QString;
 
+        /// ★P0-2b1：统一变换会话的诊断快照（JSON）；无手势时 active=false。
+        #[qinvokable]
+        fn transform_state(self: Pin<&mut Self>) -> QString;
+
+        /// 统一取消进行中的变换手势（切工具 / 失焦兜底），返回是否真有会话。
+        #[qinvokable]
+        fn transform_abort(self: Pin<&mut Self>) -> bool;
+
         /// Crop to the selection's bounding box, then drop the selection
         /// (the canvas coordinate frame changed).
         #[qinvokable]
@@ -1053,10 +1061,8 @@ pub struct BridgeRust {
     /// Opacity of the selected layer before the current live slider drag, so
     /// the committed history op can record the true pre-drag value.
     opacity_live: RefCell<Option<f32>>,
-    /// Offset of the selected layer when a drag started; `None` while not
-    /// dragging. `drag_translate_update` mutates the offset without touching
-    /// history, `drag_translate_end` commits a single history op.
-    drag_start_offset: RefCell<Option<(i32, i32)>>,
+    /// ★P0-2b1：拖动起点已并入 `Session::transform`（TransformSession::Move），
+    /// 不再在 Bridge 上单独留一份容易和手势状态不同步的副本。
     /// The selected mark and its pre-drag geometry; live updates map
     /// geometry without history, end commits one UpdateMark op.
     mark_drag: RefCell<Option<(usize, Mark)>>,
@@ -1146,7 +1152,6 @@ impl Default for BridgeRust {
             }),
             paste_counter: RefCell::new(0),
             opacity_live: RefCell::new(None),
-            drag_start_offset: RefCell::new(None),
             mark_drag: RefCell::new(None),
             session: RefCell::new(None),
             viewport: RefCell::new(Size::new(0, 0)),

@@ -596,18 +596,25 @@ impl qobject::Bridge {
         }
         session.rotate_token = session.rotate_token.wrapping_add(1);
         let token = session.rotate_token;
+        // 统一会话：起手先整体清掉上一场手势（缩放 / 移动 / 没收尾的旋转），
+        // 不再可能出现「旋转帧和缩放帧同时挂在 session 上抢合成器」。
+        session.clear_live_gestures();
         if !keep_session {
             session.rotate_origin = None;
             let one = std::rc::Rc::new(session.doc.layers[ix].clone());
-            session.rotate_live = Some(RotateLive {
-                index: ix,
-                before: one.clone(),
-                token,
-                start: one,
-                base_degrees: 0.0,
-                last_delta: 0.0,
-                expand: true,
-                keep: false,
+            session.transform = Some(TransformSession::Rotate {
+                live: RotateLive {
+                    index: ix,
+                    before: one.clone(),
+                    token,
+                    start: one,
+                    base_degrees: 0.0,
+                    last_delta: 0.0,
+                    expand: true,
+                    keep: false,
+                },
+                frame: None,
+                cap: None,
             });
             return 0.0;
         }
@@ -646,15 +653,19 @@ impl qobject::Bridge {
             "{{\"phase\":\"ui\",\"event\":\"rotate-anchor\",\"reuse\":{},\"base\":{:.2}}}",
             reusable, base
         );
-        session.rotate_live = Some(RotateLive {
-            index: ix,
-            before,
-            token,
-            start,
-            base_degrees: base,
-            last_delta: 0.0,
-            expand: true,
-            keep: true,
+        session.transform = Some(TransformSession::Rotate {
+            live: RotateLive {
+                index: ix,
+                before,
+                token,
+                start,
+                base_degrees: base,
+                last_delta: 0.0,
+                expand: true,
+                keep: true,
+            },
+            frame: None,
+            cap: None,
         });
         base as f64
     }
@@ -668,14 +679,16 @@ impl qobject::Bridge {
         {
             let mut guard = self.session.borrow_mut();
             let Some(session) = guard.as_mut() else { return };
-            let Some(st) = session.rotate_live.as_mut() else {
+            let Some(TransformSession::Rotate { live: st, frame, cap }) =
+                session.transform.as_mut()
+            else {
                 return;
             };
             let total = st.base_degrees + degrees as f32;
             st.last_delta = degrees as f32;
             st.expand = expand;
             // 超大画布上顺手把预览压到 1600 长边（QML 会拉回窗口尺寸）。
-            session.live_cap = Some(LIVE_ROTATE_EDGE);
+            *cap = Some(LIVE_ROTATE_EDGE);
             let index = st.index;
             let snapshot = st.before.clone();
             // ★预览的摆放基准 = **当前图层的中心**，和 finish 里的提交算法一致。
@@ -696,7 +709,7 @@ impl qobject::Bridge {
                     .round() as i32,
             );
             let token = st.token;
-            session.live_rotate = Some(LiveRotate {
+            *frame = Some(LiveRotate {
                 index,
                 snapshot,
                 offset,
@@ -714,7 +727,7 @@ impl qobject::Bridge {
         {
             let mut guard = self.session.borrow_mut();
             let Some(session) = guard.as_mut() else { return };
-            let Some(st) = session.rotate_live.take() else {
+            let Some(st) = session.take_rotate_live() else {
                 // 迟到 / 重复的收尾（onReleased 之后又来一次 onCanceled，或
                 // QML 补的清理调用）：会话已经结束了，但临时预览态可能因为
                 // 更早漏发过 finish 而残留。清掉并按真实文档重画一帧。
@@ -730,9 +743,8 @@ impl qobject::Bridge {
                 self.as_mut().refresh_preview();
                 return;
             };
-            // 会话结束：撤销预览上限，丢掉临时旋转态（文档像素本来就还没动）。
-            session.live_cap = None;
-            session.live_rotate = None;
+            // 会话已由 take_rotate_live() 整体结束：预览上限与临时旋转帧
+            // 都是同一个枚举变体的字段，不会残留（文档像素本来就没动过）。
             let total = st.base_degrees + degrees as f32;
             // 这次拖拽的净效果为零（含「压根没动」）：文档没被改过，什么都不用做。
             let neutral = !apply || (total - st.base_degrees).abs() < 0.001;
@@ -845,8 +857,8 @@ impl qobject::Bridge {
             .session
             .borrow()
             .as_ref()
-            .and_then(|s| s.rotate_live.as_ref())
-            .map(|s| format!("{:.2},{}", s.base_degrees + s.last_delta, s.expand as i32))
+            .and_then(|s| s.rotate_state())
+            .map(|(degrees, expand)| format!("{:.2},{}", degrees, expand as i32))
             .unwrap_or_default();
         QString::from(text.as_str())
     }

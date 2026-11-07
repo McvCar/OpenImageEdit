@@ -420,13 +420,13 @@ impl qobject::Bridge {
             // 没收尾的旋转会整个吞掉这次缩放预览。起手先清干净。
             session.clear_live_gestures();
             if let Some(layer) = session.doc.layers.get(ix) {
-                session.live_scale = Some(LiveScaleState {
+                session.transform = Some(TransformSession::Scale(LiveScaleState {
                     index: ix,
                     snapshot: layer.image.clone(),
                     to: Size::new(layer.image.width(), layer.image.height()),
                     offset: layer.offset,
                     flip: (false, false),
-                });
+                }));
             }
         }
     }
@@ -451,8 +451,8 @@ impl qobject::Bridge {
             let Some(session) = guard.as_mut() else {
                 return;
             };
-            match &mut session.live_scale {
-                Some(ls) if ls.index == ix => {
+            match &mut session.transform {
+                Some(TransformSession::Scale(ls)) if ls.index == ix => {
                     ls.to = Size::new(w as u32, h as u32);
                     ls.offset = (ox, oy);
                     ls.flip = (flip_x, flip_y);
@@ -483,7 +483,7 @@ impl qobject::Bridge {
             if let Some(session) = guard.as_mut() {
                 // Drop the live state first: the document bitmap was never
                 // modified during the gesture, so a cancel needs no rollback.
-                match session.live_scale.take() {
+                match session.take_scale_state() {
                     Some(ls) if ls.index == ix && commit => {
                         let to = Size::new(w.max(1) as u32, h.max(1) as u32);
                         match session
@@ -663,16 +663,29 @@ impl qobject::Bridge {
             // 立刻按真实文档重画一帧，把残留的临时合成帧换掉。
             self.as_mut().refresh_preview();
         }
-        let guard = self.session.borrow();
-        if let Some(session) = guard.as_ref() {
+        // 起点不再是 BridgeRust 上另一个孤立字段，而是统一会话的一部分：
+        // 缩放 / 旋转起手时清会话会连带把旧起点一起丢掉，不会再出现
+        // 「新手势已经起手、旧 drag_start 还留着」的错位。
+        let mut guard = self.session.borrow_mut();
+        if let Some(session) = guard.as_mut() {
             if let Some(layer) = session.doc.layers.get(ix) {
-                *self.drag_start_offset.borrow_mut() = Some(layer.offset);
+                let start = layer.offset;
+                session.transform = Some(TransformSession::Move {
+                    index: ix,
+                    start,
+                    last: start,
+                });
             }
         }
     }
 
     pub fn drag_translate_update(self: Pin<&mut Self>, dx: i32, dy: i32) {
-        let Some(start) = *self.drag_start_offset.borrow() else {
+        let Some(start) = self.session.borrow().as_ref().and_then(|s| {
+            match s.transform.as_ref() {
+                Some(TransformSession::Move { start, .. }) => Some(*start),
+                _ => None,
+            }
+        }) else {
             return;
         };
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
@@ -698,9 +711,13 @@ impl qobject::Bridge {
         {
             let mut guard = self.session.borrow_mut();
             if let Some(session) = guard.as_mut() {
+                let next = (start.0 + dx, start.1 + dy);
                 if let Some(layer) = session.doc.layers.get_mut(ix) {
                     // Live preview only: no history entry until commit.
-                    layer.offset = (start.0 + dx, start.1 + dy);
+                    layer.offset = next;
+                }
+                if let Some(TransformSession::Move { last, .. }) = session.transform.as_mut() {
+                    *last = next;
                 }
             }
         }
@@ -709,7 +726,12 @@ impl qobject::Bridge {
 
     pub fn drag_translate_end(self: Pin<&mut Self>, commit: bool) {
         let viewport = *self.viewport.borrow();
-        let Some(start) = self.drag_start_offset.borrow_mut().take() else {
+        let Some(start) = self
+            .session
+            .borrow_mut()
+            .as_mut()
+            .and_then(|s| s.take_move_start().map(|(_, start)| start))
+        else {
             return;
         };
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {

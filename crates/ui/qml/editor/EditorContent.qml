@@ -422,6 +422,12 @@ Item {
     // 选区数值输入框正在编辑：此时 M/L/Q 快捷键必须让路（否则输入框
     // 里打的字会切成工具 / 开关快速蒙版）。
     property bool selFieldEditing: false
+    // ★ 单字母工具快捷键（V/M/L/W/J/G/[/]/Q）的 enabled 绑定必须等整个
+    //   组件树建完再求值：这些 Shortcut 定义在文件前部（885 行起），却要
+    //   引用后面才实例化的 `view` / `fontPopover`。创建期求值抛 TypeError
+    //   会让 QML 丢弃绑定，enabled 永久停在 false —— 表现就是按 V 没反应。
+    //   Component.onCompleted 之后才放行，绑定此时能完整收集依赖。
+    property bool toolKeysReady: false
     // Transient "rubber band in use" state; hides the handle dots and
     // disables the wheel zoom while dragging a new selection.
     readonly property bool selRubberBanding: view.canvasSurface.selDragMouse.dragging
@@ -837,13 +843,13 @@ Shortcut { sequences: [StandardKey.ZoomIn, "Ctrl+="]; onActivated: view.queueZoo
 Shortcut { sequences: [StandardKey.ZoomOut]; onActivated: view.queueZoom(1 / 1.25) }
 // Preview-aligned: ⌘0 actual size, ⌘9 zoom-to-fit (old keys kept as aliases).
 // Ctrl+方向键 = 平移选区（PS 的蚂蚁线平移；图层 nudge 仍归方向键）。
-Shortcut { sequence: "Ctrl+Left";  enabled: root.selExists && root.canUseToolKeys()
+Shortcut { sequence: "Ctrl+Left";  enabled: root.selExists && root.toolKeysReady && root.canUseToolKeys()
            onActivated: bridge.sel_translate(-1, 0) }
-Shortcut { sequence: "Ctrl+Right"; enabled: root.selExists && root.canUseToolKeys()
+Shortcut { sequence: "Ctrl+Right"; enabled: root.selExists && root.toolKeysReady && root.canUseToolKeys()
            onActivated: bridge.sel_translate(1, 0) }
-Shortcut { sequence: "Ctrl+Up";    enabled: root.selExists && root.canUseToolKeys()
+Shortcut { sequence: "Ctrl+Up";    enabled: root.selExists && root.toolKeysReady && root.canUseToolKeys()
            onActivated: bridge.sel_translate(0, -1) }
-Shortcut { sequence: "Ctrl+Down";  enabled: root.selExists && root.canUseToolKeys()
+Shortcut { sequence: "Ctrl+Down";  enabled: root.selExists && root.toolKeysReady && root.canUseToolKeys()
            onActivated: bridge.sel_translate(0, 1) }
 Shortcut { sequences: ["Ctrl+0", "Ctrl+1"]; onActivated: bridge.zoom_actual() }
 Shortcut { sequences: ["Ctrl+9"]; onActivated: bridge.zoom_fit() }
@@ -882,31 +888,39 @@ Shortcut { sequence: "Ctrl+A"
            onActivated: selectAllCanvas() }
 // ---- 选区（PS 快捷键）----
 // V = 移动工具开关（开：图层可拖可缩放；关：手柄收起，碰不到图层）。
-Shortcut { sequence: "V"; enabled: root.canUseToolKeys()
-           onActivated: root.toggleMoveTool() }
+Shortcut {
+    id: moveShortcut
+    // 大小写双写：Qt 对 "V" 的解析在不同输入法/键盘布局下可能带 Shift，
+    // 补一个小写序列保证裸 v 一定能命中。ApplicationShortcut 让窗口刚
+    // 从别的程序切回来、标题栏还没拿到焦点时也能切工具。
+    sequences: ["V", "v"]
+    context: Qt.ApplicationShortcut
+    enabled: root.toolKeysReady && root.canUseToolKeys()
+    onActivated: root.toggleMoveTool()
+}
 // M / Shift+M = 矩形 / 椭圆选框；L / Shift+L = 套索 / 多边形套索。
-Shortcut { sequence: "M"; enabled: root.canUseToolKeys()
+Shortcut { sequence: "M"; enabled: root.toolKeysReady && root.canUseToolKeys()
            onActivated: root.setSelToolByShortcut("rect") }
-Shortcut { sequence: "Shift+M"; enabled: root.canUseToolKeys()
+Shortcut { sequence: "Shift+M"; enabled: root.toolKeysReady && root.canUseToolKeys()
            onActivated: root.setSelToolByShortcut("ellipse") }
-Shortcut { sequence: "L"; enabled: root.canUseToolKeys()
+Shortcut { sequence: "L"; enabled: root.toolKeysReady && root.canUseToolKeys()
            onActivated: root.setSelToolByShortcut("lasso") }
-Shortcut { sequence: "Shift+L"; enabled: root.canUseToolKeys()
+Shortcut { sequence: "Shift+L"; enabled: root.toolKeysReady && root.canUseToolKeys()
            onActivated: root.setSelToolByShortcut("polygon") }
 // W：快速选择（PS 默认）；Shift+W：魔术棒（PS 里两个工具同组，W 循环）。
-Shortcut { sequence: "W"; enabled: root.canUseToolKeys()
+Shortcut { sequence: "W"; enabled: root.toolKeysReady && root.canUseToolKeys()
            onActivated: root.setSelToolByShortcut("quick") }
-Shortcut { sequence: "Shift+W"; enabled: root.canUseToolKeys()
+Shortcut { sequence: "Shift+W"; enabled: root.toolKeysReady && root.canUseToolKeys()
            onActivated: root.setSelToolByShortcut("wand") }
 // J：修复组（污点修复 → 修复画笔 → 修补 循环）；G：油漆组（油漆桶 / 渐变）。
-Shortcut { sequence: "J"; enabled: root.canUseToolKeys()
+Shortcut { sequence: "J"; enabled: root.toolKeysReady && root.canUseToolKeys()
            onActivated: {
                const order = ["spot", "heal", "patch"]
                const i = order.indexOf(root.paintTool)
                root.setPaintTool(order[(i + 1) % order.length])
                root.markBarVisible = true
            } }
-Shortcut { sequence: "G"; enabled: root.canUseToolKeys()
+Shortcut { sequence: "G"; enabled: root.toolKeysReady && root.canUseToolKeys()
            onActivated: {
                const order = ["bucket", "gradient"]
                const i = order.indexOf(root.paintTool)
@@ -914,14 +928,14 @@ Shortcut { sequence: "G"; enabled: root.canUseToolKeys()
                root.markBarVisible = true
            } }
 // [ / ]：修复笔刷大小（PS 的笔刷大小快捷键）；不在修复工具下时调快速选择。
-Shortcut { sequence: "["; enabled: root.canUseToolKeys()
+Shortcut { sequence: "["; enabled: root.toolKeysReady && root.canUseToolKeys()
            onActivated: {
                if (root.paintTool === "spot" || root.paintTool === "heal")
                    root.setHealSize(root.healSize - 4)
                else
                    root.setQuickRadius(root.quickRadius - 4)
            } }
-Shortcut { sequence: "]"; enabled: root.canUseToolKeys()
+Shortcut { sequence: "]"; enabled: root.toolKeysReady && root.canUseToolKeys()
            onActivated: {
                if (root.paintTool === "spot" || root.paintTool === "heal")
                    root.setHealSize(root.healSize + 4)
@@ -933,7 +947,7 @@ Shortcut { sequence: "Ctrl+D"; enabled: root.selExists
 Shortcut { sequence: "Ctrl+Shift+I"; enabled: bridge.image_width > 0
            onActivated: bridge.sel_invert() }
 // Q: 快速蒙版（要看羽化软边在哪就按它）。
-Shortcut { sequence: "Q"; enabled: bridge.image_width > 0 && root.canUseToolKeys()
+Shortcut { sequence: "Q"; enabled: bridge.image_width > 0 && root.toolKeysReady && root.canUseToolKeys()
            onActivated: bridge.sel_toggle_quick_mask() }
 // ⌘W / ⌘Q: close window / quit, both through the dirty-confirm guard.
 Shortcut { sequence: "Ctrl+W"; onActivated: requestQuit() }
@@ -1215,6 +1229,35 @@ MouseArea {
     }
 }
 
+// ---- 工具开关的即时反馈（V / 移动按钮）------------------------------
+// 1.3s 自动消失。以前开关状态只能靠手柄是否出现来猜：选区还在时手柄
+// 本来就藏着，按 V 看上去毫无反应，像是快捷键坏了。
+Rectangle {
+    id: toolToast
+    visible: false
+    z: 400
+    anchors.horizontalCenter: parent.horizontalCenter
+    anchors.bottom: parent.bottom
+    anchors.bottomMargin: root.statusHeight + 18
+    width: toolToastLabel.implicitWidth + 24
+    height: toolToastLabel.implicitHeight + 12
+    radius: 5
+    color: "#e02b2d31"
+    border.color: "#5b9dff"
+    border.width: 1
+    Text {
+        id: toolToastLabel
+        anchors.centerIn: parent
+        color: "#e9eaec"
+        font.pixelSize: 12
+    }
+}
+Timer {
+    id: toolToastTimer
+    interval: 1300
+    onTriggered: toolToast.visible = false
+}
+
 StatusBar {
     id: statusBar
     host: root
@@ -1472,10 +1515,25 @@ function cancelLayerScale() {
 // 单字母快捷键（M/L/Q）只有在没有任何文本输入获得焦点时才生效，否则会
 // 把用户正在输入的字符吞成工具切换。
 function canUseToolKeys() {
-    return !view.canvasSurface.textPopup.visible
+    // 每项都判空：任何一个 id 尚未实例化时抛 TypeError，整组快捷键的
+    // enabled 绑定就会被 QML 丢弃并永久停在 false（V/M/L 全按不动）。
+    const tp = (typeof view !== "undefined" && view && view.canvasSurface
+                && view.canvasSurface.textPopup)
+               ? view.canvasSurface.textPopup : null
+    const si = (typeof fontPopover !== "undefined" && fontPopover
+                && fontPopover.sizeInput) ? fontPopover.sizeInput : null
+    return !(tp !== null && tp.visible)
         && root.renamingIndex < 0
-        && !root.selFieldEditing
-        && !fontPopover.sizeInput.activeFocus
+        // 菜单被别处直接藏起来时 selFieldEditing 可能卡在 true；只有菜单
+        // 确实开着才认它，否则「开过一次右键菜单 → 快捷键全废」。
+        && !(root.selMenuOpen && root.selFieldEditing)
+        && !(si !== null && si.activeFocus)
+}
+
+function showToolToast(text) {
+    toolToastLabel.text = text
+    toolToast.visible = true
+    toolToastTimer.restart()
 }
 
 // 魔术棒参数：从 settings.ini 的 "容差,连续,全部图层" 读入 / 写回。
@@ -1561,6 +1619,11 @@ function setSelToolByShortcut(tool) {
 // 也不再拾取图层。默认开（见 moveMode）。
 function toggleMoveTool() {
     root.moveMode = !root.moveMode
+    // 立刻给一句可见反馈：以前只能靠手柄是否出现来猜状态，选区还在时
+    // 手柄本来就藏着，按 V 看起来像完全没反应。
+    root.showToolToast(root.moveMode
+                       ? "移动工具：开 · 可拖动 / 缩放 / 旋转图层"
+                       : "移动工具：关 · 只绘制与选区")
     if (root.moveMode) {
         // 重新打开时顺手取消正在画的多边形/快选预览，避免半截状态。
         return
@@ -3007,6 +3070,36 @@ Timer {
     }
 }
 
+// Probe: --probe-keys 报出单字母快捷键的 enabled 绑定是否健康。
+// 修复前这里会是 vEnabled=false（创建期求值抛异常把绑定丢了）。
+Timer {
+    id: keysProbeTimer
+    interval: 900
+    running: Qt.application.arguments.indexOf("--probe-keys") !== -1
+    onTriggered: {
+        let canUse = "ERR"
+        try { canUse = root.canUseToolKeys() } catch (e) { canUse = "throw:" + e }
+        bridge.mark("keys-probe: ready=" + root.toolKeysReady
+                    + " vEnabled=" + moveShortcut.enabled
+                    + " moveMode=" + root.moveMode
+                    + " canUse=" + canUse
+                    + " selFieldEditing=" + root.selFieldEditing
+                    + " selMenuOpen=" + root.selMenuOpen
+                    + " renaming=" + root.renamingIndex
+                    + " textPopup=" + view.canvasSurface.textPopup.visible
+                    + " sizeFocus=" + fontPopover.sizeInput.activeFocus)
+    }
+}
+
+// Probe: --probe-session 报统一变换会话（P0-2b1）。配合 --script 的
+// rotate-hold / transform-state / transform-abort 断言「同一时刻只有一个手势」。
+Timer {
+    id: sessionProbeTimer
+    interval: 1100
+    running: Qt.application.arguments.indexOf("--probe-session") !== -1
+    onTriggered: bridge.mark("session-probe: " + bridge.transform_state())
+}
+
 // Probe: --probe-rotate 选中最上面的图层（配合 --script=extract:… 造图层），
 // 显示画布旋转手柄；再加 --rotate-dialog 打开角度对话框。
 Timer {
@@ -3155,6 +3248,9 @@ Timer {
 
 Component.onCompleted: {
     bridge.mark("qml-completed");
+    // 此刻整棵组件树已建好，才放行单字母工具快捷键的 enabled 绑定
+    //（见 toolKeysReady 的注释）。
+    root.toolKeysReady = true
     // 魔术棒参数：settings.ini 里的 "容差,连续,全部图层"。
     root.applyWandSpec(bridge.selWandSaved);
     // 修复 / 油漆工具参数（含上次使用的工具），`|` 分隔 12 段。
