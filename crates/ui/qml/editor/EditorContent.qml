@@ -444,6 +444,14 @@ Item {
     // 本次缩放拖的是哪几条边（1 左 / 4 右 / 8 上 / 32 下）。落定时交给
     // Rust：被拖的边贴目标、对侧锚点不动；旋转过的图层靠它反解 scale。
     property int scaleEdges: 0
+    // P1-A：Ctrl+拖边的斜切量与对侧锚定补偿（transform_solve_scale 解出，
+    // 原样透传给 scale_layer_update / scale_layer_end；非斜切手势恒 0）。
+    property real scaleSkewX: 0
+    property real scaleSkewY: 0
+    property real scaleCenterDx: 0
+    property real scaleCenterDy: 0
+    // 旋转拖动中的实时修饰键（Shift 15° 吸角，语义在 Rust 解出）。
+    property int rotateMods: 0
     property int renamingIndex: -1
     readonly property var layerList: Layers.parseLayers(bridge.layers_json)
     // The layer PANEL rebuilds its Repeater whenever the model array is
@@ -1454,77 +1462,40 @@ function canvasCursor(x, y) {
 }
 
 // Live scale-target box for the selected layer; committed on release.
-// 拖过对边（负宽高）时框照样显示成正尺寸，另外记下镜像方向，松手后
-// Rust 侧按 `flip_x/flip_y` 翻转图层位图 —— 这就是「宽高拖成负数 = 镜像」。
-function resizeLayerFrom(startRect, role, dx, dy, free) {
-    const s = Math.max(toDispScale(), 0.001)
-    // P0-3 / D3：图层变换框不再钳到 [0, 画布宽高]。画布外不渲染像素
-    // （render 输出矩形恒为 bounds ∩ canvas），但控件允许越界，拖出画布
-    // 不会被挡。选区侧的 resizedSelBox() 钳制保持不变。
-    let l = startRect.x, t = startRect.y
-    let r = startRect.x + startRect.width, b = startRect.y + startRect.height
-    if (role.indexOf("w") >= 0)
-        l = snapDisplay(startRect.x + dx)
-    if (role.indexOf("e") >= 0)
-        r = snapDisplay(startRect.x + startRect.width + dx)
-    if (role.indexOf("n") >= 0)
-        t = snapDisplay(startRect.y + dy)
-    if (role.indexOf("s") >= 0)
-        b = snapDisplay(startRect.y + startRect.height + dy)
-    const flipX = r < l, flipY = b < t
-    let x = Math.min(l, r), y = Math.min(t, b)
-    let w = Math.abs(r - l), h = Math.abs(b - t)
-    if (role.length === 2 && !free && !flipX && !flipY) {
-        // Corner handles keep the layer's aspect ratio by default
-        // (D5-A); hold Shift for a free resize. 镜像状态下不锁比例：
-        // 锚点在对侧，锁比例会让框跳一下。
-        const ar = startRect.width / Math.max(1, startRect.height)
-        if (w / Math.max(1, h) > ar)
-            w = h * ar
-        else
-            h = w / ar
-        if (role.indexOf("w") >= 0)
-            x = startRect.x + startRect.width - w
-        if (role.indexOf("n") >= 0)
-            y = startRect.y + startRect.height - h
+// ★P1-A（D14 / §9.1）：语义只在 Rust 一处求解。这里只把起手框 / role /
+// 光标位移 / 修饰键原样交给 `transform_solve_scale`，拿回解算后的框
+//（含锁比例 / 从中心 / 斜切 / 吸附）填进 viz 属性；拖过对边的镜像
+// 与斜切量也由求解器给出，本函数不再有任何几何判断。
+function resizeLayerFrom(startRect, role, dx, dy, mods) {
+    const s = Math.max(toDispScale(), 0.0001)
+    let r
+    try {
+        r = JSON.parse(bridge.transform_solve_scale(
+            startRect.x / s, startRect.y / s,
+            startRect.width / s, startRect.height / s,
+            role, dx / s, dy / s, mods, s))
+    } catch (e) {
+        return
     }
-    // P0-4：八向缩放吸附。只让「被拖的那条边 / 角」参与求解，对侧锚点
-    // 坐标恒定（D16）；求解在 Rust（图像坐标是唯一真值），这里只把修正量
-    // 换算回显示像素并叠加到被拖边上。
+    if (!r || r.error !== undefined)
+        return
+    // P0-3 / D3：图层变换框不钳画布（画布外不渲染像素，控件允许越界）。
+    root.scaleX = r.x * s
+    root.scaleY = r.y * s
+    root.scaleW = Math.max(1, r.w * s)
+    root.scaleH = Math.max(1, r.h * s)
+    root.scaleFlipX = !!r.fx
+    root.scaleFlipY = !!r.fy
+    root.scaleSkewX = r.kx || 0
+    root.scaleSkewY = r.ky || 0
+    root.scaleCenterDx = r.cx || 0
+    root.scaleCenterDy = r.cy || 0
     let edges = 0
     if (role.indexOf("w") >= 0) edges |= 1
     if (role.indexOf("e") >= 0) edges |= 4
     if (role.indexOf("n") >= 0) edges |= 8
     if (role.indexOf("s") >= 0) edges |= 32
     root.scaleEdges = edges
-    if (bridge.snapEnabled) {
-        let adj = {dx: 0, dy: 0}
-        try {
-            adj = JSON.parse(bridge.transform_snap_rect(
-                x / s, y / s, w / s, h / s, edges, 0, s)) || adj
-        } catch (e) {}
-        const adx = (adj.dx || 0) * s
-        const ady = (adj.dy || 0) * s
-        if (adx !== 0) {
-            if (role.indexOf("e") >= 0)
-                w += adx
-            else if (role.indexOf("w") >= 0) {
-                x += adx; w -= adx
-            }
-        }
-        if (ady !== 0) {
-            if (role.indexOf("s") >= 0)
-                h += ady
-            else if (role.indexOf("n") >= 0) {
-                y += ady; h -= ady
-            }
-        }
-        w = Math.max(1, w); h = Math.max(1, h)
-    }
-    root.scaleFlipX = flipX
-    root.scaleFlipY = flipY
-    root.scaleX = x; root.scaleY = y
-    root.scaleW = Math.max(1, w); root.scaleH = Math.max(1, h)
     if (!view.canvasSurface.scaleTimer.running) {
         view.canvasSurface.scaleTimer.lastW = -1; view.canvasSurface.scaleTimer.lastH = -1
         view.canvasSurface.scaleTimer.lastX = 0; view.canvasSurface.scaleTimer.lastY = 0
@@ -1537,26 +1508,31 @@ function commitLayerScale() {
     const s = toDispScale()
     if (root.scaleW >= 1 && root.scaleH >= 1 && s > 0) {
         // offset 始终是框的左上角（镜像后图层仍填满同一个框），镜像本身
-        // 走 flip_x/flip_y。
+        // 走 flip_x/flip_y；斜切量与补偿原样透传（P1-A）。
         bridge.scale_layer_end(
             true,
             Math.max(1, Math.round(root.scaleW / s)),
             Math.max(1, Math.round(root.scaleH / s)),
             Math.round(root.scaleX / s), Math.round(root.scaleY / s),
-            root.scaleFlipX, root.scaleFlipY, root.scaleEdges)
+            root.scaleFlipX, root.scaleFlipY, root.scaleEdges,
+            root.scaleSkewX, root.scaleSkewY)
     }
     root.scaleX = 0; root.scaleY = 0; root.scaleW = 0; root.scaleH = 0
     root.scaleFlipX = false; root.scaleFlipY = false
     root.scaleEdges = 0
+    root.scaleSkewX = 0; root.scaleSkewY = 0
+    root.scaleCenterDx = 0; root.scaleCenterDy = 0
 }
 
 function cancelLayerScale() {
     view.canvasSurface.scaleTimer.stop()
     if (root.scaleW > 0)
-        bridge.scale_layer_end(false, 0, 0, 0, 0, false, false, 0)
+        bridge.scale_layer_end(false, 0, 0, 0, 0, false, false, 0, 0, 0)
     root.scaleX = 0; root.scaleY = 0; root.scaleW = 0; root.scaleH = 0
     root.scaleFlipX = false; root.scaleFlipY = false
     root.scaleEdges = 0
+    root.scaleSkewX = 0; root.scaleSkewY = 0
+    root.scaleCenterDx = 0; root.scaleCenterDy = 0
 }
 
 // ---- 选区工具 -------------------------------------------------------
@@ -2146,25 +2122,28 @@ function applyRotateFrame() {
     root.rotateLastAt = now
     root.rotateRenderedAngle = root.rotateAnglePreview
     const t0 = Date.now()
-    bridge.rotate_layer_update(root.rotateAnglePreview, true)
+    // P1-A：修饰键透传（Shift 15° 吸角在 Rust 按累计角解出）。
+    bridge.rotate_layer_update(root.rotateAnglePreview, true, root.rotateMods)
     // 记下本帧真实耗时（含同步合成/编码/写盘），下一格据此决定跳不跳。
     root.rotateFrameCost = Math.min(80, Date.now() - t0)
 }
 
-function previewLayerRotate(deg) {
+function previewLayerRotate(deg, mods) {
     if (!root.rotating)
         return
+    root.rotateMods = mods || 0
     root.rotateAnglePreview = deg
     // 首帧立即出（跟着鼠标起手），之后的帧交给定时器。
     root.applyRotateFrame()
 }
 
-function finishLayerRotate(apply) {
+function finishLayerRotate(apply, mods) {
     if (!root.rotating)
         return
     root.rotating = false
     // 松手时可能还有一帧没算：把最终角度交给 finish，由它决定复用还是重算。
-    bridge.rotate_layer_finish(apply, root.rotateAnglePreview, true)
+    // P1-A：Shift 吸角与拖动帧同一语义（Rust 按累计角吸附）。
+    bridge.rotate_layer_finish(apply, root.rotateAnglePreview, true, mods || 0)
     const ix = bridge.selected_layer
     const f = root.rotateFrames[ix]
     // 框的宽高始终沿用"旋转前"那一份，只在角度上累加；这里绝不能用
@@ -2175,7 +2154,11 @@ function finishLayerRotate(apply) {
         root.setRotateFrame(ix, w, h, root.rotateBase)
         return
     }
+    // 帧记录的角度与落定保持同一吸角规则（与 Rust snap_angle_15 相同公式，
+    // 按累计角吸附；这只是 viz 簿记，几何真值仍以历史 params 为准）。
     let a = root.rotateBase + root.rotateAnglePreview
+    if ((mods || 0) & Qt.ShiftModifier)
+        a = Math.round(a / 15) * 15
     // 归一化到 (-180, 180]，转一整圈后框不该"看起来转了 360°"。
     while (a > 180) a -= 360
     while (a <= -180) a += 360
@@ -3188,8 +3171,8 @@ Timer {
             rotFirst = false
             const deg = parseFloat(args[i].substring("--probe-hand-rotate=".length)) || 45
             root.startLayerRotate()
-            root.previewLayerRotate(deg)
-            root.finishLayerRotate(true)
+            root.previewLayerRotate(deg, 0)
+            root.finishLayerRotate(true, 0)
             bridge.mark("hand-rotate: deg=" + deg + " base=" + root.rotateBase
                         + " angle=" + root.layerFrameAngle
                         + " rotated=" + root.layerFrameRotated
@@ -3236,9 +3219,9 @@ Timer {
         }
         angle += 2
         sent += 1
-        bridge.rotate_layer_update(angle, true)
+        bridge.rotate_layer_update(angle, true, 0)
         if (sent >= 40) {
-            bridge.rotate_layer_finish(false, 0, true)
+            bridge.rotate_layer_finish(false, 0, true, 0)
             bridge.mark("dragchurn:" + sent + " frames")
             Qt.quit()
         }
@@ -3286,9 +3269,9 @@ Timer {
         bridge.rotate_layer_begin(bridge.selected_layer, true)
         const t0 = Date.now()
         for (let i = 1; i <= n; ++i)
-            bridge.rotate_layer_update(i * 1.5, true)
+            bridge.rotate_layer_update(i * 1.5, true, 0)
         const t1 = Date.now()
-        bridge.rotate_layer_finish(false, 0, true)
+        bridge.rotate_layer_finish(false, 0, true, 0)
         bridge.mark("rotate-bench:" + ((t1 - t0) / n).toFixed(1) + "ms/frame")
         Qt.quit()
     }

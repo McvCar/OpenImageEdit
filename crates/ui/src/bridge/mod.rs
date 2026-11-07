@@ -563,15 +563,17 @@ pub mod qobject {
         fn rotate_layer_begin(self: Pin<&mut Self>, index: i32, keep_session: bool) -> f64;
 
         #[qinvokable]
-        fn rotate_layer_update(self: Pin<&mut Self>, degrees: f64, expand: bool);
+        fn rotate_layer_update(self: Pin<&mut Self>, degrees: f64, expand: bool, mods: i32);
 
-        /// `degrees` = 最终增量角（不必先调 update）。
+        /// `degrees` = 最终增量角（不必先调 update）；`mods` 带 Shift 时
+        /// 落定角吸附 15°（P1-A）。
         #[qinvokable]
         fn rotate_layer_finish(
             self: Pin<&mut Self>,
             apply: bool,
             degrees: f64,
             expand: bool,
+            mods: i32,
         );
 
         /// 一次性旋转（角度对话框确认 / 脚本探针）。
@@ -829,6 +831,12 @@ pub mod qobject {
                             mods: i32, disp_scale: f64) -> bool;
         #[qinvokable]
         fn transform_end(self: Pin<&mut Self>, commit: bool, mods: i32) -> bool;
+        /// ★P1-A：缩放手势语义求解（锁比例 / 从中心 / 斜切 / 吸附都在
+        /// Rust 解出），返回 `{"x","y","w","h","fx","fy","kx","ky","cx","cy"}`。
+        #[qinvokable]
+        fn transform_solve_scale(self: Pin<&mut Self>, sx: f64, sy: f64, sw: f64, sh: f64,
+                                 role: QString, dx: f64, dy: f64, mods: i32,
+                                 disp_scale: f64) -> QString;
         /// 八向缩放吸附：返回 `{"dx":..,"dy":..}`，只让 `edges` 指定的边参与。
         #[qinvokable]
         fn transform_snap_rect(self: Pin<&mut Self>, x: f64, y: f64, w: f64, h: f64,
@@ -950,6 +958,8 @@ pub mod qobject {
 
         /// `w` / `h` are always positive; `flip_x` / `flip_y` say the handle
         /// was dragged past the opposite edge, so the bitmap mirrors.
+        /// `skew_x` / `skew_y`：Ctrl+拖边的斜切量（P1-A）；非斜切手势传 0。
+        /// `center_dx` / `center_dy`：斜切的对侧锚定补偿（W/N 缘）。
         #[qinvokable]
         fn scale_layer_update(
             self: Pin<&mut Self>,
@@ -959,12 +969,17 @@ pub mod qobject {
             oy: i32,
             flip_x: bool,
             flip_y: bool,
+            skew_x: f64,
+            skew_y: f64,
+            center_dx: f64,
+            center_dy: f64,
         );
 
         /// `w` / `h` are always positive; `flip_x` / `flip_y` say the handle
         /// was dragged past the opposite edge, so the bitmap mirrors.
         /// `edges` 是本次被拖动的边位掩码（1 左 / 4 右 / 8 上 / 32 下），
         /// 未列出的边在对侧锚定 —— 旋转过的图层靠它反解 scale（不再烘焙）。
+        /// `skew_x` / `skew_y` 非零 = 斜切手势落定（P1-A），走 skew 分支。
         #[qinvokable]
         fn scale_layer_end(
             self: Pin<&mut Self>,
@@ -976,6 +991,8 @@ pub mod qobject {
             flip_x: bool,
             flip_y: bool,
             edges: i32,
+            skew_x: f64,
+            skew_y: f64,
         );
     }
 }

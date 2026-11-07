@@ -660,7 +660,14 @@ impl qobject::Bridge {
     /// 拖动期间**不碰文档像素**：只把角度交给合成器，由它按预览尺寸临时旋
     /// 转（见 `composite_live_rotate_adjusted`）。整层重采样留到松手那一帧，
     /// 所以来回拖多少次，位图都只被插值一次 —— 不会越拖越糊。
-    pub fn rotate_layer_update(mut self: Pin<&mut Self>, degrees: f64, expand: bool) {
+    /// P1-A：拖动帧角度可带修饰键 —— Shift 把**累计角度**吸附到 15° 整数倍
+    /// （PS 语义；增量角按 `snap(base+delta)-base` 反推）。QML 只透传掩码。
+    pub fn rotate_layer_update(
+        mut self: Pin<&mut Self>,
+        degrees: f64,
+        expand: bool,
+        mods: i32,
+    ) {
         {
             let mut guard = self.session.borrow_mut();
             let Some(session) = guard.as_mut() else { return };
@@ -669,6 +676,10 @@ impl qobject::Bridge {
             else {
                 return;
             };
+            let degrees = editcore::snap_angle_15(
+                st.base_degrees as f64 + degrees,
+                mods & super::transform::MOD_SHIFT != 0,
+            ) - st.base_degrees as f64;
             let total = st.base_degrees + degrees as f32;
             st.last_delta = degrees as f32;
             st.expand = expand;
@@ -708,10 +719,25 @@ impl qobject::Bridge {
 
     /// 结束会话：把拖动期间只存在于合成器里的角度真正落到位图上（一次重采样），
     /// 或者直接丢掉（取消）。
-    pub fn rotate_layer_finish(mut self: Pin<&mut Self>, apply: bool, degrees: f64, expand: bool) {
+    /// P1-A：`mods` 带 Shift 时，落定角度同样吸附 15°（与拖动帧一致）。
+    pub fn rotate_layer_finish(
+        mut self: Pin<&mut Self>,
+        apply: bool,
+        degrees: f64,
+        expand: bool,
+        mods: i32,
+    ) {
         {
             let mut guard = self.session.borrow_mut();
             let Some(session) = guard.as_mut() else { return };
+            // 落定吸角要按累计角算，但 base 在 take 之后才拿得到：先偷看。
+            let base = match session.transform.as_ref() {
+                Some(TransformSession::Rotate { live, .. }) => live.base_degrees as f64,
+                _ => 0.0,
+            };
+            let degrees =
+                editcore::snap_angle_15(base + degrees, mods & super::transform::MOD_SHIFT != 0)
+                    - base;
             let Some(st) = session.take_rotate_live() else {
                 // 迟到 / 重复的收尾（onReleased 之后又来一次 onCanceled，或
                 // QML 补的清理调用）：会话已经结束了，但临时预览态可能因为

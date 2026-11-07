@@ -37,7 +37,7 @@ Item {
     function close(apply) {
         previewTimer.stop()
         if (targetIndex >= 0 && bridge.rotate_layer_state().length > 0)
-            bridge.rotate_layer_finish(apply, angle, expand)
+            bridge.rotate_layer_finish(apply, angle, expand, 0)
         targetIndex = -1
         visible = false
     }
@@ -50,7 +50,7 @@ Item {
         onTriggered: {
             if (rotateOverlay.visible && rotateOverlay.targetIndex >= 0)
                 bridge.rotate_layer_update(rotateOverlay.angle,
-                                           rotateOverlay.expand)
+                                           rotateOverlay.expand, 0)
         }
     }
 

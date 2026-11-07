@@ -518,11 +518,14 @@ impl PreviewComposer {
             let src = match hit {
                 Some(img) => img,
                 None => {
+                    // P1-A 质量分层（D14/R11）：拖动帧用双线性（Triangle），
+                    // 不再 Nearest 马赛克；落定仍走 HQ（Lanczos3/sample HQ），
+                    // 「不许把落定画质降到拖动水平」的反向约束照旧。
                     let mut img = image::imageops::resize(
                         snapshot,
                         nw,
                         nh,
-                        FilterType::Nearest,
+                        FilterType::Triangle,
                     );
                     if flip.0 {
                         img = image::imageops::flip_horizontal(&img);
@@ -557,6 +560,115 @@ impl PreviewComposer {
     /// 顺序是「先把图层缩到预览尺寸，再在小图上转」：单帧代价只跟预览像素
     /// 数有关，原图多大都一样。反过来（先转整层再缩放）在 2200×1500 的图上
     /// 每帧要 40ms 以上 —— 那正是旋转手柄一顿一顿的原因。
+    ///
+    /// P1-A：斜切拖动帧的实时合成（Ctrl+拖边）。文档像素不动：活动层按
+    /// 「起手快照 → 预览尺寸 → LayerTransform（与落定同一个 sample_affine
+    /// 采样器，hq=false 双线性）」画出，其余图层照旧。`skew` 是本次手势
+    /// 的累计剪切量，`center_delta` 是 W/N 缘的对侧锚定补偿（图像坐标）。
+    pub fn composite_live_skew_adjusted(
+        &mut self,
+        doc: &Document,
+        target: Size,
+        layer_index: usize,
+        snapshot: &RgbaImage,
+        skew: (f64, f64),
+        center_delta: (f64, f64),
+        adjust: Option<(AdjustTarget, Adjust)>,
+    ) -> RgbaImage {
+        let Some((sx, sy)) = self.prepare(doc, target) else {
+            return RgbaImage::new(target.width.max(1), target.height.max(1));
+        };
+        let drag_opacity = doc
+            .layers
+            .get(layer_index)
+            .map(|l| if l.visible { l.opacity } else { 0.0 })
+            .unwrap_or(0.0);
+        let mut out = self.base_buffer(doc, target, sx, sy);
+        if let Some((AdjustTarget::Base, params)) = adjust {
+            params.apply_in_place(&mut out);
+        }
+        for (li, layer) in doc.layers.iter().enumerate() {
+            if !layer.visible || layer.opacity <= 0.0 || li == layer_index {
+                continue;
+            }
+            let src = self.scaled_layer(li, &layer.image, sx, sy);
+            let ox = (layer.offset.0 as f64 * sx).round() as i32;
+            let oy = (layer.offset.1 as f64 * sy).round() as i32;
+            match adjust {
+                Some((AdjustTarget::Layer(index), params)) if index == li => {
+                    let mut adjusted = (*src).clone();
+                    params.apply_in_place(&mut adjusted);
+                    Self::blend_layer(&mut out, target, &adjusted, ox, oy, layer.opacity);
+                }
+                _ => Self::blend_layer(&mut out, target, &src, ox, oy, layer.opacity),
+            }
+        }
+        if drag_opacity > 0.0 {
+            let Some(layer) = doc.layers.get(layer_index) else {
+                return out;
+            };
+            // 起手参数（手势不写文档，layer.transform 就是 begin 状态）。
+            let base = layer.transform.clone().unwrap_or_else(|| {
+                editcore::LayerTransform::from_offset(layer.image.clone(), layer.offset.0, layer.offset.1)
+            });
+            let (sw, sh) = base.source_size();
+            let nw = ((sw * base.scale.0.abs() * sx).round() as u32).max(1);
+            let nh = ((sh * base.scale.1.abs() * sy).round() as u32).max(1);
+            // 复用 live 缓存（键 (w,h)，flip 恒 (false,false)：斜切不镜像，
+            // 若上一段缩放手势留了 flip=true 的缓存，键不匹配会自动重算）。
+            let scaled = if self.live_flip == (false, false) {
+                Self::cached_hit(&self.live, nw, nh)
+            } else {
+                None
+            };
+            let scaled = match scaled {
+                Some(img) => img,
+                None => {
+                    let img = Arc::new(image::imageops::resize(
+                        snapshot,
+                        nw,
+                        nh,
+                        FilterType::Triangle,
+                    ));
+                    self.live = Some((nw, nh, img.clone()));
+                    self.live_flip = (false, false);
+                    img
+                }
+            };
+            // 预览空间的变换：source 已是「预览尺寸的显示位图」，scale 归 1，
+            // center / 补偿量按 (sx, sy) 折算，旋转 / 斜切角度原样保留。
+            //（source 字段直接换绑 Arc，避免为构造再拷一次位图。）
+            let mut t = editcore::LayerTransform::new(RgbaImage::new(1, 1));
+            t.source = scaled;
+            t.rotation = base.rotation;
+            t.skew = (base.skew.0 + skew.0, base.skew.1 + skew.1);
+            t.center = (
+                (base.center.0 + center_delta.0) * sx,
+                (base.center.1 + center_delta.1) * sy,
+            );
+            let active = t.render(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: target.width,
+                    height: target.height,
+                },
+                false,
+            );
+            let stretched = match adjust {
+                Some((AdjustTarget::Layer(index), params)) if index == layer_index => {
+                    let mut adjusted = active;
+                    params.apply_in_place(&mut adjusted);
+                    adjusted
+                }
+                _ => active,
+            };
+            Self::blend_layer(&mut out, target, &stretched, 0, 0, drag_opacity);
+        }
+        Self::draw_marks(doc, &mut out, sx, sy);
+        out
+    }
+
     pub fn composite_live_rotate_adjusted(
         &mut self,
         doc: &Document,

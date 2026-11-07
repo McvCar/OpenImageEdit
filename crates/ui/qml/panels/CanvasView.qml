@@ -372,7 +372,41 @@ Item {
     y: previewImage.y
     width: previewImage.width
     height: previewImage.height
-    visible: view.bridge.gpuLive
+    // P1-A（R11 观感一致）：落定帧（CPU HQ）比拖动帧（GPU 双线性）锐，
+    // 直接切换会有一次「突然变锐」的跳变。落定时 GPU 层不立即隐藏，
+    // 而是 ~90ms 淡出，下面的 HQ 预览同步淡入 —— 交叉过渡消除突变。
+    // 纹理 URL 在 gpu_end 后仍保留（下次 begin 才重建），淡出期间可渲染。
+    visible: view.bridge.gpuLive || fadeTimer.running
+    opacity: view.bridge.gpuLive ? 1.0 : fadeOpacity
+    property real fadeOpacity: 0.0
+    property bool wasLive: false
+    onVisibleChanged: if (visible) { wasLive = true; fadeTimer.stop(); fadeOpacity = 1.0 }
+    Timer {
+        id: fadeTimer
+        interval: 16
+        repeat: true
+        onTriggered: {
+            gpuLayer.fadeOpacity -= 0.2
+            if (gpuLayer.fadeOpacity <= 0.0) {
+                gpuLayer.fadeOpacity = 0.0
+                stop()
+            }
+        }
+    }
+    Connections {
+        target: view.bridge
+        function onGpuLiveChanged() {
+            if (view.bridge.gpuLive) {
+                gpuLayer.wasLive = true
+                gpuLayer.fadeOpacity = 1.0
+                fadeTimer.stop()
+            } else if (gpuLayer.wasLive) {
+                gpuLayer.wasLive = false
+                gpuLayer.fadeOpacity = 1.0
+                fadeTimer.restart()
+            }
+        }
+    }
     clip: true
 
     readonly property var rect: {

@@ -416,3 +416,117 @@ impl qobject::Bridge {
 pub(super) const MOD_SHIFT: i32 = QT_SHIFT;
 pub(super) const MOD_CTRL: i32 = QT_CTRL;
 pub(super) const MOD_ALT: i32 = QT_ALT;
+
+impl qobject::Bridge {
+    /// ★P1-A（D14 / §9.1）：缩放手势语义求解 —— **修饰键语义只在这里**。
+    ///
+    /// QML 只透传起手外接框（图像坐标）、被拖手柄 role、光标位移与修饰键
+    /// 位掩码；锁比例（角点+Shift）、从中心（Alt）、斜切（Ctrl+拖边）与
+    /// 八向吸附全部在这一个入口解出，返回解算后的框 + 翻转 + 斜切量 JSON。
+    /// 斜切手势跳过吸附（scale+Ctrl 的 Ctrl 语义就是斜切，D17）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn transform_solve_scale(
+        mut self: Pin<&mut Self>,
+        sx: f64,
+        sy: f64,
+        sw: f64,
+        sh: f64,
+        role: QString,
+        dx: f64,
+        dy: f64,
+        mods: i32,
+        disp_scale: f64,
+    ) -> QString {
+        let Some(r) = editcore::ScaleRole::parse(role.to_string().as_str()) else {
+            return QString::from(r#"{"error":"role"}"#);
+        };
+        let enabled = *self.snap_enabled();
+        let shift = mods & QT_SHIFT != 0;
+        let alt = mods & QT_ALT != 0;
+        let ctrl = mods & QT_CTRL != 0;
+        let ix = (*self.selected_layer()).max(0) as usize;
+        let (x, y, w, h, fx, fy, kx, ky, cx, cy) = {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return QString::from(r#"{"error":"no_document"}"#);
+            };
+            session.disp_scale = if disp_scale > 0.0 { disp_scale } else { 1.0 };
+            // 斜切换算需要图层当前 (sx, sy)：identity 层恒 (1,1)。
+            let (lsx, lsy) = session
+                .doc
+                .layers
+                .get(ix)
+                .map(|l| {
+                    l.transform
+                        .as_ref()
+                        .map(|t| (t.scale.0.max(1e-6), t.scale.1.max(1e-6)))
+                        .unwrap_or((1.0, 1.0))
+                })
+                .unwrap_or((1.0, 1.0));
+            let solved = editcore::solve_scale_gesture(
+                editcore::RectF::new(sx, sy, sw, sh),
+                r,
+                dx,
+                dy,
+                shift,
+                alt,
+                ctrl,
+                (lsx, lsy),
+            );
+            let (mut x, mut y) = (solved.x, solved.y);
+            let (mut w, mut h) = (solved.width, solved.height);
+            // 非斜切手势才吸附（Ctrl 的语义在 scale 手势里是斜切）。
+            if !ctrl && enabled {
+                if session.snap_statics.is_empty() {
+                    prepare_snap(session, ix);
+                }
+                let res = solve_rect(
+                    (x, y, w, h),
+                    &session.snap_statics,
+                    8.0,
+                    session.disp_scale,
+                    r.edge_bits(),
+                );
+                let (adx, ady) = (res.dx, res.dy);
+                session.snap = res;
+                if adx != 0.0 {
+                    if r.edge_bits() & 4 != 0 {
+                        w += adx;
+                    } else if r.edge_bits() & 1 != 0 {
+                        x += adx;
+                        w -= adx;
+                    }
+                }
+                if ady != 0.0 {
+                    if r.edge_bits() & 32 != 0 {
+                        h += ady;
+                    } else if r.edge_bits() & 8 != 0 {
+                        y += ady;
+                        h -= ady;
+                    }
+                }
+            } else if !enabled {
+                session.snap = SnapResult::default();
+            }
+            (
+                x,
+                y,
+                w.max(1.0),
+                h.max(1.0),
+                solved.flip.0,
+                solved.flip.1,
+                solved.skew.0,
+                solved.skew.1,
+                solved.center_delta.0,
+                solved.center_delta.1,
+            )
+        };
+        QString::from(
+            format!(
+                r#"{{"x":{x:.4},"y":{y:.4},"w":{w:.4},"h":{h:.4},"fx":{},"fy":{},"kx":{kx:.6},"ky":{ky:.6},"cx":{cx:.4},"cy":{cy:.4}}}"#,
+                fx as i32, fy as i32
+            )
+            .as_str(),
+        )
+    }
+}

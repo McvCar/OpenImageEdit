@@ -426,6 +426,9 @@ impl qobject::Bridge {
                     to: Size::new(layer.image.width(), layer.image.height()),
                     offset: layer.offset,
                     flip: (false, false),
+                    // P1-A：Ctrl+拖边 = 斜切，量由 `transform_solve_scale` 解出。
+                    skew: (0.0, 0.0),
+                    center_delta: (0.0, 0.0),
                 }));
             }
         }
@@ -439,6 +442,10 @@ impl qobject::Bridge {
         oy: i32,
         flip_x: bool,
         flip_y: bool,
+        skew_x: f64,
+        skew_y: f64,
+        center_dx: f64,
+        center_dy: f64,
     ) {
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
             return;
@@ -456,6 +463,8 @@ impl qobject::Bridge {
                     ls.to = Size::new(w as u32, h as u32);
                     ls.offset = (ox, oy);
                     ls.flip = (flip_x, flip_y);
+                    ls.skew = (skew_x, skew_y);
+                    ls.center_delta = (center_dx, center_dy);
                 }
                 _ => return,
             }
@@ -474,6 +483,8 @@ impl qobject::Bridge {
         flip_x: bool,
         flip_y: bool,
         edges: i32,
+        skew_x: f64,
+        skew_y: f64,
     ) {
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
             return;
@@ -505,28 +516,44 @@ impl qobject::Bridge {
                             (t, sw, sh)
                         };
                         let cumulative = (t.flip.0 ^ flip_x, t.flip.1 ^ flip_y);
-                        // 回到原始尺寸（±2px 手柄误差吸附）时 1:1 回到原图，
-                        // 与 P0-2a 的「拖回来不糊」保持逐像素一致。
-                        let snap_back = !cumulative.0
-                            && !cumulative.1
-                            && t.rotation.abs() < 1e-9
-                            && (to.width as f64 - sw).abs() <= 2.0
-                            && (to.height as f64 - sh).abs() <= 2.0;
-                        let (fw, fh) = if snap_back {
-                            (sw, sh)
-                        } else {
-                            (to.width as f64, to.height as f64)
-                        };
-                        t.flip = cumulative;
-                        // edges 位掩码与 core 的 EDGE_* 一致：被拖的边贴目标，
-                        // 对侧锚点不动（八向手柄的手感）。
-                        let result = if t.set_bounds_rect(
-                            editcore::RectF::new(ox as f64, oy as f64, fw, fh),
-                            (edges.max(0) as u8) & 0x2d,
-                        ) {
+                        // ★P1-A：斜切手势落定 —— 缩放 / 中心在剪切里保持
+                        // 不变（剪切绕 source 中心），只写 skew；W/N 缘的
+                        // 对侧锚定补偿在 gesture 期间已累计进 ls.center_delta。
+                        let skew = (skew_x, skew_y);
+                        let result = if skew != (0.0, 0.0) {
+                            t.skew = (
+                                (t.skew.0 + skew.0).max(-4.0).min(4.0),
+                                (t.skew.1 + skew.1).max(-4.0).min(4.0),
+                            );
+                            t.center = (
+                                t.center.0 + ls.center_delta.0,
+                                t.center.1 + ls.center_delta.1,
+                            );
                             session.doc.set_layer_transform(ix, Some(t))
                         } else {
-                            Err(editcore::EditError::InvalidCanvasSize)
+                            // 回到原始尺寸（±2px 手柄误差吸附）时 1:1 回到原图，
+                            // 与 P0-2a 的「拖回来不糊」保持逐像素一致。
+                            let snap_back = !cumulative.0
+                                && !cumulative.1
+                                && t.rotation.abs() < 1e-9
+                                && (to.width as f64 - sw).abs() <= 2.0
+                                && (to.height as f64 - sh).abs() <= 2.0;
+                            let (fw, fh) = if snap_back {
+                                (sw, sh)
+                            } else {
+                                (to.width as f64, to.height as f64)
+                            };
+                            t.flip = cumulative;
+                            // edges 位掩码与 core 的 EDGE_* 一致：被拖的边贴
+                            // 目标，对侧锚点不动（八向手柄的手感）。
+                            if t.set_bounds_rect(
+                                editcore::RectF::new(ox as f64, oy as f64, fw, fh),
+                                (edges.max(0) as u8) & 0x2d,
+                            ) {
+                                session.doc.set_layer_transform(ix, Some(t))
+                            } else {
+                                Err(editcore::EditError::InvalidCanvasSize)
+                            }
                         };
                         match result {
                             Ok(()) => {

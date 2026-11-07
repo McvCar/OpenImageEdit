@@ -325,7 +325,7 @@ Item {
                 // 提交掉再起拖；Rust 的 drag_translate_begin 还会再兜一次底，
                 // 把残留的临时预览态清干净，避免「框拖走了、内容没动」。
                 if (host.rotating)
-                    host.finishLayerRotate(true)
+                    host.finishLayerRotate(true, 0)
                 if (bridge.selected_mark >= 0)
                     bridge.select_mark(-1)   // 标记/图层选中互斥
                 // 上一次拖动如果没收尾（切窗口、Alt+Tab、浮层抢焦点导致丢了
@@ -1380,7 +1380,11 @@ Item {
             if (w === lastW && h === lastH && x === lastX && y === lastY)
                 return
             lastW = w; lastH = h; lastX = x; lastY = y
-            bridge.scale_layer_update(w, h, x, y, host.scaleFlipX, host.scaleFlipY)
+            // P1-A：斜切量 / 锚定补偿由 transform_solve_scale 解出后存在
+            // host 属性上，这里原样透传（非斜切手势恒 0）。
+            bridge.scale_layer_update(w, h, x, y, host.scaleFlipX, host.scaleFlipY,
+                                      host.scaleSkewX, host.scaleSkewY,
+                                      host.scaleCenterDx, host.scaleCenterDy)
         }
     }
 

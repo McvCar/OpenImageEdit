@@ -69,8 +69,10 @@ Item {
                 onPositionChanged: (mouse) => {
                     if (pressed && handles.resizeFn) {
                         const p = mapToItem(handles, mouse.x, mouse.y)
+                        // P1-A：完整修饰键位掩码原样透传，语义在 Rust 解出
+                        // （Shift 锁比例 / Alt 从中心 / Ctrl 斜切）。
                         handles.resizeFn(startRect, role, p.x - px, p.y - py,
-                                         (mouse.modifiers & Qt.ShiftModifier) !== 0)
+                                         mouse.modifiers)
                     }
                 }
                 onReleased: handles.engaged = false
@@ -164,8 +166,9 @@ Item {
             onPositionChanged: (mouse) => {
                 if (pressed && handles.resizeFn) {
                     const p = mapToItem(handles, mouse.x, mouse.y)
+                    // P1-A：完整修饰键位掩码（同上，语义在 Rust 解出）。
                     handles.resizeFn(startRect, role, p.x - px, p.y - py,
-                                     (mouse.modifiers & Qt.ShiftModifier) !== 0)
+                                     mouse.modifiers)
                 }
             }
             onReleased: handles.engaged = false

@@ -191,7 +191,8 @@ Item {
         bh: selectionViz.resizingSel ? selectionViz.liveSelBox.height : host.selH
         moveEnabled: false
         pxScale: host.toDispScale()
-        resizeFn: function(startRect, role, dx, dy, free) {
+        resizeFn: function(startRect, role, dx, dy, mods) {
+            // 选区缩放没有修饰键语义；mods 只是 EdgeHandles 的统一签名。
             selectionViz.liveSelBox = selectionViz.resizedSelBox(
                         startRect, role, dx, dy)
             // 拖过对边 = 镜像：记下方向，松手时以负宽高交给 Rust。
@@ -380,8 +381,8 @@ Item {
                             : (host.selLayerBox !== null ? host.selLayerBox.h * host.toDispScale() : 0)
         moveEnabled: false
         pxScale: host.toDispScale()
-        resizeFn: function(startRect, role, dx, dy, free) {
-            host.resizeLayerFrom(startRect, role, dx, dy, free)
+        resizeFn: function(startRect, role, dx, dy, mods) {
+            host.resizeLayerFrom(startRect, role, dx, dy, mods)
         }
         onEngagedChanged: {
             if (layerHandles.engaged) {
@@ -463,6 +464,8 @@ Item {
                 hoverEnabled: true
                 preventStealing: true
                 property real startAngle: 0
+                // P1-A：拖动中的实时修饰键（Shift 15° 吸角在 Rust 解出）。
+                property int rotateMods: 0
                 // 旋转中心在按下那一刻就锁死：图层一扩边界，框会跟着变大，
                 // 每帧重算中心会让同一个鼠标位置算出不同角度，手感像在抖。
                 property real pivotX: 0
@@ -489,16 +492,17 @@ Item {
                 onPositionChanged: (mouse) => {
                     if (!pressed)
                         return
+                    rotateMods = mouse.modifiers
                     const p = mapToItem(previewImage, mouse.x, mouse.y)
                     const a = Math.atan2(p.y - pivotY, p.x - pivotX) * 180 / Math.PI
                     let d = a - startAngle
                     // 跨 ±180 时不要跳一整圈。
                     while (d > 180) d -= 360
                     while (d < -180) d += 360
-                    host.previewLayerRotate(d)
+                    host.previewLayerRotate(d, rotateMods)
                 }
                 onReleased: {
-                    host.finishLayerRotate(true)
+                    host.finishLayerRotate(true, rotateMods)
                     host.rotateKnobHover = containsMouse
                 }
                 onCanceled: {
@@ -509,7 +513,7 @@ Item {
                     //   的外接矩形位图起手，框就越转越大、图越转越糊。
                     //   现在按「提交当前角度」处理：真没动过就是 neutral，
                     //   不会产生历史，也不会清锚点。
-                    host.finishLayerRotate(true)
+                    host.finishLayerRotate(true, rotateMods)
                     host.rotateKnobHover = false
                 }
             }

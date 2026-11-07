@@ -640,6 +640,126 @@ impl qobject::Bridge {
                         )
                     }
                 }
+                // `solve-scale:sx,sy,sw,sh,role,dx,dy,mods[,disp]` —— P1-A：
+                // 直接调用缩放手势语义求解器，打印解算 JSON（框 + 翻转 +
+                // 斜切 + 锚定补偿）。吸附候选按当前文档现场生成。
+                other if other.starts_with("solve-scale:") => {
+                    let body = other.trim_start_matches("solve-scale:");
+                    let parts: Vec<&str> = body.split(',').collect();
+                    if parts.len() >= 8 {
+                        let nums: Vec<f64> =
+                            parts[..4].iter().filter_map(|p| p.parse().ok()).collect();
+                        let tail: Vec<f64> = parts[5..8]
+                            .iter()
+                            .filter_map(|p| p.parse().ok())
+                            .collect();
+                        if nums.len() == 4 && tail.len() == 3 {
+                            let disp = parts
+                                .get(8)
+                                .and_then(|p| p.parse().ok())
+                                .unwrap_or(1.0_f64);
+                            let out = self.as_mut().transform_solve_scale(
+                                nums[0], nums[1], nums[2], nums[3],
+                                QString::from(parts[4]),
+                                tail[0], tail[1], tail[2] as i32, disp,
+                            );
+                            println!(
+                                "{{\"phase\":\"ui\",\"event\":\"solve-scale\",\"out\":{}}}",
+                                out.to_string()
+                            );
+                        } else {
+                            println!(
+                                "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                            )
+                        }
+                    } else {
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        )
+                    }
+                }
+                // `skew-layer:dx_or_dy,role` —— P1-A：走完整斜切链路（solve →
+                // begin → update(skew) → end(skew)），验证落定后 skew 进
+                // params、原图不烘焙。`role` 取 w/e/n/s；位移按轴自动选取。
+                other if other.starts_with("skew-layer:") => {
+                    let body = other.trim_start_matches("skew-layer:");
+                    let parts: Vec<&str> = body.split(',').collect();
+                    if parts.len() >= 2 {
+                        let delta = parts[0].parse::<f64>().unwrap_or(0.0);
+                        let role = parts[1];
+                        let ix = (*self.selected_layer()).max(0) as usize;
+                        let box0 = {
+                            let guard = self.session.borrow();
+                            guard
+                                .as_ref()
+                                .and_then(|s| s.doc.layers.get(ix))
+                                .map(|l| {
+                                    let b = l.bounds();
+                                    (b.x as f64, b.y as f64,
+                                     b.width as f64, b.height as f64)
+                                })
+                                .unwrap_or((0.0, 0.0, 1.0, 1.0))
+                        };
+                        let (dx, dy) = if role.contains("w") || role.contains("e") {
+                            (0.0, delta)
+                        } else {
+                            (delta, 0.0)
+                        };
+                        let out = self.as_mut().transform_solve_scale(
+                            box0.0, box0.1, box0.2, box0.3,
+                            QString::from(role), dx, dy,
+                            super::transform::MOD_CTRL, 1.0,
+                        );
+                        // solve-scale 的 JSON 结构固定（transform.rs 打印），
+                        // 用一个小读取器取数，避免为脚本探针引入 serde_json。
+                        let text = out.to_string();
+                        let num = |key: &str| -> f64 {
+                            let pat = format!("\"{}\":", key);
+                            match text.find(&pat) {
+                                Some(i) => {
+                                    let rest = &text[i + pat.len()..];
+                                    let end = rest
+                                        .find([',', '}'])
+                                        .unwrap_or(rest.len());
+                                    rest[..end].parse().unwrap_or(0.0)
+                                }
+                                None => 0.0,
+                            }
+                        };
+                        let (x, y, w, h) = (
+                            num("x").round() as i32,
+                            num("y").round() as i32,
+                            (num("w").round() as i32).max(1),
+                            (num("h").round() as i32).max(1),
+                        );
+                        let (kx, ky) = (num("kx"), num("ky"));
+                        let (cx, cy) = (num("cx"), num("cy"));
+                        let edges = if role.contains("w") {
+                            1
+                        } else if role.contains("e") {
+                            4
+                        } else if role.contains("n") {
+                            8
+                        } else {
+                            32
+                        };
+                        self.as_mut().scale_layer_begin();
+                        self.as_mut().scale_layer_update(
+                            w, h, x, y, false, false, kx, ky, cx, cy,
+                        );
+                        self.as_mut().scale_layer_end(
+                            true, w, h, x, y, false, false, edges, kx, ky,
+                        );
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"skew-layer\",\"kx\":{kx:.6},\
+                             \"ky\":{ky:.6},\"box\":[{x},{y},{w},{h}]}}"
+                        );
+                    } else {
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        )
+                    }
+                }
                 // `scale-layer:w,h` —— 模拟拖 8 点手柄把图层缩放到 w×h
                 // （保持中心不变），走真实 begin → update → end 链路。用来
                 // 复现「旋转 → 拉伸 → 再旋转」时外接矩形被二次烘焙、框越来
@@ -667,8 +787,8 @@ impl qobject::Bridge {
                             None => (0, 0),
                         };
                         self.as_mut().scale_layer_begin();
-                        self.as_mut().scale_layer_update(w, h, ox, oy, false, false);
-                        self.as_mut().scale_layer_end(true, w, h, ox, oy, false, false, 0);
+                        self.as_mut().scale_layer_update(w, h, ox, oy, false, false, 0.0, 0.0, 0.0, 0.0);
+                        self.as_mut().scale_layer_end(true, w, h, ox, oy, false, false, 0, 0.0, 0.0);
                         println!(
                             "{{\"phase\":\"ui\",\"event\":\"scale-layer\",\"w\":{w},\"h\":{h},\
                              \"ox\":{ox},\"oy\":{oy}}}"
@@ -909,7 +1029,7 @@ impl qobject::Bridge {
                         let (ix, deg) = (n[0] as i32, n[1]);
                         let expand = n.get(2).copied().unwrap_or(1.0) > 0.5;
                         let base = self.as_mut().rotate_layer_begin(ix, true);
-                        self.as_mut().rotate_layer_update(deg, expand);
+                        self.as_mut().rotate_layer_update(deg, expand, 0);
                         println!(
                             "{{\"phase\":\"ui\",\"event\":\"rotate-hold\",\"base\":{base:.2},\
                              \"degrees\":{deg:.2}}}"
@@ -928,9 +1048,11 @@ impl qobject::Bridge {
                     if n.len() >= 2 {
                         let (ix, deg) = (n[0] as i32, n[1]);
                         let expand = n.get(2).copied().unwrap_or(1.0) > 0.5;
+                        // P1-A：第 4 参 = 修饰键位掩码（Shift 15° 吸角）。
+                        let mods = n.get(3).copied().unwrap_or(0.0) as i32;
                         self.as_mut().rotate_layer_begin(ix, true);
-                        self.as_mut().rotate_layer_update(deg, expand);
-                        self.as_mut().rotate_layer_finish(true, deg, expand);
+                        self.as_mut().rotate_layer_update(deg, expand, mods);
+                        self.as_mut().rotate_layer_finish(true, deg, expand, mods);
                         println!(
                             "{{\"phase\":\"ui\",\"event\":\"rotate-handle\",\"degrees\":{deg:.2}}}"
                         );

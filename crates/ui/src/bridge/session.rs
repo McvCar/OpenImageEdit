@@ -391,6 +391,10 @@ pub(in crate::bridge) struct LiveScaleState {
     pub(in crate::bridge) offset: (i32, i32),
     /// 手柄被拖过对边：预览也要镜像（负宽高的可视化）。
     pub(in crate::bridge) flip: (bool, bool),
+    /// P1-A：Ctrl+拖边 = 斜切（source 空间剪切量），非斜切手势恒为 0。
+    pub(in crate::bridge) skew: (f64, f64),
+    /// 斜切的对侧锚定补偿（W/N 缘剪切绕中心会把对侧带走，平移抵消）。
+    pub(in crate::bridge) center_delta: (f64, f64),
 }
 
 /// 修复画笔 / 污点修复的进行中手势。
@@ -819,6 +823,19 @@ impl Session {
                     lr.degrees,
                     lr.expand,
                     lr.token,
+                    adjust,
+                )
+            }
+            TransformSession::Scale(ls) if ls.skew != (0.0, 0.0) => {
+                // P1-A：Ctrl+拖边的斜切帧走参数化采样（与落定同一个
+                // sample_affine 采样器，双线性档），不再按 AABB 拉伸。
+                self.composer.composite_live_skew_adjusted(
+                    &self.doc,
+                    target,
+                    ls.index,
+                    &ls.snapshot,
+                    ls.skew,
+                    ls.center_delta,
                     adjust,
                 )
             }
