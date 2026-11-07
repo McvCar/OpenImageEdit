@@ -63,6 +63,16 @@ fn main() {
         elapsed_ms()
     );
 
+    // P0-0 基线探针：纯数学自检，打印完立即退出，不加载 QML、不占用单实例。
+    // 与 `cargo run -p imageedit-core --example transform_probe` 输出逐字一致，
+    // 供 P0-1 接线前后比对几何期望值。
+    if args.iter().any(|a| a == "--probe-transform") {
+        for line in editcore::transform_probe_lines() {
+            println!("{line}");
+        }
+        return;
+    }
+
     // Single instance: a plain `imageedit.exe <image>` run (what Explorer's
     // double-click produces) hands the path to the running instance and exits,
     // so every document window shares one process — and therefore one layer

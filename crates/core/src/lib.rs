@@ -11,6 +11,7 @@ pub use font::{measure_text, FONTS};
 mod geometry;
 mod mark;
 mod layer;
+pub mod layer_transform;
 mod transform;
 mod op;
 mod ops;
@@ -25,6 +26,10 @@ pub use selection::{
 };
 pub use mark::{MarkKind, Mark};
 pub use layer::Layer;
+pub use layer_transform::{
+    probe_lines as transform_probe_lines, Affine2, BoundsSolve, Field, LayerTransform, PanelValues,
+    RectF, ReferencePoint, TransformParams, TRANSFORM_SERIAL_VERSION,
+};
 pub use transform::{
     rotate_image, rotate_image_hq, rotate_into, rotated_box_size, Transform,
 };
