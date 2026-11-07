@@ -744,16 +744,31 @@ impl Session {
         // 时另一张继续显示上一帧，避免换源瞬间画面空白）。槽位按帧的奇偶
         // 轮换，若只有 2 个文件名，某个槽位下次拿到的又会是它当前持有的那个
         // URL——`Image.source` 赋同一个值时 Qt 不会重新加载，画面就卡住。
-        // 4 个名字保证每个槽位相邻两次拿到的 URL 必然不同。
+        //
+        // ★11-07 晚修正：改用**每次渲染唯一**的文件名。原来 `% 4` 轮换在
+        //   GPU 拖动下必然死锁：一次 GPU 拖动 = gpu_begin(+1) + 提交渲染(+1)，
+        //   相邻两次提交渲染的计数步长恰为 2，mod 4 下文件名只在两个值之间
+        //   振荡 —— 第三次提交的名字必然等于双缓冲「后台槽」当前持有的 URL，
+        //   pumpPreview 的防重派发守卫把它拒掉：拖动提交后**画面停在旧帧**，
+        //   而选框（layers_json）实时跟进 → 「图层和选框位置不一致」，直到
+        //   改尺寸等连续两次非 GPU 渲染打破循环。步长随 GPU 次数可取任意
+        //   值，只有唯一文件名对一切步长稳健；旧文件延迟三帧删除（双缓冲
+        //   最多引用最近两帧）。
         let bytes = encode(&image, Format::Bmp, 90).map_err(|e| e.to_string())?;
         let encode_ms = prof_t0.elapsed().as_millis();
         self.render_count = self.render_count.wrapping_add(1);
         let path = std::env::temp_dir().join(format!(
             "imageedit-preview-{}-{}.bmp",
-            self.id,
-            self.render_count % 4
+            self.id, self.render_count
         ));
         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        if let Some(old) = self.render_count.checked_sub(3) {
+            let stale = std::env::temp_dir().join(format!(
+                "imageedit-preview-{}-{}.bmp",
+                self.id, old
+            ));
+            let _ = std::fs::remove_file(stale);
+        }
         println!(
             "{{\"phase\":\"ui\",\"event\":\"render-profile\",\"composite\":{},\"encode\":{},\"write\":{},\"target\":\"{}x{}\"}}",
             composite_ms,

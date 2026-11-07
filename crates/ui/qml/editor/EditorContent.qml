@@ -987,8 +987,10 @@ MarkBar {
 TransformPanel {
     id: transformPanel
     bridge: bridge
-    x: 12
-    y: root.toolbarHeight * 2 + 12
+    // 初始位置注入（面板内部 x/y 绑定到这两个值；用户拖动后绑定被
+    // 命令式赋值替换，位置由用户接管，本次会话内保持）。
+    defaultX: 12
+    defaultY: root.toolbarHeight * 2 + 12
     z: 60
 }
 

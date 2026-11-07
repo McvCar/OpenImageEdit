@@ -56,13 +56,11 @@ Item {
     // 显示坐标下的临时偏移（SelectionViz 绘制时叠加）。
     property real selOffX: 0
     property real selOffY: 0
-    // P0-2b2：手势起手时锁存的修饰键位掩码，整段拖拽原样透传。起手值只用于
-    // 「起手那一刻」的判定（要不要预生成吸附候选）。
-    property int gestureMods: 0
-    // ★拖动过程中的**实时**修饰键：按 Ctrl 想临时关掉吸附时，按下瞬间的
-    //   掩码里还没有 Ctrl。Qt 只在鼠标事件里带 modifiers，所以每次
-    //   onPositionChanged 都刷新一次，手感上等于「按住 Ctrl 立刻生效」。
-    property int liveMods: 0
+    // ★11-07 晚修正：gestureMods / liveMods 已移入 selDragMouse MouseArea。
+    //   原来声明在根级，而 liveTimer 读的是 `selDragMouse.liveMods` ——
+    //   MouseArea 上根本没有这个属性，读到 undefined，传给 Rust 的
+    //   qinvokable(int) 被静默强转成 0：拖动全程修饰键恒为「无」，
+    //   移动中按 Ctrl 永远关不掉吸附（用户复测报的就是这个）。
 
     // 把画布坐标换算成图像坐标（可能越界，交给 Rust 裁剪）。
     function toImage(mx, my) {
@@ -226,6 +224,14 @@ Item {
         // Last deltas sent to the bridge (skip redundant renders).
         property int lastDx: 0
         property int lastDy: 0
+        // 手势起手时锁存的修饰键位掩码（只用于「起手那一刻」的判定）。
+        property int gestureMods: 0
+        // ★拖动过程中的**实时**修饰键：按 Ctrl 想临时关掉吸附时，按下瞬间
+        //   的掩码里还没有 Ctrl。Qt 只在鼠标事件里带 modifiers，所以每次
+        //   onPositionChanged 都刷新一次，手感上等于「按住 Ctrl 立刻生效」。
+        //   必须声明在 MouseArea 上：liveTimer 用 `selDragMouse.liveMods`
+        //   读它，放根级会读到 undefined → 强转 0 → Ctrl 失效。
+        property int liveMods: 0
 
         // PS 惯例：Shift = 加选，Alt = 减选，Shift+Alt = 相交，否则用
         // 工具条上的粘滞模式。

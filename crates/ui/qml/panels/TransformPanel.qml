@@ -29,6 +29,12 @@ Rectangle {
     property int refPoint: 0
     property bool suppress: false
 
+    // 初始位置（外部注入）；拖动一次之后 x/y 的绑定被替换，位置由用户接管。
+    property real defaultX: 12
+    property real defaultY: 100
+    x: defaultX
+    y: defaultY
+
     // 文档状态变化时回显；用户正在输入时不抢输入框。
     onValsChanged: syncFromBridge()
     Component.onCompleted: syncFromBridge()
@@ -63,6 +69,32 @@ Rectangle {
         height: 26
         color: "#ff262a30"
         radius: 6
+        // ★拖动面板：标题栏空白处按住即可移动（声明在 ✕ 之前，后声明的
+        //   关闭按钮命中优先级更高，不会被拖动手势吃掉）。
+        MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.SizeAllCursor
+            property real grabX: 0
+            property real grabY: 0
+            property real panelX: 0
+            property real panelY: 0
+            onPressed: (mouse) => {
+                grabX = mouse.x; grabY = mouse.y
+                panelX = panel.x; panelY = panel.y
+            }
+            onPositionChanged: (mouse) => {
+                if (!pressed)
+                    return
+                const px = panel.parent ? panel.parent.width : 0
+                const py = panel.parent ? panel.parent.height : 0
+                // 允许拖出左边一点（贴边收纳），但永远留 40px 可抓回来；
+                // 上下不出父项可视范围。
+                panel.x = Math.max(40 - panel.width,
+                                   Math.min(panelX + mouse.x - grabX, px - 40))
+                panel.y = Math.max(0,
+                                   Math.min(panelY + mouse.y - grabY, py - 24))
+            }
+        }
         Text {
             anchors.left: parent.left
             anchors.leftMargin: 10
