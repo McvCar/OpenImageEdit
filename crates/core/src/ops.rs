@@ -216,6 +216,9 @@ pub(crate) fn apply_resize(doc: &mut Document, to: Size) {
     doc.view = Rect::new(0, 0, to.width, to.height);
     doc.canvas = to;
     for layer in &mut doc.layers {
+        // 文档级 resize 直接改每层的位图：先烘焙，别让残留的原始像素
+        // 在下次缩放时把缩放后的内容覆盖回去。
+        layer.ensure_baked();
         let ow = ((layer.image.width() as f64) * sx).round() as u32;
         let oh = ((layer.image.height() as f64) * sy).round() as u32;
         layer.image = image::imageops::resize(
@@ -256,7 +259,11 @@ pub(crate) fn apply_region(doc: &mut Document, target: AdjustTarget, rect: Rect,
     let dst = match target {
         AdjustTarget::Base => &mut doc.base,
         AdjustTarget::Layer(index) => match doc.layers.get_mut(index) {
-            Some(layer) => &mut layer.image,
+            Some(layer) => {
+                // 像素补丁写进 image 之前必须烘焙（D11 / §2.4）。
+                layer.ensure_baked();
+                &mut layer.image
+            }
             None => return,
         },
     };

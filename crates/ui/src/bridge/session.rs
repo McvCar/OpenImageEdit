@@ -155,6 +155,8 @@ impl Session {
         let ow = (origin_layer.image.width() as f64 * sx).round().max(1.0) as u32;
         let oh = (origin_layer.image.height() as f64 * sy).round().max(1.0) as u32;
         let old = (origin_layer.image.width(), origin_layer.image.height());
+        // 锚点是「已缩放的原图」克隆，不再是任何 transform 的有效缓存。
+        origin_layer.ensure_baked();
         origin_layer.image = render::resize_to(&origin_layer.image, Size::new(ow, oh));
         let committed = match self.doc.layers.get(ix) {
             Some(layer) => std::rc::Rc::new(layer.clone()),

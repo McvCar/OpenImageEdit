@@ -57,6 +57,8 @@ pub(crate) fn transform_document(doc: &mut Document, transform: Transform) {
         let (ox, oy) = (bounds.x, bounds.y);
         let (lw, lh) = (bounds.width as i32, bounds.height as i32);
         let (cw, ch) = (canvas.width as i32, canvas.height as i32);
+        // 文档级旋转 / 翻转直接改每层位图，先烘焙掉非破坏性状态。
+        layer.ensure_baked();
         layer.image = transform.apply_to_image(&layer.image);
         layer.offset = match transform {
             Transform::Rotate90Cw => (ch - (oy + lh), ox),

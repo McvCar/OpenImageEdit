@@ -38,6 +38,14 @@ pub enum EditOp {
     SetVisible { index: usize, from: bool, to: bool },
     SetOpacity { index: usize, from: f32, to: f32 },
     TranslateLayer { index: usize, from: (i32, i32), to: (i32, i32) },
+    /// P0-1 参数化变换历史：from/to 只存参数 + `Arc<原图>` 的浅引用，
+    /// 一条 op 取代整文档快照。P0-2 统一会话启用后，移动 / 缩放 / 旋转
+    /// 全部汇流到这里；P0-1 期间 `ScaleLayer` 仍走 Lanczos3 适配层。
+    SetLayerTransform {
+        index: usize,
+        from: Option<LayerTransform>,
+        to: Option<LayerTransform>,
+    },
     RenameLayer { index: usize, from: String, to: String },
     /// Non-destructive "delete selection pixels": the base pixels under the
     /// selection fade out (scaled by the mask's alpha coverage, so a feathered
@@ -211,6 +219,20 @@ impl EditOp {
                 layer.offset = *to;
                 Ok(())
             }
+            EditOp::SetLayerTransform { index, to, .. } => {
+                let layer = doc
+                    .layers
+                    .get_mut(*index)
+                    .ok_or(EditError::LayerIndex(*index))?;
+                match to {
+                    Some(t) => {
+                        let (image, offset) = t.render_bounds(true);
+                        layer.set_transform_pixels(image, offset, t.clone());
+                    }
+                    None => layer.ensure_baked(),
+                }
+                Ok(())
+            }
             EditOp::RenameLayer { index, to, .. } => {
                 let layer = doc
                     .layers
@@ -223,29 +245,75 @@ impl EditOp {
                 erase_base_pixels(doc, selection);
                 Ok(())
             }
-            EditOp::ScaleLayer { index, to, offset, flip, .. } => {
-                let layer = doc
-                    .layers
-                    .get_mut(*index)
-                    .ok_or(EditError::LayerIndex(*index))?;
+            EditOp::ScaleLayer { index, from, to, offset, flip } => {
                 if to.width < 1 || to.height < 1 {
                     return Err(EditError::InvalidCanvasSize);
                 }
+                // P0-1 非破坏性缩放：旧实现每次都对「当前 image」再采一次，
+                // 缩小→放大就累积了两次插值，越缩越糊。现在无论缩多少次，
+                // 输入恒定是变换前快照里保存的未插值原图。
+                let prev = from
+                    .layers
+                    .get(*index)
+                    .ok_or(EditError::LayerIndex(*index))?;
+                let mut t = prev.transform.clone().unwrap_or_else(|| {
+                    LayerTransform::from_offset(prev.image.clone(), prev.offset.0, prev.offset.1)
+                });
+                // 旋转 / 斜切后的外接框不能用目标宽高简单反解 scale，这部分
+                // 仍走旧路径（从当前位图重采样），保持既有几何数值不变。
+                let pure_axis_aligned = t.rotation.abs() < 1e-9
+                    && t.skew == (0.0, 0.0)
+                    && t.perspective.is_none();
+                if !pure_axis_aligned {
+                    let layer = doc
+                        .layers
+                        .get_mut(*index)
+                        .ok_or(EditError::LayerIndex(*index))?;
+                    let mut image = image::imageops::resize(
+                        &prev.image,
+                        to.width,
+                        to.height,
+                        image::imageops::FilterType::Lanczos3,
+                    );
+                    if flip.0 {
+                        image = image::imageops::flip_horizontal(&image);
+                    }
+                    if flip.1 {
+                        image = image::imageops::flip_vertical(&image);
+                    }
+                    layer.image = image;
+                    layer.offset = *offset;
+                    layer.ensure_baked();
+                    return Ok(());
+                }
+                // 累计翻转一次生成：从原始像素出发，不能把之前已翻过的
+                // image 当输入，否则第二次缩放会把翻转丢掉。
+                let cumulative = (t.flip.0 ^ flip.0, t.flip.1 ^ flip.1);
+                let source = t.source.clone();
                 let mut image = image::imageops::resize(
-                    &layer.image,
+                    source.as_ref(),
                     to.width,
                     to.height,
                     image::imageops::FilterType::Lanczos3,
                 );
-                // 拖过对边 = 镜像。先重采样再翻，尺寸语义与正拖完全一致。
-                if flip.0 {
+                if cumulative.0 {
                     image = image::imageops::flip_horizontal(&image);
                 }
-                if flip.1 {
+                if cumulative.1 {
                     image = image::imageops::flip_vertical(&image);
                 }
-                layer.image = image;
-                layer.offset = *offset;
+                let (sw, sh) = t.source_size();
+                t.scale = (to.width as f64 / sw, to.height as f64 / sh);
+                t.center = (
+                    offset.0 as f64 + to.width as f64 / 2.0,
+                    offset.1 as f64 + to.height as f64 / 2.0,
+                );
+                t.flip = cumulative;
+                let layer = doc
+                    .layers
+                    .get_mut(*index)
+                    .ok_or(EditError::LayerIndex(*index))?;
+                layer.set_transform_pixels(image, *offset, t);
                 Ok(())
             }
             EditOp::TransformLayer { index, transform } => {
@@ -253,6 +321,7 @@ impl EditOp {
                     .layers
                     .get_mut(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
+                layer.ensure_baked();
                 layer.image = transform.apply_to_image(&layer.image);
                 Ok(())
             }
@@ -309,6 +378,7 @@ impl EditOp {
                             .layers
                             .get_mut(*index)
                             .ok_or(EditError::LayerIndex(*index))?;
+                        layer.ensure_baked();
                         layer.image = adjusted;
                         Ok(())
                     }
@@ -413,6 +483,20 @@ impl EditOp {
                 layer.offset = *from;
                 Ok(())
             }
+            EditOp::SetLayerTransform { index, from, .. } => {
+                let layer = doc
+                    .layers
+                    .get_mut(*index)
+                    .ok_or(EditError::LayerIndex(*index))?;
+                match from {
+                    Some(t) => {
+                        let (image, offset) = t.render_bounds(true);
+                        layer.set_transform_pixels(image, offset, t.clone());
+                    }
+                    None => layer.ensure_baked(),
+                }
+                Ok(())
+            }
             EditOp::RenameLayer { index, from, .. } => {
                 let layer = doc
                     .layers
@@ -434,6 +518,7 @@ impl EditOp {
                     .layers
                     .get_mut(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
+                layer.ensure_baked();
                 layer.image = transform.inverted().apply_to_image(&layer.image);
                 Ok(())
             }
@@ -487,6 +572,7 @@ impl EditOp {
                             .layers
                             .get_mut(*index)
                             .ok_or(EditError::LayerIndex(*index))?;
+                        layer.ensure_baked();
                         layer.image = from.clone();
                         Ok(())
                     }

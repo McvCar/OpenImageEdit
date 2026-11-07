@@ -52,6 +52,9 @@ pub(crate) use ops::{
 };
 
 #[cfg(test)]
+mod nondestructive_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

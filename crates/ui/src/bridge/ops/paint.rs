@@ -778,6 +778,8 @@ impl qobject::Bridge {
                     opacity: st.start.opacity,
                     visible: st.start.visible,
                     locked: st.start.locked,
+                    // 旋转结果是一次性重采样出来的，不保留旧的变换源图。
+                    transform: None,
                 };
                 // 像素其实没变（拖一圈又回原位）：别再记一条空历史。
                 if *st.start != after {

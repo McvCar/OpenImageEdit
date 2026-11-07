@@ -345,6 +345,34 @@ impl Document {
         self.execute(EditOp::TranslateLayer { index, from, to })
     }
 
+    /// P0-1 参数化变换入口。from/to 只带参数与 `Arc<原图>`，一条历史即可
+    /// 精确撤销；P0-2 的统一会话会把移动 / 缩放 / 旋转全部汇流到这里。
+    /// 传 `None` = 把该层烘焙成普通位图图层（丢弃无损状态）。
+    pub fn set_layer_transform(
+        &mut self,
+        index: usize,
+        to: Option<LayerTransform>,
+    ) -> Result<(), EditError> {
+        if index >= self.layers.len() {
+            return Err(EditError::LayerIndex(index));
+        }
+        // 「变换前是普通位图图层」也必须留下可恢复的状态，否则 undo 时
+        // 没有位图可还原（只有 None 会让 image 停在变换后的尺寸）。用当前
+        // image 建一个 identity 状态，撤销走 1:1 索引快路径精确还原。
+        let from = self.layers[index].transform.clone().unwrap_or_else(|| {
+            let l = &self.layers[index];
+            LayerTransform::from_offset(l.image.clone(), l.offset.0, l.offset.1)
+        });
+        if to.as_ref() == Some(&from) {
+            return Ok(());
+        }
+        self.execute(EditOp::SetLayerTransform {
+            index,
+            from: Some(from),
+            to,
+        })
+    }
+
     pub fn rename_layer(&mut self, index: usize, name: impl Into<String>) -> Result<(), EditError> {
         let from = self
             .layers
@@ -796,6 +824,9 @@ impl Document {
         // 摊不进拖动帧，没有理由省）。
         let (image, delta) = rotate_image_hq(&layer.image, degrees, expand);
         let mut after = before.clone();
+        // after 的位图是从 before.image 重新旋转出来的，原始像素已经不再
+        // 对应新的内容，烘焙掉非破坏性状态（P0-2 会把旋转也参数化）。
+        after.ensure_baked();
         after.image = image;
         after.offset = (before.offset.0 + delta.0, before.offset.1 + delta.1);
         if after == before {
