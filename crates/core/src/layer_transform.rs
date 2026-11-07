@@ -309,7 +309,7 @@ impl TransformParams {
     }
 }
 
-/// 图层变换状态。P0 期间独立存在，尚未挂进 `Layer`。
+/// 图层变换状态。P0-0 独立存在，P0-1 起挂进 `Layer`。
 #[derive(Debug, Clone)]
 pub struct LayerTransform {
     /// 未插值原图；变换期间只读。快照克隆只增引用计数。
@@ -585,12 +585,73 @@ impl LayerTransform {
         })
     }
 
+    /// 按指定画布矩形逆变换取样（core 烘焙 / render 预览共用同一采样器，
+    /// 见 `crate::transform::sample_affine`）。
+    ///
+    /// §2.4 陷阱 2：identity（含烘焙后的图层）必须 **1:1 索引拷贝**，不能再
+    /// 走一遍插值 —— 否则透明像素的 RGB 会被 normalize 清掉、整层边缘也会
+    /// 平白发糊。
+    pub fn render(&self, out: Rect, hq: bool) -> RgbaImage {
+        if self.is_identity_fast_path() {
+            return self.copy_identity(out);
+        }
+        match self.inverse() {
+            Some(inv) => crate::transform::sample_affine(&self.source, &inv, out, hq),
+            None => RgbaImage::new(out.width, out.height),
+        }
+    }
+
+    /// 纯整数平移：把 `out ∩ source 矩形` 按行 memcpy，其余保持全透明。
+    fn copy_identity(&self, out: Rect) -> RgbaImage {
+        let mut dst = RgbaImage::new(out.width, out.height);
+        if out.is_empty() {
+            return dst;
+        }
+        let (ox, oy) = self.offset();
+        let (sx, sy) = (out.x as i64 - ox as i64, out.y as i64 - oy as i64);
+        let (sw, sh) = (self.source.width() as i64, self.source.height() as i64);
+        let (x0, y0) = (sx.max(0) as u32, sy.max(0) as u32);
+        let (x1, y1) = (
+            (sx + out.width as i64).min(sw).max(0) as u32,
+            (sy + out.height as i64).min(sh).max(0) as u32,
+        );
+        if x1 <= x0 || y1 <= y0 {
+            return dst;
+        }
+        let src: &[u8] = self.source.as_raw();
+        let dst_raw: &mut [u8] = &mut dst;
+        let row_len = (x1 - x0) as usize * 4;
+        let dst_stride = out.width as usize * 4;
+        let src_stride = self.source.width() as usize * 4;
+        for y in y0..y1 {
+            let s = y as usize * src_stride + x0 as usize * 4;
+            let d = (y as i64 - sy) as usize * dst_stride + (x0 as i64 - sx) as usize * 4;
+            dst_raw[d..d + row_len].copy_from_slice(&src[s..s + row_len]);
+        }
+        dst
+    }
+
+    /// 渲染整个外接框，返回位图与它在画布中的左上角（可为负）。
+    pub fn render_bounds(&self, hq: bool) -> (RgbaImage, (i32, i32)) {
+        let r = self.bounds().round_out();
+        let img = self.render(r, hq);
+        (img, (r.x, r.y))
+    }
+
     pub fn params_bytes(&self) -> Vec<u8> {
         self.params().to_bytes()
     }
 
     pub fn from_params_bytes(bytes: &[u8], source: Arc<RgbaImage>) -> Option<Self> {
         Self::from_params(TransformParams::from_bytes(bytes)?, source)
+    }
+}
+
+impl PartialEq for LayerTransform {
+    fn eq(&self, other: &Self) -> bool {
+        self.params() == other.params()
+            && (Arc::ptr_eq(&self.source, &other.source)
+                || self.source.as_raw() == other.source.as_raw())
     }
 }
 
@@ -734,6 +795,39 @@ pub fn probe_lines() -> Vec<String> {
         panel_ok, num(after.width), num(after.rotation)
     ));
     all_ok &= panel_ok;
+    n += 1;
+
+    // §2.4 的输出等价性契约（--probe-bake 的地基）：烘焙成 identity 位图后
+    // 必须走 1:1 索引，不能被二次插值，否则整幅发糊。
+    let mut b = LayerTransform::from_offset(source(), 10, 5);
+    b.rotation = 27.0;
+    b.scale = (0.8, 1.3);
+    let (baked, origin) = b.render_bounds(true);
+    let rect = Rect::new(origin.0, origin.1, baked.width(), baked.height());
+    let direct = b.render(rect, true);
+    let identity = LayerTransform::from_offset(baked.clone(), origin.0, origin.1);
+    // §2.4 陷阱 2 的核心：烘焙成 identity 后必须逐像素 1:1，HQ 与拖动帧都一样。
+    let once_more = identity.render(rect, true);
+    let once_more_bl = identity.render(rect, false);
+    let diff = |a: &RgbaImage, c: &RgbaImage| -> u32 {
+        a.as_raw()
+            .iter()
+            .zip(c.as_raw())
+            .map(|(x, y)| x.abs_diff(*y) as u32)
+            .max()
+            .unwrap_or(0)
+    };
+    let direct_diff = diff(&direct, &baked);
+    let identity_diff = diff(&baked, &once_more);
+    let identity_diff_bl = diff(&baked, &once_more_bl);
+    let max_diff = direct_diff.max(identity_diff).max(identity_diff_bl);
+    let bake_ok = max_diff == 0 && identity.is_identity_fast_path();
+    lines.push(format!(
+        r#"{{"event":"transform-case","case":"bake-equivalence","bake_ok":{},"max_diff":{},"hq_diff":{},"bl_diff":{},"fast_path":{},"w":{},"h":{}}}"#,
+        bake_ok, max_diff, identity_diff, identity_diff_bl,
+        identity.is_identity_fast_path(), baked.width(), baked.height()
+    ));
+    all_ok &= bake_ok;
     n += 1;
 
     lines.push(format!(
@@ -925,6 +1019,23 @@ mod tests {
         assert_eq!(back.perspective, t.perspective);
         assert_eq!(back.matrix().as_array(), t.matrix().as_array());
         assert_eq!(back.bounds(), t.bounds());
+    }
+
+    #[test]
+    fn identity_render_never_interpolates_transparent_pixels() {
+        // 全透明像素里残留的 RGB 必须原样保留：走一遍采样 normalize 会把它
+        // 清成 (0,0,0,0)，就是 §2.4「identity 被二次插值」的可见症状。
+        let mut img = RgbaImage::new(4, 4);
+        img.put_pixel(1, 1, Rgba([10, 20, 30, 0]));
+        let t = LayerTransform::from_offset(img.clone(), -3, 7);
+        assert!(t.is_identity_fast_path());
+        for hq in [false, true] {
+            let out = t.render(Rect::new(-3, 7, 4, 4), hq);
+            assert_eq!(out.as_raw(), img.as_raw(), "hq={hq}");
+        }
+        let part = t.render(Rect::new(-2, 8, 3, 3), true);
+        assert_eq!(*part.get_pixel(0, 0), *img.get_pixel(1, 1));
+        assert_eq!(*part.get_pixel(2, 2), Rgba([0, 0, 0, 0]));
     }
 
     #[test]

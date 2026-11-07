@@ -459,3 +459,246 @@ fn normalize(acc: [f32; 3], a_sum: f32) -> [u8; 4] {
         a_sum.round().clamp(0.0, 255.0) as u8,
     ]
 }
+
+// ---------------------------------------------------------------------------
+// 共享仿射取样器（P0-1 / §2.3 / §11 Tier 0）
+//
+// core 的 flatten/烘焙与 render 的预览必须共用这一个函数，禁止再出现
+// 「预览 Nearest / 提交 Lanczos3」两条实现（D14 / R11）。与旋转路径一样，
+// 全程预乘 alpha 累加、最后 normalize 反预乘，透明边缘不会泛黑。
+//
+// `inverse` 是「画布连续坐标 → 源图连续坐标」的逆变换；输出矩形 `out` 用
+// 画布坐标，可为负 / 越出画布（调用方负责取 `bounds ∩ canvas`）。
+// 逆变换按行增量步进：每行只算一次矩阵乘法，x 方向加常量 `(a, b)`。
+// ---------------------------------------------------------------------------
+
+struct AffineCtx {
+    iw: i32,
+    ih: i32,
+    stride: usize,
+    nstride: usize,
+    nw: u32,
+    out_x: f32,
+    out_y: f32,
+    ia: f32,
+    ib: f32,
+    ic: f32,
+    id: f32,
+    ie: f32,
+    i_f: f32,
+    hq: bool,
+}
+
+/// 逆变换取样：`hq=false` 双线性（拖动临时帧），`true` Catmull-Rom（落定/导出）。
+/// 输出尺寸恒为 `out.width × out.height`，`out` 之外的区域不采样。
+pub fn sample_affine(src: &RgbaImage, inverse: &Affine2, out: Rect, hq: bool) -> RgbaImage {
+    let mut dst = RgbaImage::new(out.width, out.height);
+    let (iw, ih) = (src.width() as i32, src.height() as i32);
+    if out.is_empty() || iw < 1 || ih < 1 {
+        return dst;
+    }
+    let ctx = AffineCtx {
+        iw,
+        ih,
+        stride: iw as usize * 4,
+        nstride: out.width as usize * 4,
+        nw: out.width,
+        out_x: out.x as f32,
+        out_y: out.y as f32,
+        ia: inverse.a as f32,
+        ib: inverse.b as f32,
+        ic: inverse.c as f32,
+        id: inverse.d as f32,
+        ie: inverse.e as f32,
+        i_f: inverse.f as f32,
+        hq,
+    };
+    let threads = rot_threads(out.height);
+    let source: &[u8] = src.as_raw();
+    let dest: &mut [u8] = &mut dst;
+    if threads > 1 {
+        let rows = (out.height as usize).div_ceil(threads);
+        let cref = &ctx;
+        std::thread::scope(|scope| {
+            for (ti, chunk) in dest.chunks_mut(rows * cref.nstride).enumerate() {
+                let dy0 = ti * rows;
+                scope.spawn(move || render_affine_rows(chunk, dy0, source, cref));
+            }
+        });
+    } else {
+        render_affine_rows(dest, 0, source, &ctx);
+    }
+    dst
+}
+
+fn render_affine_rows(dst: &mut [u8], dy0: usize, src: &[u8], c: &AffineCtx) {
+    for (r, row) in dst.chunks_mut(c.nstride).enumerate() {
+        let cy = c.out_y + (dy0 + r) as f32 + 0.5;
+        let cx = c.out_x + 0.5;
+        // 目标像素中心 → 源图像素中心；`-0.5` 把连续坐标换成取样网格坐标。
+        let mut sx = c.ia * cx + c.ic * cy + c.ie - 0.5;
+        let mut sy = c.ib * cx + c.id * cy + c.i_f - 0.5;
+        for dx in 0..c.nw as usize {
+            let pixel = if c.hq {
+                sample_hq(src, c, sx, sy)
+            } else {
+                sample_bilinear(src, c, sx, sy)
+            };
+            row[dx * 4..dx * 4 + 4].copy_from_slice(&pixel);
+            sx += c.ia;
+            sy += c.ib;
+        }
+    }
+}
+
+#[inline]
+fn sample_bilinear(src: &[u8], c: &AffineCtx, sx: f32, sy: f32) -> [u8; 4] {
+    let (fx, fy) = (sx.floor(), sy.floor());
+    let (x0, y0) = (fx as i32, fy as i32);
+    let (tx, ty) = (sx - fx, sy - fy);
+    let mut acc = [0f32; 3];
+    let mut a_sum = 0f32;
+    for &(ox, oy, w) in &[
+        (0, 0, (1.0 - tx) * (1.0 - ty)),
+        (1, 0, tx * (1.0 - ty)),
+        (0, 1, (1.0 - tx) * ty),
+        (1, 1, tx * ty),
+    ] {
+        if w <= 0.0 {
+            continue;
+        }
+        let (x, y) = (x0 + ox, y0 + oy);
+        if x < 0 || y < 0 || x >= c.iw || y >= c.ih {
+            continue;
+        }
+        let i = y as usize * c.stride + x as usize * 4;
+        let a = src[i + 3] as f32 * w;
+        if a <= 0.0 {
+            continue;
+        }
+        acc[0] += src[i] as f32 * a;
+        acc[1] += src[i + 1] as f32 * a;
+        acc[2] += src[i + 2] as f32 * a;
+        a_sum += a;
+    }
+    normalize(acc, a_sum)
+}
+
+#[inline]
+fn sample_hq(src: &[u8], c: &AffineCtx, sx: f32, sy: f32) -> [u8; 4] {
+    let (fx, fy) = (sx.floor(), sy.floor());
+    let (x0, y0) = (fx as i32, fy as i32);
+    let wx = catmull(sx - fx);
+    let wy = catmull(sy - fy);
+    let mut acc = [0f32; 3];
+    let mut a_sum = 0f32;
+    for (j, wyv) in wy.iter().enumerate() {
+        let y = y0 - 1 + j as i32;
+        if y < 0 || y >= c.ih || *wyv == 0.0 {
+            continue;
+        }
+        let base = y as usize * c.stride;
+        for (i, wxv) in wx.iter().enumerate() {
+            let x = x0 - 1 + i as i32;
+            if x < 0 || x >= c.iw {
+                continue;
+            }
+            let w = wyv * wxv;
+            if w == 0.0 {
+                continue;
+            }
+            let p = base + x as usize * 4;
+            let a = src[p + 3] as f32 * w;
+            if a == 0.0 {
+                continue;
+            }
+            acc[0] += src[p] as f32 * a;
+            acc[1] += src[p + 1] as f32 * a;
+            acc[2] += src[p + 2] as f32 * a;
+            a_sum += a;
+        }
+    }
+    normalize(acc, a_sum)
+}
+
+#[cfg(test)]
+mod affine_sample_tests {
+    use super::*;
+    use crate::layer_transform::LayerTransform;
+
+    fn checker() -> RgbaImage {
+        RgbaImage::from_fn(64, 48, |x, y| {
+            if (x / 8 + y / 8) % 2 == 0 {
+                image::Rgba([230, 30, 40, 255])
+            } else {
+                image::Rgba([20, 40, 220, 255])
+            }
+        })
+    }
+
+    #[test]
+    fn identity_is_pixel_exact_for_both_quality_modes() {
+        let src = checker();
+        let inv = Affine2::identity();
+        for hq in [false, true] {
+            let out = sample_affine(&src, &inv, Rect::new(0, 0, 64, 48), hq);
+            assert_eq!(out.as_raw(), src.as_raw(), "hq={hq}");
+        }
+    }
+
+    #[test]
+    fn identity_is_pixel_exact_on_threaded_rows() {
+        // 高度 >= 96 才会走 std::thread::scope 分行；逐行 dy0 错位时这里会红。
+        let src = RgbaImage::from_fn(120, 130, |x, y| {
+            image::Rgba([(x * 2) as u8, (y * 2) as u8, ((x + y) % 256) as u8, 255])
+        });
+        let out = sample_affine(&src, &Affine2::identity(), Rect::new(0, 0, 120, 130), false);
+        assert_eq!(out.as_raw(), src.as_raw());
+    }
+
+    #[test]
+    fn integer_translation_is_lossless() {
+        let src = checker();
+        let inv = Affine2::translation(-7.0, -11.0);
+        let out = sample_affine(&src, &inv, Rect::new(7, 11, 64, 48), false);
+        assert_eq!(out.as_raw(), src.as_raw());
+    }
+
+    #[test]
+    fn out_rect_may_be_negative_and_is_clipped_to_requested_size() {
+        let src = checker();
+        let out = sample_affine(&src, &Affine2::identity(), Rect::new(-5, -5, 10, 10), false);
+        assert_eq!((out.width(), out.height()), (10, 10));
+        // 只有 (5,5)..(10,10) 与源图相交，其余全透明。
+        assert_eq!(*out.get_pixel(5, 5), *src.get_pixel(0, 0));
+        assert_eq!(*out.get_pixel(0, 0), image::Rgba([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn transparent_pixels_never_get_black_halo() {
+        let mut src = RgbaImage::new(8, 8);
+        src.put_pixel(3, 3, image::Rgba([250, 10, 10, 255]));
+        let inv = Affine2::translation(-0.5, -0.5);
+        let out = sample_affine(&src, &inv, Rect::new(0, 0, 8, 8), false);
+        // 完全透明的邻域必须仍是 (0,0,0,0)，而不是被 unpremultiply 放大成噪点。
+        assert_eq!(*out.get_pixel(0, 0), image::Rgba([0, 0, 0, 0]));
+        let p = out.get_pixel(3, 3);
+        assert!(p[3] > 0 && p[0] > 180, "半透明插值不该把红色染黑: {p:?}");
+    }
+
+    #[test]
+    fn layer_transform_render_matches_bounds_geometry() {
+        let mut t = LayerTransform::from_offset(checker(), 10, 20);
+        t.rotation = 30.0;
+        let (img, origin) = t.render_bounds(true);
+        let r = t.bounds().round_out();
+        assert_eq!(origin, (r.x, r.y));
+        assert_eq!((img.width(), img.height()), (r.width, r.height));
+        // 中心像素不该是 transparent（源图全不透明）。
+        let (cx, cy) = t.bounds().center();
+        let px = ((cx - r.x as f64) as u32).min(img.width() - 1);
+        let py = ((cy - r.y as f64) as u32).min(img.height() - 1);
+        assert!(img.get_pixel(px, py)[3] > 0);
+    }
+}
+
