@@ -335,14 +335,23 @@ impl Document {
         })
     }
 
+    /// P0-2b2：移动也汇流到一条 `SetLayerTransform`。旧 `TranslateLayer`
+    /// 只写 `layer.offset`，会让 params.center 与位图脱节（连续旋转 / 数值
+    /// 面板随后读到错误中心）；参数级历史 undo 还能精确还原尺寸与角度。
     pub fn translate_layer(&mut self, index: usize, dx: i32, dy: i32) -> Result<(), EditError> {
+        if dx == 0 && dy == 0 {
+            return Ok(());
+        }
         let layer = self
             .layers
             .get(index)
             .ok_or(EditError::LayerIndex(index))?;
-        let from = layer.offset;
-        let to = (from.0 + dx, from.1 + dy);
-        self.execute(EditOp::TranslateLayer { index, from, to })
+        let mut to = layer.transform.clone().unwrap_or_else(|| {
+            LayerTransform::from_offset(layer.image.clone(), layer.offset.0, layer.offset.1)
+        });
+        to.center.0 += dx as f64;
+        to.center.1 += dy as f64;
+        self.set_layer_transform(index, Some(to))
     }
 
     /// P0-1 参数化变换入口。from/to 只带参数与 `Arc<原图>`，一条历史即可

@@ -226,7 +226,8 @@ impl EditOp {
                     .ok_or(EditError::LayerIndex(*index))?;
                 match to {
                     Some(t) => {
-                        let (image, offset) = t.render_bounds(true);
+                        // P0-2b2：统一用兼容后端，落定像素与旧三条路径逐像素一致。
+                        let (image, offset) = t.render_compatible();
                         layer.set_transform_pixels(image, offset, t.clone());
                     }
                     None => layer.ensure_baked(),
@@ -511,7 +512,8 @@ impl EditOp {
                     .ok_or(EditError::LayerIndex(*index))?;
                 match from {
                     Some(t) => {
-                        let (image, offset) = t.render_bounds(true);
+                        // P0-2b2：统一用兼容后端，落定像素与旧三条路径逐像素一致。
+                        let (image, offset) = t.render_compatible();
                         layer.set_transform_pixels(image, offset, t.clone());
                     }
                     None => layer.ensure_baked(),

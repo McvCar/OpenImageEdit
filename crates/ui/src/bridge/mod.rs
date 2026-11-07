@@ -9,8 +9,9 @@ use std::time::Instant;
 use cxx_qt_lib::{QString, QUrl};
 use decode::{decode_path, encode, format_from_path, DecodeOptions, Decoded, Format};
 use editcore::{
-    adjust_json, Adjust, AdjustTarget, Document, Histogram, Layer, Mark, MarkKind, PickedColor,
-    QuickSelectOptions, Rect, SelOps, SelectionMask, SelectionState, Size, Transform, WandOptions,
+    adjust_json, Adjust, AdjustTarget, BoundsSolve, Document, Field, Histogram, Layer,
+    LayerTransform, Mark, MarkKind, PickedColor, QuickSelectOptions, Rect, ReferencePoint, SelOps,
+    SelectionMask, SelectionState, Size, Transform, WandOptions,
 };
 use image::RgbaImage;
 
@@ -173,6 +174,23 @@ pub mod qobject {
         #[qproperty(QString, sel_wand_saved, cxx_name = "selWandSaved")]
         /// 修复 / 油漆工具与参数（settings.ini，`|` 分隔）。
         #[qproperty(QString, paint_spec_saved, cxx_name = "paintSpecSaved")]
+        // ---- P0-4 智能参考线 / P0-5 数值面板 ----
+        /// D13：数值面板显示状态（settings.ini 记忆）。
+        #[qproperty(bool, transform_panel_visible, cxx_name = "transformPanelVisible")]
+        /// D16：只控制提示线绘制，不短路吸附求解。
+        #[qproperty(bool, show_guides, cxx_name = "showGuides")]
+        /// D16：关闭后吸附求解直接返回空结果。
+        #[qproperty(bool, snap_enabled, cxx_name = "snapEnabled")]
+        /// 每帧随 refresh 下发的参考线 / 距离标签 JSON。
+        #[qproperty(QString, guides_json, cxx_name = "guidesJson")]
+        /// 选中图层的外接框参数（数值面板只读回显）。
+        #[qproperty(QString, transform_values_json, cxx_name = "transformValuesJson")]
+        // ---- P0-2b2 Tier 1 GPU 快路径 ----
+        #[qproperty(bool, gpu_live, cxx_name = "gpuLive")]
+        #[qproperty(QString, gpu_static_url, cxx_name = "gpuStaticUrl")]
+        #[qproperty(QString, gpu_active_url, cxx_name = "gpuActiveUrl")]
+        /// 活动层显示矩形 + 不透明度 JSON（每帧只改这几个数）。
+        #[qproperty(QString, gpu_rect_json, cxx_name = "gpuRectJson")]
         #[namespace = "imageedit"]
         type Bridge = super::BridgeRust;
 
@@ -784,6 +802,40 @@ pub mod qobject {
         #[qinvokable]
         fn update_ruler_bottom_up(self: Pin<&mut Self>, value: bool);
 
+        // ---- P0-4 / P0-5 开关与数值面板 ----
+        #[qinvokable]
+        fn update_transform_panel_visible(self: Pin<&mut Self>, value: bool);
+        #[qinvokable]
+        fn update_show_guides(self: Pin<&mut Self>, value: bool);
+        #[qinvokable]
+        fn update_snap_enabled(self: Pin<&mut Self>, value: bool);
+        /// 数值面板写回：x/y/w/h 是变换后外接框（图像坐标），rotation 单位度。
+        /// 一次调用 = 一条 SetLayerTransform 历史。
+        #[qinvokable]
+        fn transform_set_params(self: Pin<&mut Self>, x: f64, y: f64, w: f64, h: f64,
+                                rotation: f64, flip_x: bool, flip_y: bool,
+                                lock_ratio: bool, ref_point: i32) -> bool;
+        /// QML 手势透传修饰键位掩码与显示比例（Rust 侧统一解释，D17）。
+        #[qinvokable]
+        fn transform_mods(self: Pin<&mut Self>, mods: i32, disp_scale: f64);
+
+        // ---- P0-2b2 统一变换三件套（旧 *_begin/update/end 保留别名）----
+        /// gesture: 0=move 1=scale 2=rotate；px/py 为图像坐标。
+        #[qinvokable]
+        fn transform_begin(self: Pin<&mut Self>, gesture: i32, index: i32,
+                           px: f64, py: f64, mods: i32, disp_scale: f64) -> bool;
+        #[qinvokable]
+        fn transform_update(self: Pin<&mut Self>, gesture: i32, px: f64, py: f64,
+                            mods: i32, disp_scale: f64) -> bool;
+        #[qinvokable]
+        fn transform_end(self: Pin<&mut Self>, commit: bool, mods: i32) -> bool;
+        /// 八向缩放吸附：返回 `{"dx":..,"dy":..}`，只让 `edges` 指定的边参与。
+        #[qinvokable]
+        fn transform_snap_rect(self: Pin<&mut Self>, x: f64, y: f64, w: f64, h: f64,
+                               edges: i32, mods: i32, disp_scale: f64) -> QString;
+        #[qinvokable]
+        fn guides_state(self: Pin<&mut Self>) -> QString;
+
         /// Open the color-picker panel (clicks on the canvas then pick pixels).
         #[qinvokable]
         fn picker_begin(self: Pin<&mut Self>);
@@ -938,6 +990,9 @@ impl Default for AppConfig {
             sel_tool: "rect".to_string(),
             sel_wand: "32,1,1".to_string(),
             paint_spec: "none|40|70|20|100|2|32|1|100|0|0|100".to_string(),
+            transform_panel_visible: false,
+            show_guides: true,
+            snap_enabled: true,
         }
     }
 }
@@ -1076,6 +1131,21 @@ pub struct BridgeRust {
     /// high-DPI displays. `Cell` because `set_dpr` mutates it behind
     /// `Pin<&mut Self>`; the render path reads it.
     dpr: std::cell::Cell<f64>,
+    // ---- P0-4 / P0-5 ----
+    /// D13：数值面板显示状态（settings.ini 记忆）。
+    transform_panel_visible: bool,
+    /// D16：提示线绘制开关（不影响求解）。
+    show_guides: bool,
+    /// D16：吸附求解开关。
+    snap_enabled: bool,
+    /// 智能参考线：QML 叠加层只读的 JSON（轴线 + 距离标签）。
+    guides_json: QString,
+    /// 数值面板：选中图层当前外接框参数 JSON。
+    transform_values_json: QString,
+    gpu_live: bool,
+    gpu_static_url: QString,
+    gpu_active_url: QString,
+    gpu_rect_json: QString,
 }
 
 impl Default for BridgeRust {
@@ -1157,6 +1227,15 @@ impl Default for BridgeRust {
             viewport: RefCell::new(Size::new(0, 0)),
             pending_decode: RefCell::new(None),
             dpr: std::cell::Cell::new(1.0),
+            transform_panel_visible: cfg.transform_panel_visible,
+            show_guides: cfg.show_guides,
+            snap_enabled: cfg.snap_enabled,
+            guides_json: QString::from("[]"),
+            transform_values_json: QString::from("{}"),
+            gpu_live: false,
+            gpu_static_url: QString::default(),
+            gpu_active_url: QString::default(),
+            gpu_rect_json: QString::from("{}"),
         }
     }
 }
@@ -1183,6 +1262,9 @@ impl qobject::Bridge {
             sel_tool: self.sel_tool_saved().to_string(),
             sel_wand: self.sel_wand_saved().to_string(),
             paint_spec: self.paint_spec_saved().to_string(),
+            transform_panel_visible: *self.transform_panel_visible(),
+            show_guides: *self.show_guides(),
+            snap_enabled: *self.snap_enabled(),
         }
         .save();
     }
@@ -1640,6 +1722,44 @@ impl qobject::Bridge {
                 if self.layers_json().to_string() != layers_json {
                     self.as_mut()
                         .set_layers_json(QString::from(layers_json.as_str()));
+                }
+                // P0-4 / P0-5：随帧下发参考线与数值面板参数；内容不变时不发信号，
+                // 避免拖动帧触发 QML 重新解析 / 重绘。
+                let guides = if *self.show_guides() {
+                    self.session
+                        .borrow()
+                        .as_ref()
+                        .map(|s| editcore::snap::guides_json(&s.snap, s.disp_scale))
+                        .unwrap_or_else(|| "[]".to_string())
+                } else {
+                    "[]".to_string()
+                };
+                if self.guides_json().to_string() != guides {
+                    self.as_mut().set_guides_json(QString::from(guides.as_str()));
+                }
+                let values = self
+                    .session
+                    .borrow()
+                    .as_ref()
+                    .map(|s| s.transform_panel_json(*self.selected_layer()))
+                    .unwrap_or_else(|| "{\"has\":false}".to_string());
+                if self.transform_values_json().to_string() != values {
+                    self.as_mut()
+                        .set_transform_values_json(QString::from(values.as_str()));
+                }
+                // Tier 1：随帧下发活动层矩形；URL 只在起手时换一次。
+                let (gpu_on, gpu_rect) = self
+                    .session
+                    .borrow()
+                    .as_ref()
+                    .map(|s| (s.gpu_live, s.gpu_rect_json()))
+                    .unwrap_or((false, "{}".to_string()));
+                if *self.gpu_live() != gpu_on {
+                    self.as_mut().set_gpu_live(gpu_on);
+                }
+                if self.gpu_rect_json().to_string() != gpu_rect {
+                    self.as_mut()
+                        .set_gpu_rect_json(QString::from(gpu_rect.as_str()));
                 }
                 if self.marks_json().to_string() != marks_json {
                     self.as_mut()

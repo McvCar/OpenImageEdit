@@ -64,6 +64,12 @@ def states(events):
     return [e["state"] for e in events if e.get("event") == "transform-state"]
 
 
+def inactive(s):
+    # P0-2b2 起 state 附带 gpu/skipped/guides/gesture/mods 诊断字段，
+    # 只断言 active，别把新字段当成回归失败。
+    return isinstance(s, dict) and s.get("active") is False
+
+
 def check(name, ok, detail=""):
     print(("PASS " if ok else "FAIL ") + name + (("  " + detail) if detail else ""))
     if not ok:
@@ -75,35 +81,35 @@ def main():
 
     ev = run("idle", "transform-state")
     s = states(ev)
-    check("空闲时无会话", s == [{"active": False}], repr(s))
+    check("空闲时无会话", len(s) == 1 and inactive(s[0]), repr(s))
 
     ev = run("move", "move-layer:7,3;transform-state")
     s = states(ev)
-    check("移动落定后无残留", s == [{"active": False}], repr(s))
+    check("移动落定后无残留", len(s) == 1 and inactive(s[0]), repr(s))
 
     ev = run("scale", "scale-layer:150,100;transform-state")
     s = states(ev)
-    check("缩放落定后无残留", s == [{"active": False}], repr(s))
+    check("缩放落定后无残留", len(s) == 1 and inactive(s[0]), repr(s))
 
     ev = run("finish", "rotate-handle:0,25;transform-state")
     s = states(ev)
-    check("旋转落定后无残留", s == [{"active": False}], repr(s))
+    check("旋转落定后无残留", len(s) == 1 and inactive(s[0]), repr(s))
 
     ev = run("hold", "rotate-hold:0,25;transform-state;transform-abort;transform-state")
     s = states(ev)
     check("rotate-hold 期间仅一个 rotate 会话",
           len(s) == 2 and s[0].get("active") is True
           and s[0].get("kind") == "rotate" and s[0].get("special") is True
-          and s[0].get("cap", 0) > 0 and s[1] == {"active": False}, repr(s))
+          and s[0].get("cap", 0) > 0 and inactive(s[1]), repr(s))
     check("transform-abort 命中会话",
           any(e.get("event") == "transform-abort" and e.get("had") is True for e in ev))
 
     ev = run("stale", "rotate-hold:0,25;move-layer:7,3;transform-state")
     s = states(ev)
     check("未收尾旋转后直接拖图层，会话被接管且清空",
-          s == [{"active": False}], repr(s))
+          len(s) == 1 and inactive(s[0]), repr(s))
 
-    print("PASS: P0-2b1 统一变换会话回归")
+    print("PASS: 统一变换会话回归（P0-2b1 / P0-2b2）")
 
 
 if __name__ == "__main__":

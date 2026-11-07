@@ -223,6 +223,8 @@ Flickable {
     // 变更信号，也不会出现空白帧。
     Item {
         id: previewImage
+        // Tier 1 拖动期间由 gpuLayer 接管显示；这里透明但保留双缓冲状态机。
+        opacity: view.bridge.gpuLive ? 0 : 1
 
         width: view.shownWidth
         height: view.shownHeight
@@ -357,6 +359,53 @@ Flickable {
         Component.onCompleted: previewImage.pushUrl(bridge.preview_url)
     }
 
+// P0-2b2 Tier 1：拖动期间用「静态层 + 活动层」两张 retained 纹理，
+// 每帧只改活动层的 x/y/w/h/opacity，Qt Quick 在 GPU 上完成合成。
+// 主预览 Item 此时透明（双缓冲仍在后台保持状态，避免解码闸门误判）。
+// clip 把画布外的像素裁掉（D12）；框 / 手柄 / 徽标是控件，不在这里裁。
+//
+// ★声明位置必须在 CanvasSurface / SelectionViz 之前：同 z 下后来者居上，
+//   否则选框和手柄会被这两张纹理盖住。
+Item {
+    id: gpuLayer
+    x: previewImage.x
+    y: previewImage.y
+    width: previewImage.width
+    height: previewImage.height
+    visible: view.bridge.gpuLive
+    clip: true
+
+    readonly property var rect: {
+        try { return JSON.parse(view.bridge.gpuRectJson) } catch (e) { return {} }
+    }
+
+    Image {
+        id: gpuStatic
+        anchors.fill: parent
+        source: view.bridge.gpuStaticUrl
+        fillMode: Image.Stretch
+        cache: false
+        asynchronous: true
+        smooth: true
+    }
+
+    Image {
+        id: gpuActive
+        x: gpuLayer.rect.x || 0
+        y: gpuLayer.rect.y || 0
+        width: Math.max(1, gpuLayer.rect.w || 0)
+        height: Math.max(1, gpuLayer.rect.h || 0)
+        opacity: gpuLayer.rect.o === undefined ? 1 : gpuLayer.rect.o
+        source: view.bridge.gpuActiveUrl
+        fillMode: Image.Stretch
+        cache: false
+        asynchronous: true
+        smooth: true
+        // 纯平移走 x/y；矩阵通道留给 P1-A 的缩放 / 旋转统一采样器。
+        transformOrigin: Item.TopLeft
+    }
+}
+
     // ---- Persistent-selection interaction stack ----------------------
     // Hit priority: selected layer content drag (no active selection) →
     // selection move (center of the selection) → new selection rubber
@@ -376,6 +425,13 @@ Flickable {
         view: view
         previewImage: previewImage
     }
+
+// P0-4 智能参考线：像素内容之上、控件之下；不受画布外裁剪影响。
+SmartGuides {
+    id: smartGuides
+    bridge: view.bridge
+    previewImage: view.previewImage
+}
 
 SelectionViz {
     id: selectionViz

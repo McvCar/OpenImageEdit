@@ -73,12 +73,36 @@ pub(in crate::bridge) struct Session {
     pub(in crate::bridge) patch_region: Option<SelectionMask>,
     /// 修复画笔的取样锚点（画布坐标），Alt + 点击设置。
     pub(in crate::bridge) heal_source: Option<(f32, f32)>,
-    /// 连续旋转会话的原图锚点（见 `RotateOrigin`）。**跨手势**存在：一次
-    /// 拖拽结束后下一次还要从没插值过的原图接着转，所以不能放进
-    /// `TransformSession`（会话一结束就被 take 掉）。
+    /// 连续旋转会话的原图锚点（见 `RotateOrigin`）。**P0-2b2 起已退场**：
+    /// 累计角度和未插值原图改由 `Layer::transform` 参数层持有，本字段只是
+    /// 旧合成缓存的兼容位，落定后恒为 None，不再参与任何读取。
     pub(in crate::bridge) rotate_origin: Option<RotateOrigin>,
     /// 旋转会话自增号（见 `LiveRotate::token`）。同样是跨会话的缓存版本号。
     pub(in crate::bridge) rotate_token: u64,
+    // ---- P0-4 智能参考线 / P0-2b2 mods 透传 ----
+    /// 起手时预生成并排序的静态候选（画布 / 其它图层 / 选区）。
+    pub(in crate::bridge) snap_statics: Vec<editcore::snap::SnapCandidate>,
+    /// 最近一次求解结果；随每帧 refresh 下发成 `guides_json`。
+    pub(in crate::bridge) snap: editcore::snap::SnapResult,
+    /// QML 透传的 `Qt::KeyboardModifiers` 位掩码，修饰键语义一律在 Rust 解释。
+    pub(in crate::bridge) mods: i32,
+    /// 显示像素 / 图像像素；`8 / disp_scale` 就是 8 显示像素阈值。
+    pub(in crate::bridge) disp_scale: f64,
+    /// 统一三件套记录的起点（图像坐标）、起手外接框与手势类型。
+    pub(in crate::bridge) gesture: i32,
+    pub(in crate::bridge) gesture_start: (f64, f64),
+    pub(in crate::bridge) gesture_rect: (f64, f64, f64, f64),
+    /// Tier 1 拖动帧**跳过**的 CPU 全幅合成次数（计数器断言：启用快路径后
+    /// 每次拖动都应递增，而实际合成次数为 0）。
+    pub(in crate::bridge) full_composites: u32,
+    // ---- P0-2b2 Tier 1 GPU 快路径 ----
+    /// true 时 render() 直接复用上一帧 URL，QML 改用「静态层 + 活动层」两纹理。
+    pub(in crate::bridge) gpu_live: bool,
+    pub(in crate::bridge) gpu_static_url: String,
+    pub(in crate::bridge) gpu_active_url: String,
+    pub(in crate::bridge) gpu_index: usize,
+    /// 活动层显示矩形 + 不透明度（QML 逻辑像素）：x, y, w, h, opacity。
+    pub(in crate::bridge) gpu_rect: (f64, f64, f64, f64, f64),
 }
 
 impl Session {
@@ -148,8 +172,16 @@ impl Session {
 
     /// 统一会话的诊断快照（给 `transform_state` 探针 / `--probe-session`）。
     pub(in crate::bridge) fn transform_state_json(&self) -> String {
+        let diag = format!(
+            r#""gpu":{},"skipped":{},"guides":{},"gesture":{},"mods":{}"#,
+            self.gpu_live,
+            self.full_composites,
+            self.snap.guides.len(),
+            self.gesture,
+            self.mods
+        );
         match self.transform.as_ref() {
-            None => r#"{"active":false}"#.to_string(),
+            None => format!(r#"{{"active":false,{diag}}}"#),
             Some(ts) => {
                 let extra = match ts {
                     TransformSession::Move { start, last, .. } => format!(
@@ -168,7 +200,7 @@ impl Session {
                     ),
                 };
                 format!(
-                    "{{\"active\":true,\"kind\":\"{}\",\"index\":{},\"special\":{},\"cap\":{},{}}}",
+                    "{{\"active\":true,\"kind\":\"{}\",\"index\":{},\"special\":{},\"cap\":{},{},{diag}}}",
                     ts.kind(), ts.index(), ts.special(), ts.cap().unwrap_or(0), extra
                 )
             }
@@ -544,6 +576,19 @@ impl Session {
                 heal_source: None,
                 rotate_origin: None,
                 rotate_token: 0,
+                snap_statics: Vec::new(),
+                snap: editcore::snap::SnapResult::default(),
+                mods: 0,
+                disp_scale: 1.0,
+                gesture: -1,
+                gesture_start: (0.0, 0.0),
+                gesture_rect: (0.0, 0.0, 0.0, 0.0),
+                full_composites: 0,
+                gpu_live: false,
+                gpu_static_url: String::new(),
+                gpu_active_url: String::new(),
+                gpu_index: 0,
+                gpu_rect: (0.0, 0.0, 0.0, 0.0, 1.0),
             },
             ms,
         )
@@ -605,6 +650,21 @@ impl Session {
             return Err("empty canvas".into());
         }
         self.last_display = display;
+        // ★Tier 1：GPU 快路径期间主预览不产生新帧。三层里只有活动层在动，
+        // QML 直接改它的位置/尺寸/不透明度即可，CPU 全幅合成、BMP 编码、
+        // 临时文件写入、Qt 解码全部跳过（拖动帧合成次数 = 0）。
+        if self.gpu_live {
+            if let Some(cached) = self.last_render.as_ref() {
+                self.full_composites = self.full_composites.saturating_add(1);
+                let url = cached.url.clone();
+                let preview = cached.target;
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"gpu-skip\",\"skipped\":{}}}",
+                    self.full_composites
+                );
+                return Ok(Rendered { url, display, preview, histogram: None });
+            }
+        }
         let special = self.adjust.is_some()
             || self.preview_hidden_mark >= 0
             || self.transform.as_ref().is_some_and(|t| t.special());
@@ -832,15 +892,32 @@ impl Session {
             // o: opacity in percent (0-100); x/y/w/h: bounds in image pixels
             // (the QML side uses them for the live layer outline while dragging);
             // l: locked (blocks move / scale / delete in the UI).
+            // P0-2b2：a = 累计旋转角（参数层真值）。QML 不再用 rotateFrames
+            // 按位图尺寸反推角度，撤销 / 重做 / 缩放后天然同步。
+            let angle = layer
+                .transform
+                .as_ref()
+                .map(|t| t.rotation)
+                .unwrap_or(0.0);
+            // sw/sh = 变换前原图尺寸；QML 用它 + 角度画倾斜框，不再靠
+            // rotateFrames 按位图尺寸反推（撤销 / 缩放后必然不同步）。
+            let (sw, sh) = layer
+                .transform
+                .as_ref()
+                .map(|t| (t.source.width(), t.source.height()))
+                .unwrap_or((layer.image.width(), layer.image.height()));
             parts.push(format!(
-                "{{\"i\":{i},\"n\":\"{name}\",\"v\":{},\"o\":{},\"l\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{}}}",
+                "{{\"i\":{i},\"n\":\"{name}\",\"v\":{},\"o\":{},\"l\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"a\":{:.3},\"sw\":{},\"sh\":{}}}",
                 layer.visible,
                 (layer.opacity * 100.0).round() as i32,
                 layer.locked,
                 bounds.x,
                 bounds.y,
                 bounds.width,
-                bounds.height
+                bounds.height,
+                angle,
+                sw,
+                sh
             ));
         }
         // The base image is listed last (display order = top first) as a
@@ -861,6 +938,137 @@ impl Session {
             ));
         }
         format!("[{}]", parts.join(","))
+    }
+
+    // ---- P0-2b2 Tier 1：静态层 + 活动层两纹理 ----------------------
+    /// 起手一次生成两张纹理：
+    ///  * static = 文档里「活动层隐藏」后的完整预览（base + 其它层）；
+    ///  * active = 活动层自身位图（未插值原图，QML 拉伸到显示尺寸）。
+    /// 之后每个拖动帧只改 QML 的 x/y/w/h/opacity 属性，render() 完全跳过
+    /// 全幅合成 + BMP 编码 + 写盘 + 解码 —— 这正是「拖动帧 CPU 全幅合成 = 0」。
+    ///
+    /// 自动回退（§11.4）：调色面板、快速蒙版、文本内联编辑、可见标记 ——
+    /// 这些状态要么会改 static 像素，要么绘制顺序在活动层之上，命中即
+    /// 返回 false 走 CPU 路径，优先保证正确性。
+    pub(in crate::bridge) fn gpu_begin(
+        &mut self,
+        index: usize,
+        disp_scale: f64,
+        dpr: f64,
+    ) -> bool {
+        self.gpu_end();
+        if self.adjust.is_some()
+            || self.quick_mask
+            || self.preview_hidden_mark >= 0
+            || self.doc.marks.iter().any(|m| m.visible)
+            || !(disp_scale > 0.0)
+        {
+            return false;
+        }
+        let Some(layer) = self.doc.layers.get(index) else {
+            return false;
+        };
+        if !layer.visible || layer.opacity <= 0.0 {
+            return false;
+        }
+        let canvas = self.doc.canvas;
+        let display = display_size(canvas, self.zoom, dpr);
+        let target = preview_target(display, canvas, dpr);
+        if target.pixels() == 0 {
+            return false;
+        }
+        let active_img = layer.image.clone();
+        let opacity = layer.opacity;
+        let saved = self.doc.layers[index].visible;
+        self.doc.layers[index].visible = false;
+        let static_img = self.composer.composite_adjusted(&self.doc, target, None);
+        self.doc.layers[index].visible = saved;
+
+        let (Ok(bytes_s), Ok(bytes_a)) = (
+            encode(&static_img, Format::Bmp, 90),
+            encode(&active_img, Format::Bmp, 90),
+        ) else {
+            return false;
+        };
+        self.render_count = self.render_count.wrapping_add(1);
+        let tag = self.render_count;
+        let ps = std::env::temp_dir().join(format!("imageedit-gpu-{}-s-{tag}.bmp", self.id));
+        let pa = std::env::temp_dir().join(format!("imageedit-gpu-{}-a-{tag}.bmp", self.id));
+        if std::fs::write(&ps, bytes_s).is_err() || std::fs::write(&pa, bytes_a).is_err() {
+            return false;
+        }
+        self.gpu_static_url = file_url(&ps);
+        self.gpu_active_url = file_url(&pa);
+        self.gpu_index = index;
+        self.gpu_rect = (
+            self.doc.layers[index].offset.0 as f64 * disp_scale,
+            self.doc.layers[index].offset.1 as f64 * disp_scale,
+            active_img.width() as f64 * disp_scale,
+            active_img.height() as f64 * disp_scale,
+            opacity as f64,
+        );
+        self.gpu_live = true;
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"gpu-begin\",\"index\":{index},\"target\":\"{}x{}\"}}",
+            target.width, target.height
+        );
+        true
+    }
+
+    /// 每帧只重算活动层的显示矩形（纯浮点，零分配）。
+    pub(in crate::bridge) fn gpu_update_rect(&mut self, disp_scale: f64) {
+        if !self.gpu_live || !(disp_scale > 0.0) {
+            return;
+        }
+        if let Some(layer) = self.doc.layers.get(self.gpu_index) {
+            self.gpu_rect.0 = layer.offset.0 as f64 * disp_scale;
+            self.gpu_rect.1 = layer.offset.1 as f64 * disp_scale;
+            self.gpu_rect.4 = layer.opacity as f64;
+        }
+    }
+
+    pub(in crate::bridge) fn gpu_end(&mut self) {
+        self.gpu_live = false;
+    }
+
+    pub(in crate::bridge) fn gpu_rect_json(&self) -> String {
+        let (x, y, w, h, o) = self.gpu_rect;
+        format!(
+            r#"{{"x":{x:.2},"y":{y:.2},"w":{w:.2},"h":{h:.2},"o":{o:.3}}}"#
+        )
+    }
+
+    /// P0-5：选中图层的外接框参数（数值面板只读回显）。
+    /// 普通位图图层用 identity 参数表达，避免面板显示两套语义。
+    pub(in crate::bridge) fn transform_panel_json(&self, index: i32) -> String {
+        let Some(layer) = self.doc.layers.get(index.max(0) as usize) else {
+            return "{\"has\":false}".to_string();
+        };
+        // 不要为「读一次数值」clone 整张位图：identity 层直接由 offset/尺寸报。
+        let (x, y, w, h, rot, sx, sy, fx, fy, param) = match layer.transform.as_ref() {
+            Some(t) => {
+                let p = t.panel_values();
+                (
+                    p.x, p.y, p.width, p.height, p.rotation,
+                    t.scale.0, t.scale.1, t.flip.0, t.flip.1, true,
+                )
+            }
+            None => (
+                layer.offset.0 as f64,
+                layer.offset.1 as f64,
+                layer.image.width() as f64,
+                layer.image.height() as f64,
+                0.0,
+                1.0,
+                1.0,
+                false,
+                false,
+                false,
+            ),
+        };
+        format!(
+            r#"{{"has":true,"x":{x:.2},"y":{y:.2},"w":{w:.2},"h":{h:.2},"rot":{rot:.2},"sx":{sx:.4},"sy":{sy:.4},"fx":{fx},"fy":{fy},"param":{param}}}"#
+        )
     }
 
     /// JSON list of markup annotations for the QML overlay (selection box,
@@ -929,6 +1137,10 @@ impl Session {
     }
 
     pub(in crate::bridge) fn refresh(&mut self, zoom_only: bool, dpr: f64) -> Refresh {
+        // GPU 快路径：每次 refresh 只重算活动层的显示矩形（纯浮点）。
+        if self.gpu_live {
+            self.gpu_update_rect(self.disp_scale);
+        }
         match self.render(zoom_only, dpr) {
             Ok(rendered) => {
                 let adjust = self.adjust;

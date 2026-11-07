@@ -12,6 +12,7 @@ mod geometry;
 mod mark;
 mod layer;
 pub mod layer_transform;
+pub mod snap;
 mod transform;
 mod op;
 mod ops;

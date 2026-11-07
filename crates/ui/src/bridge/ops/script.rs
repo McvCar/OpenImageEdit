@@ -679,6 +679,44 @@ impl qobject::Bridge {
                         )
                     }
                 }
+                // `gpu-gesture[:dx,dy]` —— 走一次真实移动手势
+                // （transform_begin → 5×transform_update → transform_end），
+                // 用来验证 Tier 1「静态层 + 活动层」两纹理快路径：日志必须
+                // 出现 gpu-begin 与多条 gpu-skip，且拖动帧没有 render-profile。
+                other if other.starts_with("gpu-gesture") => {
+                    let n = parse_nums(other);
+                    let (dx, dy) = (
+                        n.first().copied().unwrap_or(40.0),
+                        n.get(1).copied().unwrap_or(30.0),
+                    );
+                    let ix = (*self.selected_layer()).max(0) as i32;
+                    let center = {
+                        let guard = self.session.borrow();
+                        guard.as_ref().and_then(|s| s.doc.layers.get(ix.max(0) as usize)).map(|l| {
+                            (
+                                l.offset.0 as f64 + l.image.width() as f64 / 2.0,
+                                l.offset.1 as f64 + l.image.height() as f64 / 2.0,
+                            )
+                        })
+                    };
+                    match center {
+                        Some((cx, cy)) => {
+                            let began = self.as_mut().transform_begin(0, ix, cx, cy, 0, 1.0);
+                            for i in 1..=5 {
+                                let t = i as f64 / 5.0;
+                                self.as_mut().transform_update(0, cx + dx * t, cy + dy * t, 0, 1.0);
+                            }
+                            let landed = self.as_mut().transform_end(true, 0);
+                            println!(
+                                "{{\"phase\":\"ui\",\"event\":\"gpu-gesture\",\"began\":{began},\
+                                 \"landed\":{landed},\"dx\":{dx},\"dy\":{dy}}}"
+                            );
+                        }
+                        None => println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        ),
+                    }
+                }
                 // `transform-state` —— P0-2b1 统一会话诊断：打印 kind / index /
                 // special / cap。手势落定后必须是 active=false（无残留）。
                 "transform-state" => {
@@ -700,6 +738,38 @@ impl qobject::Bridge {
                     let had = self.as_mut().transform_abort();
                     println!(
                         "{{\"phase\":\"ui\",\"event\":\"transform-abort\",\"had\":{had}}}"
+                    );
+                }
+                // `transform-params:x,y,w,h,rot,lock,ref` —— P0-5 数值面板写入
+                //（一次调用一条历史），供无 GUI 回归脚本验证外接框语义。
+                other if other.starts_with("transform-params:") => {
+                    let n = parse_nums(other);
+                    let g = |i: usize, d: f64| n.get(i).copied().unwrap_or(d);
+                    let ok = self.as_mut().transform_set_params(
+                        g(0, 0.0), g(1, 0.0), g(2, 100.0), g(3, 100.0),
+                        g(4, 0.0), false, false, g(5, 1.0) != 0.0,
+                        g(6, 0.0) as i32,
+                    );
+                    let values = self
+                        .session
+                        .borrow()
+                        .as_ref()
+                        .map(|s| s.transform_panel_json(*self.selected_layer()))
+                        .unwrap_or_else(|| "{}".to_string());
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"transform-params\",\"ok\":{ok},\"values\":{values}}}"
+                    );
+                }
+                // `snap-probe:x,y,w,h,edges` —— P0-4 求解器端到端（8 显示像素）。
+                other if other.starts_with("snap-probe:") => {
+                    let n = parse_nums(other);
+                    let g = |i: usize| n.get(i).copied().unwrap_or(0.0);
+                    let text = self.as_mut().transform_snap_rect(
+                        g(0), g(1), g(2), g(3), g(4) as i32, 0, 1.0,
+                    );
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"snap-probe\",\"result\":{}}}",
+                        text.to_string()
                     );
                 }
                 // `layer-info:index[,tag]` —— 打印图层位图尺寸与 offset。

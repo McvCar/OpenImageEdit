@@ -503,6 +503,14 @@ Rectangle {
                 }
             }
         }
+        // P0-5：变换数值面板开关（D7 首次默认隐藏 / D13 记住上次状态）。
+        IconButton {
+            id: transformPanelBtn
+            glyph: "⊞"
+            tip: "变换数值面板：外接框 X/Y/W/H、角度、参考点"
+            selected: bridge.transformPanelVisible
+            onClicked: bridge.update_transform_panel_visible(!bridge.transformPanelVisible)
+        }
     }
 
     // 操作提示：贴在按钮行右边剩下的空间里，右对齐 + 省略号，窄窗口下绝不

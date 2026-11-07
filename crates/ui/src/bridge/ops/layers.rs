@@ -486,10 +486,43 @@ impl qobject::Bridge {
                 match session.take_scale_state() {
                     Some(ls) if ls.index == ix && commit => {
                         let to = Size::new(w.max(1) as u32, h.max(1) as u32);
-                        match session
-                            .doc
-                            .scale_layer_flipped(ix, to, (ox, oy), (flip_x, flip_y))
-                        {
+                        // ★P0-2b2：轴对齐缩放落定统一成一条 SetLayerTransform
+                        //（params 真值 + 原图重采样），与移动 / 旋转共用历史。
+                        // 已旋转 / 斜切的图层仍走旧 Lanczos3 回退，保持既有
+                        // 几何数值不变（等 P1-A 透视接入后再统一）。
+                        let layer = &session.doc.layers[ix];
+                        let mut t = layer.transform.clone().unwrap_or_else(|| {
+                            LayerTransform::from_offset(
+                                layer.image.clone(),
+                                layer.offset.0,
+                                layer.offset.1,
+                            )
+                        });
+                        let axis_aligned = t.rotation.abs() < 1e-9
+                            && t.skew == (0.0, 0.0)
+                            && t.perspective.is_none();
+                        let result = if axis_aligned {
+                            let (sw, sh) = t.source_size();
+                            let cumulative = (t.flip.0 ^ flip_x, t.flip.1 ^ flip_y);
+                            let snap_back = !cumulative.0
+                                && !cumulative.1
+                                && (to.width as f64 - sw).abs() <= 2.0
+                                && (to.height as f64 - sh).abs() <= 2.0;
+                            let (fw, fh) = if snap_back {
+                                (sw, sh)
+                            } else {
+                                (to.width as f64, to.height as f64)
+                            };
+                            t.scale = (fw / sw, fh / sh);
+                            t.center = (ox as f64 + fw / 2.0, oy as f64 + fh / 2.0);
+                            t.flip = cumulative;
+                            session.doc.set_layer_transform(ix, Some(t))
+                        } else {
+                            session
+                                .doc
+                                .scale_layer_flipped(ix, to, (ox, oy), (flip_x, flip_y))
+                        };
+                        match result {
                             Ok(()) => {
                                 // 旋转过的图层：拉伸会把连续旋转的原图锚点判据
                                 // 打废，下一次旋转只能拿已经烘焙过的外接矩形

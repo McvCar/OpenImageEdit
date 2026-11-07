@@ -180,3 +180,61 @@ fn transform_does_not_change_export_size() {
     doc.scale_layer(0, Size::new(20, 20), (5, 5)).unwrap();
     assert_eq!(doc.flatten().dimensions(), (60, 50));
 }
+
+// ---- P0-5 数值面板：外接框语义（D10 / R10）-------------------------------
+
+#[test]
+fn panel_values_are_axis_aligned_bounds_after_rotation() {
+    let t = LayerTransform::from_offset(checker(40, 20), 10, 10);
+    let p = t.panel_values();
+    assert_eq!((p.x, p.y, p.width, p.height), (10.0, 10.0, 40.0, 20.0));
+    let mut r = t.clone();
+    r.rotation = 90.0;
+    let p90 = r.panel_values();
+    assert!((p90.width - 20.0).abs() < 1e-6, "90° 外接框宽应变成原高");
+    assert!((p90.height - 40.0).abs() < 1e-6, "90° 外接框高应变成原宽");
+    assert!((p90.rotation - 90.0).abs() < 1e-9);
+}
+
+#[test]
+fn panel_width_keeps_rotation_and_pivot_at_0_45_90_degrees() {
+    for angle in [0.0, 45.0, 90.0, 123.0] {
+        let mut t = LayerTransform::from_offset(checker(40, 20), 100, 80);
+        t.rotation = angle;
+        let before = t.bounds().pivot(ReferencePoint::TopLeft);
+        let ok = t.set_panel_value_with_solve(
+            Field::Width,
+            80.0,
+            ReferencePoint::TopLeft,
+            BoundsSolve::SingleAxis,
+        );
+        assert!(ok, "angle {angle} 应可解");
+        assert!((t.rotation - angle).abs() < 1e-9, "W/H 写入不应改 rotation");
+        assert!((t.bounds().width - 80.0).abs() < 1e-6, "angle {angle} 外接框宽");
+        let after = t.bounds().pivot(ReferencePoint::TopLeft);
+        assert!((after.0 - before.0).abs() < 1e-6 && (after.1 - before.1).abs() < 1e-6,
+                "angle {angle} 参考点应保持不动");
+    }
+}
+
+#[test]
+fn panel_x_y_are_plain_translations_and_undo_is_one_step() {
+    let mut t = LayerTransform::from_offset(checker(40, 20), 10, 10);
+    t.set_panel_value(Field::X, 50.0, ReferencePoint::TopLeft);
+    t.set_panel_value(Field::Y, 70.0, ReferencePoint::TopLeft);
+    let p = t.panel_values();
+    assert_eq!((p.x, p.y), (50.0, 70.0));
+    assert_eq!(t.scale, (1.0, 1.0), "平移不应改 scale");
+
+    let mut doc = doc_with_layer(checker(60, 50));
+    let mut to = doc.layers[0].transform.clone().unwrap_or_else(|| {
+        LayerTransform::from_offset(doc.layers[0].image.clone(), 0, 0)
+    });
+    to.set_panel_value(Field::X, 12.0, ReferencePoint::TopLeft);
+    let before = doc.history_len();
+    doc.set_layer_transform(0, Some(to)).unwrap();
+    assert_eq!(doc.history_len(), before + 1, "一次写入 = 一条历史");
+    doc.undo().unwrap();
+    let q = doc.layers[0].transform_state().panel_values();
+    assert_eq!(q.x, 0.0);
+}

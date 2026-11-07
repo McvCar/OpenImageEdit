@@ -638,6 +638,76 @@ impl LayerTransform {
         (img, (r.x, r.y))
     }
 
+    /// P0-2b2 落定渲染：参数化历史的 **唯一** 像素后端。
+    ///
+    /// `render_bounds(true)` 走 `sample_affine` HQ，而 P0-2a 之前 UI 的三条
+    /// 落定路径分别用 `imageops::resize(Lanczos3)`（缩放）与
+    /// `rotate_image_hq`（旋转）。统一历史时若直接换采样器，用户已经测过的
+    /// 「文字缩回原尺寸不糊 / 旋转不累积模糊」会悄悄变画质。这里按参数
+    /// 分派到既有 HQ 后端，保证「落定前后逐像素一致」，同时历史只剩
+    /// `SetLayerTransform` 一条；斜切 / 透视 / 组合变换才走通用取样器。
+    pub fn render_compatible(&self) -> (RgbaImage, (i32, i32)) {
+        let affine = self.is_affine();
+        let no_rotation = self.rotation.abs() < 1e-9;
+        let no_skew = self.skew == (0.0, 0.0);
+        let (sw, sh) = self.source_size();
+        let (sx, sy) = (self.scale.0.abs(), self.scale.1.abs());
+        let w = (sw * sx).round().max(1.0) as u32;
+        let h = (sh * sy).round().max(1.0) as u32;
+        let place = |width: u32, height: u32| {
+            (
+                (self.center.0 - width as f64 / 2.0).round() as i32,
+                (self.center.1 - height as f64 / 2.0).round() as i32,
+            )
+        };
+        if affine && no_rotation && no_skew {
+            // 回到原始尺寸（±2px 手柄误差吸附）时 1:1 索引拷贝，
+            // 与 ScaleLayer 的 P0-2a 修复保持逐像素一致。
+            let snap_back = !self.flip.0
+                && !self.flip.1
+                && (w as f64 - sw).abs() <= 2.0
+                && (h as f64 - sh).abs() <= 2.0;
+            let mut image = if snap_back {
+                (*self.source).clone()
+            } else {
+                image::imageops::resize(
+                    self.source.as_ref(),
+                    w,
+                    h,
+                    image::imageops::FilterType::Lanczos3,
+                )
+            };
+            if self.flip.0 {
+                image = image::imageops::flip_horizontal(&image);
+            }
+            if self.flip.1 {
+                image = image::imageops::flip_vertical(&image);
+            }
+            // 吸附时输出尺寸是原图尺寸，不能用 QML 换算出的 ±2px 值摆放。
+            let offset = place(image.width(), image.height());
+            return (image, offset);
+        }
+        if affine && no_skew && !self.flip.0 && !self.flip.1 && !no_rotation {
+            // 任意 scale + 旋转：先把未插值原图按 Lanczos3 缩放到目标尺度，
+            // 再从那张图一次性 HQ 旋转 —— 与旧「当前位图 → rotate_image_hq」
+            // 逐像素一致，但输入恒为原图，连续旋转永不累积模糊。
+            let base = if (sx - 1.0).abs() < 1e-9 && (sy - 1.0).abs() < 1e-9 {
+                (*self.source).clone()
+            } else {
+                image::imageops::resize(
+                    self.source.as_ref(),
+                    w,
+                    h,
+                    image::imageops::FilterType::Lanczos3,
+                )
+            };
+            let (image, _) = crate::transform::rotate_image_hq(&base, self.rotation as f32, true);
+            let offset = place(image.width(), image.height());
+            return (image, offset);
+        }
+        self.render_bounds(true)
+    }
+
     pub fn params_bytes(&self) -> Vec<u8> {
         self.params().to_bytes()
     }

@@ -62,12 +62,15 @@ def main():
     src = os.path.join(TMP, "rotfix_src.png")
     fixture(src)
 
-    a, b, c = (os.path.join(TMP, f"rotfix_{k}.png") for k in "abc")
+    a, b, c, d = (os.path.join(TMP, f"rotfix_{k}.png") for k in "abcd")
     run(src, "rotate-layer:0,37", a)
     run(src, "rotate-handle:0,18.5;rotate-handle:0,18.5", b)
     run(src, "rotate-layer:0,18.5;rotate-layer:0,18.5", c)
+    # 对照组：「不扩展」选项会裁剪，只能烘焙进位图，两次必然掉细节 ——
+    # 用它证明这套 RMSE 指标确实能测出累积重采样。
+    run(src, "rotate-layer:0,18.5,0;rotate-layer:0,18.5,0", d)
 
-    A, B, C = (Image.open(p).convert("L") for p in (a, b, c))
+    A, B, C, D = (Image.open(p).convert("L") for p in (a, b, c, d))
     fails = []
 
     r_ab = rmse(A, B)
@@ -75,11 +78,16 @@ def main():
     if r_ab > 0.01:
         fails.append(f"旋柄两次拖拽与单次旋转不一致（RMSE={r_ab:.2f}），原图复用失效")
 
-    ca, cc = contrast(A), contrast(C)
     r_ac = rmse(A, C)
-    print(f"  连续改两次角度 vs 一次 37°：RMSE={r_ac:.2f}   对比度 {ca:.1f} → {cc:.1f}")
-    if r_ac < 1.0 or cc > ca * 0.98:
-        fails.append("连续两次独立重采样没有掉细节，说明 C 这组参照失效（测试本身有问题）")
+    print(f"  连续改两次角度 vs 一次 37°：RMSE={r_ac:.2f}   对比度 {contrast(A):.1f} → {contrast(C):.1f}")
+    if r_ac > 0.01:
+        fails.append(f"连续改两次角度与单次旋转不一致（RMSE={r_ac:.2f}），参数化落定失效")
+
+    ca, cd = contrast(A), contrast(D)
+    r_ad = rmse(A, D)
+    print(f"  [对照] 不扩展连转两次 vs 一次 37°：RMSE={r_ad:.2f}   对比度 {ca:.1f} → {cd:.1f}")
+    if r_ad < 1.0 or cd > ca * 0.98:
+        fails.append("对照组的累积重采样没有掉细节，说明指标本身失效（测试有问题）")
 
     if fails:
         for f in fails:

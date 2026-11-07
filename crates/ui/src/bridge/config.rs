@@ -32,6 +32,13 @@ pub(in crate::bridge) struct AppConfig {
     /// `工具|笔刷|硬度|间距|强度|扩散|容差|连续|不透明|径向|反向|渐变不透明`
     /// （如 "none|40|70|20|100|2|32|1|100|0|0|100"）。
     pub(in crate::bridge) paint_spec: String,
+    // ---- P0-4 智能参考线 / P0-5 数值面板（settings.ini 跨启动记忆）----
+    /// D7/D13：数值面板首次默认隐藏，按钮切换后记住上次显示状态。
+    pub(in crate::bridge) transform_panel_visible: bool,
+    /// D16：只控制提示线绘制，不影响吸附求解。
+    pub(in crate::bridge) show_guides: bool,
+    /// D16：关闭时求解直接短路，不吸附也不画线。
+    pub(in crate::bridge) snap_enabled: bool,
 }
 
 impl AppConfig {
@@ -95,6 +102,11 @@ impl AppConfig {
                         "paint_spec" if !value.is_empty() => {
                             cfg.paint_spec = value.to_string()
                         }
+                        "transform_panel_visible" => {
+                            cfg.transform_panel_visible = value == "true"
+                        }
+                        "show_guides" => cfg.show_guides = value != "false",
+                        "snap_enabled" => cfg.snap_enabled = value != "false",
                         _ => {}
                     }
                 }
@@ -109,7 +121,7 @@ impl AppConfig {
                 let _ = std::fs::create_dir_all(dir);
             }
             let text = format!(
-                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\nruler_bottom_up={}\nmax_dimension={}\nsel_border={}\nsel_smooth={}\nsel_feather={}\nsel_tool={}\nsel_wand={}\npaint_spec={}\n",
+                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\nruler_bottom_up={}\nmax_dimension={}\nsel_border={}\nsel_smooth={}\nsel_feather={}\nsel_tool={}\nsel_wand={}\npaint_spec={}\ntransform_panel_visible={}\nshow_guides={}\nsnap_enabled={}\n",
                 self.checker_light,
                 self.checker_dark,
                 self.open_in_new_window,
@@ -121,7 +133,10 @@ impl AppConfig {
                 self.sel_feather,
                 self.sel_tool,
                 self.sel_wand,
-                self.paint_spec
+                self.paint_spec,
+                self.transform_panel_visible,
+                self.show_guides,
+                self.snap_enabled
             );
             let _ = std::fs::write(path, text);
         }

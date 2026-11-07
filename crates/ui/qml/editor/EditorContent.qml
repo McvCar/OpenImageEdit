@@ -469,30 +469,28 @@ Item {
     // ★按图层分别记（index -> { w, h, angle }）：以前是单份全局状态，
     //   一切换图层就清空，切回来时框退回轴对齐的扩边矩形 —— 像素还转着，
     //   框却正了，就是用户说的"放手角度会复位"。
+    // P0-2b2：角度与原图尺寸的真值改为 layers_json 的 a / sw / sh
+    //（来自 Layer::transform 参数层）。撤销 / 重做 / 缩放 / 切换图层之后
+    // 天然同步，不会再出现「按位图尺寸反推角度」失配导致框角度复位。
+    // rotateFrames 仍由旧探针写入，但不再参与任何显示判定。
     property var rotateFrames: ({})
     readonly property var rotateFrame: {
-        const f = bridge.selected_layer >= 0 ? root.rotateFrames[bridge.selected_layer] : null
-        return f ? ({ w: f.w, h: f.h }) : null
+        const b = selLayerBox
+        if (b !== null && b.sw > 0 && b.sh > 0)
+            return ({ w: b.sw, h: b.sh })
+        return null
     }
     readonly property real rotateFrameAngle: {
-        const f = bridge.selected_layer >= 0 ? root.rotateFrames[bridge.selected_layer] : null
-        return f ? f.angle : 0
+        const b = selLayerBox
+        if (b !== null && typeof b.a === "number" && Math.abs(b.a) > 0.001)
+            return b.a
+        return 0
     }
-    // 只在「当前位图尺寸 == 这个角度应有的外接矩形」时才画倾斜框。
-    // 缩放、撤销、在别处编辑之后尺寸对不上，自动退回普通的轴对齐框——
-    // 不用在每个编辑入口手动清状态，也就不会漏。
     readonly property bool layerFrameRotated: {
-        if (rotateFrame === null || Math.abs(rotateFrameAngle) <= 0.01)
+        if (Math.abs(rotateFrameAngle) <= 0.01)
             return false
         const b = selLayerBox
-        if (b === null || b.w <= 0 || b.h <= 0)
-            return false
-        const a = rotateFrameAngle * Math.PI / 180
-        const c = Math.abs(Math.cos(a))
-        const s = Math.abs(Math.sin(a))
-        const ew = Math.ceil(rotateFrame.w * c + rotateFrame.h * s - 0.001)
-        const eh = Math.ceil(rotateFrame.w * s + rotateFrame.h * c - 0.001)
-        return Math.abs(b.w - ew) <= 2 && Math.abs(b.h - eh) <= 2
+        return b !== null && b.w > 0 && b.h > 0 && rotateFrame !== null
     }
     readonly property real layerFrameW: rotateFrame !== null ? rotateFrame.w : 0
     readonly property real layerFrameH: rotateFrame !== null ? rotateFrame.h : 0
@@ -982,6 +980,15 @@ MarkBar {
     toolbar: toolbar
 }
 
+// P0-5：变换数值面板，停靠工作区左上角；显示状态由 settings.ini 记忆。
+TransformPanel {
+    id: transformPanel
+    bridge: bridge
+    x: 12
+    y: root.toolbarHeight * 2 + 12
+    z: 60
+}
+
 // ---- 选区浮动面板（标记栏「选区」按钮点开）--------------------------
 SelectionPopover {
     id: selPopover
@@ -1446,18 +1453,19 @@ function canvasCursor(x, y) {
 // Rust 侧按 `flip_x/flip_y` 翻转图层位图 —— 这就是「宽高拖成负数 = 镜像」。
 function resizeLayerFrom(startRect, role, dx, dy, free) {
     const s = Math.max(toDispScale(), 0.001)
-    const maxW = view.previewImage.width
-    const maxH = view.previewImage.height
+    // P0-3 / D3：图层变换框不再钳到 [0, 画布宽高]。画布外不渲染像素
+    // （render 输出矩形恒为 bounds ∩ canvas），但控件允许越界，拖出画布
+    // 不会被挡。选区侧的 resizedSelBox() 钳制保持不变。
     let l = startRect.x, t = startRect.y
     let r = startRect.x + startRect.width, b = startRect.y + startRect.height
     if (role.indexOf("w") >= 0)
-        l = Math.max(0, Math.min(snapDisplay(startRect.x + dx), maxW))
+        l = snapDisplay(startRect.x + dx)
     if (role.indexOf("e") >= 0)
-        r = Math.max(0, Math.min(snapDisplay(startRect.x + startRect.width + dx), maxW))
+        r = snapDisplay(startRect.x + startRect.width + dx)
     if (role.indexOf("n") >= 0)
-        t = Math.max(0, Math.min(snapDisplay(startRect.y + dy), maxH))
+        t = snapDisplay(startRect.y + dy)
     if (role.indexOf("s") >= 0)
-        b = Math.max(0, Math.min(snapDisplay(startRect.y + startRect.height + dy), maxH))
+        b = snapDisplay(startRect.y + startRect.height + dy)
     const flipX = r < l, flipY = b < t
     let x = Math.min(l, r), y = Math.min(t, b)
     let w = Math.abs(r - l), h = Math.abs(b - t)
@@ -1474,6 +1482,38 @@ function resizeLayerFrom(startRect, role, dx, dy, free) {
             x = startRect.x + startRect.width - w
         if (role.indexOf("n") >= 0)
             y = startRect.y + startRect.height - h
+    }
+    // P0-4：八向缩放吸附。只让「被拖的那条边 / 角」参与求解，对侧锚点
+    // 坐标恒定（D16）；求解在 Rust（图像坐标是唯一真值），这里只把修正量
+    // 换算回显示像素并叠加到被拖边上。
+    if (bridge.snapEnabled) {
+        let edges = 0
+        if (role.indexOf("w") >= 0) edges |= 1
+        if (role.indexOf("e") >= 0) edges |= 4
+        if (role.indexOf("n") >= 0) edges |= 8
+        if (role.indexOf("s") >= 0) edges |= 32
+        let adj = {dx: 0, dy: 0}
+        try {
+            adj = JSON.parse(bridge.transform_snap_rect(
+                x / s, y / s, w / s, h / s, edges, 0, s)) || adj
+        } catch (e) {}
+        const adx = (adj.dx || 0) * s
+        const ady = (adj.dy || 0) * s
+        if (adx !== 0) {
+            if (role.indexOf("e") >= 0)
+                w += adx
+            else if (role.indexOf("w") >= 0) {
+                x += adx; w -= adx
+            }
+        }
+        if (ady !== 0) {
+            if (role.indexOf("s") >= 0)
+                h += ady
+            else if (role.indexOf("n") >= 0) {
+                y += ady; h -= ady
+            }
+        }
+        w = Math.max(1, w); h = Math.max(1, h)
     }
     root.scaleFlipX = flipX
     root.scaleFlipY = flipY

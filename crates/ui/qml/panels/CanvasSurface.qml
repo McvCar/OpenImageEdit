@@ -56,6 +56,8 @@ Item {
     // 显示坐标下的临时偏移（SelectionViz 绘制时叠加）。
     property real selOffX: 0
     property real selOffY: 0
+    // P0-2b2：手势起手时锁存的修饰键位掩码，整段拖拽原样透传给 Rust。
+    property int gestureMods: 0
 
     // 把画布坐标换算成图像坐标（可能越界，交给 Rust 裁剪）。
     function toImage(mx, my) {
@@ -329,6 +331,7 @@ Item {
                 if (host.selExists)
                     bridge.sel_clear()
                 bridge.select_layer(hit.i)
+                gestureMods = mouse.modifiers
                 pickDrag = true
                 pickMoved = false
                 startX = mouse.x
@@ -371,6 +374,7 @@ Item {
                     if ((mouse.modifiers & Qt.ControlModifier) !== 0
                             && bridge.cut_selection_to_layer()) {
                         bridge.sel_clear()
+                        gestureMods = mouse.modifiers
                         pickDrag = true
                         pickMoved = false
                         startX = mouse.x
@@ -435,7 +439,12 @@ Item {
                     pickMoved = true
                     lastDx = 0
                     lastDy = 0
-                    bridge.drag_translate_begin()
+                    // P0-2b2：三件套统一入口（内部仍拉起旧 live 预览态）。
+                    // 坐标是图像像素，mods 原样透传，吸附由 Rust 求解。
+                    const p0 = toImage(startX, startY)
+                    bridge.transform_begin(0, bridge.selected_layer,
+                                           p0[0], p0[1],
+                                           gestureMods, host.toDispScale())
                     // Start ONCE and keep repeating: restarting the
                     // timer on every mouse-move event would reset the
                     // countdown faster than it can expire (mouse
@@ -517,16 +526,17 @@ Item {
                 if (pickMoved) {
                     pickMoved = false
                     liveTimer.stop()
-                    const scale = host.toImageScale()
                     // ★框不额外加本地偏移：drag_translate_update 每次都会改
                     //   文档里的 layer.offset 并重新发布 layers_json，QML 的
                     //   selLayerBox / 8 点 / 旋柄 / 徽标本来就跟着走。上一版
                     //   又叠了一份鼠标位移，等于两份位移相加 —— 拖得越远，
                     //   框和内容分得越开（用户截图里的"图层渲染跑到框外"）。
-                    bridge.drag_translate_update(
-                        Math.round((curX - startX) * scale),
-                        Math.round((curY - startY) * scale))
+                    // P0-2b2：最终帧也走统一会话，保证吸附修正量带进落定。
+                    const pf = toImage(curX, curY)
+                    bridge.transform_update(0, pf[0], pf[1],
+                                            gestureMods, host.toDispScale())
                     bridge.drag_translate_end(true)
+                    bridge.transform_end(true, gestureMods)
                     if (host.pasteFloating)
                         host.floatingOps += 1
                 }
@@ -643,6 +653,7 @@ Item {
                 pickMoved = false
                 liveTimer.stop()
                 bridge.drag_translate_end(false)
+                bridge.transform_end(false, gestureMods)
             }
             if (moveSelActive) {
                 moveSelActive = false
@@ -1315,7 +1326,8 @@ Item {
                 return
             // 上一帧还没上屏就先等：连续换 source 会把后台解码取消重来，
             // 预览会一直停在旧帧（表现为"拖动时画面不动/闪没"）。
-            if (previewImage.previewBusy())
+            // Tier 1 不产生新帧，无需等后台解码；否则帧率被旧闸门拖慢。
+            if (!bridge.gpuLive && previewImage.previewBusy())
                 return
             const scale = host.toImageScale()
             const dx = Math.round((selDragMouse.curX - selDragMouse.startX) * scale)
@@ -1324,7 +1336,9 @@ Item {
                 return
             selDragMouse.lastDx = dx
             selDragMouse.lastDy = dy
-            bridge.drag_translate_update(dx, dy)
+            const p = toImage(selDragMouse.curX, selDragMouse.curY)
+            bridge.transform_update(0, p[0], p[1],
+                                    selDragMouse.gestureMods, host.toDispScale())
         }
     }
 

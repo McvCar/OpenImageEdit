@@ -385,10 +385,18 @@ Item {
         }
         onEngagedChanged: {
             if (layerHandles.engaged) {
-                if (host.scaleW === 0)
-                    bridge.scale_layer_begin()
+                if (host.scaleW === 0) {
+                    // P0-2b2：三件套统一入口（内部仍拉起旧 live 预览态），
+                    // 并在这里预生成智能参考线的静态候选。
+                    const b = host.selLayerBox
+                    bridge.transform_begin(1, bridge.selected_layer,
+                                           b !== null ? b.x : 0,
+                                           b !== null ? b.y : 0,
+                                           0, host.toDispScale())
+                }
             } else if (host.scaleW > 0) {
                 host.commitLayerScale()
+                bridge.transform_end(true, 0)
             }
         }
     }

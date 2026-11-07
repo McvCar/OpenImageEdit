@@ -599,60 +599,31 @@ impl qobject::Bridge {
         // 统一会话：起手先整体清掉上一场手势（缩放 / 移动 / 没收尾的旋转），
         // 不再可能出现「旋转帧和缩放帧同时挂在 session 上抢合成器」。
         session.clear_live_gestures();
-        if !keep_session {
-            session.rotate_origin = None;
-            let one = std::rc::Rc::new(session.doc.layers[ix].clone());
-            session.transform = Some(TransformSession::Rotate {
-                live: RotateLive {
-                    index: ix,
-                    before: one.clone(),
-                    token,
-                    start: one,
-                    base_degrees: 0.0,
-                    last_delta: 0.0,
-                    expand: true,
-                    keep: false,
-                },
-                frame: None,
-                cap: None,
-            });
-            return 0.0;
-        }
-        // 锚点还新鲜才复用：同一个图层 + 真的转出过角度 + **像素内容**还是
-        // 提交后的那一版。
-        //
-        // ★这里只比 image，不比整个 Layer：以前比整个结构，于是图层只要被
-        //   挪动过 1px（offset 变了）锚点就废，base 归零，下一次旋转从已经
-        //   放大过的位图再转一遍 —— 转几次 45°，包围盒就 150→213→301 一路
-        //   长大。位移/透明度/名字跟"原图能不能接着转"无关，提交时都从
-        //   `st.start`（当前状态）取，所以挪过也能接着转。
-        let reusable = session
-            .rotate_origin
+        // ★P0-2b2：累计角度与原图的唯一真值是 `Layer::transform`（params），
+        // 不再是跨会话的 `rotate_origin` 锚点缓存。撤销 / 重做 / 缩放之后
+        // 它自动同步，不会再出现「锚点判据失效 → 从烘焙过的外接矩形再转
+        // 一遍 → 包围盒一路长大」。
+        let current = &session.doc.layers[ix];
+        let start = std::rc::Rc::new(current.clone());
+        let base = current
+            .transform
             .as_ref()
-            .map(|o| {
-                o.index == ix
-                    && o.degrees.abs() > 0.001
-                    && session.doc.layers[ix].image == o.committed.image
-            })
-            .unwrap_or(false);
-        let (before, start, base) = if reusable {
-            let origin = session.rotate_origin.as_ref().expect("checked above");
-            (
-                origin.layer.clone(),
-                std::rc::Rc::new(session.doc.layers[ix].clone()),
-                origin.degrees,
-            )
-        } else {
-            session.rotate_origin = None;
-            let one = std::rc::Rc::new(session.doc.layers[ix].clone());
-            (one.clone(), one, 0.0)
+            .map(|t| t.rotation as f32)
+            .unwrap_or(0.0);
+        let before = match current.transform.as_ref() {
+            Some(t) => {
+                let mut pristine = (*start).clone();
+                pristine.image = (*t.source).clone();
+                std::rc::Rc::new(pristine)
+            }
+            None => start.clone(),
         };
-        // 诊断：锚点有没有接上。base=0 且图层其实已经转过时，说明这次又从
-        // 烘焙过的位图重算 —— 包围盒就会一路长大。
         println!(
             "{{\"phase\":\"ui\",\"event\":\"rotate-anchor\",\"reuse\":{},\"base\":{:.2}}}",
-            reusable, base
+            current.transform.is_some(),
+            base
         );
+        let keep = keep_session;
         session.transform = Some(TransformSession::Rotate {
             live: RotateLive {
                 index: ix,
@@ -662,7 +633,7 @@ impl qobject::Bridge {
                 base_degrees: base,
                 last_delta: 0.0,
                 expand: true,
-                keep: true,
+                keep,
             },
             frame: None,
             cap: None,
@@ -756,63 +727,67 @@ impl qobject::Bridge {
             //   （对话框 / Esc 的取消同样落在这里。）
             if !neutral {
                 let commit_t0 = std::time::Instant::now();
-                // 双三次：整段拖拽只在这里真正重采样一次，用双线性转完会整层
-                // 发软（用户反馈的"转一下就变模糊"）。
-                let (image, _delta) = editcore::rotate_image_hq(&st.before.image, total, expand);
-                // ★摆放必须按「当前图层的中心」算，不能用 `start.offset + delta`。
-                //
-                // `delta` 是相对 `before`（锚点原图）那张位图的位移，而 offset
-                // 取的是 `start`（当前图层，可能是上一次旋转烘焙出的更大位图）。
-                // 两者基准不同：80×80 第一次转 45° 变成 114×114，offset 减 17，
-                // 中心不变；再转 90° 时 delta=0，`start.offset + 0` 就少了这 17
-                // —— 松手瞬间图层往左上"跳"，而拖动中的预览（按中心转）是对的。
-                // 以中心摆放则是几何上唯一自洽的：转轴就是中心，尺寸怎么变，
-                // 中心都不动。
+                // ★摆放按「当前图层的中心」算：转轴就是中心，尺寸怎么变中心
+                // 都不动（旧的 `start.offset + delta` 会在第二次旋转跳 17px）。
                 let cx = st.start.offset.0 as f64 + st.start.image.width() as f64 / 2.0;
                 let cy = st.start.offset.1 as f64 + st.start.image.height() as f64 / 2.0;
-                let offset = (
-                    (cx - image.width() as f64 / 2.0).round() as i32,
-                    (cy - image.height() as f64 / 2.0).round() as i32,
+                let (start_offset, start_size) = (
+                    st.start.offset,
+                    (st.start.image.width(), st.start.image.height()),
                 );
-                println!(
-                    "{{\"phase\":\"ui\",\"event\":\"rotate-place\",\"start\":[{},{}],\"start_size\":[{}x{}],\
-                     \"new_size\":[{}x{}],\"placed\":[{},{}]}}",
-                    st.start.offset.0, st.start.offset.1,
-                    st.start.image.width(), st.start.image.height(),
-                    image.width(), image.height(), offset.0, offset.1
-                );
-                // 除像素之外的一切都取**当前**状态（st.start），而不是锚点那份：
-                // 两次旋转之间用户可能挪过图层、改过透明度/名字，这些都得留着。
-                let after = Layer {
-                    name: st.start.name.clone(),
-                    image,
-                    offset,
-                    opacity: st.start.opacity,
-                    visible: st.start.visible,
-                    locked: st.start.locked,
-                    // 旋转结果是一次性重采样出来的，不保留旧的变换源图。
-                    transform: None,
-                };
-                // 像素其实没变（拖一圈又回原位）：别再记一条空历史。
-                if *st.start != after {
-                    let _ = session
-                        .doc
-                        .commit_layer(st.index, (*st.start).clone(), after);
-                }
-                if st.keep {
-                    // 锚点推进到最新角度：手柄下一次拖动还是从没被插值过的
-                    // 原图出发，角度累加。committed 记下"这一版内容"，下一
-                    // 次 begin 用它判断图层有没有被别人改过。
-                    let committed = std::rc::Rc::new(session.doc.layers[st.index].clone());
-                    session.rotate_origin = Some(RotateOrigin {
-                        index: st.index,
-                        layer: st.before,
-                        degrees: total,
-                        committed,
+                // ★P0-2b2：旋转落定统一成一条 `SetLayerTransform`。
+                // `source` 恒为未插值原图、rotation 是累计角度，所以：
+                // ① 连续旋转不再累积模糊；② undo 精确回退到上一个角度；
+                // ③ 与缩放 / 移动共用同一条参数级历史，锚点缓存彻底退场。
+                //
+                // 「不扩展」例外：裁剪到原尺寸这件事仿射表达不了，只能把本次
+                // 旋转烘焙进位图（该选项的固有代价，用户显式勾选才走）。
+                if expand {
+                    let layer = &session.doc.layers[st.index];
+                    let mut t = layer.transform.clone().unwrap_or_else(|| {
+                        LayerTransform::from_offset(
+                            layer.image.clone(),
+                            layer.offset.0,
+                            layer.offset.1,
+                        )
                     });
+                    t.rotation = total as f64;
+                    t.center = (cx, cy);
+                    if session.doc.set_layer_transform(st.index, Some(t)).is_ok() {
+                        let placed = session.doc.layers[st.index].offset;
+                        let new_size = session.doc.layers[st.index].image.dimensions();
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"rotate-place\",\"start\":[{},{}],\"start_size\":[{}x{}],\
+                             \"new_size\":[{}x{}],\"placed\":[{},{}]}}",
+                            start_offset.0, start_offset.1, start_size.0, start_size.1,
+                            new_size.0, new_size.1, placed.0, placed.1
+                        );
+                    }
                 } else {
-                    session.rotate_origin = None;
+                    let (image, _delta) = editcore::rotate_image_hq(&st.before.image, total, false);
+                    let offset = (
+                        (cx - image.width() as f64 / 2.0).round() as i32,
+                        (cy - image.height() as f64 / 2.0).round() as i32,
+                    );
+                    let after = Layer {
+                        name: st.start.name.clone(),
+                        image,
+                        offset,
+                        opacity: st.start.opacity,
+                        visible: st.start.visible,
+                        locked: st.start.locked,
+                        transform: None,
+                    };
+                    if *st.start != after {
+                        let _ = session
+                            .doc
+                            .commit_layer(st.index, (*st.start).clone(), after);
+                    }
                 }
+                // 旧 rotate_origin 锚点不再参与任何读取（begin 只读 params），
+                // 显式清空避免它继续占着一份整层 Rc<Layer>。
+                session.rotate_origin = None;
+                let _ = (st.keep, &st.before);
                 println!(
                     "{{\"phase\":\"ui\",\"event\":\"rotate-commit\",\"ms\":{},\"degrees\":{:.2}}}",
                     commit_t0.elapsed().as_millis(),
@@ -836,12 +811,36 @@ impl qobject::Bridge {
     pub fn rotate_layer_angle(mut self: Pin<&mut Self>, index: i32, degrees: f64, expand: bool) {
         let mut changed = false;
         if let Some(session) = self.session.borrow_mut().as_mut() {
-            // 一次性旋转是直接改当前位图（会累加重采样），锚点必须作废。
+            // 锚点缓存已退场（begin 只读 params），这里清一下纯属保险。
             session.rotate_origin = None;
-            changed = session
-                .doc
-                .rotate_layer_angle(index.max(0) as usize, degrees as f32, expand)
-                .is_ok();
+            let ix = index.max(0) as usize;
+            // ★P0-2b2：默认（扩展包围盒）走参数化旋转 —— `source` 恒为未插值
+            // 原图，连续改角度不再累积重采样。只有显式「不扩展」还需要把
+            // 裁剪烘焙进位图（仿射表达不了裁剪），走旧的破坏性路径。
+            let params_ok = if expand {
+                let next = session.doc.layers.get(ix).map(|l| {
+                    let mut t = l.transform.clone().unwrap_or_else(|| {
+                        LayerTransform::from_offset(l.image.clone(), l.offset.0, l.offset.1)
+                    });
+                    t.rotation += degrees;
+                    t.center = (
+                        l.offset.0 as f64 + l.image.width() as f64 / 2.0,
+                        l.offset.1 as f64 + l.image.height() as f64 / 2.0,
+                    );
+                    t
+                });
+                match next {
+                    Some(t) => session.doc.set_layer_transform(ix, Some(t)).is_ok(),
+                    None => false,
+                }
+            } else {
+                false
+            };
+            changed = params_ok
+                || session
+                    .doc
+                    .rotate_layer_angle(ix, degrees as f32, expand)
+                    .is_ok();
         }
         if changed {
             self.as_mut().refresh_preview();
