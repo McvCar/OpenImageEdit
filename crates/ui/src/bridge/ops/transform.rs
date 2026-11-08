@@ -106,6 +106,21 @@ fn solve_fit(session: &mut Session, disp: (f64, f64), threshold: f64) -> FitResu
     let skip = session.gesture_index;
     {
         let occ = &mut session.fit_occ;
+        // 默认背景也参与：它的不透明像素同样是墙。整块盖满窗口时不盖
+        // （那是垫底，盖进去空窗全灭 = 咬合失效），只有透出空白才算数。
+        let base = &session.doc.base;
+        if !session.doc.base_hidden && !session.doc.base_deleted {
+            let (bx, by) = (-session.doc.view.x, -session.doc.view.y);
+            let canvas = (
+                0.0,
+                0.0,
+                session.doc.canvas.width as f64,
+                session.doc.canvas.height as f64,
+            );
+            if !occ.covered_by(base, bx, by, canvas, ALPHA_THRESHOLD) {
+                occ.stamp_image(base, bx, by, ALPHA_THRESHOLD);
+            }
+        }
         for (i, layer) in session.doc.layers.iter().enumerate() {
             if i as i32 == skip {
                 continue;

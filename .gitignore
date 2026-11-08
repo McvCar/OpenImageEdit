@@ -19,3 +19,5 @@ probe_mark_*.png
 check_ui.log
 probe_gap_fit.png
 probe_gap_fit.log
+probe_gap_base_hole.png
+probe_gap_opaque.png

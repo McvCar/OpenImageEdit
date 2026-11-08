@@ -105,25 +105,80 @@ impl Occupancy {
                     }
                 }
             }
-            None => {
-                let (sw, sh) = layer.image.dimensions();
-                let (ox, oy) = layer.offset;
-                let x0 = ox.max(self.x0);
-                let y0 = oy.max(self.y0);
-                let x1 = (ox + sw as i32).min(self.x0 + self.width as i32);
-                let y1 = (oy + sh as i32).min(self.y0 + self.height as i32);
-                if x1 <= x0 || y1 <= y0 {
-                    return;
-                }
-                for gy in y0..y1 {
-                    for gx in x0..x1 {
-                        if layer.image.get_pixel((gx - ox) as u32, (gy - oy) as u32)[3] >= threshold {
-                            self.set(gx, gy);
-                        }
-                    }
+            None => self.stamp_image(&layer.image, layer.offset.0, layer.offset.1, threshold),
+        }
+    }
+
+    /// 把一张位图的不透明像素盖进来，`(ox, oy)` 是它在画布坐标下的左上角。
+    ///
+    /// 背景（base）走这条：它的 `view` 原点就是画布原点，所以传
+    /// `(-view.x, -view.y)`；被裁掉的部分不会被采样，裁切边自然成为一堵墙。
+    pub fn stamp_image(&mut self, img: &RgbaImage, ox: i32, oy: i32, threshold: u8) {
+        let (sw, sh) = img.dimensions();
+        if sw == 0 || sh == 0 {
+            return;
+        }
+        let x0 = ox.max(self.x0);
+        let y0 = oy.max(self.y0);
+        let x1 = (ox + sw as i32).min(self.x0 + self.width as i32);
+        let y1 = (oy + sh as i32).min(self.y0 + self.height as i32);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        for gy in y0..y1 {
+            for gx in x0..x1 {
+                if img.get_pixel((gx - ox) as u32, (gy - oy) as u32)[3] >= threshold {
+                    self.set(gx, gy);
                 }
             }
         }
+    }
+
+    /// 窗口是否**整块被这张位图的不透明像素盖满**（只看 `area` 之内）。
+    ///
+    /// 用来判断「默认背景」该不该当墙：背景盖满整块画布时它只是垫底，
+    /// 无条件盖进来会让空窗全部消失（每列都有像素），等于把咬合关掉；
+    /// 只有背景真的透出空白（抠出的洞、画布留白、透明 PNG 的底）时才参与。
+    ///
+    /// `area` = 画布矩形：画布之外没有可咬的东西，窗口溢出的那部分不算
+    /// 「露白」，否则「内容贴着画布边」会莫名其妙把咬合关掉。
+    /// 按 4 像素步长采样（早退）：判断只是「有没有空白」，不需要逐像素。
+    pub fn covered_by(
+        &self,
+        img: &RgbaImage,
+        ox: i32,
+        oy: i32,
+        area: (f64, f64, f64, f64),
+        threshold: u8,
+    ) -> bool {
+        const STEP: i32 = 4;
+        let (sw, sh) = img.dimensions();
+        if sw == 0 || sh == 0 {
+            return false;
+        }
+        let x0 = self.x0.max(area.0.floor() as i32);
+        let y0 = self.y0.max(area.1.floor() as i32);
+        let x1 = (self.x0 + self.width as i32).min((area.0 + area.2).ceil() as i32);
+        let y1 = (self.y0 + self.height as i32).min((area.1 + area.3).ceil() as i32);
+        if x1 <= x0 || y1 <= y0 {
+            return false;
+        }
+        // 画布内还有一块落在背景范围之外 → 那里是真实空白。
+        if x0 < ox || y0 < oy || x1 > ox + sw as i32 || y1 > oy + sh as i32 {
+            return false;
+        }
+        let mut gy = y0;
+        while gy < y1 {
+            let mut gx = x0;
+            while gx < x1 {
+                if img.get_pixel((gx - ox) as u32, (gy - oy) as u32)[3] < threshold {
+                    return false;
+                }
+                gx += STEP;
+            }
+            gy += STEP;
+        }
+        true
     }
 
     #[inline]
@@ -563,5 +618,56 @@ mod tests {
         l.offset = (0, 0);
         occ.stamp(&l, ALPHA_THRESHOLD);
         assert_eq!(occ.occupied_in((0.0, 0.0, 50.0, 50.0)), 0);
+    }
+
+    /// 背景只剩「一块不透明的底 + 一个透明洞」时，洞壁要能当墙。
+    fn base_with_hole() -> RgbaImage {
+        let mut img = RgbaImage::from_pixel(400, 200, image::Rgba([255, 255, 255, 255]));
+        for py in 0..200 {
+            for px in 100..260 {
+                img.put_pixel(px, py, image::Rgba([0, 0, 0, 0]));
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn covered_by_distinguishes_backdrop_from_holed_base() {
+        let opaque = RgbaImage::from_pixel(400, 200, image::Rgba([255, 255, 255, 255]));
+        let canvas = (0.0, 0.0, 400.0, 200.0);
+        let mut occ = Occupancy::default();
+        occ.reset((120.0, 40.0, 60.0, 60.0));
+        assert!(
+            occ.covered_by(&opaque, 0, 0, canvas, ALPHA_THRESHOLD),
+            "整块不透明的背景算垫底"
+        );
+        assert!(
+            !occ.covered_by(&base_with_hole(), 0, 0, canvas, ALPHA_THRESHOLD),
+            "洞落在窗口里不算垫底"
+        );
+        // 画布比背景宽 / 高：背景之外的那条边是真空白，要当墙。
+        let mut out = Occupancy::default();
+        out.reset((380.0, 40.0, 60.0, 60.0));
+        assert!(
+            !out.covered_by(&opaque, 0, 0, (0.0, 0.0, 500.0, 200.0), ALPHA_THRESHOLD),
+            "画布留白不算垫底"
+        );
+        // 反过来，窗口溢出画布之外的部分不算露白（否则贴画布边就没吸附了）。
+        assert!(
+            out.covered_by(&opaque, 0, 0, canvas, ALPHA_THRESHOLD),
+            "画布之外的部分忽略"
+        );
+    }
+
+    #[test]
+    fn base_hole_walls_are_snappable() {
+        let mut occ = Occupancy::default();
+        occ.reset((40.0, 0.0, 260.0, 200.0));
+        occ.stamp_image(&base_with_hole(), 0, 0, ALPHA_THRESHOLD);
+        // 洞 100..260，内容 60 宽，左边放在 98（离洞左壁 2px）→ 咬到 100。
+        let r = fit_into_gaps((98.0, 20.0, 60.0, 60.0), &occ, 8.0);
+        assert!(r.snapped_x, "{r:?}");
+        assert!((r.dx - 2.0).abs() < 1e-6, "{r:?}");
+        assert!((r.guides[0].pos - 100.0).abs() < 1e-6, "{r:?}");
     }
 }

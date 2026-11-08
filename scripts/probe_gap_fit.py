@@ -20,6 +20,8 @@ from PIL import Image, ImageDraw
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.path.join(ROOT, "target", "debug", "imageedit.exe")
 FIX = os.path.join(ROOT, "probe_gap_fit.png")
+FIX_HOLE = os.path.join(ROOT, "probe_gap_base_hole.png")
+FIX_OPAQUE = os.path.join(ROOT, "probe_gap_opaque.png")
 
 # 布局（图像坐标）：
 #   移动块区域 0..100（内容 60x60 在 20..80，四周 20px 透明）
@@ -38,16 +40,32 @@ def fixture():
     img.save(FIX)
 
 
-def run(extra_ops):
-    # ★每次 extract 之前必须 select-layer:-1：抠完会把新图层选中，而
-    #   effective_selection 会把选区裁到选中图层里，下一块矩形一旦不在这层
-    #   范围内就报 "selection is empty"（第二次抠图必失败）。
-    ops = []
-    for rect in ("150,0,40,300", "280,0,40,300", "0,0,100,100"):
-        ops.append("extract:" + rect)
-        ops.append("select-layer:-1")
+def fixture_hole():
+    """默认背景整块不透明，只在 100..260 挖了一条通高的透明洞。"""
+    img = Image.new("RGBA", (400, 200), (255, 255, 255, 255))
+    d = ImageDraw.Draw(img)
+    d.rectangle([100, 0, 259, 199], fill=(0, 0, 0, 0))
+    img.save(FIX_HOLE)
+
+
+def fixture_opaque():
+    """默认背景整块不透明（照片型）：背景不该当墙，图层之间的咬合照旧。"""
+    img = Image.new("RGBA", (400, 300), (255, 255, 255, 255))
+    img.save(FIX_OPAQUE)
+
+
+def run(extra_ops, path=FIX, ops=None):
+    if ops is None:
+        ops = []
+        # ★每次 extract 之前必须 select-layer:-1：抠完会把新图层选中，而
+        #   effective_selection 会把选区裁到选中图层里，下一块矩形一旦不在这层
+        #   范围内就报 "selection is empty"（第二次抠图必失败）。
+        for rect in ("150,0,40,300", "280,0,40,300", "0,0,100,100"):
+            ops.append("extract:" + rect)
+            ops.append("select-layer:-1")
+    ops = list(ops)
     ops += extra_ops
-    cmd = [EXE, FIX, "--script=" + ";".join(ops), "--auto-quit"]
+    cmd = [EXE, path, "--script=" + ";".join(ops), "--auto-quit"]
     env = dict(os.environ)
     env["QT_FORCE_STDERR_LOGGING"] = "1"
     p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=90, env=env)
@@ -69,9 +87,9 @@ def run(extra_ops):
     return res, out
 
 
-def one(dx, dy=0.0, disp=1.0):
-    """让 index=2 的移动块平移 (dx,dy) 后求咬合，返回解析后的 dict。"""
-    got, out = run(["fit-probe:2,%g,%g,%g" % (dx, dy, disp)])
+def one(dx, dy=0.0, disp=1.0, path=FIX, ops=None, idx=2):
+    """让 index=idx 的移动块平移 (dx,dy) 后求咬合，返回解析后的 dict。"""
+    got, out = run(["fit-probe:%d,%g,%g,%g" % (idx, dx, dy, disp)], path, ops)
     if not got:
         print("!! 没读到 fit-probe 输出，原始日志尾部：")
         print(out[-1200:])
@@ -79,9 +97,11 @@ def one(dx, dy=0.0, disp=1.0):
     return got[-1]
 
 
-def drag(dx, dy=0.0, mods=0):
+def drag(dx, dy=0.0, mods=0, path=FIX, ops=None, idx=2):
     """走完整的移动三件套（begin → 5×update → end），返回落定后的 offset。"""
-    got, out = run(["select-layer:2", "move-gesture:%g,%g,%d" % (dx, dy, mods)])
+    got, out = run(
+        ["select-layer:%d" % idx, "move-gesture:%g,%g,%d" % (dx, dy, mods)], path, ops
+    )
     for item in got:
         if item.get("event") == "move-gesture":
             return item
@@ -134,6 +154,31 @@ def main():
     # 7) Ctrl 临时关吸附：同一拖动手势必须原地落在 172。
     m = drag(172, 0, 0x0400_0000)
     check("Ctrl 临时关吸附", m is not None and m["ox"] == 172, str(m))
+
+    # ---- 默认背景参与咬合 ----
+    # 8) 背景上挖了通高透明洞（100..260）：块从 40,40 拖到内容左边 98，
+    #    应被洞的左壁咬到 100（dx = +2）。
+    fixture_hole()
+    hole_ops = ["extract:40,40,60,60", "select-layer:-1"]
+    r = one(58, 0, 1.0, FIX_HOLE, hole_ops, 0)
+    check("背景透明洞当墙（求解）", r is not None and r["sx"] and abs(r["dx"] - 2) < 0.01, str(r))
+    m = drag(58, 0, 0, FIX_HOLE, hole_ops, 0)
+    check("背景透明洞当墙（真手势）", m is not None and m["ox"] == 100, str(m))
+
+    # 9) 整块不透明的照片型背景只是垫底：不能把图层之间的空窗堵死，
+    #    否则「内容 60 卡进 190..280 的空窗」这条行为会整体失效。
+    fixture_opaque()
+    opaque_ops = [
+        "extract:150,0,40,300",
+        "select-layer:-1",
+        "extract:280,0,40,300",
+        "select-layer:-1",
+        "extract:40,40,60,60",
+    ]
+    r = one(152, 0, 1.0, FIX_OPAQUE, opaque_ops)
+    check("不透明背景不堵空窗", r is not None and r["sx"] and abs(r["dx"] + 2) < 0.01, str(r))
+    m = drag(152, 0, 0, FIX_OPAQUE, opaque_ops)
+    check("不透明背景下图层咬合", m is not None and m["ox"] == 190, str(m))
 
     print()
     if fails:
