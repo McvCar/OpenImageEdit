@@ -450,6 +450,10 @@ Item {
     property real scaleSkewY: 0
     property real scaleCenterDx: 0
     property real scaleCenterDy: 0
+    // 等比（角点 + Shift）拖动：起手比例与锁定标记。落定时按它反解高度，
+    // 免得 w/h 各自取整把刚保住的宽高比又打回 ±1px（25% 缩放下很明显）。
+    property bool scaleRatioLocked: false
+    property real scaleStartRatio: 0
     // 旋转拖动中的实时修饰键（Shift 15° 吸角，语义在 Rust 解出）。
     property int rotateMods: 0
     // 角度磁吸的合成位掩码（对应 Rust `MOD_MAGNET`）：交互式手柄才带，
@@ -1489,6 +1493,12 @@ function resizeLayerFrom(startRect, role, dx, dy, mods) {
     }
     if (!r || r.error !== undefined)
         return
+    // 等比（角点 + Shift）：记下起手比例，落定时用它反解另一轴（见
+    // commitLayerScale）。角点 = role 有两个字母（"se"），单字母是边中点。
+    if (root.scaleW <= 0)
+        root.scaleStartRatio = startRect.height > 0
+                             ? startRect.width / startRect.height : 0
+    root.scaleRatioLocked = (mods & 0x02000000) !== 0 && role.length > 1
     // P0-3 / D3：图层变换框不钳画布（画布外不渲染像素，控件允许越界）。
     root.scaleX = r.x * s
     root.scaleY = r.y * s
@@ -1519,10 +1529,15 @@ function commitLayerScale() {
     if (root.scaleW >= 1 && root.scaleH >= 1 && s > 0) {
         // offset 始终是框的左上角（镜像后图层仍填满同一个框），镜像本身
         // 走 flip_x/flip_y；斜切量与补偿原样透传（P1-A）。
+        let wImg = Math.max(1, Math.round(root.scaleW / s))
+        let hImg = Math.max(1, Math.round(root.scaleH / s))
+        // 等比手势：两轴各自取整会把刚保住的宽高比重新打回 ±1px（25% 缩放
+        // 下就是 4 图像像素），所以高度统一由宽度反解。
+        if (root.scaleRatioLocked && !root.scaleFlipX && !root.scaleFlipY
+                && root.scaleStartRatio > 0)
+            hImg = Math.max(1, Math.round(wImg / root.scaleStartRatio))
         bridge.scale_layer_end(
-            true,
-            Math.max(1, Math.round(root.scaleW / s)),
-            Math.max(1, Math.round(root.scaleH / s)),
+            true, wImg, hImg,
             Math.round(root.scaleX / s), Math.round(root.scaleY / s),
             root.scaleFlipX, root.scaleFlipY, root.scaleEdges,
             root.scaleSkewX, root.scaleSkewY)
@@ -1532,6 +1547,7 @@ function commitLayerScale() {
     root.scaleEdges = 0
     root.scaleSkewX = 0; root.scaleSkewY = 0
     root.scaleCenterDx = 0; root.scaleCenterDy = 0
+    root.scaleRatioLocked = false; root.scaleStartRatio = 0
 }
 
 function cancelLayerScale() {
@@ -1543,6 +1559,7 @@ function cancelLayerScale() {
     root.scaleEdges = 0
     root.scaleSkewX = 0; root.scaleSkewY = 0
     root.scaleCenterDx = 0; root.scaleCenterDy = 0
+    root.scaleRatioLocked = false; root.scaleStartRatio = 0
 }
 
 // ---- 选区工具 -------------------------------------------------------

@@ -788,21 +788,66 @@ impl qobject::Bridge {
                     r.edge_bits(),
                 );
                 let (adx, ady) = (res.dx, res.dy);
-                session.snap = res;
-                if adx != 0.0 {
-                    if r.edge_bits() & 4 != 0 {
-                        w += adx;
-                    } else if r.edge_bits() & 1 != 0 {
-                        x += adx;
-                        w -= adx;
+                // ★等比（角点 + Shift，且未镜像）：吸附只能落在**一条**线上，
+                //   另一轴必须按锁定比例跟着走。旧实现把单轴修正直接加到 w 或 h
+                //   上，宽高比被最多 8 图像像素的吸附一次性拉坏 —— 用户看到的
+                //   就是「等比拖一下，图被压扁 / 拉长」。这里改成：取位移更小的
+                //   那一轴命中，另一轴按比例重算，锚点仍是对侧 / 中心。
+                let ratio_locked = shift && r.corner() && !solved.flip.0 && !solved.flip.1;
+                if ratio_locked && adx == 0.0 && ady == 0.0 {
+                    // 刚好压在参考线上（修正量为 0）：尺寸不用动，两条线都是真的。
+                    session.snap = res;
+                } else if ratio_locked {
+                    let fixed = editcore::apply_ratio_snap(
+                        editcore::RectF::new(x, y, w, h),
+                        r,
+                        adx,
+                        ady,
+                        alt,
+                    );
+                    match fixed.axis {
+                        Some(axis) => {
+                            x = fixed.rect.x;
+                            y = fixed.rect.y;
+                            w = fixed.rect.width;
+                            h = fixed.rect.height;
+                            // 只保留生效那一轴的参考线：另一轴已被比例带偏，
+                            // 画出来就是「线在，边没贴上」。
+                            let want = match axis {
+                                editcore::RatioSnapAxis::X => SnapAxis::X,
+                                editcore::RatioSnapAxis::Y => SnapAxis::Y,
+                            };
+                            let mut kept = SnapResult::default();
+                            for (i, g) in res.guides.iter().enumerate() {
+                                if g.axis != want {
+                                    continue;
+                                }
+                                kept.guides.push(*g);
+                                if let Some(l) = res.labels.get(i) {
+                                    kept.labels.push(l.clone());
+                                }
+                            }
+                            session.snap = kept;
+                        }
+                        None => session.snap = SnapResult::default(),
                     }
-                }
-                if ady != 0.0 {
-                    if r.edge_bits() & 32 != 0 {
-                        h += ady;
-                    } else if r.edge_bits() & 8 != 0 {
-                        y += ady;
-                        h -= ady;
+                } else {
+                    session.snap = res;
+                    if adx != 0.0 {
+                        if r.edge_bits() & 4 != 0 {
+                            w += adx;
+                        } else if r.edge_bits() & 1 != 0 {
+                            x += adx;
+                            w -= adx;
+                        }
+                    }
+                    if ady != 0.0 {
+                        if r.edge_bits() & 32 != 0 {
+                            h += ady;
+                        } else if r.edge_bits() & 8 != 0 {
+                            y += ady;
+                            h -= ady;
+                        }
                     }
                 }
             } else if !enabled {

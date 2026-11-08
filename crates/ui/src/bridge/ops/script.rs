@@ -760,6 +760,56 @@ impl qobject::Bridge {
                         )
                     }
                 }
+                // `scale-solve:role,dx,dy[,mods[,disp]]` —— 直接跑一次缩放求解
+                // （含锁比例 / 从中心 / 斜切 / 吸附），打印起始框与解算结果。
+                // 用来回归「等比（Shift）缩放被吸附拉成非等比」：同一组参数下
+                // w/h 必须恒等于起始比例，参考线最多一条轴。
+                other if other.starts_with("scale-solve:") => {
+                    let body = other.strip_prefix("scale-solve:").unwrap_or("");
+                    let mut it = body.split(',');
+                    let role = it.next().unwrap_or("").trim().to_string();
+                    let nums: Vec<f64> = it.filter_map(|s| s.trim().parse().ok()).collect();
+                    let ix = (*self.selected_layer()).max(0) as usize;
+                    let start = {
+                        let guard = self.session.borrow();
+                        guard.as_ref().and_then(|s| s.doc.layers.get(ix)).map(|l| {
+                            let b = l.bounds();
+                            (b.x as f64, b.y as f64, b.width as f64, b.height as f64)
+                        })
+                    };
+                    match (start, nums.len()) {
+                        (Some((sx, sy, sw, sh)), n) if n >= 2 => {
+                            let mods = if n >= 3 { nums[2] as i32 } else { 0 };
+                            let disp = if n >= 4 { nums[3] } else { 1.0 };
+                            let out = self.as_mut().transform_solve_scale(
+                                sx,
+                                sy,
+                                sw,
+                                sh,
+                                QString::from(role.as_str()),
+                                nums[0],
+                                nums[1],
+                                mods,
+                                disp,
+                            );
+                            println!(
+                                "{{\"phase\":\"ui\",\"event\":\"scale-solve\",\"role\":\"{role}\",\
+                                 \"sx\":{sx},\"sy\":{sy},\"sw\":{sw},\"sh\":{sh},\"solved\":{out},\
+                                 \"guides\":{}}}",
+                                {
+                                    let guard = self.session.borrow();
+                                    match guard.as_ref() {
+                                        Some(s) => editcore::snap::guides_json(&s.snap, s.disp_scale),
+                                        None => "[]".to_string(),
+                                    }
+                                }
+                            );
+                        }
+                        _ => println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        ),
+                    }
+                }
                 // `scale-layer:w,h` —— 模拟拖 8 点手柄把图层缩放到 w×h
                 // （保持中心不变），走真实 begin → update → end 链路。用来
                 // 复现「旋转 → 拉伸 → 再旋转」时外接矩形被二次烘焙、框越来

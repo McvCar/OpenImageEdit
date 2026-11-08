@@ -45,15 +45,15 @@ impl ScaleRole {
         })
     }
 
-    fn corner(self) -> bool {
+    pub fn corner(self) -> bool {
         !matches!(self, Self::EdgeW | Self::EdgeE | Self::EdgeN | Self::EdgeS)
     }
 
-    fn west(self) -> bool {
+    pub fn west(self) -> bool {
         matches!(self, Self::EdgeW | Self::CornerNW | Self::CornerSW)
     }
 
-    fn north(self) -> bool {
+    pub fn north(self) -> bool {
         matches!(self, Self::EdgeN | Self::CornerNW | Self::CornerNE)
     }
 
@@ -232,6 +232,112 @@ pub fn solve_scale_gesture(
     }
 }
 
+/// 等比缩放里真正生效的吸附轴。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RatioSnapAxis {
+    X,
+    Y,
+}
+
+/// `apply_ratio_snap` 的结果：修正后的框 + 被采纳的吸附轴。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RatioSnap {
+    pub rect: RectF,
+    /// `None` 表示这次吸附全部放弃（会把框压到 <1px 时）。
+    pub axis: Option<RatioSnapAxis>,
+}
+
+/// 把吸附修正量摊到「等比（角点 + Shift）」的缩放手势上。
+///
+/// `solve_rect` 给出的 `adx/ady` 是**单轴**的边位移：直接叠加到 w 或 h 上，
+/// 另一轴不动，锁定好的宽高比就被拉坏了（用户看到的「等比拖一下，图被压
+/// 扁 / 拉长」）。等比手势只可能满足一条对齐线，所以这里：
+///
+/// 1. 两轴都有修正时取**位移更小**的那一轴（它才是更近的那条参考线），
+///    只有一个轴有修正时就用它；
+/// 2. 该轴按吸附量移动被拖边，另一轴**按锁定比例重算**；
+/// 3. 锚点与手势一致：未拖的对侧固定，`from_center`（Alt）时绕中心对称。
+///
+/// 结果尺寸会被夹到 ≥1px；夹到就整条吸附放弃（返回原框 + `axis: None`），
+/// 免得在极小尺寸上出现「吸一下宽度没了」。
+pub fn apply_ratio_snap(
+    rect: RectF,
+    role: ScaleRole,
+    adx: f64,
+    ady: f64,
+    from_center: bool,
+) -> RatioSnap {
+    let none = RatioSnap {
+        rect,
+        axis: None,
+    };
+    let (w, h) = (rect.width.max(1.0), rect.height.max(1.0));
+    if !adx.is_finite() || !ady.is_finite() || (adx == 0.0 && ady == 0.0) {
+        return none;
+    }
+    let ar = w / h;
+    if !(ar > 0.0) {
+        return none;
+    }
+    let use_x = if adx != 0.0 && ady != 0.0 {
+        adx.abs() <= ady.abs()
+    } else {
+        adx != 0.0
+    };
+
+    let (mut x, mut y) = (rect.x, rect.y);
+    let (mut nw, mut nh) = (w, h);
+    if use_x {
+        // 被拖边位移直接换算成宽度变化：西缘右移 → 变窄。
+        let dw = if role.west() { -adx } else { adx };
+        nw = w + dw;
+        if nw < 1.0 {
+            return none;
+        }
+        nh = nw / ar;
+        if nh < 1.0 {
+            return none;
+        }
+        // 水平锚点：东缘被拖 → 西缘固定；西缘被拖 → 东缘固定。
+        if from_center {
+            x = rect.x + w / 2.0 - nw / 2.0;
+        } else if role.west() {
+            x = rect.x + w - nw;
+        }
+        // 竖直方向跟随：未拖的一侧固定。
+        if from_center {
+            y = rect.y + h / 2.0 - nh / 2.0;
+        } else if role.north() {
+            y = rect.y + h - nh;
+        }
+    } else {
+        let dh = if role.north() { -ady } else { ady };
+        nh = h + dh;
+        if nh < 1.0 {
+            return none;
+        }
+        nw = nh * ar;
+        if nw < 1.0 {
+            return none;
+        }
+        if from_center {
+            y = rect.y + h / 2.0 - nh / 2.0;
+        } else if role.north() {
+            y = rect.y + h - nh;
+        }
+        if from_center {
+            x = rect.x + w / 2.0 - nw / 2.0;
+        } else if role.west() {
+            x = rect.x + w - nw;
+        }
+    }
+
+    RatioSnap {
+        rect: RectF::new(x, y, nw, nh),
+        axis: Some(if use_x { RatioSnapAxis::X } else { RatioSnapAxis::Y }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,5 +468,57 @@ mod tests {
         assert!((snap_angle(93.6, true, 15.0, 0.0) - 90.0).abs() < 1e-9);
         // tol = 0 等于不吸（脚本 / 数值面板路径行为不变）。
         assert!((snap_angle(91.4, false, 15.0, 0.0) - 91.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ratio_snap_keeps_aspect_and_anchor() {
+        // 240×120（ar=2），右下角拖动，吸附把右缘再推 +6。
+        let r = apply_ratio_snap(RectF::new(40.0, 30.0, 240.0, 120.0), ScaleRole::CornerSE, 6.0, 0.0, false);
+        let (rect, axis) = (r.rect, r.axis);
+        assert_eq!(axis, Some(RatioSnapAxis::X));
+        assert!((rect.width - 246.0).abs() < 1e-9, "{rect:?}");
+        // 另一轴按比例跟随，左上角锚定不动。
+        assert!((rect.height - 123.0).abs() < 1e-9, "{rect:?}");
+        assert!((rect.x - 40.0).abs() < 1e-9 && (rect.y - 30.0).abs() < 1e-9);
+        assert!((rect.width / rect.height - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ratio_snap_prefers_the_closer_axis() {
+        // 两轴都有修正时取位移小的那条（更近的参考线），不再两轴各改一半。
+        let r = apply_ratio_snap(RectF::new(40.0, 30.0, 240.0, 120.0), ScaleRole::CornerSE, 7.0, -2.0, false);
+        assert_eq!(r.axis, Some(RatioSnapAxis::Y));
+        assert!((r.rect.height - 118.0).abs() < 1e-9, "{:?}", r.rect);
+        assert!((r.rect.width - 236.0).abs() < 1e-9, "{:?}", r.rect);
+        // 底边被拖，顶边固定。
+        assert!((r.rect.y - 30.0).abs() < 1e-9);
+        assert!((r.rect.width / r.rect.height - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ratio_snap_anchors_west_and_north_edges() {
+        // 左上角拖动：吸附把西缘再推 +4 → 右 / 下缘固定。
+        let r = apply_ratio_snap(RectF::new(40.0, 30.0, 240.0, 120.0), ScaleRole::CornerNW, 4.0, 0.0, false);
+        assert_eq!(r.axis, Some(RatioSnapAxis::X));
+        assert!((r.rect.width - 236.0).abs() < 1e-9, "{:?}", r.rect);
+        assert!((r.rect.right() - 280.0).abs() < 1e-6, "{:?}", r.rect);
+        assert!((r.rect.bottom() - 150.0).abs() < 1e-6, "{:?}", r.rect);
+    }
+
+    #[test]
+    fn ratio_snap_from_center_stays_centered() {
+        let r = apply_ratio_snap(RectF::new(40.0, 30.0, 240.0, 120.0), ScaleRole::CornerSE, 8.0, 0.0, true);
+        let rect = r.rect;
+        assert!((rect.width - 248.0).abs() < 1e-9);
+        assert!((rect.width / rect.height - 2.0).abs() < 1e-9);
+        assert!((rect.center().0 - 160.0).abs() < 1e-9 && (rect.center().1 - 90.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ratio_snap_gives_up_when_it_would_collapse() {
+        // 缩到 1px 以下就整条放弃：不能为了贴线把尺寸吸没。
+        let r = apply_ratio_snap(RectF::new(40.0, 30.0, 4.0, 2.0), ScaleRole::CornerNW, 10.0, 0.0, false);
+        assert_eq!(r.axis, None);
+        assert!((r.rect.width - 4.0).abs() < 1e-9);
     }
 }

@@ -24,7 +24,10 @@ mod paint;
 mod retouch;
 
 pub use geometry::{Size, Rect, Selection};
-pub use gesture::{snap_angle, snap_angle_15, solve_scale_gesture, ScaleRole, ScaleSolve};
+pub use gesture::{
+    apply_ratio_snap, snap_angle, snap_angle_15, solve_scale_gesture, RatioSnap, RatioSnapAxis,
+    ScaleRole, ScaleSolve,
+};
 pub use selection::{
     QuickSelectOptions, SelOps, SelShape, SelectionMask, SelectionState, WandOptions,
 };
