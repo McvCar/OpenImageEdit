@@ -610,6 +610,15 @@ impl qobject::Bridge {
             .as_ref()
             .map(|t| t.rotation as f32)
             .unwrap_or(0.0);
+        // ★精确中心：有 params 时它就是唯一真值；普通位图图层才用
+        // `offset + 尺寸/2`（此时两者本来就相等，且是整/半像素，不会被量化）。
+        let start_center = match current.transform.as_ref() {
+            Some(t) => t.center,
+            None => (
+                current.offset.0 as f64 + current.image.width() as f64 / 2.0,
+                current.offset.1 as f64 + current.image.height() as f64 / 2.0,
+            ),
+        };
         let before = match current.transform.as_ref() {
             Some(t) => {
                 let mut pristine = (*start).clone();
@@ -644,6 +653,7 @@ impl qobject::Bridge {
                 before,
                 token,
                 start,
+                start_center,
                 base_degrees: base,
                 last_delta: 0.0,
                 expand: true,
@@ -687,22 +697,21 @@ impl qobject::Bridge {
             *cap = Some(LIVE_ROTATE_EDGE);
             let index = st.index;
             let snapshot = st.before.clone();
-            // ★预览的摆放基准 = **当前图层的中心**，和 finish 里的提交算法一致。
+            // ★预览的摆放基准 = **当前图层的精确中心**，和 finish 里的提交算法
+            // 一致。
             //
             // 合成器画的是「snapshot 按 angle 转完、落在 offset+delta」的位置，
             // 也就是以 snapshot.center 为转轴。但锚点 snapshot 不一定是图层现在
             // 的样子（连续旋转时它是没被插值过的原图，尺寸更小、offset 也更早），
             // 直接传 st.start.offset 会让「小图 + 大 offset」凑出一个错中心。
             // 所以这里把 offset 折算成「让 snapshot 中心落在当前图层中心」的值。
+            // 中心必须取 `start_center`（params 真值），不能由 `start.offset +
+            // 位图尺寸/2` 反推 —— 那是被 round 过的值，转一次就漂 0.5px。
             let snap_w = snapshot.image.width() as f64;
             let snap_h = snapshot.image.height() as f64;
             let offset = (
-                (st.start.offset.0 as f64 + st.start.image.width() as f64 / 2.0
-                    - snap_w / 2.0)
-                    .round() as i32,
-                (st.start.offset.1 as f64 + st.start.image.height() as f64 / 2.0
-                    - snap_h / 2.0)
-                    .round() as i32,
+                (st.start_center.0 - snap_w / 2.0).round() as i32,
+                (st.start_center.1 - snap_h / 2.0).round() as i32,
             );
             let token = st.token;
             *frame = Some(LiveRotate {
@@ -767,10 +776,10 @@ impl qobject::Bridge {
             //   （对话框 / Esc 的取消同样落在这里。）
             if !neutral {
                 let commit_t0 = std::time::Instant::now();
-                // ★摆放按「当前图层的中心」算：转轴就是中心，尺寸怎么变中心
-                // 都不动（旧的 `start.offset + delta` 会在第二次旋转跳 17px）。
-                let cx = st.start.offset.0 as f64 + st.start.image.width() as f64 / 2.0;
-                let cy = st.start.offset.1 as f64 + st.start.image.height() as f64 / 2.0;
+                // ★摆放按「起手时的精确中心」算：转轴就是中心，尺寸怎么变中心
+                // 都不动（旧的 `start.offset + 位图尺寸/2` 在每轮旋转后都会被
+                // 重新量化一次，转两三次就漂 1px）。
+                let (cx, cy) = st.start_center;
                 let (start_offset, start_size) = (
                     st.start.offset,
                     (st.start.image.width(), st.start.image.height()),
@@ -798,9 +807,9 @@ impl qobject::Bridge {
                         let new_size = session.doc.layers[st.index].image.dimensions();
                         println!(
                             "{{\"phase\":\"ui\",\"event\":\"rotate-place\",\"start\":[{},{}],\"start_size\":[{}x{}],\
-                             \"new_size\":[{}x{}],\"placed\":[{},{}]}}",
+                             \"new_size\":[{}x{}],\"placed\":[{},{}],\"center\":[{:.3},{:.3}]}}",
                             start_offset.0, start_offset.1, start_size.0, start_size.1,
-                            new_size.0, new_size.1, placed.0, placed.1
+                            new_size.0, new_size.1, placed.0, placed.1, cx, cy
                         );
                     }
                 } else {
@@ -863,10 +872,10 @@ impl qobject::Bridge {
                         LayerTransform::from_offset(l.image.clone(), l.offset.0, l.offset.1)
                     });
                     t.rotation += degrees;
-                    t.center = (
-                        l.offset.0 as f64 + l.image.width() as f64 / 2.0,
-                        l.offset.1 as f64 + l.image.height() as f64 / 2.0,
-                    );
+                    // ★中心**不动**：转轴就是中心，角度变化不改变中心。
+                    // 以前这里按 `offset + 位图尺寸/2` 重算一遍，等于把 params
+                    // 里的亚像素中心量化成整像素 —— 反复改角度就一路往一个
+                    // 方向漂（用户 11-08 报的「转两三次偏 1px」）。
                     t
                 });
                 match next {

@@ -1,0 +1,668 @@
+[
+{
+"a": 1485,
+"b": 1882,
+"name": "run_script",
+"pub": false
+},
+{
+"a": 1884,
+"b": 1895,
+"name": "image_shown",
+"pub": true
+},
+{
+"a": 1897,
+"b": 1903,
+"name": "mark",
+"pub": true
+},
+{
+"a": 1905,
+"b": 1908,
+"name": "open_file",
+"pub": true
+},
+{
+"a": 1912,
+"b": 1972,
+"name": "navigate",
+"pub": true
+},
+{
+"a": 1978,
+"b": 2051,
+"name": "register_as_viewer",
+"pub": true
+},
+{
+"a": 2053,
+"b": 2063,
+"name": "persist_config",
+"pub": false
+},
+{
+"a": 2065,
+"b": 2072,
+"name": "update_checker_light",
+"pub": true
+},
+{
+"a": 2074,
+"b": 2081,
+"name": "update_checker_dark",
+"pub": true
+},
+{
+"a": 2085,
+"b": 2093,
+"name": "regenerate_checker_tile",
+"pub": false
+},
+{
+"a": 2095,
+"b": 2101,
+"name": "update_open_in_new_window",
+"pub": true
+},
+{
+"a": 2103,
+"b": 2109,
+"name": "update_large_downsample",
+"pub": true
+},
+{
+"a": 2111,
+"b": 2122,
+"name": "update_save_quality",
+"pub": true
+},
+{
+"a": 2128,
+"b": 2187,
+"name": "export_layer_png",
+"pub": true
+},
+{
+"a": 2190,
+"b": 2219,
+"name": "update_file_info",
+"pub": false
+},
+{
+"a": 2221,
+"b": 2245,
+"name": "set_viewport",
+"pub": true
+},
+{
+"a": 2247,
+"b": 2252,
+"name": "zoom_in",
+"pub": true
+},
+{
+"a": 2254,
+"b": 2259,
+"name": "zoom_out",
+"pub": true
+},
+{
+"a": 2261,
+"b": 2269,
+"name": "zoom_step",
+"pub": true
+},
+{
+"a": 2271,
+"b": 2277,
+"name": "zoom_fit",
+"pub": true
+},
+{
+"a": 2279,
+"b": 2285,
+"name": "zoom_actual",
+"pub": true
+},
+{
+"a": 2287,
+"b": 2289,
+"name": "rotate_cw",
+"pub": true
+},
+{
+"a": 2291,
+"b": 2294,
+"name": "rotate_ccw",
+"pub": true
+},
+{
+"a": 2296,
+"b": 2299,
+"name": "flip_horizontal",
+"pub": true
+},
+{
+"a": 2301,
+"b": 2304,
+"name": "flip_vertical",
+"pub": true
+},
+{
+"a": 2306,
+"b": 2327,
+"name": "undo",
+"pub": true
+},
+{
+"a": 2329,
+"b": 2350,
+"name": "redo",
+"pub": true
+},
+{
+"a": 2352,
+"b": 2367,
+"name": "save_edited",
+"pub": true
+},
+{
+"a": 2369,
+"b": 2396,
+"name": "save_as",
+"pub": true
+},
+{
+"a": 2398,
+"b": 2446,
+"name": "crop_to",
+"pub": true
+},
+{
+"a": 2448,
+"b": 2492,
+"name": "resize_to",
+"pub": true
+},
+{
+"a": 2494,
+"b": 2538,
+"name": "resize_canvas",
+"pub": true
+},
+{
+"a": 2540,
+"b": 2583,
+"name": "reset_crop",
+"pub": true
+},
+{
+"a": 2585,
+"b": 2599,
+"name": "clamp_selection",
+"pub": false
+},
+{
+"a": 2601,
+"b": 2606,
+"name": "selected_guard",
+"pub": false
+},
+{
+"a": 2608,
+"b": 2615,
+"name": "layer_locked",
+"pub": false
+},
+{
+"a": 2617,
+"b": 2653,
+"name": "extract_selection",
+"pub": true
+},
+{
+"a": 2655,
+"b": 2664,
+"name": "layer_name",
+"pub": true
+},
+{
+"a": 2666,
+"b": 2673,
+"name": "layer_visible",
+"pub": true
+},
+{
+"a": 2675,
+"b": 2685,
+"name": "select_layer",
+"pub": true
+},
+{
+"a": 2687,
+"b": 2722,
+"name": "toggle_selected_visible",
+"pub": true
+},
+{
+"a": 2725,
+"b": 2763,
+"name": "set_layer_visible_at",
+"pub": true
+},
+{
+"a": 2765,
+"b": 2805,
+"name": "delete_selected_layer",
+"pub": true
+},
+{
+"a": 2807,
+"b": 2835,
+"name": "move_selected_up",
+"pub": true
+},
+{
+"a": 2837,
+"b": 2865,
+"name": "move_selected_down",
+"pub": true
+},
+{
+"a": 2869,
+"b": 2903,
+"name": "reorder_layer",
+"pub": true
+},
+{
+"a": 2905,
+"b": 2932,
+"name": "translate_selected",
+"pub": true
+},
+{
+"a": 2938,
+"b": 2967,
+"name": "adjust_begin",
+"pub": true
+},
+{
+"a": 2970,
+"b": 3006,
+"name": "adjust_set",
+"pub": true
+},
+{
+"a": 3008,
+"b": 3023,
+"name": "adjust_set_levels",
+"pub": true
+},
+{
+"a": 3027,
+"b": 3052,
+"name": "adjust_auto_levels",
+"pub": true
+},
+{
+"a": 3054,
+"b": 3066,
+"name": "adjust_reset",
+"pub": true
+},
+{
+"a": 3070,
+"b": 3111,
+"name": "adjust_commit",
+"pub": true
+},
+{
+"a": 3113,
+"b": 3123,
+"name": "adjust_cancel",
+"pub": true
+},
+{
+"a": 3127,
+"b": 3133,
+"name": "update_ruler_bottom_up",
+"pub": true
+},
+{
+"a": 3135,
+"b": 3141,
+"name": "picker_begin",
+"pub": true
+},
+{
+"a": 3143,
+"b": 3149,
+"name": "picker_close",
+"pub": true
+},
+{
+"a": 3154,
+"b": 3195,
+"name": "picker_pick",
+"pub": true
+},
+{
+"a": 3197,
+"b": 3214,
+"name": "picker_select",
+"pub": true
+},
+{
+"a": 3216,
+"b": 3221,
+"name": "picker_clear",
+"pub": true
+},
+{
+"a": 3224,
+"b": 3233,
+"name": "publish_picker_history",
+"pub": false
+},
+{
+"a": 3237,
+"b": 3268,
+"name": "copy_selection_pixels",
+"pub": true
+},
+{
+"a": 3270,
+"b": 3314,
+"name": "cut_selection_pixels",
+"pub": true
+},
+{
+"a": 3316,
+"b": 3349,
+"name": "erase_selection_pixels",
+"pub": true
+},
+{
+"a": 3351,
+"b": 3368,
+"name": "copy_selected_layer",
+"pub": true
+},
+{
+"a": 3370,
+"b": 3386,
+"name": "cut_selected_layer",
+"pub": true
+},
+{
+"a": 3388,
+"b": 3449,
+"name": "paste_clipboard",
+"pub": true
+},
+{
+"a": 3453,
+"b": 3463,
+"name": "take_external_open",
+"pub": true
+},
+{
+"a": 3467,
+"b": 3508,
+"name": "set_selected_opacity",
+"pub": true
+},
+{
+"a": 3510,
+"b": 3533,
+"name": "rename_selected_layer",
+"pub": true
+},
+{
+"a": 3538,
+"b": 3597,
+"name": "scale_selected_layer",
+"pub": true
+},
+{
+"a": 3608,
+"b": 3626,
+"name": "scale_layer_begin",
+"pub": true
+},
+{
+"a": 3628,
+"b": 3649,
+"name": "scale_layer_update",
+"pub": true
+},
+{
+"a": 3651,
+"b": 3688,
+"name": "scale_layer_end",
+"pub": true
+},
+{
+"a": 3692,
+"b": 3705,
+"name": "set_layer_locked",
+"pub": true
+},
+{
+"a": 3707,
+"b": 3736,
+"name": "set_base_locked",
+"pub": true
+},
+{
+"a": 3739,
+"b": 3763,
+"name": "toggle_base_visible",
+"pub": true
+},
+{
+"a": 3765,
+"b": 3806,
+"name": "delete_base_layer",
+"pub": true
+},
+{
+"a": 3809,
+"b": 3819,
+"name": "refresh_layers_only",
+"pub": false
+},
+{
+"a": 3823,
+"b": 3836,
+"name": "drag_translate_begin",
+"pub": true
+},
+{
+"a": 3838,
+"b": 3872,
+"name": "drag_translate_update",
+"pub": true
+},
+{
+"a": 3874,
+"b": 3918,
+"name": "drag_translate_end",
+"pub": true
+},
+{
+"a": 3920,
+"b": 3935,
+"name": "apply_layer_edit",
+"pub": false
+},
+{
+"a": 3937,
+"b": 3952,
+"name": "report_save",
+"pub": false
+},
+{
+"a": 3955,
+"b": 3964,
+"name": "decode_opts",
+"pub": false
+},
+{
+"a": 3969,
+"b": 3991,
+"name": "load_path",
+"pub": false
+},
+{
+"a": 3996,
+"b": 4057,
+"name": "poll_decode",
+"pub": true
+},
+{
+"a": 4061,
+"b": 4092,
+"name": "load_path_sync",
+"pub": false
+},
+{
+"a": 4094,
+"b": 4119,
+"name": "apply_transform",
+"pub": false
+},
+{
+"a": 4123,
+"b": 4130,
+"name": "parse_color",
+"pub": false
+},
+{
+"a": 4132,
+"b": 4138,
+"name": "mark_kind",
+"pub": false
+},
+{
+"a": 4140,
+"b": 4142,
+"name": "select_mark",
+"pub": true
+},
+{
+"a": 4144,
+"b": 4199,
+"name": "add_shape_mark",
+"pub": true
+},
+{
+"a": 4201,
+"b": 4255,
+"name": "add_brush_mark",
+"pub": true
+},
+{
+"a": 4259,
+"b": 4269,
+"name": "select_newest_mark",
+"pub": false
+},
+{
+"a": 4271,
+"b": 4312,
+"name": "add_mosaic_mark",
+"pub": true
+},
+{
+"a": 4314,
+"b": 4347,
+"name": "add_mosaic_rect",
+"pub": true
+},
+{
+"a": 4349,
+"b": 4391,
+"name": "add_text_mark",
+"pub": true
+},
+{
+"a": 4393,
+"b": 4418,
+"name": "update_mark_cell",
+"pub": true
+},
+{
+"a": 4420,
+"b": 4465,
+"name": "update_text_style",
+"pub": true
+},
+{
+"a": 4467,
+"b": 4484,
+"name": "set_editing_mark",
+"pub": true
+},
+{
+"a": 4486,
+"b": 4519,
+"name": "update_text_content",
+"pub": true
+},
+{
+"a": 4521,
+"b": 4537,
+"name": "mark_drag_begin",
+"pub": true
+},
+{
+"a": 4539,
+"b": 4559,
+"name": "mark_drag_update",
+"pub": true
+},
+{
+"a": 4561,
+"b": 4584,
+"name": "mark_drag_end",
+"pub": true
+},
+{
+"a": 4586,
+"b": 4603,
+"name": "delete_selected_mark",
+"pub": true
+},
+{
+"a": 4605,
+"b": 4630,
+"name": "set_mark_visible",
+"pub": true
+},
+{
+"a": 4632,
+"b": 4666,
+"name": "update_mark_style",
+"pub": true
+},
+{
+"a": 4668,
+"b": 4670,
+"name": "refresh_preview",
+"pub": false
+},
+{
+"a": 4675,
+"b": 4677,
+"name": "refresh_preview_zoom",
+"pub": false
+},
+{
+"a": 4679,
+"b": 4816,
+"name": "refresh_preview_inner",
+"pub": false
+}
+]

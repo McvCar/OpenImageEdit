@@ -1022,23 +1022,38 @@ impl qobject::Bridge {
                     let guard = self.session.borrow();
                     if let Some(session) = guard.as_ref() {
                         if let Some(layer) = session.doc.layers.get(ix.max(0) as usize) {
-                            let (rot, cx, cy, sx, sy, sw, sh) = match layer.transform.as_ref() {
-                                Some(t) => (
-                                    t.rotation,
-                                    t.center.0,
-                                    t.center.1,
-                                    t.scale.0,
-                                    t.scale.1,
-                                    t.source.width(),
-                                    t.source.height(),
-                                ),
-                                None => (0.0, 0.0, 0.0, 0.0, 0.0, 0, 0),
-                            };
+                            // 没有 params 的普通位图图层也要报中心：默认取
+                            // `offset + 位图尺寸/2`（此时它等价于 params 中心），
+                            // 否则「旋转前 / 旋转后」的漂移回归会拿 0 当基线。
+                            let (rot, cx, cy, sx, sy, sw, sh, has_t) =
+                                match layer.transform.as_ref() {
+                                    Some(t) => (
+                                        t.rotation,
+                                        t.center.0,
+                                        t.center.1,
+                                        t.scale.0,
+                                        t.scale.1,
+                                        t.source.width(),
+                                        t.source.height(),
+                                        true,
+                                    ),
+                                    None => (
+                                        0.0,
+                                        layer.offset.0 as f64 + layer.image.width() as f64 / 2.0,
+                                        layer.offset.1 as f64 + layer.image.height() as f64 / 2.0,
+                                        1.0,
+                                        1.0,
+                                        layer.image.width(),
+                                        layer.image.height(),
+                                        false,
+                                    ),
+                                };
                             println!(
                                 "{{\"phase\":\"ui\",\"event\":\"layer-info\",\"index\":{ix},\
                                  \"w\":{},\"h\":{},\"ox\":{},\"oy\":{},\"history\":{},\
                                  \"rot\":{rot:.4},\"cx\":{cx:.3},\"cy\":{cy:.3},\
-                                 \"sx\":{sx:.6},\"sy\":{sy:.6},\"sw\":{sw},\"sh\":{sh}}}",
+                                 \"sx\":{sx:.6},\"sy\":{sy:.6},\"sw\":{sw},\"sh\":{sh},\
+                                 \"params\":{has_t}}}",
                                 layer.image.width(),
                                 layer.image.height(),
                                 layer.offset.0,

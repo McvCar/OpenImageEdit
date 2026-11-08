@@ -13,6 +13,7 @@
 """
 
 import os
+import json
 import subprocess
 import sys
 import tempfile
@@ -53,6 +54,52 @@ def rmse(a, b):
     st = ImageStat.Stat(d)
     return (sum(v * v for v in st.rms) / len(st.rms)) ** 0.5
 
+
+def layer_infos(img, ops):
+    """跑一段脚本，把其中每条 layer-info 解析成 dict 返回。"""
+    env = dict(os.environ)
+    env["PATH"] = QT_BIN + os.pathsep + env.get("PATH", "")
+    out = subprocess.run(
+        [EXE, img, "--script=" + ops, "--auto-quit"],
+        capture_output=True, text=True, env=env, timeout=180,
+    )
+    return [
+        json.loads(line)
+        for line in out.stdout.splitlines()
+        if '"event":"layer-info"' in line
+    ]
+
+
+def check_no_drift(src):
+    """★11-08 回归：反复拖旋柄（净角度回到 0）不许把图层挪走。
+
+    旧实现落定时用 `offset + 位图尺寸/2` 反推中心，位图摆放本身是
+    `round(center - w/2)`，于是每转一轮中心被量化一次；外接框宽高奇偶交替
+    让量化方向跟着翻转，转两三次就肉眼可见地漂 1px（用户报的 bug）。
+    """
+    ops = (
+        "extract:100,100,1000,800;layer-info:0,base;"
+        + "rotate-handle:0,9,1;rotate-handle:0,-9,1;" * 3
+        + "layer-info:0,after"
+    )
+    infos = layer_infos(src, ops)
+    if len(infos) < 2:
+        return ["读不到 layer-info（旋转漂移回归没法判定）"]
+    a, b = infos[0], infos[-1]
+    fails = []
+    for key in ("cx", "cy"):
+        if abs(a[key] - b[key]) > 1e-6:
+            fails.append(f"三轮旋柄往返后中心 {key} 漂移：{a[key]:.3f} → {b[key]:.3f}")
+    for key in ("ox", "oy"):
+        if a[key] != b[key]:
+            fails.append(f"三轮旋柄往返后位置 {key} 漂移：{a[key]} → {b[key]}")
+    print(
+        f"  三轮旋柄往返后的中心/位置："
+        f"({a['cx']:.3f},{a['cy']:.3f})@{a['ox']},{a['oy']} → "
+        f"({b['cx']:.3f},{b['cy']:.3f})@{b['ox']},{b['oy']}"
+    )
+    return fails
+
 def contrast(p):
     return ImageStat.Stat(p.crop(BOX)).stddev[0]
 
@@ -88,6 +135,8 @@ def main():
     print(f"  [对照] 不扩展连转两次 vs 一次 37°：RMSE={r_ad:.2f}   对比度 {ca:.1f} → {cd:.1f}")
     if r_ad < 1.0 or cd > ca * 0.98:
         fails.append("对照组的累积重采样没有掉细节，说明指标本身失效（测试有问题）")
+
+    fails.extend(check_no_drift(src))
 
     if fails:
         for f in fails:

@@ -449,6 +449,15 @@ pub(in crate::bridge) struct RotateLive {
     pub(in crate::bridge) token: u64,
     /// 本次**拖拽**开始时图层的样子（取消时还原到它，而不是还原到 `before`）。
     pub(in crate::bridge) start: std::rc::Rc<Layer>,
+    /// ★本次拖拽开始时图层的**精确几何中心**（连续坐标，可以为小数）。
+    ///
+    /// 不能再用 `offset + image.size/2` 现场推：位图摆放是
+    /// `round(center - w/2)`，反推回来已经被量化到 0.5px 栅格；而旋转会改
+    /// 变外接框的宽高（奇/偶交替），量化误差的方向跟着翻转，于是每转一轮
+    /// 中心就漂 0.5px，转两三次就肉眼可见地偏移 1px（用户 11-08 报的 bug）。
+    /// `LayerTransform::center` 才是真值，这里在起手时抓一次，拖动帧与落定
+    /// 都用它，反复旋转多少次都不会漂。
+    pub(in crate::bridge) start_center: (f64, f64),
     /// 会话开始前已经转过的角度（`before` 就是那个状态）。
     pub(in crate::bridge) base_degrees: f32,
     /// 最后一次 update 传进来的增量角（`rotate_layer_state` 报告用）。
