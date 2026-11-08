@@ -10,3 +10,9 @@ aqtinstall.log
 *.user
 .qmlls.ini
 tmp/
+
+# 构建 / 探针临时产物
+build_ui.log
+focus_probe.log
+probe_mark_*.log
+probe_mark_*.png

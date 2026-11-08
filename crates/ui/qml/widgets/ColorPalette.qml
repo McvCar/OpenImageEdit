@@ -38,7 +38,9 @@ Item {
                 color: modelData
                 border.width: 2
                 // 由 palette 记账的当前色高亮；transparent 时 Qt 不描边。
-                border.color: palette.current.toLowerCase() === modelData.toLowerCase()
+                // String(...) 兜底：调用方绑定的颜色属性在极早期可能还是
+                // undefined，直接 .toLowerCase() 会每帧抛 TypeError 刷屏。
+                border.color: String(palette.current || "").toLowerCase() === modelData.toLowerCase()
                               ? "#378add" : "transparent"
 
                 MouseArea {

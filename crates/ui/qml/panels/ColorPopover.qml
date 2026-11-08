@@ -17,7 +17,13 @@ Rectangle {
     border.color: "#3c4043"
     radius: 6
     y: toolbar.height + (markBar.visible ? markBar.height : 0) + 2
-    onVisibleChanged: if (visible) host.placePopover(colorPopover, markBar.colorBtn)
+    onVisibleChanged: {
+        if (visible)
+            host.placePopover(colorPopover, markBar.colorBtn)
+        else
+            // 同 FontPopover：隐藏的 TextInput 留着焦点会吃掉 Ctrl+Z / Delete。
+            customHexInput.focus = false
+    }
 
     property bool editingFill: false
 

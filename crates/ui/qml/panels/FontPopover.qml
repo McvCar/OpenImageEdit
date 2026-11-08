@@ -22,8 +22,15 @@ Rectangle {
     onVisibleChanged: {
         if (visible)
             host.placePopover(fontPopover, markBar.fontBtn)
-        else
+        else {
             fontListOpen = false
+            // ★关闭时清输入框焦点。隐藏的 TextInput 会继续吃按键：Ctrl+Z
+            //   变成文本撤销、Delete 变成删字符，而 QML 的 Shortcut 组
+            //   （V/M/L/W/J/G 与 Delete）本来就被 `sizeInput.activeFocus`
+            //   禁用 —— 表现就是用户说的「所有快捷键失效 / 删不掉标记」。
+            //   ResizeOverlay 早就有同样的处理，这里漏了。
+            sizeInput.focus = false
+        }
     }
 
     property bool fontListOpen: false

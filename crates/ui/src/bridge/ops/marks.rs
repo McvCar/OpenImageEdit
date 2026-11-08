@@ -382,13 +382,29 @@ impl qobject::Bridge {
             }
         };
         match grabbed {
-            Some(mark) => *self.mark_drag.borrow_mut() = Some((index as usize, mark)),
-            None => self.as_mut().set_selected_mark(-1),
+            Some(mark) => {
+                if std::env::var("IMAGEEDIT_MARK_TRACE").is_ok() {
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"mark-drag-begin\",\"index\":{index},\"rect\":[{},{},{},{}]}}",
+                        mark.rect.0, mark.rect.1, mark.rect.2, mark.rect.3
+                    );
+                }
+                *self.mark_drag.borrow_mut() = Some((index as usize, mark))
+            }
+            None => {
+                if std::env::var("IMAGEEDIT_MARK_TRACE").is_ok() {
+                    println!("{{\"phase\":\"ui\",\"event\":\"mark-drag-begin-skip\",\"index\":{index}}}");
+                }
+                self.as_mut().set_selected_mark(-1)
+            }
         }
     }
 
     pub fn mark_drag_update(mut self: Pin<&mut Self>, x: f64, y: f64, w: f64, h: f64) {
         let Some((index, from)) = self.mark_drag.borrow().clone() else {
+            if std::env::var("IMAGEEDIT_MARK_TRACE").is_ok() {
+                println!("{{\"phase\":\"ui\",\"event\":\"mark-drag-update-skip\",\"why\":\"no-session\"}}");
+            }
             return;
         };
         let to = from.mapped(
@@ -400,6 +416,13 @@ impl qobject::Bridge {
                 y as f32 + h.max(1.0) as f32,
             ),
         );
+        if std::env::var("IMAGEEDIT_MARK_TRACE").is_ok() {
+            println!(
+                "{{\"phase\":\"ui\",\"event\":\"mark-drag-update\",\"index\":{index},\"req\":[{x},{y},{w},{h}],\"from\":[{},{},{},{}],\"to\":[{},{},{},{}]}}",
+                from.rect.0, from.rect.1, from.rect.2, from.rect.3,
+                to.rect.0, to.rect.1, to.rect.2, to.rect.3
+            );
+        }
         let mut guard = self.session.borrow_mut();
         if let Some(session) = guard.as_mut() {
             if session.doc.update_mark_live(index, to).is_ok() {
@@ -411,6 +434,9 @@ impl qobject::Bridge {
 
     pub fn mark_drag_end(mut self: Pin<&mut Self>, commit: bool) {
         let Some((index, from)) = self.mark_drag.borrow_mut().take() else {
+            if std::env::var("IMAGEEDIT_MARK_TRACE").is_ok() {
+                println!("{{\"phase\":\"ui\",\"event\":\"mark-drag-end-skip\",\"why\":\"no-session\"}}");
+            }
             return;
         };
         let mut guard = self.session.borrow_mut();
@@ -429,7 +455,16 @@ impl qobject::Bridge {
             None => return,
         };
         session.dirty = true;
+        let trace = std::env::var("IMAGEEDIT_MARK_TRACE").is_ok();
+        let from_rect = from.rect;
         let _ = session.doc.execute(editcore::EditOp::UpdateMark { index, from, to });
+        if trace {
+            println!(
+                "{{\"phase\":\"ui\",\"event\":\"mark-drag-end\",\"index\":{index},\"from\":[{},{},{},{}],\"now\":{:?}}}",
+                from_rect.0, from_rect.1, from_rect.2, from_rect.3,
+                session.doc.marks.get(index).map(|m| m.rect)
+            );
+        }
         drop(guard);
         self.as_mut().refresh_preview();
     }

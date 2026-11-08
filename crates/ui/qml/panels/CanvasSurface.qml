@@ -95,6 +95,18 @@ Item {
         return host.topLayerAt(mx, my)
     }
 
+    // 空白处单击 = 退出「图层 / 选区」选择（PS 的「点空白清选择」）。
+    // ★图层优先，一次点击只解一层：否则「图层悄悄不选了、选区还在」这种
+    //   看不见的状态会让人以为点击没生效。旧逻辑只在 selTool 为 none 时
+    //   执行，而默认工具是矩形选框 —— 于是「选中图层 → 点空白」什么都不会
+    //   发生（用户报的就是这个）。
+    function clickEmptyCanvas() {
+        if (bridge.selected_layer >= 0)
+            bridge.select_layer(-1)
+        else if (host.selExists)
+            bridge.sel_clear()
+    }
+
     function cancelPolygon() {
         if (!selPolyActive && polyPts.length === 0)
             return
@@ -248,6 +260,9 @@ Item {
         }
 
         onPressed: (mouse) => {
+            // 按下画布 = 离开所有浮层输入框：字号框握着 activeFocus 会把
+            // Delete / 工具键整组禁掉（详见 host.dropPopoverFocus 注释）。
+            host.dropPopoverFocus()
             // 在画布上按下 = 选区面板收起（不吞掉这次点击）。
             if (host.selPopoverOpen)
                 host.selPopoverOpen = false
@@ -410,11 +425,8 @@ Item {
                 return
             }
             if (host.selTool === "none") {
-                // 没选任何选区工具：点空白 = 取消选区（旧行为）。
-                if (bridge.selected_layer >= 0)
-                    bridge.select_layer(-1)
-                else if (host.selExists)
-                    bridge.sel_clear()
+                // 没选任何选区工具：点空白 = 退出选择（旧行为）。
+                clickEmptyCanvas()
                 return
             }
             startX = mouse.x
@@ -641,14 +653,13 @@ Item {
                         .join(" ")
                     bridge.sel_set_polygon(text, selMode)
                 } else {
-                    // 套索单击（没拖动）= 取消选区。
-                    bridge.sel_clear()
+                    // 套索单击（没拖动）= 点空白。
+                    clickEmptyCanvas()
                 }
             } else if (host.selTool === "rect" || host.selTool === "ellipse") {
                 if (dx < 0.5 || dy < 0.5) {
-                    // 点击（没拖出面积）= 取消选区。图层选中不动：选区工具
-                    // 只操作选区，取消图层选中会让"选区作用于当前图层"断掉。
-                    bridge.sel_clear()
+                    // 点击（没拖出面积）= 点空白。
+                    clickEmptyCanvas()
                 } else if (host.selTool === "rect") {
                     bridge.sel_set_rect(a[0], a[1], b[0], b[1], selMode)
                 } else {
@@ -943,6 +954,20 @@ Item {
                 textPopup.close(true)
                 return
             }
+            // 同上：标记手势入口也要放开浮层输入框的焦点。
+            host.dropPopoverFocus()
+            // 探针：把「画布坐标 → 图像坐标」的实算结果打出来。
+            // scripts/probe_mark_delete.py 用它反推合成鼠标消息与窗口像素
+            // 之间的固定偏移（两者差 60~125px，不校准就会漏点小元素）。
+            if (Qt.application.arguments.indexOf("--probe-keys") !== -1)
+                bridge.mark("mark-press: mx=" + Math.round(mouse.x)
+                            + " my=" + Math.round(mouse.y)
+                            + " ix=" + Math.round(imgX(mouse.x))
+                            + " iy=" + Math.round(imgY(mouse.y))
+                            + " pad=" + Math.round(view.pad)
+                            + " hit=" + markAt(mouse.x, mouse.y)
+                            + " handle=" + handleAt(mouse.x, mouse.y)
+                            + " tool=" + host.markTool)
             // 画笔按住 Alt = 临时吸管（PS 惯例）：取画布颜色作为下一笔的颜色，
             // 不落笔。光标已经由 EditorContent 换成吸管（cursorKind 5）。
             if (host.markTool === "brush"
@@ -1327,6 +1352,10 @@ Item {
                 bridge.update_text_content(text)
             bridge.set_editing_mark(-1)
             visible = false
+            // 清焦点：隐藏后的 TextInput 若仍 activeFocus，会继续吃 Delete
+            // 与 Ctrl+Z（QML Shortcut 的 enabled 也引用了 textPopup.visible，
+            // 但残留焦点会让"点别处再按键"这一路失灵）。
+            focus = false
             editIndex = -1
             editMark = null
             text = ""

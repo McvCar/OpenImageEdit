@@ -879,8 +879,10 @@ Shortcut { sequence: "Ctrl+Shift+R"; onActivated: bridge.rotate_cw() }
 // Delete/Backspace 在文本输入（文本标记就地编辑 / 字号输入 / 图层
 // 重命名）获得焦点时必须禁用：QML Shortcut 先于焦点项拦截按键，
 // 不禁用会吞掉输入框的退格键，还会误删选中的标记/图层。
-Shortcut { sequences: ["Delete", "Backspace"]
-           enabled: !view.canvasSurface.textPopup.visible && !fontPopover.sizeInput.activeFocus
+Shortcut { id: deleteShortcut
+           sequences: ["Delete", "Backspace"]
+           enabled: !view.canvasSurface.textPopup.visible
+                    && !(fontPopover.visible && fontPopover.sizeInput.activeFocus)
                     && !root.selFieldEditing
                     && root.renamingIndex < 0
                     && (root.selExists || bridge.selected_mark >= 0
@@ -1551,7 +1553,30 @@ function canUseToolKeys() {
         // 菜单被别处直接藏起来时 selFieldEditing 可能卡在 true；只有菜单
         // 确实开着才认它，否则「开过一次右键菜单 → 快捷键全废」。
         && !(root.selMenuOpen && root.selFieldEditing)
-        && !(si !== null && si.activeFocus)
+        // 同理：面板已经关掉时，输入框残留的 activeFocus 不算数 —— 它只是
+        // 没被清掉（QML 里点画布不会自动 blur），不该把整组工具键废掉。
+        && !(si !== null && si.activeFocus && fontPopover.visible)
+}
+
+// 画布一按下就放开「浮层面板输入框」的焦点。
+// ★字号输入框（字体面板）只要被点过一次，就会一直握着 activeFocus ——
+//   面板本身不会因为点画布而关闭，QML 也不会自动 blur。而 Delete 和
+//   V/M/L/W/J/G 这些 Shortcut 的 enabled 全都以 activeFocus 为条件，
+//   于是用户看到的是「创建元素 → 拖动缩放一下 → 之后删也删不掉、工具
+//   键也全按不动」，直到手动关掉面板。面板留在屏幕上（macOS 行为），
+//   但焦点必须还给画布。
+function dropPopoverFocus() {
+    const w = root.hostWindow
+    const af = w ? w.activeFocusItem : null
+    if (!af)
+        return
+    // 就地文本编辑框有自己的提交逻辑（textPopup.close），别在这里抢。
+    const tp = (typeof view !== "undefined" && view && view.canvasSurface)
+               ? view.canvasSurface.textPopup : null
+    if (tp !== null && tp !== undefined && af === tp)
+        return
+    if (af.focus !== undefined)
+        af.focus = false
 }
 
 function showToolToast(text) {
@@ -3109,22 +3134,75 @@ Timer {
 
 // Probe: --probe-keys 报出单字母快捷键的 enabled 绑定是否健康。
 // 修复前这里会是 vEnabled=false（创建期求值抛异常把绑定丢了）。
+// repeat: 用户按键前后各打一行，才能分清「窗口没激活」「enabled 变 false」
+// 「绑定都健康但按键不响应」三种完全不同的失效。
 Timer {
     id: keysProbeTimer
-    interval: 900
+    interval: 1200
+    repeat: true
+    // 只在 --probe-keys 下跑；其余时候必须闭嘴（它会临时弹出字体面板）。
     running: Qt.application.arguments.indexOf("--probe-keys") !== -1
+    property int ticks: 0
     onTriggered: {
+        // 整段包 try：QML 里 onTriggered 抛异常不一定进日志（之前就是
+        // `Window.window` 抛错 → 探针静默不输出），catch 后再 mark 一次。
+        try {
+        ticks += 1
+        // 焦点模拟只在 --probe-keys-focus 下做：它会弹出字体面板并抢焦点，
+        // 平时跑 --probe-keys 是要观察**真实**手势之后的状态，不能被探针
+        // 自己打乱（用户复现「拖动缩放后删不了」时就踩到过这个）。
+        if (Qt.application.arguments.indexOf("--probe-keys-focus") !== -1) {
+            // 第 3 tick：模拟「用户点过字号输入框」（面板开着、焦点在输入框）；
+            // 第 8 tick：关面板 —— 之后 canUse / delEnabled 必须回到 true。
+            // 留 5 个 tick 的窗口，够外部探针在「面板开着」这段时间里点一下
+            // 画布、验证画布是否会把这个焦点收走。
+            if (ticks === 3) {
+                fontPopover.visible = true
+                fontPopover.sizeInput.forceActiveFocus()
+            } else if (ticks === 8) {
+                fontPopover.visible = false
+            }
+        }
         let canUse = "ERR"
         try { canUse = root.canUseToolKeys() } catch (e) { canUse = "throw:" + e }
-        bridge.mark("keys-probe: ready=" + root.toolKeysReady
+        const win = root.hostWindow
+        const af = win ? win.activeFocusItem : null
+        const afName = af ? String(af).replace(/\s*\(.*$/, "") : "null"
+        bridge.mark("keys-probe: appActive=" + Qt.application.active
+                    + " winActive=" + (win ? win.active : "?")
+                    + " hasWin=" + (win ? "y" : "n")
+                    + " focusItem=" + afName
+                    + " ready=" + root.toolKeysReady
                     + " vEnabled=" + moveShortcut.enabled
+                    + " delEnabled=" + deleteShortcut.enabled
+                    + " selMark=" + bridge.selected_mark
+                    + " selLayer=" + bridge.selected_layer
+                    + " selExists=" + root.selExists
                     + " moveMode=" + root.moveMode
                     + " canUse=" + canUse
                     + " selFieldEditing=" + root.selFieldEditing
                     + " selMenuOpen=" + root.selMenuOpen
                     + " renaming=" + root.renamingIndex
                     + " textPopup=" + view.canvasSurface.textPopup.visible
-                    + " sizeFocus=" + fontPopover.sizeInput.activeFocus)
+                    + " sizeFocus=" + fontPopover.sizeInput.activeFocus
+                    + " markTool=" + root.markTool
+                    + " layers=" + bridge.layer_count
+                    + " mbox=" + (function () {
+                        const b = root.selectedMarkBox()
+                        return b ? [Math.round(b[0]), Math.round(b[1]),
+                                    Math.round(b[2]), Math.round(b[3])].join(",") : "null"
+                    })()
+                    + " lbox=" + (root.selLayerBox ? [Math.round(root.selLayerBox.x),
+                                    Math.round(root.selLayerBox.y),
+                                    Math.round(root.selLayerBox.w),
+                                    Math.round(root.selLayerBox.h)].join(",") : "null")
+                    + " mmode=" + view.canvasSurface.markMa.mode
+                    + " pad=" + Math.round(view.pad)
+                    + " marks=" + (root.markList && root.markList.length !== undefined
+                                    ? root.markList.length : "?"))
+        } catch (e) {
+            bridge.mark("keys-probe-ERR: " + e)
+        }
     }
 }
 
