@@ -594,7 +594,21 @@ Item {
                     //   又叠了一份鼠标位移，等于两份位移相加 —— 拖得越远，
                     //   框和内容分得越开（用户截图里的"图层渲染跑到框外"）。
                     // P0-2b2：最终帧也走统一会话，保证吸附修正量带进落定。
-                    const pf = toImage(curX, curY)
+                    // ★落定这一帧用**松手事件自己的坐标**，不要用 curX/curY：
+                    //   curX 只在 onPositionChanged 里更新，Qt 会把最后几个
+                    //   move 合并 / 丢掉（GPU 纹理生成时尤其明显），于是图层
+                    //   停在「最后一帧收到的 move」上 —— 实测能差 11 图像像素，
+                    //   刚好把 8px 的吸附窗口跳过去（用户看到「差一点点吸不进
+                    //   去」）。松手事件总是带真实坐标，用它最准。
+                    curX = mouse.x
+                    curY = mouse.y
+                    const pf = toImage(mouse.x, mouse.y)
+                    if (Qt.application.arguments.indexOf("--probe-keys") !== -1) {
+                        const p0 = toImage(startX, startY)
+                        bridge.mark("move-release: from=" + Math.round(p0[0]) + ","
+                                    + Math.round(p0[1]) + " to=" + Math.round(pf[0]) + ","
+                                    + Math.round(pf[1]) + " layer=" + bridge.selected_layer)
+                    }
                     bridge.transform_update(0, pf[0], pf[1],
                                             liveMods, host.toDispScale())
                     bridge.drag_translate_end(true)

@@ -106,7 +106,7 @@ Rectangle {
                 glyph: "▣"
                 tip: "全选 (Ctrl+A)"
                 active: bridge.image_width > 0
-                onClicked: bridge.sel_select_all()
+                onClicked: host.selectAllCanvas()
             }
             IconButton {
                 glyph: "⇄"

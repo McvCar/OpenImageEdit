@@ -555,6 +555,10 @@ Item {
     property string paintTool: "none" // none | spot | heal | patch | bucket | gradient
     property bool paintPopoverOpen: false
     property string paintGroup: "heal" // 参数面板当前展示的组
+    // 进入修复 / 油漆工具**之前**用的选区工具：退出这组工具时还回去。
+    // （以前把 selTool 置成 none 就撒手了 —— 关掉污点工具后画布按下走的是
+    //   「点空白」分支，框选彻底失灵，只能重新挑一次选区工具。）
+    property string selToolBeforePaint: ""
     property bool paintMenuOpen: false
     // 笔刷参数（修复类共用）：大小按画布像素，硬度/间距/强度按百分比。
     property int healSize: 40
@@ -1646,6 +1650,8 @@ function setSelTool(tool) {
         if (root.paintTool !== "none") {
             view.canvasSurface.cancelPaint()
             root.paintTool = "none"
+            // 用户手动挑了选区工具：不必再记住「进入前」的那个。
+            root.selToolBeforePaint = ""
             root.closePaintPopovers()
             root.savePaintSpec()
         }
@@ -1747,6 +1753,12 @@ function selectAllCanvas() {
     if (bridge.image_width < 1 || bridge.image_height < 1)
         return
     settlePaste()
+    // 整块画布的选区必然「在选中图层框之外」——和 `dropLayerForSelection`
+    // 同一套语义：移动工具开着时先退出图层选中，否则后续抠图 / 调色 / 擦除
+    // 只会作用在那一层里（用户看到的「全选之后删不掉整幅图」）。移动工具
+    // 关掉时保持原样（纯选区模式）。
+    if (root.moveMode && bridge.selected_layer >= 0)
+        bridge.select_layer(-1)
     bridge.sel_select_all()
 }
 
@@ -1897,6 +1909,8 @@ function setMarkTool(tool) {
         // 标记工具与修复 / 油漆工具互斥。
         view.canvasSurface.cancelPaint()
         root.paintTool = "none"
+        // 同样把被 paintTool 抢走的选区工具还回去（见 restoreSelToolAfterPaint）。
+        root.restoreSelToolAfterPaint()
         root.closePaintPopovers()
         root.savePaintSpec()
     }
@@ -1942,7 +1956,11 @@ function paintGroupOf(tool) {
 // 切换修复 / 油漆工具。三个工具族互斥；切走时把进行中的手势撤销掉。
 function setPaintTool(tool) {
     const next = (root.paintTool === tool) ? "none" : tool
+    // 从「没有修复工具」进入这一族的这一刻，记住当时的选区工具。
+    const entering = (next !== "none" && root.paintTool === "none")
     view.canvasSurface.cancelPaint()
+    if (entering && root.selTool !== "none")
+        root.selToolBeforePaint = root.selTool
     root.paintTool = next
     if (next !== "patch")
         view.canvasSurface.clearPatchRegion()
@@ -1956,8 +1974,27 @@ function setPaintTool(tool) {
         mosaicPopover.visible = false
         colorPopover.visible = false
         fontPopover.visible = false
+    } else if (root.selTool === "none") {
+        root.restoreSelToolAfterPaint()
     }
     root.savePaintSpec()
+}
+
+// 退出修复 / 油漆工具后把选区工具还回去。
+//
+// `setPaintTool` 进入这一族时会把 selTool 置成 "none"（三族互斥）。以前退出
+// 时不管它 —— 画布按下就只剩「点空白」，框选整个失灵，用户以为污点工具把
+// 选区功能弄坏了。这里还原：优先用进入前记下的那个，其次 settings.ini 里
+// 记住的上一个选区工具，最后兜底矩形选框。
+function restoreSelToolAfterPaint() {
+    if (root.selTool !== "none") {
+        root.selToolBeforePaint = ""
+        return
+    }
+    root.selTool = root.selToolBeforePaint !== ""
+                ? root.selToolBeforePaint
+                : (bridge.selToolSaved.length > 0 ? bridge.selToolSaved : "rect")
+    root.selToolBeforePaint = ""
 }
 
 // 标记栏上的两个工具组按钮：点开/收起对应的参数面板；该组工具**正在用**
@@ -3159,6 +3196,50 @@ Timer {
     }
 }
 
+// Probe: --probe-select-all / --probe-select-all-off —— 直接调用 Ctrl+A 与
+// 菜单「全选」共用的 `selectAllCanvas()`，断言「有选中图层时先取消图层选中」
+//（移动工具关掉时保持不动）。按键派发是既有 Shortcut，这里只验逻辑。
+Timer {
+    id: selectAllProbeTimer
+    interval: 1400
+    running: Qt.application.arguments.indexOf("--probe-select-all") !== -1
+             || Qt.application.arguments.indexOf("--probe-select-all-off") !== -1
+    onTriggered: {
+        if (Qt.application.arguments.indexOf("--probe-select-all-off") !== -1)
+            root.toggleMoveTool()
+        if (bridge.layer_count > 0 && bridge.selected_layer < 0)
+            bridge.select_layer(0)
+        bridge.mark("selall-before: selLayer=" + bridge.selected_layer
+                    + " moveMode=" + root.moveMode
+                    + " selExists=" + root.selExists)
+        root.selectAllCanvas()
+        bridge.mark("selall-after: selLayer=" + bridge.selected_layer
+                    + " moveMode=" + root.moveMode
+                    + " selExists=" + root.selExists)
+    }
+}
+
+// Probe: --probe-toggle-heal / --probe-toggle-paint —— 直接调用标记栏那两个
+// 工具组按钮的处理函数（`togglePaintGroup`）：开一次、再关一次，断言关掉之后
+// 选区工具回到原样（以前会停在 none，框选整个失灵）。
+Timer {
+    id: paintToggleProbeTimer
+    interval: 1400
+    running: Qt.application.arguments.indexOf("--probe-toggle-heal") !== -1
+             || Qt.application.arguments.indexOf("--probe-toggle-paint") !== -1
+    onTriggered: {
+        const grp = Qt.application.arguments.indexOf("--probe-toggle-heal") !== -1
+                  ? "heal" : "paint"
+        root.markBarVisible = true
+        root.togglePaintGroup(grp)
+        bridge.mark("paint-toggle-open: paintTool=" + root.paintTool
+                    + " selTool=" + root.selTool)
+        root.togglePaintGroup(grp)
+        bridge.mark("paint-toggle-close: paintTool=" + root.paintTool
+                    + " selTool=" + root.selTool)
+    }
+}
+
 // Probe: --probe-keys 报出单字母快捷键的 enabled 绑定是否健康。
 // 修复前这里会是 vEnabled=false（创建期求值抛异常把绑定丢了）。
 // repeat: 用户按键前后各打一行，才能分清「窗口没激活」「enabled 变 false」
@@ -3214,6 +3295,7 @@ Timer {
                     + " sizeFocus=" + fontPopover.sizeInput.activeFocus
                     + " markTool=" + root.markTool
                     + " paintTool=" + root.paintTool
+                    + " selTool=" + root.selTool
                     + " layers=" + bridge.layer_count
                     + " mbox=" + (function () {
                         const b = root.selectedMarkBox()
@@ -3226,6 +3308,7 @@ Timer {
                                     Math.round(root.selLayerBox.h)].join(",") : "null")
                     + " mmode=" + view.canvasSurface.markMa.mode
                     + " pad=" + Math.round(view.pad)
+                    + " scale=" + root.toDispScale().toFixed(5)
                     + " marks=" + (root.markList && root.markList.length !== undefined
                                     ? root.markList.length : "?"))
         } catch (e) {

@@ -91,12 +91,19 @@ fn prepare_snap(session: &mut Session, moving: usize) {
 ///
 /// 窗口边距不是只有阈值：居中的候选要看**两侧墙**，空窗比内容宽时两墙都在
 /// 阈值之外，只留 `threshold` 会永远看不到它们，居中就永远不会触发。所以
-/// 再按内容尺寸的一半放宽（上限 48 图像像素，大图层不至于把窗口撑爆）。
+/// 余量按内容尺寸放大（最多 `MAX_MARGIN`），再用窗口面积预算收口 —— 大内容
+/// 只留必要的那点余量，避免每帧重建一张超大栅格拖垮拖动帧率。
 /// 内容本身超过 `MAX_FIT_AREA` 时直接放弃：这种尺寸的图层基本不可能塞进
-/// 别人的空档，省下的每帧 O(面积) 采样更值钱。
+/// 别人的空档（而且 1:1 栅格每帧重建太贵）。
 fn solve_fit(session: &mut Session, disp: (f64, f64), threshold: f64) -> FitResult {
-    const MAX_FIT_AREA: f64 = 400_000.0;
-    const MAX_MARGIN: f64 = 48.0;
+    /// 内容面积上限（≈1095×1095）。旧值 400k（632×632）会把「正常大小的
+    /// 元素」静默排除在咬合之外 —— 用户看到的就是「大一点就吸不进去」。
+    const MAX_FIT_AREA: f64 = 1_200_000.0;
+    /// 窗口边长预算（1:1 栅格 ≈ 1.1M 格/帧）。
+    const WINDOW_EDGE: f64 = 1048.0;
+    /// 最小余量：贴最近的墙至少要看见墙本身。
+    const MIN_MARGIN: f64 = 48.0;
+    const MAX_MARGIN: f64 = 400.0;
     let Some(c) = session.fit_content else {
         return FitResult::default();
     };
@@ -107,7 +114,11 @@ fn solve_fit(session: &mut Session, disp: (f64, f64), threshold: f64) -> FitResu
         return FitResult::default();
     }
     let cur = (c.x + disp.0, c.y + disp.1, c.width, c.height);
-    let m = threshold.ceil() + (c.width.max(c.height) * 0.5).min(MAX_MARGIN);
+    let cm = c.width.max(c.height);
+    let t = threshold.ceil();
+    let want = t + (cm * 0.75).clamp(MIN_MARGIN, MAX_MARGIN);
+    let cap = ((WINDOW_EDGE - cm) * 0.5).max(t + 24.0);
+    let m = want.min(cap);
     session
         .fit_occ
         .reset((cur.0 - m, cur.1 - m, cur.2 + 2.0 * m, cur.3 + 2.0 * m));

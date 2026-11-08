@@ -103,7 +103,7 @@ Rectangle {
                 { l: "魔术棒 (W)", ok: bridge.image_width > 0,
                   run: function () { host.setSelToolByShortcut("wand") } },
                 { l: "全选 (Ctrl+A)", ok: bridge.image_width > 0,
-                  run: function () { bridge.sel_select_all() } },
+                  run: function () { host.selectAllCanvas() } },
                 { l: "选择反选 (Ctrl+Shift+I)", ok: bridge.image_width > 0,
                   run: function () { bridge.sel_invert() } },
                 { l: "取消选择 (Ctrl+D)", ok: host.selExists,
