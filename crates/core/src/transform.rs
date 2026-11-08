@@ -205,6 +205,46 @@ fn rotate_to(
     // "放手后位置有微小偏移"，以及转几次就发软。用 delta 反推后，源图中
     // 心恰好落在「旧位置 + delta」上，和图层的整数 offset 严格一致。
     let (dcx, dcy) = (scx - delta.0 as f32, scy - delta.1 as f32);
+    (rotate_to_at(img, sin, cos, nw, nh, hq, dcx, dcy), delta)
+}
+
+/// 旋转到指定尺寸，并让**源图中心**落在输出图连续坐标 `center` 上。
+///
+/// 拖动帧专用：落定帧的内容中心是 `round(center - AABB/2) + AABB/2`（外接框
+/// 宽高为奇数时带 0.5px），而拖动帧若死守「源图中心」，两者就会差 0.5~1px，
+/// 松手瞬间整层肉眼看得出挪一下。这里把落定的那个亚像素中心原样喂进来，
+/// 于是拖动帧与落定帧的采样网格锚在同一点，`sx = 1` 时两者逐像素等价。
+pub fn rotate_into_centered(
+    img: &RgbaImage,
+    sin: f32,
+    cos: f32,
+    nw: u32,
+    nh: u32,
+    center: (f32, f32),
+) -> RgbaImage {
+    let nw = nw.max(1);
+    let nh = nh.max(1);
+    if img.width() < 1 || img.height() < 1 {
+        return RgbaImage::new(nw, nh);
+    }
+    rotate_to_at(img, sin, cos, nw, nh, false, center.0, center.1)
+}
+
+/// 采样实现：`dcx/dcy` = 源图中心在输出图连续坐标里的位置（可为小数）。
+fn rotate_to_at(
+    img: &RgbaImage,
+    sin: f32,
+    cos: f32,
+    nw: u32,
+    nh: u32,
+    hq: bool,
+    dcx: f32,
+    dcy: f32,
+) -> RgbaImage {
+    let nw = nw.max(1);
+    let nh = nh.max(1);
+    let (iw, ih) = (img.width() as i32, img.height() as i32);
+    let (scx, scy) = (iw as f32 / 2.0, ih as f32 / 2.0);
     let mut out = RgbaImage::new(nw, nh);
     let ctx = RotCtx {
         iw,
@@ -246,7 +286,7 @@ fn rotate_to(
             render_rows(dst, 0, src, &ctx);
         }
     }
-    (out, delta)
+    out
 }
 
 /// 整段旋转手势里恒定不变的输出尺寸：取对角线长度的正方形——
@@ -258,6 +298,17 @@ pub fn rotated_box_size(w: u32, h: u32, expand: bool) -> (u32, u32) {
     }
     let d = (((w as f32) * (w as f32) + (h as f32) * (h as f32)).sqrt() - 1e-3).ceil() as u32;
     (d.max(1), d.max(1))
+}
+
+/// 落定时的**紧致**外接框尺寸（与 `rotate_image_hq(.., expand=true)` 的输出
+/// 逐位一致，同一套 f32 运算）。
+///
+/// 拖动帧要提前知道这个尺寸：落定的内容中心是
+/// `round(center - AABB/2) + AABB/2`，外接框宽高为奇数时会落在半像素上，
+/// 拖动帧必须跟着落在同一个点，松手才不会跳。
+pub fn rotated_aabb_size(w: u32, h: u32, degrees: f32) -> (u32, u32) {
+    let rad = degrees.to_radians();
+    expanded_size(w as f32, h as f32, rad.sin(), rad.cos())
 }
 
 /// 一次旋转运算的常量参数（各线程共享只读）。

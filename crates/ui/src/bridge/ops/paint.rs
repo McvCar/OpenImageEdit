@@ -697,27 +697,29 @@ impl qobject::Bridge {
             *cap = Some(LIVE_ROTATE_EDGE);
             let index = st.index;
             let snapshot = st.before.clone();
-            // ★预览的摆放基准 = **当前图层的精确中心**，和 finish 里的提交算法
-            // 一致。
+            // ★拖动帧必须摆在**落定后的内容中心**上，不是「源图中心」。
             //
-            // 合成器画的是「snapshot 按 angle 转完、落在 offset+delta」的位置，
-            // 也就是以 snapshot.center 为转轴。但锚点 snapshot 不一定是图层现在
-            // 的样子（连续旋转时它是没被插值过的原图，尺寸更小、offset 也更早），
-            // 直接传 st.start.offset 会让「小图 + 大 offset」凑出一个错中心。
-            // 所以这里把 offset 折算成「让 snapshot 中心落在当前图层中心」的值。
-            // 中心必须取 `start_center`（params 真值），不能由 `start.offset +
-            // 位图尺寸/2` 反推 —— 那是被 round 过的值，转一次就漂 0.5px。
-            let snap_w = snapshot.image.width() as f64;
-            let snap_h = snapshot.image.height() as f64;
-            let offset = (
-                (st.start_center.0 - snap_w / 2.0).round() as i32,
-                (st.start_center.1 - snap_h / 2.0).round() as i32,
+            // 落定（`render_compatible`）的摆放是 `round(center - AABB/2)`，
+            // 内容中心 = 摆放 + AABB/2；AABB 宽高为奇数时它落在 .5 上。
+            // 预览如果按源图尺寸自己凑一个中心，二次旋转（源图宽与 AABB 的
+            // 奇偶不同）就差 0.5~1px —— 用户看到「松手画面挪一下」。
+            // 中心仍取 `start_center`（params 真值），不能由 `start.offset +
+            // 位图尺寸/2` 反推（那是被 round 过的，转一次漂 0.5px）。
+            let (sw, sh) = snapshot.image.dimensions();
+            let (out_w, out_h) = if expand {
+                editcore::rotated_aabb_size(sw, sh, total)
+            } else {
+                (sw, sh)
+            };
+            let center = (
+                (st.start_center.0 - out_w as f64 / 2.0).round() + out_w as f64 / 2.0,
+                (st.start_center.1 - out_h as f64 / 2.0).round() + out_h as f64 / 2.0,
             );
             let token = st.token;
             *frame = Some(LiveRotate {
                 index,
                 snapshot,
-                offset,
+                center,
                 degrees: total,
                 expand,
                 token,

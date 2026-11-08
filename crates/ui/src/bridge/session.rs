@@ -472,13 +472,17 @@ pub(in crate::bridge) struct RotateLive {
 pub(in crate::bridge) struct LiveRotate {
     pub(in crate::bridge) index: usize,
     pub(in crate::bridge) snapshot: std::rc::Rc<Layer>,
-    /// 预览用的图层原点，必须取**当前**图层的 offset。
+    /// ★落定后图层内容的**中心**（画布坐标，允许 .5）。
     ///
-    /// ★不能用 `snapshot.offset`：`snapshot` 在连续旋转时会复用「没被插值过
-    ///   的原图」，那是第一次旋转前的状态，它的 offset 也比当前的小一圈（扩张
-    ///   过的外接矩形会往左上顶）。拿它出图，拖动时内容就画在旧位置上，松手
-    ///   提交（用当前 offset + delta）才"跳"进框里 —— 用户报的正是这个。
-    pub(in crate::bridge) offset: (i32, i32),
+    /// 拖动帧必须摆在这个点上，否则松手会跳：
+    /// * 落定的摆放是 `round(center - AABB/2)`，内容中心 = `摆放 + AABB/2`；
+    ///   外接框宽高为**奇数**时它就落在 `.5` 上（偶数时正好是 center）。
+    /// * 预览若死守「源图中心」（`round(center - 源图宽/2) + 源图宽/2`），两次
+    ///   旋转之后源图宽与 AABB 的奇偶不同，两边就差 0.5~1px —— 用户报的
+    ///   「旋转中的画面和放手的画面不一致」正是这个。
+    ///
+    /// 存中心而不是 offset：offset 是整数，表达不了这半个像素。
+    pub(in crate::bridge) center: (f64, f64),
     pub(in crate::bridge) degrees: f32,
     pub(in crate::bridge) expand: bool,
     /// 会话编号：合成器用它判定「缩到预览尺寸的那张快照」还能不能复用。
@@ -843,7 +847,7 @@ impl Session {
                     target,
                     lr.index,
                     &lr.snapshot.image,
-                    lr.offset,
+                    lr.center,
                     lr.degrees,
                     lr.expand,
                     lr.token,

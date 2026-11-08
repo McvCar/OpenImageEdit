@@ -2140,6 +2140,12 @@ function previewLayerRotate(deg, mods) {
 function finishLayerRotate(apply, mods) {
     if (!root.rotating)
         return
+    // 诊断：松手时还没画出来的那一点角度。节流（16ms 网格 + 按帧耗时跳格）
+    // 会让最后一帧落后光标，落定却按最新角度提交 —— 差得多时用户会看到
+    // 「松手瞬间又转了一点」。日志里超 0.5° 才打，正常拖动不该出现。
+    const lag = Math.abs(root.rotateAnglePreview - root.rotateRenderedAngle)
+    if (lag > 0.5)
+        console.log("[rotate] settle-gap", lag.toFixed(2))
     root.rotating = false
     // 松手时可能还有一帧没算：把最终角度交给 finish，由它决定复用还是重算。
     // P1-A：Shift 吸角与拖动帧同一语义（Rust 按累计角吸附）。
