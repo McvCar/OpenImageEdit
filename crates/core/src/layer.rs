@@ -43,6 +43,48 @@ impl Layer {
         )
     }
 
+    /// 不透明内容的包围盒（**源图**像素坐标 `(x, y, w, h)`）。
+    ///
+    /// 有变换参数时取 `transform.source`（未插值原图），否则直接扫 `image`。
+    /// 全透明层返回 `None`。
+    pub fn content_bbox(&self, threshold: u8) -> Option<(u32, u32, u32, u32)> {
+        let img = match self.transform.as_ref() {
+            Some(t) => &t.source,
+            None => &self.image,
+        };
+        crate::alpha_fit::alpha_bbox(img, threshold)
+    }
+
+    /// 内容在**画布坐标**下的轴对齐外接框。
+    ///
+    /// 只有未旋转（且无斜切 / 透视）时才有意义 —— 旋转后内容框是斜的，
+    /// 投影吸附会失真，这里返回 `None` 让调用方退回外框吸附。
+    pub fn content_bounds(&self, threshold: u8) -> Option<RectF> {
+        let (cx, cy, cw, ch) = self.content_bbox(threshold)?;
+        let (cx, cy, cw, ch) = (cx as f64, cy as f64, cw as f64, ch as f64);
+        match self.transform.as_ref() {
+            Some(t) => {
+                if !t.is_affine() || t.rotation.abs() > 1e-6 || t.skew.0 != 0.0 || t.skew.1 != 0.0 {
+                    return None;
+                }
+                let m = t.matrix();
+                let pts = [
+                    m.apply((cx, cy)),
+                    m.apply((cx + cw, cy)),
+                    m.apply((cx + cw, cy + ch)),
+                    m.apply((cx, cy + ch)),
+                ];
+                Some(RectF::from_points(&pts))
+            }
+            None => Some(RectF::new(
+                self.offset.0 as f64 + cx,
+                self.offset.1 as f64 + cy,
+                cw,
+                ch,
+            )),
+        }
+    }
+
     /// 取得（或就地建立）本层的变换状态。已烘焙层用当前 `image` 作为新原图，
     /// identity 参数对齐 `offset`，因此第一次变换前后的几何完全一致。
     pub fn transform_state(&mut self) -> LayerTransform {

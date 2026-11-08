@@ -92,6 +92,14 @@ pub(in crate::bridge) struct Session {
     pub(in crate::bridge) gesture: i32,
     pub(in crate::bridge) gesture_start: (f64, f64),
     pub(in crate::bridge) gesture_rect: (f64, f64, f64, f64),
+    // ---- 拼图咬合（内容占位吸附） ----
+    /// 移动图层的**内容框**（alpha 包围盒，画布坐标）。`None` = 内容全透明
+    /// 或图层已旋转（投影失真，退回纯外框吸附）。
+    pub(in crate::bridge) fit_content: Option<editcore::layer_transform::RectF>,
+    /// 起手时记录的手势目标图层，供每帧重建占位栅格时排除自己。
+    pub(in crate::bridge) gesture_index: i32,
+    /// 复用的占位栅格（每帧按当前内容框重建，窗口很小）。
+    pub(in crate::bridge) fit_occ: editcore::alpha_fit::Occupancy,
     /// Tier 1 拖动帧**跳过**的 CPU 全幅合成次数（计数器断言：启用快路径后
     /// 每次拖动都应递增，而实际合成次数为 0）。
     pub(in crate::bridge) full_composites: u32,
@@ -611,6 +619,9 @@ impl Session {
                 gesture: -1,
                 gesture_start: (0.0, 0.0),
                 gesture_rect: (0.0, 0.0, 0.0, 0.0),
+                fit_content: None,
+                gesture_index: -1,
+                fit_occ: editcore::alpha_fit::Occupancy::default(),
                 full_composites: 0,
                 gpu_live: false,
                 gpu_static_url: String::new(),

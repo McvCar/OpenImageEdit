@@ -1,6 +1,7 @@
 use image::RgbaImage;
 
 mod adjust;
+pub mod alpha_fit;
 mod color;
 pub mod font;
 pub use adjust::{adjust_json, Adjust, AdjustTarget, Histogram, BINS};

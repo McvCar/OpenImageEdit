@@ -25,6 +25,8 @@ pub enum SnapKind {
     LayerEdge = 2,
     LayerCenter = 3,
     Selection = 4,
+    /// 拼图咬合：卡进附近图层内容之间的空窗，参考线画在空窗的墙上。
+    GapEdge = 5,
 }
 
 /// 一条可吸附的轴线。`pos` 是图像坐标；`owner` 是来源标识（图层索引、

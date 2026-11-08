@@ -1013,6 +1013,19 @@ impl qobject::Bridge {
                         text.to_string()
                     );
                 }
+                // `fit-probe:index,dx,dy[,disp]` —— 拼图咬合求解器端到端：
+                // 用图层内容框 + 位移求空窗，输出咬合修正量与墙位置。
+                other if other.starts_with("fit-probe:") => {
+                    let n = parse_nums(other);
+                    let g = |i: usize, d: f64| n.get(i).copied().unwrap_or(d);
+                    let text =
+                        self.as_mut()
+                            .fit_probe(g(0, 0.0) as i32, g(1, 0.0), g(2, 0.0), g(3, 1.0));
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"fit-probe\",\"result\":{}}}",
+                        text.to_string()
+                    );
+                }
                 // `layer-info:index[,tag]` —— 打印图层位图尺寸与 offset。
                 // 诊断"转一圈图层变大 / 放手后位置漂移"时直接读这几项，
                 // 别再从截图上量像素。

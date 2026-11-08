@@ -16,3 +16,6 @@ build_ui.log
 focus_probe.log
 probe_mark_*.log
 probe_mark_*.png
+check_ui.log
+probe_gap_fit.png
+probe_gap_fit.log

@@ -9,9 +9,10 @@
 //! * 落定统一成 `Document::set_layer_transform`（见各旧 API 内部）。
 
 use super::super::*;
+use editcore::alpha_fit::{fit_into_gaps, FitResult, ALPHA_THRESHOLD};
 use editcore::snap::{
     canvas_candidates, guides_json, prepare, rect_candidates, selection_candidates, solve_rect,
-    SnapResult, EDGE_ALL,
+    SnapAxis, SnapResult, EDGE_ALL,
 };
 
 // Qt::KeyboardModifier 位（QML 的 mouse.modifiers 原样透传）。
@@ -67,6 +68,75 @@ fn prepare_snap(session: &mut Session, moving: usize) {
     prepare(&mut c);
     session.snap_statics = c;
     session.snap = SnapResult::default();
+    // 拼图咬合的基准：移动图层**自己的内容框**（alpha 包围盒）。带透明
+    // 边距的素材按外框去卡空窗会永远差一个 padding，这里换成真实内容。
+    session.gesture_index = moving as i32;
+    session.fit_content = session
+        .doc
+        .layers
+        .get(moving)
+        .filter(|l| l.visible)
+        .and_then(|l| l.content_bounds(ALPHA_THRESHOLD));
+}
+
+/// 每帧重建「内容框 + 阈值」窗口的占位栅格，求空窗咬合。
+///
+/// 窗口边距不是只有阈值：居中的候选要看**两侧墙**，空窗比内容宽时两墙都在
+/// 阈值之外，只留 `threshold` 会永远看不到它们，居中就永远不会触发。所以
+/// 再按内容尺寸的一半放宽（上限 48 图像像素，大图层不至于把窗口撑爆）。
+/// 内容本身超过 `MAX_FIT_AREA` 时直接放弃：这种尺寸的图层基本不可能塞进
+/// 别人的空档，省下的每帧 O(面积) 采样更值钱。
+fn solve_fit(session: &mut Session, disp: (f64, f64), threshold: f64) -> FitResult {
+    const MAX_FIT_AREA: f64 = 400_000.0;
+    const MAX_MARGIN: f64 = 48.0;
+    let Some(c) = session.fit_content else {
+        return FitResult::default();
+    };
+    if !(threshold > 0.0) || !threshold.is_finite() {
+        return FitResult::default();
+    }
+    if c.width * c.height > MAX_FIT_AREA {
+        return FitResult::default();
+    }
+    let cur = (c.x + disp.0, c.y + disp.1, c.width, c.height);
+    let m = threshold.ceil() + (c.width.max(c.height) * 0.5).min(MAX_MARGIN);
+    session
+        .fit_occ
+        .reset((cur.0 - m, cur.1 - m, cur.2 + 2.0 * m, cur.3 + 2.0 * m));
+    let skip = session.gesture_index;
+    {
+        let occ = &mut session.fit_occ;
+        for (i, layer) in session.doc.layers.iter().enumerate() {
+            if i as i32 == skip {
+                continue;
+            }
+            occ.stamp(layer, ALPHA_THRESHOLD);
+        }
+    }
+    fit_into_gaps(cur, &session.fit_occ, threshold)
+}
+
+/// 把「咬合」结果叠到「外框对齐」结果上：某个轴已经被空窗咬住，就不再
+/// 用那一轴的外框候选，免得两条线互相打架（参考线也只留生效的那条）。
+fn merge_snap(edge: SnapResult, fit: FitResult) -> SnapResult {
+    let mut out = SnapResult::default();
+    out.dx = if fit.snapped_x { fit.dx } else { edge.dx };
+    out.dy = if fit.snapped_y { fit.dy } else { edge.dy };
+    for (i, g) in edge.guides.iter().enumerate() {
+        let taken = match g.axis {
+            SnapAxis::X => fit.snapped_x,
+            SnapAxis::Y => fit.snapped_y,
+        };
+        if taken {
+            continue;
+        }
+        out.guides.push(*g);
+        if let Some(l) = edge.labels.get(i) {
+            out.labels.push(l.clone());
+        }
+    }
+    out.guides.extend(fit.guides.iter().copied());
+    out
 }
 
 /// 本次手势是否应该求解吸附（D17 手势分流 + D16 开关）。
@@ -172,6 +242,8 @@ impl qobject::Bridge {
                 })
                 .unwrap_or((0.0, 0.0, 0.0, 0.0));
             session.snap = SnapResult::default();
+            session.fit_content = None;
+            session.gesture_index = index.max(0);
             if snap_allowed(enabled, gesture, mods) && gesture != GESTURE_ROTATE {
                 prepare_snap(session, index.max(0) as usize);
             } else {
@@ -280,15 +352,18 @@ impl qobject::Bridge {
                     return false;
                 };
                 let (x, y, w, h) = session.gesture_rect;
-                let r = solve_rect(
+                let threshold = (8.0 / session.disp_scale).abs();
+                let edge = solve_rect(
                     (x + dx, y + dy, w, h),
                     &session.snap_statics,
                     8.0,
                     session.disp_scale,
                     EDGE_ALL,
                 );
-                let delta = (r.dx, r.dy);
-                session.snap = r;
+                let fit = solve_fit(session, (dx, dy), threshold);
+                let merged = merge_snap(edge, fit);
+                let delta = (merged.dx, merged.dy);
+                session.snap = merged;
                 delta
             } else {
                 (0.0, 0.0)
@@ -341,6 +416,53 @@ impl qobject::Bridge {
         );
         let text = format!(r#"{{"dx":{:.4},"dy":{:.4}}}"#, r.dx, r.dy);
         session.snap = r;
+        QString::from(text.as_str())
+    }
+
+    /// 拼图咬合探针：按 `index` 图层的内容框 + 位移求解，返回 JSON。
+    /// `--script=fit-probe:index,dx,dy[,disp_scale]`
+    pub fn fit_probe(
+        mut self: Pin<&mut Self>,
+        index: i32,
+        dx: f64,
+        dy: f64,
+        disp_scale: f64,
+    ) -> QString {
+        let text = {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return QString::from(r#"{"ok":false,"why":"no-session"}"#);
+            };
+            session.disp_scale = if disp_scale > 0.0 { disp_scale } else { 1.0 };
+            prepare_snap(session, index.max(0) as usize);
+            let threshold = 8.0 / session.disp_scale;
+            let fit = solve_fit(session, (dx, dy), threshold);
+            let content = session
+                .fit_content
+                .map(|c| format!("[{:.2},{:.2},{:.2},{:.2}]", c.x, c.y, c.width, c.height))
+                .unwrap_or_else(|| "null".to_string());
+            let walls: Vec<String> = fit
+                .guides
+                .iter()
+                .map(|g| {
+                    format!(
+                        "[\"{}\",{:.2}]",
+                        if g.axis == SnapAxis::X { "x" } else { "y" },
+                        g.pos
+                    )
+                })
+                .collect();
+            format!(
+                r#"{{"ok":true,"content":{},"dx":{:.4},"dy":{:.4},"sx":{},"sy":{},"walls":[{}],"threshold":{:.3}}}"#,
+                content,
+                fit.dx,
+                fit.dy,
+                fit.snapped_x,
+                fit.snapped_y,
+                walls.join(","),
+                threshold
+            )
+        };
         QString::from(text.as_str())
     }
 
