@@ -224,7 +224,7 @@ def main():
     fixture(FIXTURE)
     if os.path.exists(LOG):
         os.remove(LOG)
-    args = [a.exe, FIXTURE, "--probe-keys"]
+    args = [a.exe, FIXTURE, "--probe-keys", "--no-restore-tool"]
     if a.focus:
         args.append("--probe-keys-focus")
     if a.scenario == "rect":

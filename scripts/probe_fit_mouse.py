@@ -180,7 +180,9 @@ def run_case(hwnd, box_now, target_left, win_fn, scale, expect_x, name):
 def one_launch(cases):
     if os.path.exists(LOG):
         os.remove(LOG)
-    args = [EXE, FIXTURE, "--probe-keys",
+    # ★`--no-restore-tool`：不恢复上次会话的修复/油漆工具。带着 spot 起跑时
+    #   画布按下是「落笔」而不是「拾取图层」，图层一动不动 → 全项假 FAIL。
+    args = [EXE, FIXTURE, "--probe-keys", "--no-restore-tool",
             "--script=extract:%d,%d,%d,%d" % (ELEM[0], ELEM[1], ELEM[2], ELEM[3])]
     env = dict(os.environ)
     env["PATH"] = QT_BIN + ";" + env.get("PATH", "")

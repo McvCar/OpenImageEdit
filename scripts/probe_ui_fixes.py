@@ -100,6 +100,26 @@ def main():
                                                      "polygon", "wand", "quick"),
           str(closed))
 
+    # ---- 3. 点空白：移动工具关掉时保留图层选中 ----
+    script3 = "--script=extract:120,100,240,180"
+    out = run([script3, "--probe-empty-click"])
+    b = grab(out, "emptyclick-before")
+    a = grab(out, "emptyclick-after")
+    check("移动工具开：点空白前有图层+选区",
+          bool(b) and b.get("selLayer") == "0" and b.get("selExists") == "true", str(b))
+    check("移动工具开：点空白取消图层选中",
+          bool(a) and a.get("selLayer") == "-1", str(a))
+
+    out = run([script3, "--probe-empty-click-off"])
+    b = grab(out, "emptyclick-before")
+    a = grab(out, "emptyclick-after")
+    check("移动工具关：随手点是区不选图层",
+          bool(b) and b.get("pick") == "null", str(b))
+    check("移动工具关：点空白保留图层选中",
+          bool(a) and a.get("selLayer") == "0" and a.get("moveMode") == "false", str(a))
+    check("移动工具关：选区照旧被清掉",
+          bool(a) and a.get("selExists") == "false", str(a))
+
     print()
     if fails:
         print("RESULT FAIL:", ", ".join(fails))

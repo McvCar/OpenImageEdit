@@ -908,10 +908,11 @@ Shortcut { sequence: "Ctrl+A"
 // V = 移动工具开关（开：图层可拖可缩放；关：手柄收起，碰不到图层）。
 Shortcut {
     id: moveShortcut
-    // 大小写双写：Qt 对 "V" 的解析在不同输入法/键盘布局下可能带 Shift，
-    // 补一个小写序列保证裸 v 一定能命中。ApplicationShortcut 让窗口刚
-    // 从别的程序切回来、标题栏还没拿到焦点时也能切工具。
-    sequences: ["V", "v"]
+    // ★单个 sequence，**不要**用 `sequences: ["V", "v"]`：同一快捷键注册两条
+    //   只差大小写的序列，Qt 的 QShortcutMap 会把它当成重载/歧义而整体不触发
+    //   （实测 moveMode 一次都不翻，而 M / J 这些单 sequence 的键全正常）。
+    //   大小写本来就不影响匹配 —— 相邻的 "M" 用大写、裸按 m 一样生效。
+    sequence: "V"
     context: Qt.ApplicationShortcut
     enabled: root.toolKeysReady && root.canUseToolKeys()
     onActivated: root.toggleMoveTool()
@@ -3219,6 +3220,34 @@ Timer {
     }
 }
 
+// Probe: --probe-empty-click / --probe-empty-click-off —— 「点空白」在移动
+// 工具关掉时必须只清选区、**保留图层选中**（纯选区模式下图层选中是调色 /
+// 滤镜 / 抠图的目标，被一次画布点击悄悄清掉就会作用到整幅图）。
+// 直接调用画布按下走的同一个 `clickEmptyCanvas()`，不合成鼠标事件。
+Timer {
+    id: emptyClickProbeTimer
+    interval: 1400
+    running: Qt.application.arguments.indexOf("--probe-empty-click") !== -1
+             || Qt.application.arguments.indexOf("--probe-empty-click-off") !== -1
+    onTriggered: {
+        const off = Qt.application.arguments.indexOf("--probe-empty-click-off") !== -1
+        root.moveMode = !off
+        if (bridge.layer_count > 0 && bridge.selected_layer < 0)
+            bridge.select_layer(0)
+        // 造一个落在图层框外的选区：点空白应该清掉它（两种模式都一样）。
+        bridge.sel_set_rect(2, 2, 40, 40, 0)
+        bridge.mark("emptyclick-before: moveMode=" + root.moveMode
+                    + " selLayer=" + bridge.selected_layer
+                    + " selExists=" + root.selExists
+                    + " pick=" + (view.canvasSurface.layerPickAt(200, 200) === null
+                                   ? "null" : "hit"))
+        view.canvasSurface.clickEmptyCanvas()
+        bridge.mark("emptyclick-after: moveMode=" + root.moveMode
+                    + " selLayer=" + bridge.selected_layer
+                    + " selExists=" + root.selExists)
+    }
+}
+
 // Probe: --probe-toggle-heal / --probe-toggle-paint —— 直接调用标记栏那两个
 // 工具组按钮的处理函数（`togglePaintGroup`）：开一次、再关一次，断言关掉之后
 // 选区工具回到原样（以前会停在 none，框选整个失灵）。
@@ -3231,6 +3260,12 @@ Timer {
         const grp = Qt.application.arguments.indexOf("--probe-toggle-heal") !== -1
                   ? "heal" : "paint"
         root.markBarVisible = true
+        // 探针要跟「上一次存进 settings.ini 的 paintTool」解耦：用户记住的是
+        // spot/heal 时，第一次 toggle 是**关**而不是开，断言会整体反向。
+        if (root.paintTool !== "none") {
+            view.canvasSurface.cancelPaint()
+            root.paintTool = "none"
+        }
         root.togglePaintGroup(grp)
         bridge.mark("paint-toggle-open: paintTool=" + root.paintTool
                     + " selTool=" + root.selTool)
@@ -3480,7 +3515,11 @@ Component.onCompleted: {
     // 魔术棒参数：settings.ini 里的 "容差,连续,全部图层"。
     root.applyWandSpec(bridge.selWandSaved);
     // 修复 / 油漆工具参数（含上次使用的工具），`|` 分隔 12 段。
-    root.applyPaintSpec(bridge.paintSpecSaved);
+    // ★探针要用**干净的工具状态**：上次会话留下的 spot/heal 会让「点画布 =
+    //   拾取图层」变成「点画布 = 落笔」，真鼠标探针里图层一动不动，看起来像
+    //   吸附坏了。只在带 `--no-restore-tool` 的探针跑里跳过恢复。
+    if (Qt.application.arguments.indexOf("--no-restore-tool") === -1)
+        root.applyPaintSpec(bridge.paintSpecSaved);
     // Push the screen's device-pixel-ratio so the first preview frame is
     // rendered at the physical resolution (onDprChanged alone may not fire
     // for the initial value).

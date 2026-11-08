@@ -186,6 +186,12 @@ impl qobject::Bridge {
             return;
         }
         self.as_mut().set_paint_spec_saved(spec.clone());
+        // 脚本 / 探针跑（带 `--` 开关）不改用户偏好：探针里按一下 J 就把
+        // "spot" 写进 settings.ini，下次正常启动就带着污点工具起跑 ——
+        // 画布一点就落笔，真鼠标探针里看起来像「图层拖不动」。内存态照常更新。
+        if std::env::args().skip(1).any(|a| a.starts_with("--")) {
+            return;
+        }
         self.persist_config();
     }
 

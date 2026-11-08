@@ -101,9 +101,15 @@ Item {
     //   执行，而默认工具是矩形选框 —— 于是「选中图层 → 点空白」什么都不会
     //   发生（用户报的就是这个）。
     function clickEmptyCanvas() {
-        if (bridge.selected_layer >= 0)
+        // ★移动工具关掉时「点空白」只清选区，绝不动图层选中：这是纯选区 /
+        //   绘制模式，图层选中只是面板、滤镜、抠图的**目标**（调色与 erase
+        //   都按 `effective_selection` 裁到那一层）。被一次画布点击悄悄清掉，
+        //   用户看到的后果是「画了几笔选区，调色突然作用到整幅图」。
+        if (host.moveMode && bridge.selected_layer >= 0) {
             bridge.select_layer(-1)
-        else if (host.selExists)
+            return
+        }
+        if (host.selExists)
             bridge.sel_clear()
     }
 
@@ -1037,8 +1043,11 @@ Item {
             //    点中标记元素只允许拖拽/调整，不产生新元素。
             const hit = markAt(mouse.x, mouse.y)
             if (hit >= 0) {
-                if (bridge.selected_layer >= 0)
-                    bridge.select_layer(-1)   // 标记/图层选中互斥
+                // 标记 / 图层选中互斥 —— 但只在移动工具开着时成立。关掉移动
+                // 工具后图层选中是「纯目标」，点画布上的任何东西（包括标记）
+                // 都不该把它带走。
+                if (host.moveMode && bridge.selected_layer >= 0)
+                    bridge.select_layer(-1)
                 bridge.select_mark(hit)
                 if (beginGesture(2, mouse))
                     return
