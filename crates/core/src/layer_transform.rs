@@ -784,9 +784,12 @@ impl LayerTransform {
         let w = (sw * sx).round().max(1.0) as u32;
         let h = (sh * sy).round().max(1.0) as u32;
         let place = |width: u32, height: u32| {
+            // ★中心量化统一走 `round_center`（朝 +∞）：必须与拖动帧
+            // `composite_live_rotate_adjusted` 里的摆放用同一个函数，否则
+            // 负坐标那一侧会差 1px（见该函数的文档）。
             (
-                (self.center.0 - width as f64 / 2.0).round() as i32,
-                (self.center.1 - height as f64 / 2.0).round() as i32,
+                crate::transform::round_center(self.center.0 - width as f64 / 2.0) as i32,
+                crate::transform::round_center(self.center.1 - height as f64 / 2.0) as i32,
             )
         };
         if affine && no_rotation && no_skew {

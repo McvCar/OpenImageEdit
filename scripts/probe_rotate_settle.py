@@ -116,6 +116,12 @@ def main() -> int:
         ("先拉伸", base + "scale-layer:300,220;"),
         ("二次旋转", base + "rotate-handle:0,11,1;"),
         ("拉伸后二次", base + "scale-layer:300,220;rotate-handle:0,11,1;"),
+        # ★半像素中心：`transform-params` 用「外接框左上角 + 尺寸」，w=213 为
+        # 奇数 → center = 100+106.5 = 206.5。这是 11-08 用户日志里的真实状态
+        # （center.y=175.5）。拖动帧正方形很大，`center - nw/2` 变成**负数**，
+        # 一旦用 `f64::round()`（.5 远离零）就会比落定少 1px。
+        ("半像素中心", base + "transform-params:100,100,213,157,0,0;"),
+        ("半像素中心+二次", base + "transform-params:100,100,213,157,0,0;rotate-handle:0,11,1;"),
     ]
     for name, pre in scenes:
         hold = run_frames(img, zoom_op + pre + "rotate-hold:0,23", "hold_" + name)

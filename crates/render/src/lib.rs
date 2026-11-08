@@ -735,8 +735,8 @@ impl PreviewComposer {
             // `round(center)` 上，拖动不抖、松手不挪。
             let cxp = center.0 * sx;
             let cyp = center.1 * sy;
-            let ox = (cxp - nw as f64 / 2.0).round() as i32;
-            let oy = (cyp - nh as f64 / 2.0).round() as i32;
+            let ox = editcore::round_center(cxp - nw as f64 / 2.0) as i32;
+            let oy = editcore::round_center(cyp - nh as f64 / 2.0) as i32;
             let rotated = editcore::rotate_into_centered(
                 small,
                 rad.sin(),

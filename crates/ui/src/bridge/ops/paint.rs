@@ -697,17 +697,32 @@ impl qobject::Bridge {
             *cap = Some(LIVE_ROTATE_EDGE);
             let index = st.index;
             let snapshot = st.before.clone();
-            // ★拖动帧的内容中心 = **起手时的精确中心，一个常量**。
+            // ★拖动帧的内容中心 = **落定量化之后**的那个中心，一个常量。
             //
-            // 这里绝对不能每帧用当前角度的 AABB 去反推中心：AABB 宽高随角度
-            // 逐度变化（奇偶交替），`round(cx - W/2) + W/2` 就会在 `.0` 与
-            // `.5` 之间来回跳，30fps 下整层每帧位移 1px —— 就是用户看到的
-            // 「持续旋转时图层来回抖动」。
+            // 落定的摆放是 `round_center(center - W/2)`（图层 offset 只能整数）：
+            //  · `W` 为偶数（扩展包围盒，现在的常态）→ `W/2` 整数，内容中心恒为
+            //    `round_center(center)`，**与角度无关**；
+            //  · `W` 为奇数（勾了「不扩展」，W 就是源尺寸）→ 恒为
+            //    `round_center(center - W/2) + W/2`，同样与角度无关。
+            // 两种都是常量，所以拖动帧直接算一次即可，绝不每帧依赖当前 AABB。
             //
-            // 落定端同样是 `round(center - W/2)`，而 W 现在恒为偶数
-            // （`expanded_size` 取偶），所以落定的内容中心也恒等于
-            // `round(center)`：拖动与落定锚在同一点，既不抖也不跳。
-            let center = st.start_center;
+            // ★不能直接用 `start_center` 原值：真值可能是半像素（用户日志
+            //   center.y=175.5，由奇数尺寸拉伸产生），而落定只能落在整像素上
+            //   （1px 栅格），拖动帧若保留 .5 就恒定差半个像素 —— 屏幕上看就是
+            //   「松手后图层挪了一下」（zoom 195% 时约 1px）。
+            let (scx, scy) = st.start_center;
+            let center = if expand {
+                (
+                    editcore::round_center(scx),
+                    editcore::round_center(scy),
+                )
+            } else {
+                let (sw, sh) = snapshot.image.dimensions();
+                (
+                    editcore::round_center(scx - sw as f64 / 2.0) + sw as f64 / 2.0,
+                    editcore::round_center(scy - sh as f64 / 2.0) + sh as f64 / 2.0,
+                )
+            };
             let token = st.token;
             *frame = Some(LiveRotate {
                 index,
@@ -809,9 +824,10 @@ impl qobject::Bridge {
                     }
                 } else {
                     let (image, _delta) = editcore::rotate_image_hq(&st.before.image, total, false);
+                    // 「不扩展」也要用同一个中心量化（见 core::round_center）。
                     let offset = (
-                        (cx - image.width() as f64 / 2.0).round() as i32,
-                        (cy - image.height() as f64 / 2.0).round() as i32,
+                        editcore::round_center(cx - image.width() as f64 / 2.0) as i32,
+                        editcore::round_center(cy - image.height() as f64 / 2.0) as i32,
                     );
                     let after = Layer {
                         name: st.start.name.clone(),

@@ -71,6 +71,22 @@ def make_big_fixture(path: str) -> None:
     im.save(path)
 
 
+def make_half_fixture(path: str) -> None:
+    """半像素中心：`extract:120,90,341,271` → 图层中心 (290.5, 225.5)。
+
+    红块必须精确画在这个中心上（121×121，覆盖 230..350 / 165..285），否则
+    旋转时它会绕中心公转，质心本来就会动。
+    """
+    im = Image.new("RGB", (500, 380), (38, 44, 56))
+    d = ImageDraw.Draw(im)
+    for y in range(0, 380, 7):
+        d.line([(0, y), (500, y)], fill=(52, 60, 74))
+    for x in range(0, 500, 9):
+        d.line([(x, 0), (x, 380)], fill=(60, 68, 84))
+    d.rectangle([230, 165, 350, 285], fill=(212, 58, 48))
+    im.save(path)
+
+
 def run_frames(img: str, ops: str) -> tuple[list[str], str]:
     tmp = os.path.join(TMP, "drag")
     shutil.rmtree(tmp, ignore_errors=True)
@@ -134,6 +150,12 @@ def main() -> int:
         img = os.path.join(TMP, "big.png")
         make_big_fixture(img)
         ops = "extract:120,90,2800,2000;rotate-drag:0,2.6,5.2,7.8,10.4,13.0,15.6,18.2,20.8,23.4"
+    if "--half" in args:
+        # 半像素中心（341/271 都是奇数 → center 落在 .5 上）：拖动帧必须先用
+        # `round_center` 把中心量化到落定的整像素栅格，否则每帧都带 .5。
+        img = os.path.join(TMP, "half.png")
+        make_half_fixture(img)
+        ops = "extract:120,90,341,271;rotate-drag:0,2.6,5.2,7.8,10.4,13.0,15.6,18.2,20.8,23.4"
     frames, log = run_frames(img, ops)
     # 大图预览帧单张就有 20~30MB，临时文件保留策略只留 3 帧（见 session.rs
     # 的按体积保留），所以门槛跟着降。
@@ -145,8 +167,11 @@ def main() -> int:
     cs = [red_centroid(f) for f in frames]
     check("每帧都能找到图层内容", all(c[2] > 500 for c in cs),
           "面积 %s" % [c[2] for c in cs])
-    xs = [c[0] for c in cs]
-    ys = [c[1] for c in cs]
+    # 前两帧是 extract 之后的静止画面（还没开始转），它们与旋转帧之间会差
+    # 半个像素（1:1 贴图 vs 重采样），不属于抖动。只量「开始旋转之后」的帧。
+    rot = cs[2:] if len(cs) >= 6 else cs
+    xs = [c[0] for c in rot]
+    ys = [c[1] for c in rot]
     spread_x = max(xs) - min(xs)
     spread_y = max(ys) - min(ys)
     check("内容中心左右不抖动", spread_x <= 0.45,

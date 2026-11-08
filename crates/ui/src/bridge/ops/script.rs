@@ -781,8 +781,8 @@ impl qobject::Bridge {
                         };
                         let (ox, oy) = match center {
                             Some((cx, cy)) => (
-                                (cx - w as f64 / 2.0).round() as i32,
-                                (cy - h as f64 / 2.0).round() as i32,
+                                editcore::round_center(cx - w as f64 / 2.0) as i32,
+                                editcore::round_center(cy - h as f64 / 2.0) as i32,
                             ),
                             None => (0, 0),
                         };
@@ -823,8 +823,8 @@ impl qobject::Bridge {
                             };
                             match cur {
                                 Some((cx, cy)) => (
-                                    (cx - w as f64 / 2.0).round() as i32,
-                                    (cy - h as f64 / 2.0).round() as i32,
+                                    editcore::round_center(cx - w as f64 / 2.0) as i32,
+                                    editcore::round_center(cy - h as f64 / 2.0) as i32,
                                 ),
                                 None => (0, 0),
                             }

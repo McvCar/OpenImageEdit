@@ -35,7 +35,7 @@ pub use layer_transform::{
 };
 pub use transform::{
     rotate_image, rotate_image_hq, rotate_into, rotate_into_centered, rotated_aabb_size,
-    rotated_box_size, sample_affine, Transform,
+    rotated_box_size, round_center, sample_affine, Transform,
 };
 pub use paint::{crop_region, flood_fill, gradient_fill, Patch};
 pub use retouch::{
