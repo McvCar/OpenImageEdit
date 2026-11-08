@@ -55,6 +55,22 @@ def make_fixture(path: str) -> None:
     im.save(path)
 
 
+def make_big_fixture(path: str) -> None:
+    """3000×2200 大图：验证大图层（1:1 全尺寸预览）同样不抖。
+
+    `extract:120,90,2800,2000` → 图层中心 = (1520,1090)，红块画在那里。
+    注意大图预览帧单张 26MB，临时文件只保留 3 帧，所以 --big 的门槛是 3 帧。
+    """
+    im = Image.new("RGB", (3000, 2200), (38, 44, 56))
+    d = ImageDraw.Draw(im)
+    for y in range(0, 2200, 23):
+        d.line([(0, y), (3000, y)], fill=(52, 60, 74))
+    for x in range(0, 3000, 31):
+        d.line([(x, 0), (x, 2200)], fill=(60, 68, 84))
+    d.rectangle([1320, 890, 1720, 1290], fill=(212, 58, 48))
+    im.save(path)
+
+
 def run_frames(img: str, ops: str) -> tuple[list[str], str]:
     tmp = os.path.join(TMP, "drag")
     shutil.rmtree(tmp, ignore_errors=True)
@@ -113,9 +129,17 @@ def main() -> int:
 
     # 一次 begin + 9 次 update：模拟按住旋柄一路转过去（每步 2.6°）。
     ops = "extract:120,90,340,270;rotate-drag:0,2.6,5.2,7.8,10.4,13.0,15.6,18.2,20.8,23.4"
+    if "--big" in args:
+        # 大图层：预览走降采样（sx<1），验证缩放路径同样不抖。
+        img = os.path.join(TMP, "big.png")
+        make_big_fixture(img)
+        ops = "extract:120,90,2800,2000;rotate-drag:0,2.6,5.2,7.8,10.4,13.0,15.6,18.2,20.8,23.4"
     frames, log = run_frames(img, ops)
-    check("至少落盘 6 帧拖动预览", len(frames) >= 6, "%d 帧" % len(frames))
-    if len(frames) < 6:
+    # 大图预览帧单张就有 20~30MB，临时文件保留策略只留 3 帧（见 session.rs
+    # 的按体积保留），所以门槛跟着降。
+    need = 3 if "--big" in args else 6
+    check("至少落盘 %d 帧拖动预览" % need, len(frames) >= need, "%d 帧" % len(frames))
+    if len(frames) < need:
         return 1
 
     cs = [red_centroid(f) for f in frames]
