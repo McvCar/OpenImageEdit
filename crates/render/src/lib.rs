@@ -725,18 +725,14 @@ impl PreviewComposer {
                 self.rotate_small = Some((token, pw, ph, Arc::new(small)));
             }
             let small = &self.rotate_small.as_ref().expect("just filled").3;
-            // ★固定输出尺寸（对角线正方形）：整段拖拽里它不变，采样网格也就
-            // 恒定，每帧只有角度在动。多留 1px 是给下面那个 ±0.5px 的居中
-            // 余量（内容中心要落在落定的亚像素位置上）。
+            // ★固定输出尺寸（对角线正方形、取偶 + 2px 余量）：整段拖拽里它
+            // 不变，采样网格也就恒定，每帧只有角度在动。尺寸取偶是硬要求 ——
+            // 奇数尺寸会让内容中心落在半像素上，见 `expanded_size` 的说明。
             let (nw, nh) = editcore::rotated_box_size(pw, ph, expand);
-            // 「扩展」时多留 1px：内容中心要跟落定的亚像素中心对齐，正方形
-            // 恰好等于对角线时再偏 0.5px 会切掉一条边。「不扩展」是裁剪语义，
-            // 尺寸必须与落定一致，不加。
-            let (nw, nh) = if expand { (nw + 1, nh + 1) } else { (nw, nh) };
             let rad = degrees.to_radians();
-            // ★关键：把内容中心摆到**落定后**的中心（画布坐标 * 预览倍率），
-            // 而不是「正方形中心」。落定用紧致 AABB，宽高为奇数时中心落在
-            // .5 上；预览若自己凑一个中心，二次旋转后松手会平移 1px。
+            // ★关键：把内容中心摆到**落定后**的中心（画布坐标 * 预览倍率）。
+            // 落定同样是 `round(center - W/2)`，W 恒为偶数 → 两边都锚在
+            // `round(center)` 上，拖动不抖、松手不挪。
             let cxp = center.0 * sx;
             let cyp = center.1 * sy;
             let ox = (cxp - nw as f64 / 2.0).round() as i32;
@@ -749,6 +745,17 @@ impl PreviewComposer {
                 nh,
                 ((cxp - ox as f64) as f32, (cyp - oy as f64) as f32),
             );
+            // 诊断开关：`set IMAGEEDIT_ROTATE_TRACE=1` 才打印每帧几何，
+            // 正常使用不刷日志（拖动时每帧一行会淹掉别的输出）。
+            if std::env::var_os("IMAGEEDIT_ROTATE_TRACE").is_some() {
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"rotate-live\",\"deg\":{degrees:.2},\"s\":[{pw}x{ph}],\
+                     \"out\":[{nw}x{nh}],\"place\":[{ox},{oy}],\"c\":[{cxp:.2},{cyp:.2}],\
+                     \"dc\":[{:.2},{:.2}],\"sx\":{sx:.4}}}",
+                    cxp - ox as f64,
+                    cyp - oy as f64
+                );
+            }
             let src = match adjust {
                 Some((AdjustTarget::Layer(index), params)) if index == layer_index => {
                     let mut adjusted = rotated;

@@ -1527,8 +1527,10 @@ mod paint_tests {
         let mut img = RgbaImage::from_pixel(10, 10, image::Rgba([255, 255, 255, 255]));
         img.put_pixel(5, 5, image::Rgba([0, 0, 0, 255]));
         let (out, delta) = rotate_image(&img, 45.0, true);
-        assert!(out.width() > 13 && out.width() < 16, "w={}", out.width());
-        assert!(out.height() > 13 && out.height() < 16);
+        // 对角线 ceil(10√2)=15 → **向上取偶** 16：偶数尺寸让内容中心恒落在
+        // 整像素上（见 expanded_size 的说明），否则拖动帧会逐帧抖半像素。
+        assert_eq!(out.width(), 16, "对角线 15 取偶 → 16");
+        assert_eq!(out.height(), 16);
         // 黑点仍存在，且位于输出画面的中心附近（旋转不移动中心）。
         let mut dark = (0u32, 0u32, 0u32);
         for y in 0..out.height() {
@@ -1557,7 +1559,7 @@ mod paint_tests {
         // 100×60 的实心块：扫一圈角度，输出尺寸与偏移都该是同一个值。
         let img = RgbaImage::from_pixel(100, 60, image::Rgba([200, 120, 40, 255]));
         let (nw, nh) = rotated_box_size(100, 60, true);
-        assert_eq!((nw, nh), (117, 117), "对角线正方形：ceil(hypot(100,60))");
+        assert_eq!((nw, nh), (120, 120), "对角线正方形：ceil(hypot(100,60)) 取偶 + 2px 余量");
         let mut first: Option<(i32, i32)> = None;
         for deg in [0.0f32, 3.25, 17.0, 45.0, 61.5, 89.9, 120.0, 180.0] {
             let rad = deg.to_radians();

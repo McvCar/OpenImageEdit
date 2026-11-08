@@ -697,24 +697,17 @@ impl qobject::Bridge {
             *cap = Some(LIVE_ROTATE_EDGE);
             let index = st.index;
             let snapshot = st.before.clone();
-            // ★拖动帧必须摆在**落定后的内容中心**上，不是「源图中心」。
+            // ★拖动帧的内容中心 = **起手时的精确中心，一个常量**。
             //
-            // 落定（`render_compatible`）的摆放是 `round(center - AABB/2)`，
-            // 内容中心 = 摆放 + AABB/2；AABB 宽高为奇数时它落在 .5 上。
-            // 预览如果按源图尺寸自己凑一个中心，二次旋转（源图宽与 AABB 的
-            // 奇偶不同）就差 0.5~1px —— 用户看到「松手画面挪一下」。
-            // 中心仍取 `start_center`（params 真值），不能由 `start.offset +
-            // 位图尺寸/2` 反推（那是被 round 过的，转一次漂 0.5px）。
-            let (sw, sh) = snapshot.image.dimensions();
-            let (out_w, out_h) = if expand {
-                editcore::rotated_aabb_size(sw, sh, total)
-            } else {
-                (sw, sh)
-            };
-            let center = (
-                (st.start_center.0 - out_w as f64 / 2.0).round() + out_w as f64 / 2.0,
-                (st.start_center.1 - out_h as f64 / 2.0).round() + out_h as f64 / 2.0,
-            );
+            // 这里绝对不能每帧用当前角度的 AABB 去反推中心：AABB 宽高随角度
+            // 逐度变化（奇偶交替），`round(cx - W/2) + W/2` 就会在 `.0` 与
+            // `.5` 之间来回跳，30fps 下整层每帧位移 1px —— 就是用户看到的
+            // 「持续旋转时图层来回抖动」。
+            //
+            // 落定端同样是 `round(center - W/2)`，而 W 现在恒为偶数
+            // （`expanded_size` 取偶），所以落定的内容中心也恒等于
+            // `round(center)`：拖动与落定锚在同一点，既不抖也不跳。
+            let center = st.start_center;
             let token = st.token;
             *frame = Some(LiveRotate {
                 index,

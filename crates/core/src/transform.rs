@@ -106,7 +106,21 @@ pub(crate) fn transform_document(doc: &mut Document, transform: Transform) {
 /// 好几像素（"旋转一圈后四边越来越大"）。减去 1‰ 像素只影响远小于一像素的
 /// 残差，真正需要裁切的角度（如 37.0001°）仍然照样进一位。
 fn expanded_size(w: f32, h: f32, sin: f32, cos: f32) -> (u32, u32) {
-    let cell = |v: f32| ((v - 1e-3).ceil() as i64).max(1) as u32;
+    // ★必须**向上取偶**（多 1px 透明边），奇偶性直接决定画面会不会抖：
+    //
+    // 摆放是 `round(center - W/2)`（图层 offset 只能是整数），所以内容中心
+    // 实际落在 `round(center - W/2) + W/2`。W 为偶数时 W/2 是整数，这个值
+    // 恒等于 `round(center)`，与旋转角度无关；W 为奇数时它变成 `round(... )
+    // + 0.5`，落在半像素上。
+    //
+    // 而 AABB 宽高随角度逐度变化（奇偶交替），拖动帧每帧都用当前角度重算
+    // 中心 → 中心在 `.0 / .5` 之间来回跳 → 整层每帧跳 1px（用户 11-08 报的
+    // 「持续旋转时图层来回抖动，放大 200 多倍才看清」）。取偶之后中心是常量，
+    // 拖动帧与落定帧也锚在同一个点，松手不再平移。
+    let cell = |v: f32| {
+        let n = ((v - 1e-3).ceil() as i64).max(1) as u32;
+        n + (n & 1)
+    };
     (
         cell(w * cos.abs() + h * sin.abs()),
         cell(w * sin.abs() + h * cos.abs()),
@@ -292,12 +306,17 @@ fn rotate_to_at(
 /// 整段旋转手势里恒定不变的输出尺寸：取对角线长度的正方形——
 /// 任何角度下的包围盒都装得下，而尺寸与角度无关。`expand=false`（不扩边界）
 /// 时直接用原尺寸。
+///
+/// ★尺寸再**向上取偶并多留 2px**：偶数让内容中心恒等于 `round(center)`
+/// （见 [`expanded_size`]），2px 余量吸收那半个像素的居中偏差，避免贴边的那
+/// 一行/一列被裁掉。
 pub fn rotated_box_size(w: u32, h: u32, expand: bool) -> (u32, u32) {
     if !expand {
         return (w.max(1), h.max(1));
     }
     let d = (((w as f32) * (w as f32) + (h as f32) * (h as f32)).sqrt() - 1e-3).ceil() as u32;
-    (d.max(1), d.max(1))
+    let d = d + (d & 1) + 2;
+    (d.max(4), d.max(4))
 }
 
 /// 落定时的**紧致**外接框尺寸（与 `rotate_image_hq(.., expand=true)` 的输出

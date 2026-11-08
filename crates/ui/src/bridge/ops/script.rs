@@ -1136,6 +1136,27 @@ impl qobject::Bridge {
                         }
                     }
                 }
+                // `rotate-drag:index,deg1,deg2,...` —— **一次** begin + 多次
+                // update，模拟「按住旋柄持续旋转」。每帧都会落一张预览 BMP，
+                // 供 `probe_rotate_jitter.py` 逐帧比内容中心：中心必须单调
+                // （不来回跳），否则就是每帧重算转轴导致的抖动。
+                other if other.starts_with("rotate-drag:") => {
+                    let n = parse_nums(other);
+                    if n.len() >= 2 {
+                        let ix = n[0] as i32;
+                        self.as_mut().rotate_layer_begin(ix, true);
+                        for deg in &n[1..] {
+                            self.as_mut().rotate_layer_update(*deg, true, 0);
+                            println!(
+                                "{{\"phase\":\"ui\",\"event\":\"rotate-drag\",\"degrees\":{deg:.2}}}"
+                            );
+                        }
+                    } else {
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        )
+                    }
+                }
                 // `rotate-hold:index,degrees[,expand]` —— 只 begin + update，
                 // **不 finish**：把拖动中的那一帧留在屏幕上，用来截图核对
                 // 「拖动中的内容位置」和松手后是否一致（以前预览用的是锚点的
