@@ -686,9 +686,15 @@ impl qobject::Bridge {
             else {
                 return;
             };
-            let degrees = editcore::snap_angle_15(
+            let degrees = editcore::snap_angle(
                 st.base_degrees as f64 + degrees,
                 mods & super::transform::MOD_SHIFT != 0,
+                15.0,
+                if mods & super::transform::MOD_MAGNET != 0 {
+                    super::transform::MAGNET_TOL
+                } else {
+                    0.0
+                },
             ) - st.base_degrees as f64;
             let total = st.base_degrees + degrees as f32;
             st.last_delta = degrees as f32;
@@ -754,9 +760,16 @@ impl qobject::Bridge {
                 Some(TransformSession::Rotate { live, .. }) => live.base_degrees as f64,
                 _ => 0.0,
             };
-            let degrees =
-                editcore::snap_angle_15(base + degrees, mods & super::transform::MOD_SHIFT != 0)
-                    - base;
+            let degrees = editcore::snap_angle(
+                base + degrees,
+                mods & super::transform::MOD_SHIFT != 0,
+                15.0,
+                if mods & super::transform::MOD_MAGNET != 0 {
+                    super::transform::MAGNET_TOL
+                } else {
+                    0.0
+                },
+            ) - base;
             let Some(st) = session.take_rotate_live() else {
                 // 迟到 / 重复的收尾（onReleased 之后又来一次 onCanceled，或
                 // QML 补的清理调用）：会话已经结束了，但临时预览态可能因为

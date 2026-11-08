@@ -19,6 +19,14 @@ use editcore::snap::{
 const QT_SHIFT: i32 = 0x0200_0000;
 const QT_CTRL: i32 = 0x0400_0000;
 const QT_ALT: i32 = 0x0800_0000;
+/// 合成位（不是 Qt 修饰键）：**交互式旋转手柄**专用，表示「角度磁吸开」。
+///
+/// 磁吸（贴近 15° 整数倍就自己咬住）只该发生在用户拖手柄时；脚本探针与数值
+/// 面板必须能摆出 91.4° 这种任意角度，所以不能无条件下沉到求解器里。QML 在
+/// `mouse.modifiers` 上或上这一位即可，脚本传 0 保持原有语义。
+pub(super) const MOD_MAGNET: i32 = 0x1000_0000;
+/// 磁吸窗口（度）：±3° 内吸到最近的 15° 整数倍。
+pub(super) const MAGNET_TOL: f64 = 3.0;
 pub(super) const GESTURE_MOVE: i32 = 0;
 pub(super) const GESTURE_SCALE: i32 = 1;
 pub(super) const GESTURE_ROTATE: i32 = 2;

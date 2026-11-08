@@ -98,6 +98,23 @@ pub fn snap_angle_15(deg: f64, shift: bool) -> f64 {
     }
 }
 
+/// 角度吸附的两档语义（旋转手柄用）：
+/// * `force`（Shift）= 硬吸，落在 `step` 的整数倍上，中间没有过渡；
+/// * 否则 = **磁吸**：只有已经贴近某个整数倍（`|差| <= tol`）才吸上去，
+///   其余角度原样返回。这样 0/45/90/180 这些常用角度会「自己咬住」，
+///   同时又能摆出任意角度（拖过去时轻微一顿，越过就脱开）。
+pub fn snap_angle(deg: f64, force: bool, step: f64, tol: f64) -> f64 {
+    if !(step > 0.0) || !step.is_finite() || !deg.is_finite() {
+        return deg;
+    }
+    let nearest = (deg / step).round() * step;
+    if force || (tol > 0.0 && (deg - nearest).abs() <= tol) {
+        nearest
+    } else {
+        deg
+    }
+}
+
 /// 缩放手势语义求解。
 ///
 /// * `start`：起手外接框（图像坐标）。
@@ -332,5 +349,18 @@ mod tests {
         assert!((snap_angle_15(23.0, true) - 30.0).abs() < 1e-9);
         assert!((snap_angle_15(-22.0, true) - (-15.0)).abs() < 1e-9);
         assert!((snap_angle_15(44.0, true) - 45.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn magnetic_angle_only_bites_near_multiples() {
+        // 磁吸窗口 3°：91.4 → 90；93.6 已经越过窗口 → 原样。
+        assert!((snap_angle(91.4, false, 15.0, 3.0) - 90.0).abs() < 1e-9);
+        assert!((snap_angle(93.6, false, 15.0, 3.0) - 93.6).abs() < 1e-9);
+        // 负角对称（-89 贴近 -90）。
+        assert!((snap_angle(-89.0, false, 15.0, 3.0) - (-90.0)).abs() < 1e-9);
+        // Shift = 硬吸，没有窗口限制。
+        assert!((snap_angle(93.6, true, 15.0, 0.0) - 90.0).abs() < 1e-9);
+        // tol = 0 等于不吸（脚本 / 数值面板路径行为不变）。
+        assert!((snap_angle(91.4, false, 15.0, 0.0) - 91.4).abs() < 1e-9);
     }
 }

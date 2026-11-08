@@ -44,8 +44,13 @@ Rectangle {
         // 只在需要时改写文本：每敲一个字都重设 text 会把光标顶到末尾。
         if (input.text !== String(v))
             input.text = String(v)
-        if (v !== sb.value)
+        if (v !== sb.value) {
+            // ★先把 value 同步过去再发信号：宿主（变换数值面板）是在
+            //   onEdited 里读 `px.value` 的，只发信号不改 value 的话，宿主拿到的
+            //   永远是上一版的旧数值 —— 表现就是「改数值完全没反应」。
+            sb.value = v
             sb.edited(v)
+        }
     }
 
     // 提交并交出键盘。★ 必须交：TextInput 拿着焦点时 Ctrl+Z 会被它自己的

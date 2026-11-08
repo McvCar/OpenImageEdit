@@ -123,12 +123,7 @@ Rectangle {
                       || host.markTool === "rect" || host.markTool === "ellipse"
                       || host.markTool === "arrow" || host.markTool === "brush"
                       || host.markTool === "mosaic"
-            onClicked: {
-                fontPopover.visible = false
-                widthPopover.visible = false
-                mosaicPopover.visible = false
-                markShapePopover.visible = !markShapePopover.visible
-            }
+            onClicked: host.toggleMarkShapeBtn()
             Canvas {
                 width: 22
                 height: 22

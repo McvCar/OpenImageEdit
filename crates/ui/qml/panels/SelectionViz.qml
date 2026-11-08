@@ -487,12 +487,15 @@ Item {
                     pivotY = rotateHandleBox.by + rotateHandleBox.bh / 2
                     const p = mapToItem(previewImage, mouse.x, mouse.y)
                     startAngle = Math.atan2(p.y - pivotY, p.x - pivotX) * 180 / Math.PI
+                    rotateMods = mouse.modifiers | host.rotateMagnetBit
                     host.startLayerRotate()
                 }
                 onPositionChanged: (mouse) => {
                     if (!pressed)
                         return
-                    rotateMods = mouse.modifiers
+                    // 0x1000_0000 = 「角度磁吸」合成位（不是 Qt 修饰键）：
+                    // 贴近 0/45/90/180… 时自己咬住，Shift 仍然是硬吸 15° 步进。
+                    rotateMods = mouse.modifiers | host.rotateMagnetBit
                     const p = mapToItem(previewImage, mouse.x, mouse.y)
                     const a = Math.atan2(p.y - pivotY, p.x - pivotX) * 180 / Math.PI
                     let d = a - startAngle

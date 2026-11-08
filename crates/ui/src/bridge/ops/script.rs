@@ -1170,6 +1170,38 @@ impl qobject::Bridge {
                         )
                     }
                 }
+                // `rotate-snap:index,degrees[,mods]` —— 带修饰键位跑一轮完整的
+                // 旋转（begin → update → finish），打印落定后的角度。用来回归
+                // 「Shift 硬吸 15°」与「交互手柄的角度磁吸（0x1000_0000）」：
+                // mods 传 0 时必须原样落定（脚本 / 数值面板要能摆任意角度）。
+                other if other.starts_with("rotate-snap:") => {
+                    let n = parse_nums(other);
+                    if n.len() >= 2 {
+                        let ix = n[0] as i32;
+                        let deg = n[1];
+                        let mods = n.get(2).copied().unwrap_or(0.0) as i32;
+                        let base = self.as_mut().rotate_layer_begin(ix, true);
+                        self.as_mut().rotate_layer_update(deg, true, mods);
+                        self.as_mut().rotate_layer_finish(true, deg, true, mods);
+                        let rot = {
+                            let guard = self.session.borrow();
+                            guard
+                                .as_ref()
+                                .and_then(|s| s.doc.layers.get(ix.max(0) as usize))
+                                .and_then(|l| l.transform.as_ref())
+                                .map(|t| t.rotation)
+                                .unwrap_or(0.0)
+                        };
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"rotate-snap\",\"base\":{base:.3},\
+                             \"in\":{deg:.3},\"mods\":{mods},\"rot\":{rot:.3}}}"
+                        );
+                    } else {
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        )
+                    }
+                }
                 // `rotate-hold:index,degrees[,expand]` —— 只 begin + update，
                 // **不 finish**：把拖动中的那一帧留在屏幕上，用来截图核对
                 // 「拖动中的内容位置」和松手后是否一致（以前预览用的是锚点的

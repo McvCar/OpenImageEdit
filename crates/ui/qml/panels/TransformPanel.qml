@@ -18,7 +18,10 @@ Rectangle {
 
     visible: bridge.transformPanelVisible && vals.has === true
     width: 222
-    height: 160
+    // 标题 26 + 上边距 10 + 三行 22×3 + 行距 6×2 = 114；参考点网格顶到
+    // 122、高 48 → 内容最低 170，再留 12 的底边距。以前写死 160，网格最后
+    // 一行被裁掉（看着像「布局错乱」）。
+    height: 182
     radius: 6
     color: "#f21d2024"
     border.color: "#5a6068"
@@ -74,25 +77,36 @@ Rectangle {
         MouseArea {
             anchors.fill: parent
             cursorShape: Qt.SizeAllCursor
-            property real grabX: 0
-            property real grabY: 0
+            // ★位移必须用**场景坐标**算：MouseArea 挂在被拖的面板自己身上，
+            //   面板一动，mouse.x/y 的参照系跟着走 —— 用局部坐标算增量会形成
+            //   正反馈（拖 1px 面板移动 2px，再拖又翻倍），表现出来是「面板不跟
+            //   鼠标 + 一直抖」。按下与移动都换算到 scene，增量才和鼠标一致。
+            property real grabSceneX: 0
+            property real grabSceneY: 0
             property real panelX: 0
             property real panelY: 0
+            function scenePt(mx, my) {
+                return mapToItem(null, mx, my)
+            }
             onPressed: (mouse) => {
-                grabX = mouse.x; grabY = mouse.y
-                panelX = panel.x; panelY = panel.y
+                const g = scenePt(mouse.x, mouse.y)
+                grabSceneX = g.x
+                grabSceneY = g.y
+                panelX = panel.x
+                panelY = panel.y
             }
             onPositionChanged: (mouse) => {
                 if (!pressed)
                     return
-                const px = panel.parent ? panel.parent.width : 0
-                const py = panel.parent ? panel.parent.height : 0
+                const g = scenePt(mouse.x, mouse.y)
+                const pw = panel.parent ? panel.parent.width : 0
+                const ph = panel.parent ? panel.parent.height : 0
                 // 允许拖出左边一点（贴边收纳），但永远留 40px 可抓回来；
                 // 上下不出父项可视范围。
                 panel.x = Math.max(40 - panel.width,
-                                   Math.min(panelX + mouse.x - grabX, px - 40))
+                                   Math.min(panelX + g.x - grabSceneX, pw - 40))
                 panel.y = Math.max(0,
-                                   Math.min(panelY + mouse.y - grabY, py - 24))
+                                   Math.min(panelY + g.y - grabSceneY, ph - 24))
             }
         }
         Text {

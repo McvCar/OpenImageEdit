@@ -452,6 +452,9 @@ Item {
     property real scaleCenterDy: 0
     // 旋转拖动中的实时修饰键（Shift 15° 吸角，语义在 Rust 解出）。
     property int rotateMods: 0
+    // 角度磁吸的合成位掩码（对应 Rust `MOD_MAGNET`）：交互式手柄才带，
+    // 脚本探针 / 数值面板不带 —— 那边必须能摆出 91.4° 这种任意角度。
+    readonly property int rotateMagnetBit: 0x10000000
     property int renamingIndex: -1
     readonly property var layerList: Layers.parseLayers(bridge.layers_json)
     // The layer PANEL rebuilds its Repeater whenever the model array is
@@ -1906,6 +1909,26 @@ function chooseMarkTool(tool) {
         root.setMarkTool(tool)
 }
 
+// 标记栏「形状与马赛克」按钮：工具开着时再点一次 = **退出**（和移动工具
+// 按钮一样的开关语义，用户报的就是「点了关不掉，只能再选别的工具」）；
+// 没有工具在用时，这个按钮才用来展开/收起选择面板。
+function toggleMarkShapeBtn() {
+    fontPopover.visible = false
+    widthPopover.visible = false
+    mosaicPopover.visible = false
+    const active = root.markTool === "rect" || root.markTool === "ellipse"
+                || root.markTool === "arrow" || root.markTool === "brush"
+                || root.markTool === "mosaic"
+    if (!active) {
+        markShapePopover.visible = !markShapePopover.visible
+        return
+    }
+    // setMarkTool 是切换语义：同一个工具再设一次就回到 none。
+    root.setMarkTool(root.markTool)
+    markShapePopover.visible = false
+    view.canvasSurface.cancelPaint()
+}
+
 // ---- 修复 / 油漆工具族 -------------------------------------------------
 
 function paintGroupOf(tool) {
@@ -1937,12 +1960,20 @@ function setPaintTool(tool) {
     root.savePaintSpec()
 }
 
-// 标记栏上的两个工具组按钮：点开/收起对应的参数面板。
+// 标记栏上的两个工具组按钮：点开/收起对应的参数面板；该组工具**正在用**
+// 时再点一次 = 退出这组工具（开关语义，和移动工具按钮一致）。
 function togglePaintGroup(group) {
     if (group !== "heal" && group !== "paint")
         return
     root.markBarVisible = true
-    if (root.paintPopoverOpen && root.paintGroup === group) {
+    const cur = root.paintTool
+    const inside = group === "heal"
+                   ? (cur === "spot" || cur === "heal" || cur === "patch")
+                   : (cur === "bucket" || cur === "gradient")
+    if (inside) {
+        // 以前这里只收面板、工具还亮着 —— 按钮看着"关不掉"，只能去选别的
+        // 工具才能退出。setPaintTool 是切换语义：同一个工具再设一次 = none。
+        root.setPaintTool(cur)
         root.closePaintPopovers()
         return
     }
@@ -1951,12 +1982,7 @@ function togglePaintGroup(group) {
     paintPop.visible = (group === "paint")
     root.paintPopoverOpen = true
     // 组里还没有激活的工具时，默认选第一个。
-    const cur = root.paintTool
-    const inside = group === "heal"
-                   ? (cur === "spot" || cur === "heal" || cur === "patch")
-                   : (cur === "bucket" || cur === "gradient")
-    if (!inside)
-        root.setPaintTool(group === "heal" ? "spot" : "bucket")
+    root.setPaintTool(group === "heal" ? "spot" : "bucket")
 }
 
 function closePaintPopovers() {
@@ -1965,19 +1991,17 @@ function closePaintPopovers() {
     root.paintPopoverOpen = false
 }
 
-// 幂等地「选中某个工具 + 展开它那一组面板」：setPaintTool 是切换语义
-// （再点一次取消），所以先比一下，避免把已经选中的工具关掉。
+// 幂等地「选中某个工具 + 展开它那一组面板」。
+// ★不能复用 togglePaintGroup：那现在是开关语义（工具在用时会被关掉），
+//   而这里要的是「确保打开」。显式设状态，重复调用也安全。
 function openPaintPanelFor(tool) {
     const g = root.paintGroupOf(tool)
     if (g === "")
         return
     if (root.paintTool !== tool)
         root.setPaintTool(tool)
-    if (!root.paintPopoverOpen || root.paintGroup !== g) {
-        root.togglePaintGroup(g)
-        return
-    }
-    // 面板已经开着：只同步可见性，不要重复走 toggle（会把它收起来）。
+    root.paintGroup = g
+    root.paintPopoverOpen = true
     healPop.visible = (g === "heal")
     paintPop.visible = (g === "paint")
 }
@@ -2185,11 +2209,14 @@ function finishLayerRotate(apply, mods) {
         root.setRotateFrame(ix, w, h, root.rotateBase)
         return
     }
-    // 帧记录的角度与落定保持同一吸角规则（与 Rust snap_angle_15 相同公式，
+    // 帧记录的角度与落定保持同一吸角规则（与 Rust `snap_angle` 相同公式，
     // 按累计角吸附；这只是 viz 簿记，几何真值仍以历史 params 为准）。
     let a = root.rotateBase + root.rotateAnglePreview
-    if ((mods || 0) & Qt.ShiftModifier)
-        a = Math.round(a / 15) * 15
+    const nearest = Math.round(a / 15) * 15
+    const shift = ((mods || 0) & Qt.ShiftModifier) !== 0
+    const magnet = ((mods || 0) & root.rotateMagnetBit) !== 0
+    if (shift || (magnet && Math.abs(a - nearest) <= 3))
+        a = nearest
     // 归一化到 (-180, 180]，转一整圈后框不该"看起来转了 360°"。
     while (a > 180) a -= 360
     while (a <= -180) a += 360
@@ -3186,6 +3213,7 @@ Timer {
                     + " textPopup=" + view.canvasSurface.textPopup.visible
                     + " sizeFocus=" + fontPopover.sizeInput.activeFocus
                     + " markTool=" + root.markTool
+                    + " paintTool=" + root.paintTool
                     + " layers=" + bridge.layer_count
                     + " mbox=" + (function () {
                         const b = root.selectedMarkBox()

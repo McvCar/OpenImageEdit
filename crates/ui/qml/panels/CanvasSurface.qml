@@ -107,6 +107,35 @@ Item {
             bridge.sel_clear()
     }
 
+    // 移动工具开着、并且已经有选中图层时：在**图层框外**起手画选区 =
+    // 明确要把这次选区作用在背景上，先取消图层选中。不取消的话选区会被
+    // `effective_selection` 裁到那一层里、抠图 / 调色也只动那一层，用户看到
+    // 的就是「在别处拉了一框，结果只选中了图层里的那一小块」。
+    // * 框内起手不动它：用户可能就是要在这层里选区。
+    // * 移动工具关掉时保持原样（纯选区模式，图层选中不影响手感）。
+    function dropLayerForSelection(mx, my) {
+        if (Qt.application.arguments.indexOf("--probe-keys") !== -1) {
+            const bx = host.selLayerBox
+            const pp = toImage(mx, my)
+            bridge.mark("drop-layer: mm=" + host.moveMode
+                        + " sel=" + bridge.selected_layer
+                        + " p=" + Math.round(pp[0]) + "," + Math.round(pp[1])
+                        + " b=" + (bx ? [Math.round(bx.x), Math.round(bx.y),
+                                          Math.round(bx.w), Math.round(bx.h)].join(",") : "null")
+                        + " tool=" + host.selTool)
+        }
+        if (!host.moveMode || bridge.selected_layer < 0)
+            return
+        const b = host.selLayerBox
+        if (b === null || !(b.w > 0) || !(b.h > 0)) {
+            bridge.select_layer(-1)
+            return
+        }
+        const p = toImage(mx, my)
+        if (p[0] < b.x || p[0] > b.x + b.w || p[1] < b.y || p[1] > b.y + b.h)
+            bridge.select_layer(-1)
+    }
+
     function cancelPolygon() {
         if (!selPolyActive && polyPts.length === 0)
             return
@@ -373,6 +402,7 @@ Item {
             // 必须排在「按在选区内 = 移动选区」前面：魔棒每次点击都是重新
             // 取色，不能因为点在旧选区里就变成拖选区。
             if (host.selTool === "wand") {
+                dropLayerForSelection(mouse.x, mouse.y)
                 const pw = toImage(mouse.x, mouse.y)
                 bridge.sel_magic_wand(pw[0], pw[1], host.wandTolerance,
                                       host.wandContiguous, host.wandSampleAll,
@@ -382,6 +412,7 @@ Item {
             // 快速选择：按住涂抹。第一笔就决定这次的合成模式（Shift 加选 /
             // Alt 减选），中途改修饰键不会让选区跳变。
             if (host.selTool === "quick") {
+                dropLayerForSelection(mouse.x, mouse.y)
                 const pw = toImage(mouse.x, mouse.y)
                 quickDrag = true
                 bridge.quick_select_brush(pw[0], pw[1], host.quickRadius,
@@ -421,6 +452,7 @@ Item {
             }
             // 多边形套索：一次点击加一个顶点，双击 / 点回起点 / 回车闭合。
             if (host.selTool === "polygon") {
+                dropLayerForSelection(mouse.x, mouse.y)
                 addPolygonPoint(mouse.x, mouse.y)
                 return
             }
@@ -429,6 +461,8 @@ Item {
                 clickEmptyCanvas()
                 return
             }
+            // 框选 / 套索起手：图层框外起手就先退出图层选中（见函数注释）。
+            dropLayerForSelection(mouse.x, mouse.y)
             startX = mouse.x
             startY = mouse.y
             curX = mouse.x
