@@ -441,6 +441,262 @@ pub fn fit_into_gaps(moving: (f64, f64, f64, f64), occ: &Occupancy, threshold: f
     out
 }
 
+// ---- 透明区域当图层：洞的边 / 中心线 --------------------------------------------
+//
+// 「咬合」只在内容**装得下**空窗时生效；元素比洞大、或者只想让某条边压在洞壁
+// 上时它帮不上忙。这里把「被不透明内容围住的透明区域」当成一个**虚拟图层**，
+// 直接产出它的外接框，交给 `snap::hole_candidates` 变成六条边 / 中心线 ——
+// 和真实图层的 `bounds()` 走同一条求解路径，于是「洞」也能当对齐基准用。
+
+/// 粗扫网格边长上限（格）。大图按步长降采样，小图 1:1 —— 每层成本恒定在
+/// ~2 万格以内，手势起手扫一圈几十层也就几毫秒。
+const HOLE_GRID: u32 = 160;
+
+#[inline]
+fn alpha_at(raw: &[u8], iw: u32, x: u32, y: u32) -> u8 {
+    raw[(y as usize * iw as usize + x as usize) * 4 + 3]
+}
+
+/// 源图里被不透明内容**围住**的透明区域外接框（源图像素坐标）。
+///
+/// 只收「洞」：连通块贴到图边界的直接丢掉 —— 那是透明边距 / 画布外空白，
+/// 当成对齐线会让每个带 padding 的素材凭空多出四条线。
+///
+/// `limit` 是返回上限（按面积从大到小取）：小碎块对对齐没用，反而把候选表
+/// 撑大、把参考线画得到处都是。
+pub fn hole_rects(img: &RgbaImage, threshold: u8, limit: usize) -> Vec<(u32, u32, u32, u32)> {
+    let (iw, ih) = img.dimensions();
+    if iw < 4 || ih < 4 || limit == 0 {
+        return Vec::new();
+    }
+    let raw = img.as_raw();
+    let step = iw.max(ih).div_ceil(HOLE_GRID).max(1);
+    let gw = iw.div_ceil(step);
+    let gh = ih.div_ceil(step);
+    let n = (gw * gh) as usize;
+    // 0 = 未分类，1 = 墙（有采样点不透明），2 = 透明
+    let mut cell = vec![0u8; n];
+    let mut any_clear = false;
+    for gy in 0..gh {
+        let y0 = gy * step;
+        let y1 = (y0 + step).min(ih);
+        let ym = y0 + (y1 - y0) / 2;
+        for gx in 0..gw {
+            let x0 = gx * step;
+            let x1 = (x0 + step).min(iw);
+            let xm = x0 + (x1 - x0) / 2;
+            // 五采样：只要有一个点不透明就当墙（保守：宁可洞小一点，也不要
+            // 把墙旁边那点透明像素算成洞，让参考线飘在半空）。
+            let wall = [(xm, ym), (x0, y0), (x1 - 1, y0), (x0, y1 - 1), (x1 - 1, y1 - 1)]
+                .iter()
+                .any(|&(px, py)| alpha_at(raw, iw, px, py) >= threshold);
+            let idx = (gy * gw + gx) as usize;
+            cell[idx] = if wall { 1 } else { 2 };
+            any_clear |= !wall;
+        }
+    }
+    if !any_clear {
+        return Vec::new();
+    }
+
+    let mut seen = vec![false; n];
+    let mut stack: Vec<u32> = Vec::new();
+    let mut found: Vec<(u64, (u32, u32, u32, u32))> = Vec::new();
+    for start in 0..n {
+        if cell[start] != 2 || seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        stack.clear();
+        stack.push(start as u32);
+        let (mut minx, mut maxx, mut miny, mut maxy) = (gw, 0u32, gh, 0u32);
+        let mut border = false;
+        while let Some(idx) = stack.pop() {
+            let cx = idx % gw;
+            let cy = idx / gw;
+            minx = minx.min(cx);
+            maxx = maxx.max(cx);
+            miny = miny.min(cy);
+            maxy = maxy.max(cy);
+            if cx == 0 || cy == 0 || cx + 1 == gw || cy + 1 == gh {
+                border = true;
+            }
+            for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                let nx = cx as i32 + dx;
+                let ny = cy as i32 + dy;
+                if nx < 0 || ny < 0 || nx >= gw as i32 || ny >= gh as i32 {
+                    continue;
+                }
+                let ni = ny as usize * gw as usize + nx as usize;
+                if cell[ni] == 2 && !seen[ni] {
+                    seen[ni] = true;
+                    stack.push(ni as u32);
+                }
+            }
+        }
+        if border {
+            continue;
+        }
+        let rough = (
+            minx * step,
+            miny * step,
+            ((maxx + 1) * step).min(iw) - minx * step,
+            ((maxy + 1) * step).min(ih) - miny * step,
+        );
+        let exact = refine_hole(img, threshold, rough, step + 1);
+        found.push(((exact.2 as u64) * (exact.3 as u64), exact));
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.truncate(limit);
+    found.into_iter().map(|(_, r)| r).collect()
+}
+
+/// 把粗网格给出的外接框精修到真实像素边界。
+///
+/// 只做四条**边带**扫描（带宽 = 粗网格步长）：粗框一定落在真实边界外侧
+/// `step` 以内，所以每条边在自己的窄带里扫一遍就能拿到精确位置，代价是
+/// O(带宽 × 边长)。早期版本用 1:1 洪水填充求连通块外接框，40 万像素的洞
+/// 单层就要 11ms（手势起手会明显卡一下），而这里只需要外接框 —— 边带扫描
+/// 精度相同、成本低一个量级。
+///
+/// 「洞」的判定（贴图边界的透明区域不算）已经在粗网格阶段完成，这里只负责
+/// 把框推到像素级；因此不需要再做连通性检查。
+fn refine_hole(
+    img: &RgbaImage,
+    threshold: u8,
+    rough: (u32, u32, u32, u32),
+    pad: u32,
+) -> (u32, u32, u32, u32) {
+    let (iw, ih) = img.dimensions();
+    let raw = img.as_raw();
+    let (rx, ry, rw, rh) = rough;
+    let y0 = ry.max(0);
+    let y1 = (ry + rh).min(ih);
+    let x0 = rx.max(0);
+    let x1 = (rx + rw).min(iw);
+    if x1 <= x0 || y1 <= y0 {
+        return rough;
+    }
+    // 某列在行带里有没有透明像素。
+    let col_clear = |x: u32, ya: u32, yb: u32| {
+        (ya..yb).any(|y| alpha_at(raw, iw, x, y) < threshold)
+    };
+    let row_clear = |y: u32, xa: u32, xb: u32| {
+        (xa..xb).any(|x| alpha_at(raw, iw, x, y) < threshold)
+    };
+    // 左 / 右：从粗框往里收，第一条「有透明像素」的列就是洞壁后的第一列。
+    let la = x0.saturating_sub(pad);
+    let lb = (x1 + pad).min(iw);
+    let left = (la..x1).find(|&x| col_clear(x, y0, y1)).unwrap_or(x0);
+    let right = (left + 1..lb)
+        .rev()
+        .find(|&x| col_clear(x, y0, y1))
+        .map(|x| x + 1)
+        .unwrap_or(x1);
+    // 上 / 下同理（用已经修好的左右范围，拐角才不会多算）。
+    let ta = y0.saturating_sub(pad);
+    let tb = (y1 + pad).min(ih);
+    let top = (ta..y1).find(|&y| row_clear(y, left, right)).unwrap_or(y0);
+    let bottom = (top + 1..tb)
+        .rev()
+        .find(|&y| row_clear(y, left, right))
+        .map(|y| y + 1)
+        .unwrap_or(y1);
+    if right <= left || bottom <= top {
+        return rough;
+    }
+    (left, top, right - left, bottom - top)
+}
+
+/// 一张位图里的洞，换算到画布坐标（`(ox, oy)` = 位图左上角的画布坐标）。
+pub fn image_holes(
+    img: &RgbaImage,
+    (ox, oy): (f64, f64),
+    threshold: u8,
+    min_side: f64,
+    limit: usize,
+) -> Vec<(f64, f64, f64, f64)> {
+    hole_rects(img, threshold, limit.max(1) * 4)
+        .into_iter()
+        .filter(|r| r.2 as f64 >= min_side && r.3 as f64 >= min_side)
+        .take(limit)
+        .map(|(x, y, w, h)| {
+            (
+                ox + x as f64,
+                oy + y as f64,
+                w as f64,
+                h as f64,
+            )
+        })
+        .collect()
+}
+
+/// 图层里的洞（画布坐标）。旋转 / 斜切的层直接返回空：洞框转过去就不再是
+/// 轴对齐矩形，拿它当对齐线会飘。
+pub fn layer_holes(
+    layer: &Layer,
+    threshold: u8,
+    min_side: f64,
+    limit: usize,
+) -> Vec<(f64, f64, f64, f64)> {
+    if !layer.visible || layer.opacity <= 0.0 || limit == 0 {
+        return Vec::new();
+    }
+    let img = match layer.transform.as_ref() {
+        Some(t) => &t.source,
+        None => &layer.image,
+    };
+    let rects = hole_rects(img, threshold, limit * 4);
+    if rects.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(rects.len().min(limit));
+    match layer.transform.as_ref() {
+        Some(t) => {
+            if !t.is_affine()
+                || t.rotation.abs() > 1e-6
+                || t.skew.0 != 0.0
+                || t.skew.1 != 0.0
+            {
+                return Vec::new();
+            }
+            let m = t.matrix();
+            for (x, y, w, h) in rects {
+                let (x, y, w, h) = (x as f64, y as f64, w as f64, h as f64);
+                let pts = [
+                    m.apply((x, y)),
+                    m.apply((x + w, y)),
+                    m.apply((x + w, y + h)),
+                    m.apply((x, y + h)),
+                ];
+                let r = crate::layer_transform::RectF::from_points(&pts);
+                if r.width >= min_side && r.height >= min_side {
+                    out.push((r.x, r.y, r.width, r.height));
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        None => {
+            for (x, y, w, h) in rects {
+                if w as f64 >= min_side && h as f64 >= min_side {
+                    out.push((
+                        layer.offset.0 as f64 + x as f64,
+                        layer.offset.1 as f64 + y as f64,
+                        w as f64,
+                        h as f64,
+                    ));
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// 不透明内容的最小包围盒（图像像素坐标）：`(x, y, w, h)`；全透明返回 `None`。
 ///
 /// 16×16 分块先粗扫、再在边缘一圈块内精扫，避免每帧全图遍历大图层。
@@ -670,4 +926,72 @@ mod tests {
         assert!((r.dx - 2.0).abs() < 1e-6, "{r:?}");
         assert!((r.guides[0].pos - 100.0).abs() < 1e-6, "{r:?}");
     }
+
+    // ---- 透明区域当图层 --------------------------------------------------------
+
+    /// 带透明边距 + 中间开洞的素材：只有洞里那块算洞，边距不算。
+    fn padded_with_hole() -> RgbaImage {
+        let mut img = blank(400, 300);
+        fill(&mut img, 40, 30, 320, 240); // 内容 40..360 / 30..270，四周 30~40 透明
+        for py in 120..210 {
+            for px in 150..250 {
+                img.put_pixel(px, py, image::Rgba([0, 0, 0, 0]));
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn hole_rects_finds_interior_hole_and_ignores_padding() {
+        let rs = hole_rects(&padded_with_hole(), ALPHA_THRESHOLD, 8);
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        // 粗网格 ±step 出框，精修后必须严丝合缝。
+        assert_eq!(rs[0], (150, 120, 100, 90));
+    }
+
+    #[test]
+    fn hole_rects_is_empty_for_opaque_or_open_images() {
+        let opaque = RgbaImage::from_pixel(200, 200, image::Rgba([255, 255, 255, 255]));
+        assert!(hole_rects(&opaque, ALPHA_THRESHOLD, 8).is_empty());
+        // 三面围住、一面朝图边界敞开：不是洞（那是背景/留白，会漏出去）。
+        let mut open = blank(200, 200);
+        fill(&mut open, 40, 40, 120, 120);
+        for px in 40..160 {
+            for py in 80..160 {
+                open.put_pixel(px, py, image::Rgba([0, 0, 0, 0]));
+            }
+        }
+        assert!(hole_rects(&open, ALPHA_THRESHOLD, 8).is_empty());
+    }
+
+    #[test]
+    fn hole_rects_keeps_biggest_ones() {
+        let mut img = RgbaImage::from_pixel(300, 300, image::Rgba([255, 255, 255, 255]));
+        for py in 20..60 {
+            for px in 20..60 {
+                img.put_pixel(px, py, image::Rgba([0, 0, 0, 0]));
+            }
+        }
+        for py in 100..260 {
+            for px in 100..260 {
+                img.put_pixel(px, py, image::Rgba([0, 0, 0, 0]));
+            }
+        }
+        let rs = hole_rects(&img, ALPHA_THRESHOLD, 1);
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs[0], (100, 100, 160, 160), "先按面积取大的");
+    }
+
+    #[test]
+    fn layer_holes_map_through_offset() {
+        let mut l = Layer::new("t", padded_with_hole());
+        l.offset = (100, 50);
+        let rs = layer_holes(&l, ALPHA_THRESHOLD, 8.0, 4);
+        assert_eq!(rs.len(), 1);
+        assert!((rs[0].0 - 250.0).abs() < 1e-9, "{rs:?}");
+        assert!((rs[0].1 - 170.0).abs() < 1e-9, "{rs:?}");
+        // 小过滤：洞小于 min_side 时不给候选。
+        assert!(layer_holes(&l, ALPHA_THRESHOLD, 120.0, 4).is_empty());
+    }
 }
+

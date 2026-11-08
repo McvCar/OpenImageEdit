@@ -11,8 +11,8 @@
 use super::super::*;
 use editcore::alpha_fit::{fit_into_gaps, FitResult, ALPHA_THRESHOLD};
 use editcore::snap::{
-    canvas_candidates, guides_json, prepare, rect_candidates, selection_candidates, solve_rect,
-    SnapAxis, SnapResult, EDGE_ALL,
+    canvas_candidates, guides_json, hole_candidates, prepare, rect_candidates, selection_candidates,
+    solve_rect, SnapAxis, SnapResult, EDGE_ALL,
 };
 
 // Qt::KeyboardModifier 位（QML 的 mouse.modifiers 原样透传）。
@@ -46,7 +46,17 @@ fn ref_point(index: i32) -> ReferencePoint {
     }
 }
 
+/// 洞当对齐线时的最小边长（画布像素）：再小的洞看起来就是个点，多出来
+/// 的候选只会把参考线画得到处都是。
+const MIN_HOLE_SIDE: f64 = 16.0;
+/// 每个来源最多收几个洞（按面积取大的）。
+const HOLES_PER_SOURCE: usize = 6;
+
 /// 起手时生成并排序静态候选：画布 0/中心/边 > 其它图层 bounds > 选区。
+///
+/// 图层除了自己的外框，还会把**被内容围住的透明区域（洞）**当虚拟图层加
+/// 进来（`hole_candidates`）：元素比洞大、或者只想让一条边压在洞壁上时，
+/// 咬合求解器（要求内容装得下）帮不上忙，但「洞的边 / 中心」照样能吸。
 fn prepare_snap(session: &mut Session, moving: usize) {
     let cw = session.doc.canvas.width as f64;
     let ch = session.doc.canvas.height as f64;
@@ -63,6 +73,23 @@ fn prepare_snap(session: &mut Session, moving: usize) {
             b.height as f64,
             i as i32,
         ));
+        for h in editcore::alpha_fit::layer_holes(layer, ALPHA_THRESHOLD, MIN_HOLE_SIDE, HOLES_PER_SOURCE)
+        {
+            c.extend(hole_candidates(h.0, h.1, h.2, h.3, i as i32));
+        }
+    }
+    // 默认背景同理：它抠出来的洞是最常见的「往里放东西」的地方。
+    if !session.doc.base_hidden && !session.doc.base_deleted {
+        let (bx, by) = (-session.doc.view.x as f64, -session.doc.view.y as f64);
+        for h in editcore::alpha_fit::image_holes(
+            &session.doc.base,
+            (bx, by),
+            ALPHA_THRESHOLD,
+            MIN_HOLE_SIDE,
+            HOLES_PER_SOURCE,
+        ) {
+            c.extend(hole_candidates(h.0, h.1, h.2, h.3, -3));
+        }
     }
     if let Some(sel) = session.doc.selection.as_ref() {
         let b = sel.base.bounds;
@@ -495,6 +522,100 @@ impl qobject::Bridge {
                 fit.snapped_y,
                 walls.join(","),
                 threshold
+            )
+        };
+        QString::from(text.as_str())
+    }
+
+    /// 诊断：某个来源的「洞」列表（画布坐标）。`index < 0` = 默认背景。
+    /// `--script=holes:index[,min_side]`
+    pub fn holes_probe(self: Pin<&mut Self>, index: i32, min_side: f64) -> QString {
+        let min_side = if min_side > 0.0 { min_side } else { 1.0 };
+        let guard = self.session.borrow();
+        let Some(session) = guard.as_ref() else {
+            return QString::from(r#"{"ok":false,"why":"no-session"}"#);
+        };
+        let rects = if index < 0 {
+            let (bx, by) = (-session.doc.view.x as f64, -session.doc.view.y as f64);
+            editcore::alpha_fit::image_holes(
+                &session.doc.base,
+                (bx, by),
+                ALPHA_THRESHOLD,
+                min_side,
+                32,
+            )
+        } else {
+            session
+                .doc
+                .layers
+                .get(index as usize)
+                .map(|l| editcore::alpha_fit::layer_holes(l, ALPHA_THRESHOLD, min_side, 32))
+                .unwrap_or_default()
+        };
+        let body: Vec<String> = rects
+            .iter()
+            .map(|r| format!("[{:.1},{:.1},{:.1},{:.1}]", r.0, r.1, r.2, r.3))
+            .collect();
+        QString::from(format!(r#"{{"ok":true,"rects":[{}]}}"#, body.join(",")).as_str())
+    }
+
+    /// 移动手势的完整求解（外框对齐 + 拼图咬合），供无 GUI 回归直接断言
+    /// 「元素边压在洞壁上 / 洞中心」这类行为。`--script=snap-move:index,dx,dy[,disp]`
+    pub fn snap_probe(
+        mut self: Pin<&mut Self>,
+        index: i32,
+        dx: f64,
+        dy: f64,
+        disp_scale: f64,
+    ) -> QString {
+        let text = {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return QString::from(r#"{"ok":false,"why":"no-session"}"#);
+            };
+            session.disp_scale = if disp_scale > 0.0 { disp_scale } else { 1.0 };
+            let ix = index.max(0) as usize;
+            prepare_snap(session, ix);
+            let (x, y, w, h) = session
+                .doc
+                .layers
+                .get(ix)
+                .map(|l| {
+                    let b = l.bounds();
+                    (b.x as f64, b.y as f64, b.width as f64, b.height as f64)
+                })
+                .unwrap_or((0.0, 0.0, 0.0, 0.0));
+            let threshold = 8.0 / session.disp_scale;
+            let edge = solve_rect(
+                (x + dx, y + dy, w, h),
+                &session.snap_statics,
+                8.0,
+                session.disp_scale,
+                EDGE_ALL,
+            );
+            let fit = solve_fit(session, (dx, dy), threshold);
+            let merged = merge_snap(edge, fit);
+            let guides: Vec<String> = merged
+                .guides
+                .iter()
+                .map(|g| {
+                    format!(
+                        "[\"{}\",{:.2}]",
+                        if g.axis == SnapAxis::X { "x" } else { "y" },
+                        g.pos
+                    )
+                })
+                .collect();
+            session.snap = merged.clone();
+            format!(
+                r#"{{"ok":true,"box":[{:.2},{:.2},{:.2},{:.2}],"dx":{:.4},"dy":{:.4},"guides":[{}]}}"#,
+                x,
+                y,
+                w,
+                h,
+                merged.dx,
+                merged.dy,
+                guides.join(",")
             )
         };
         QString::from(text.as_str())

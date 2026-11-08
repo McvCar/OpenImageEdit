@@ -1026,6 +1026,35 @@ impl qobject::Bridge {
                         text.to_string()
                     );
                 }
+                // `holes:index[,min_side]` —— 某个来源的「洞」列表（画布坐标），
+                // index < 0 是默认背景。用来验证「透明区域当图层」的候选来源。
+                other if other.starts_with("holes:") => {
+                    let n = parse_nums(other);
+                    let text = self
+                        .as_mut()
+                        .holes_probe(n.first().copied().unwrap_or(0.0) as i32,
+                                     n.get(1).copied().unwrap_or(1.0));
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"holes\",\"result\":{}}}",
+                        text.to_string()
+                    );
+                }
+                // `snap-move:index,dx,dy[,disp]` —— 移动手势完整求解（外框对齐 +
+                // 咬合）。元素比洞大时也应当被洞壁 / 洞中心吸住。
+                other if other.starts_with("snap-move:") => {
+                    let n = parse_nums(other);
+                    let g = |i: usize, d: f64| n.get(i).copied().unwrap_or(d);
+                    let text = self.as_mut().snap_probe(
+                        g(0, 0.0) as i32,
+                        g(1, 0.0),
+                        g(2, 0.0),
+                        g(3, 1.0),
+                    );
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"snap-move\",\"result\":{}}}",
+                        text.to_string()
+                    );
+                }
                 // `layer-info:index[,tag]` —— 打印图层位图尺寸与 offset。
                 // 诊断"转一圈图层变大 / 放手后位置漂移"时直接读这几项，
                 // 别再从截图上量像素。

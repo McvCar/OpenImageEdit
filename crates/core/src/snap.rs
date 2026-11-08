@@ -120,6 +120,18 @@ pub fn selection_candidates(x: f64, y: f64, w: f64, h: f64) -> Vec<SnapCandidate
     v
 }
 
+/// 「洞」的六条线：被内容围住的透明区域当成一个虚拟图层参与对齐。
+///
+/// 语义和真实图层完全一致（左/中/右、上/中/下都能吸），只是优先级排在
+/// 真实边之后 —— 偏差相同时真实图层的边胜出，洞壁让位。
+pub fn hole_candidates(x: f64, y: f64, w: f64, h: f64, owner: i32) -> Vec<SnapCandidate> {
+    let mut v = rect_candidates(x, y, w, h, owner);
+    for c in &mut v {
+        c.kind = SnapKind::GapEdge;
+    }
+    v
+}
+
 /// 起手时调用一次：按 `(axis, pos)` 排序，供每帧二分。
 pub fn prepare(statics: &mut Vec<SnapCandidate>) {
     statics.sort_by(|a, b| {
@@ -328,8 +340,23 @@ mod tests {
     }
 
     #[test]
-    fn json_shape_is_qml_ready() {
-        let st = statics();
+    fn hole_candidates_behave_like_a_layer() {
+        // 洞 300..500 x 200..400：六条线和真实图层一样，优先级是 GapEdge。
+        let mut st = canvas_candidates(1000.0, 800.0);
+        st.extend(hole_candidates(300.0, 200.0, 200.0, 200.0, 7));
+        prepare(&mut st);
+        assert_eq!(st.iter().filter(|c| c.kind == SnapKind::GapEdge).count(), 6);
+        // 左边贴洞左壁：元素 60 宽，左边落在 296 → 吸到 300。
+        let r = solve_rect((296.0, 210.0, 60.0, 40.0), &st, 8.0, 1.0, EDGE_ALL);
+        assert!((r.dx - 4.0).abs() < 1e-6, "{r:?}");
+        assert_eq!(r.guides[0].kind, SnapKind::GapEdge);
+        // 中心线也在：元素中心 397 吸到洞中心 400（+3）。
+        let c = solve_rect((367.0, 300.0, 60.0, 40.0), &st, 8.0, 1.0, EDGE_CENTER_X);
+        assert!((c.dx - 3.0).abs() < 1e-6, "{c:?}");
+    }
+
+    #[test]
+    fn json_shape_is_qml_ready() {        let st = statics();
         let r = solve_rect((498.0, 398.0, 20.0, 20.0), &st, 8.0, 2.0, EDGE_ALL);
         let s = guides_json(&r, 2.0);
         assert!(s.starts_with("[{") && s.ends_with("}]"));
