@@ -472,37 +472,39 @@ Item {
     width: previewImage.width
     height: previewImage.height
     // P1-A（R11 观感一致）：落定帧（CPU HQ）比拖动帧（GPU 双线性）锐，
-    // 直接切换会有一次「突然变锐」的跳变。落定时 GPU 层不立即隐藏，
-    // 而是 ~90ms 淡出，下面的 HQ 预览同步淡入 —— 交叉过渡消除突变。
-    // 纹理 URL 在 gpu_end 后仍保留（下次 begin 才重建），淡出期间可渲染。
-    visible: view.bridge.gpuLive || fadeTimer.running
+    // 直接切换会有一次「突然变锐」的跳变。落定时 GPU 层淡出 ~90ms，下面的
+    // HQ 预览同时露出来 —— 交叉过渡消除突变。
+    //
+    // ★★可见性只跟 `gpuLive` 走，**不要**再写成 `gpuLive || 淡出计时器在跑`：
+    //   11-08 用户复测「拖动时图层像被背景盖住、松手也不变大、再移动一下
+    //   才正常」就是这里 —— 旧写法用 16ms 定时器逐帧减 opacity 来做淡出，
+    //   一旦 `onVisibleChanged` 里把计时器 stop 掉、把 opacity 复位成 1，
+    //   计时器就再也不跑，`visible` 恒为 true。于是 Tier 1 的两张**旧**纹理
+    //   （静态背景 + 活动层停在旧矩形）永久压在 CPU 预览之上：拖动时看到
+    //   的是背景和旧图层，落定后的新帧被完全遮住，只有再起一次移动手势
+    //   （重新 gpu_begin 换纹理）才「突然正常」。淡出改用一条 NumberAnimation
+    //   跑完自己结束，不可能卡住。
+    visible: view.bridge.gpuLive || fadeOpacity > 0.01
     opacity: view.bridge.gpuLive ? 1.0 : fadeOpacity
     property real fadeOpacity: 0.0
-    property bool wasLive: false
-    onVisibleChanged: if (visible) { wasLive = true; fadeTimer.stop(); fadeOpacity = 1.0 }
-    Timer {
-        id: fadeTimer
-        interval: 16
-        repeat: true
-        onTriggered: {
-            gpuLayer.fadeOpacity -= 0.2
-            if (gpuLayer.fadeOpacity <= 0.0) {
-                gpuLayer.fadeOpacity = 0.0
-                stop()
-            }
-        }
+    NumberAnimation {
+        id: gpuFade
+        target: gpuLayer
+        property: "fadeOpacity"
+        from: 1.0
+        to: 0.0
+        duration: 90
+        easing.type: Easing.OutCubic
     }
     Connections {
         target: view.bridge
         function onGpuLiveChanged() {
             if (view.bridge.gpuLive) {
-                gpuLayer.wasLive = true
+                gpuFade.stop()
                 gpuLayer.fadeOpacity = 1.0
-                fadeTimer.stop()
-            } else if (gpuLayer.wasLive) {
-                gpuLayer.wasLive = false
+            } else {
                 gpuLayer.fadeOpacity = 1.0
-                fadeTimer.restart()
+                gpuFade.restart()
             }
         }
     }
