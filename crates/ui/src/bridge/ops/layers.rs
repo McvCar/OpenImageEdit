@@ -366,8 +366,8 @@ impl qobject::Bridge {
                 None => Err("no document".into()),
                 Some(session) => {
                     let layer = &session.doc.layers[ix];
-                    let (ow, oh) = (layer.image.width() as i32, layer.image.height() as i32);
-                    let offset = layer.offset;
+                    let (ow, oh) = (layer.img().width() as i32, layer.img().height() as i32);
+                    let offset = layer.offset();
                     let (mut tw, mut th) = (width, height);
                     if keep_ratio && (tw <= 0 || th <= 0) {
                         // Derive the missing side from the current aspect.
@@ -422,9 +422,9 @@ impl qobject::Bridge {
             if let Some(layer) = session.doc.layers.get(ix) {
                 session.transform = Some(TransformSession::Scale(LiveScaleState {
                     index: ix,
-                    snapshot: layer.image.clone(),
-                    to: Size::new(layer.image.width(), layer.image.height()),
-                    offset: layer.offset,
+                    snapshot: layer.img().clone(),
+                    to: Size::new(layer.img().width(), layer.img().height()),
+                    offset: layer.offset(),
                     flip: (false, false),
                     // P1-A：Ctrl+拖边 = 斜切，量由 `transform_solve_scale` 解出。
                     skew: (0.0, 0.0),
@@ -480,10 +480,10 @@ impl qobject::Bridge {
                     format!(
                         "{}:{},{},{},{}",
                         i,
-                        l.offset.0,
-                        l.offset.1,
-                        l.image.width(),
-                        l.image.height()
+                        l.offset().0,
+                        l.offset().1,
+                        l.img().width(),
+                        l.img().height()
                     )
                 })
                 .collect::<Vec<_>>()
@@ -536,11 +536,11 @@ impl qobject::Bridge {
                         // 未插值原图按目标外接框反解 scale，永不累积。
                         let (mut t, sw, sh) = {
                             let layer = &session.doc.layers[ix];
-                            let t = layer.transform.clone().unwrap_or_else(|| {
+                            let t = layer.xform().cloned().unwrap_or_else(|| {
                                 LayerTransform::from_offset(
-                                    layer.image.clone(),
-                                    layer.offset.0,
-                                    layer.offset.1,
+                                    layer.img().clone(),
+                                    layer.offset().0,
+                                    layer.offset().1,
                                 )
                             });
                             let (sw, sh) = t.source_size();
@@ -612,10 +612,10 @@ impl qobject::Bridge {
                         .and_then(|s| s.doc.layers.get(ix))
                         .map(|l| {
                             (
-                                l.image.width() as i32,
-                                l.image.height() as i32,
-                                l.offset.0,
-                                l.offset.1,
+                                l.img().width() as i32,
+                                l.img().height() as i32,
+                                l.offset().0,
+                                l.offset().1,
                             )
                         })
                         .unwrap_or((0, 0, 0, 0))
@@ -644,8 +644,21 @@ impl qobject::Bridge {
         {
             let mut guard = self.session.borrow_mut();
             if let Some(session) = guard.as_mut() {
-                if let Some(layer) = session.doc.layers.get_mut(index as usize) {
-                    layer.locked = locked;
+                let same = session
+                    .doc
+                    .layers
+                    .get(index as usize)
+                    .map(|l| l.locked == locked)
+                    .unwrap_or(true);
+                if !same {
+                    match session.doc.set_layer_locked(index as usize, locked) {
+                        Ok(()) => session.dirty = true,
+                        Err(e) => println!(
+                            "{{\"phase\":\"ui\",\"event\":\"layer-lock-failed\",\
+                             \"index\":{index},\"reason\":\"{}\"}}",
+                            e.to_string().replace('"', "'")
+                        ),
+                    }
                 }
             }
         }
@@ -653,34 +666,25 @@ impl qobject::Bridge {
     }
 
     pub fn set_base_locked(mut self: Pin<&mut Self>, locked: bool) {
-        let converted = {
+        // 背景就是 0 号图层：解锁 / 加锁都是普通的一次可撤销编辑，
+        // 不再有「解锁即把背景迁移成普通层」的隐式动作。
+        {
             let mut guard = self.session.borrow_mut();
-            match guard.as_mut() {
-                Some(session) => {
-                    session.base_locked = locked;
-                    // Unlocking converts the base into a regular bottom
-                    // layer once: from then on it moves / scales / deletes
-                    // / renames exactly like any other layer, and the
-                    // synthetic base row disappears from the panel.
-                    if !locked {
-                        matches!(session.doc.convert_base_to_layer(), Ok(()))
-                    } else {
-                        false
+            if let Some(session) = guard.as_mut() {
+                let same = session.doc.background().locked == locked;
+                if !same {
+                    match session.doc.set_layer_locked(0, locked) {
+                        Ok(()) => session.dirty = true,
+                        Err(e) => println!(
+                            "{{\"phase\":\"ui\",\"event\":\"base-lock-failed\",\
+                             \"reason\":\"{}\"}}",
+                            e.to_string().replace('"', "'")
+                        ),
                     }
                 }
-                None => false,
             }
-        };
-        if converted {
-            // Inserting at index 0 shifts every other layer index, so a
-            // stale selection must go; a layer was added too, so
-            // layer_count / undo state changed and a full refresh (not
-            // just layers_json) is required.
-            self.as_mut().set_selected_layer(-1);
-            self.as_mut().refresh_preview();
-        } else {
-            self.as_mut().refresh_layers_only();
         }
+        self.as_mut().refresh_layers_only();
     }
 
     pub fn toggle_base_visible(mut self: Pin<&mut Self>) {
@@ -689,7 +693,7 @@ impl qobject::Bridge {
             match guard.as_mut() {
                 None => Err("no document".into()),
                 Some(session) => {
-                    let make_visible = session.doc.base_hidden;
+                    let make_visible = session.doc.base_hidden();
                     match session.doc.set_base_visible(make_visible) {
                         Ok(()) => {
                             session.dirty = true;
@@ -716,13 +720,9 @@ impl qobject::Bridge {
             match guard.as_mut() {
                 None => Err("no document".into()),
                 Some(session) => {
-                    if session.base_locked {
+                    if session.doc.background().locked {
                         Err("背景已锁定，先点击锁图标解锁".into())
-                    } else if session.doc.base_converted {
-                        // The base row no longer exists as such; deletion
-                        // goes through the normal layer path.
-                        Ok(false)
-                    } else if session.doc.base_deleted {
+                    } else if session.doc.base_deleted() {
                         Ok(false)
                     } else {
                         match session.doc.delete_base() {
@@ -785,8 +785,8 @@ impl qobject::Bridge {
         let mut guard = self.session.borrow_mut();
         if let Some(session) = guard.as_mut() {
             if let Some(layer) = session.doc.layers.get(ix) {
-                let start = layer.offset;
-                let start_center = layer.transform.as_ref().map(|t| t.center);
+                let start = layer.offset();
+                let start_center = layer.xform().as_ref().map(|t| t.center);
                 session.transform = Some(TransformSession::Move {
                     index: ix,
                     start,
@@ -819,7 +819,7 @@ impl qobject::Bridge {
             match guard.as_ref() {
                 Some(session) => {
                     // Skip render when the offset did not actually change.
-                    if session.doc.layers.get(ix).map(|l| l.offset)
+                    if session.doc.layers.get(ix).map(|l| l.offset())
                         == Some((start.0 + dx, start.1 + dy))
                     {
                         return;
@@ -834,10 +834,10 @@ impl qobject::Bridge {
                 let next = (start.0 + dx, start.1 + dy);
                 if let Some(layer) = session.doc.layers.get_mut(ix) {
                     // Live preview only: no history entry until commit.
-                    layer.offset = next;
+                    layer.set_offset(next);
                     // ★参数层与 offset 同步（见 TransformSession::Move 的注释）：
                     // 渲染走 transform.center，不跟着动就会「框走、内容不动」。
-                    if let (Some(c), Some(t)) = (start_center, layer.transform.as_mut()) {
+                    if let (Some(c), Some(t)) = (start_center, layer.xform_mut()) {
                         t.center = (c.0 + dx as f64, c.1 + dy as f64);
                     }
                 }
@@ -871,15 +871,15 @@ impl qobject::Bridge {
                         .doc
                         .layers
                         .get(ix)
-                        .map(|l| l.offset)
+                        .map(|l| l.offset())
                         .unwrap_or(start);
                     // 参数层的 center 也回到起手时的值：提交走 translate_layer
                     // （它按 center 加位移），不回滚就会把拖动量算两遍。
                     if !commit || cur == start {
                         // Roll back the live (history-free) offset.
                         if let Some(layer) = session.doc.layers.get_mut(ix) {
-                            layer.offset = start;
-                            if let (Some(c), Some(t)) = (start_center, layer.transform.as_mut()) {
+                            layer.set_offset(start);
+                            if let (Some(c), Some(t)) = (start_center, layer.xform_mut()) {
                                 t.center = c;
                             }
                         }
@@ -888,8 +888,8 @@ impl qobject::Bridge {
                         // Reset to the drag start, then translate once so the
                         // history op records from=start to=cur.
                         if let Some(layer) = session.doc.layers.get_mut(ix) {
-                            layer.offset = start;
-                            if let (Some(c), Some(t)) = (start_center, layer.transform.as_mut()) {
+                            layer.set_offset(start);
+                            if let (Some(c), Some(t)) = (start_center, layer.xform_mut()) {
                                 t.center = c;
                             }
                         }

@@ -27,8 +27,8 @@ impl qobject::Bridge {
             Ok(layer) => {
                 let text = format!(
                     "已复制 {}×{}（Ctrl+V 粘贴，可跨文档）",
-                    layer.image.width(),
-                    layer.image.height()
+                    layer.img().width(),
+                    layer.img().height()
                 );
                 *clipboard().lock().unwrap() = Some(layer);
                 *self.paste_counter.borrow_mut() = 0;
@@ -72,8 +72,8 @@ impl qobject::Bridge {
             Ok(layer) => {
                 let text = format!(
                     "已剪切 {}×{}（Ctrl+V 粘贴，可跨文档）",
-                    layer.image.width(),
-                    layer.image.height()
+                    layer.img().width(),
+                    layer.img().height()
                 );
                 *clipboard().lock().unwrap() = Some(layer);
                 *self.paste_counter.borrow_mut() = 0;
@@ -256,14 +256,16 @@ impl qobject::Bridge {
                     layer.name = session.doc.next_layer_name();
                     // Keep the pasted layer at its copied position, clamped so
                     // part of it stays on the canvas; repeated pastes fan out.
-                    layer.offset.0 = (clip.offset.0 + PASTE_SHIFT * count).clamp(
-                        -(layer.image.width() as i32 - 1),
+                    let (bx, by) = layer.offset();
+                    let ox = (bx + PASTE_SHIFT * count).clamp(
+                        -(layer.img().width() as i32 - 1),
                         canvas.width as i32 - 1,
                     );
-                    layer.offset.1 = (clip.offset.1 + PASTE_SHIFT * count).clamp(
-                        -(layer.image.height() as i32 - 1),
+                    let oy = (by + PASTE_SHIFT * count).clamp(
+                        -(layer.img().height() as i32 - 1),
                         canvas.height as i32 - 1,
                     );
+                    layer.set_offset((ox, oy));
                     match session.doc.add_layer(layer) {
                         Ok(index) => {
                             session.dirty = true;

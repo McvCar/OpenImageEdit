@@ -3,7 +3,7 @@ use std::sync::Arc;
 use image::imageops::FilterType;
 use image::RgbaImage;
 
-use editcore::{Adjust, AdjustTarget, Document, Rect, Size};
+use editcore::{Adjust, AdjustTarget, Document, LayerContent, Rect, Size};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Viewport {
@@ -269,31 +269,115 @@ impl PreviewComposer {
         ))
     }
 
-    /// Cached preview-scaled visible base (or a transparent buffer).
+    /// 背景层（`layers[0]`）的预览位图。
+    ///
+    /// 正常状态（背景未被移动）时走「按 `view` 裁剪 + 重采样」的快路径，避免
+    /// 50MP 背景每帧整幅拷贝；被解锁拖走 / 缩放过时退回普通图层路径
+    /// （`scaled_layer` + `blend_layer`），几何才是对的。
     fn base_buffer(&mut self, doc: &Document, target: Size, sx: f64, sy: f64) -> RgbaImage {
-        if doc.base_hidden {
+        let bg = &doc.layers[0];
+        if !bg.visible || bg.opacity <= 0.0 {
             return RgbaImage::new(target.width, target.height);
+        }
+        let Some(r) = bg.raster() else {
+            return RgbaImage::new(target.width, target.height);
+        };
+        let aligned = r.offset.0 == -doc.view.x && r.offset.1 == -doc.view.y;
+        if !aligned {
+            let mut out = RgbaImage::new(target.width, target.height);
+            let src = self.scaled_layer(0, &r.image, sx, sy);
+            let ox = (r.offset.0 as f64 * sx).round() as i32;
+            let oy = (r.offset.1 as f64 * sy).round() as i32;
+            Self::blend_layer(&mut out, target, &src, ox, oy, bg.opacity);
+            return out;
         }
         let nw = ((doc.view.width as f64 * sx).round() as u32).max(1);
         let nh = ((doc.view.height as f64 * sy).round() as u32).max(1);
-        if let Some(img) = Self::cached_hit(&self.base, nw, nh) {
-            return (*img).clone();
-        }
-        // "Reset crop" leaves `view` equal to the whole bitmap; cropping then is
-        // a pure full-size copy, so hand the base to the resampler directly (a
-        // 50 MP base would otherwise be memcpy'd on every render — the copy was
-        // ~35 ms of a 1100×688 preview render in a debug build).
-        let full_view = doc.view.x <= 0
-            && doc.view.y <= 0
-            && doc.view.width >= doc.base.width()
-            && doc.view.height >= doc.base.height();
-        let img = if full_view {
-            resize_to(&doc.base, target)
+        let img = if let Some(img) = Self::cached_hit(&self.base, nw, nh) {
+            (*img).clone()
         } else {
-            resize_to(&crop_region(&doc.base, doc.view), target)
+            // "Reset crop" leaves `view` equal to the whole bitmap; cropping
+            // then is a pure full-size copy, so hand the base to the resampler
+            // directly (a 50 MP base would otherwise be memcpy'd on every
+            // render — the copy was ~35 ms of a 1100×688 preview render).
+            let full_view = doc.view.x <= 0
+                && doc.view.y <= 0
+                && doc.view.width >= r.image.width()
+                && doc.view.height >= r.image.height();
+            let img = if full_view {
+                resize_to(&r.image, target)
+            } else {
+                resize_to(&crop_region(&r.image, doc.view), target)
+            };
+            self.base = Some((nw, nh, Arc::new(img.clone())));
+            img
         };
-        self.base = Some((nw, nh, Arc::new(img.clone())));
-        img
+        if bg.opacity >= 0.999 {
+            return img;
+        }
+        let mut out = RgbaImage::new(img.width(), img.height());
+        Self::blend_layer(&mut out, target, &img, 0, 0, bg.opacity);
+        out
+    }
+
+    /// 把 `layers[1..]` 按 z 序叠到 `out` 上（背景已由 `base_buffer` 画好）。
+    /// 位图走缓存 + `blend_layer`，标记按同一套不透明度规则栅格化 ——
+    /// 标记不再「恒置顶」，顺序就是图层顺序。
+    fn blend_upper_layers(
+        &mut self,
+        doc: &Document,
+        out: &mut RgbaImage,
+        target: Size,
+        sx: f64,
+        sy: f64,
+        skip: Option<usize>,
+        adjust: Option<(AdjustTarget, Adjust)>,
+    ) {
+        for (li, layer) in doc.layers.iter().enumerate().skip(1) {
+            if !layer.visible || layer.opacity <= 0.0 || skip == Some(li) {
+                continue;
+            }
+            match &layer.content {
+                LayerContent::Mark(m) => {
+                    if layer.opacity >= 0.999 {
+                        m.draw_scaled(out, sx as f32, sy as f32);
+                    } else {
+                        let mut tmp = out.clone();
+                        m.draw_scaled(&mut tmp, sx as f32, sy as f32);
+                        for (dst, src) in out.pixels_mut().zip(tmp.pixels()) {
+                            let p = dst.0;
+                            dst.0 = [
+                                (p[0] as f32 * (1.0 - layer.opacity)
+                                    + src.0[0] as f32 * layer.opacity)
+                                    .round() as u8,
+                                (p[1] as f32 * (1.0 - layer.opacity)
+                                    + src.0[1] as f32 * layer.opacity)
+                                    .round() as u8,
+                                (p[2] as f32 * (1.0 - layer.opacity)
+                                    + src.0[2] as f32 * layer.opacity)
+                                    .round() as u8,
+                                (p[3] as f32 * (1.0 - layer.opacity)
+                                    + src.0[3] as f32 * layer.opacity)
+                                    .round() as u8,
+                            ];
+                        }
+                    }
+                }
+                LayerContent::Raster(r) => {
+                    let src = self.scaled_layer(li, &r.image, sx, sy);
+                    let ox = (r.offset.0 as f64 * sx).round() as i32;
+                    let oy = (r.offset.1 as f64 * sy).round() as i32;
+                    match adjust {
+                        Some((AdjustTarget::Layer(index), params)) if index == li => {
+                            let mut adjusted = (*src).clone();
+                            params.apply_in_place(&mut adjusted);
+                            Self::blend_layer(out, target, &adjusted, ox, oy, layer.opacity);
+                        }
+                        _ => Self::blend_layer(out, target, &src, ox, oy, layer.opacity),
+                    }
+                }
+            }
+        }
     }
 
     /// Cached preview-scaled copy of a layer bitmap, stored in slot `li`.
@@ -366,14 +450,6 @@ impl PreviewComposer {
             .expect("preview buffer size preserved");
     }
 
-    fn draw_marks(doc: &Document, out: &mut RgbaImage, sx: f64, sy: f64) {
-        for mark in &doc.marks {
-            if mark.visible {
-                mark.draw_scaled(out, sx as f32, sy as f32);
-            }
-        }
-    }
-
     pub fn composite(&mut self, doc: &Document, target: Size) -> RgbaImage {
         self.composite_adjusted(doc, target, None)
     }
@@ -400,23 +476,7 @@ impl PreviewComposer {
         if let Some((AdjustTarget::Base, params)) = adjust {
             params.apply_in_place(&mut out);
         }
-        for (li, layer) in doc.layers.iter().enumerate() {
-            if !layer.visible || layer.opacity <= 0.0 {
-                continue;
-            }
-            let src = self.scaled_layer(li, &layer.image, sx, sy);
-            let ox = (layer.offset.0 as f64 * sx).round() as i32;
-            let oy = (layer.offset.1 as f64 * sy).round() as i32;
-            match adjust {
-                Some((AdjustTarget::Layer(index), params)) if index == li => {
-                    let mut adjusted = (*src).clone();
-                    params.apply_in_place(&mut adjusted);
-                    Self::blend_layer(&mut out, target, &adjusted, ox, oy, layer.opacity);
-                }
-                _ => Self::blend_layer(&mut out, target, &src, ox, oy, layer.opacity),
-            }
-        }
-        Self::draw_marks(doc, &mut out, sx, sy);
+        self.blend_upper_layers(doc, &mut out, target, sx, sy, None, adjust);
         out
     }
 
@@ -489,22 +549,7 @@ impl PreviewComposer {
         if let Some((AdjustTarget::Base, params)) = adjust {
             params.apply_in_place(&mut out);
         }
-        for (li, layer) in doc.layers.iter().enumerate() {
-            if !layer.visible || layer.opacity <= 0.0 || li == layer_index {
-                continue;
-            }
-            let src = self.scaled_layer(li, &layer.image, sx, sy);
-            let ox = (layer.offset.0 as f64 * sx).round() as i32;
-            let oy = (layer.offset.1 as f64 * sy).round() as i32;
-            match adjust {
-                Some((AdjustTarget::Layer(index), params)) if index == li => {
-                    let mut adjusted = (*src).clone();
-                    params.apply_in_place(&mut adjusted);
-                    Self::blend_layer(&mut out, target, &adjusted, ox, oy, layer.opacity);
-                }
-                _ => Self::blend_layer(&mut out, target, &src, ox, oy, layer.opacity),
-            }
-        }
+        self.blend_upper_layers(doc, &mut out, target, sx, sy, Some(layer_index), adjust);
         if drag_opacity > 0.0 {
             let nw = ((to.width as f64 * sx).round() as u32).max(1);
             let nh = ((to.height as f64 * sy).round() as u32).max(1);
@@ -551,7 +596,6 @@ impl PreviewComposer {
             };
             Self::blend_layer(&mut out, target, &stretched, ox, oy, drag_opacity);
         }
-        Self::draw_marks(doc, &mut out, sx, sy);
         out
     }
 
@@ -587,29 +631,17 @@ impl PreviewComposer {
         if let Some((AdjustTarget::Base, params)) = adjust {
             params.apply_in_place(&mut out);
         }
-        for (li, layer) in doc.layers.iter().enumerate() {
-            if !layer.visible || layer.opacity <= 0.0 || li == layer_index {
-                continue;
-            }
-            let src = self.scaled_layer(li, &layer.image, sx, sy);
-            let ox = (layer.offset.0 as f64 * sx).round() as i32;
-            let oy = (layer.offset.1 as f64 * sy).round() as i32;
-            match adjust {
-                Some((AdjustTarget::Layer(index), params)) if index == li => {
-                    let mut adjusted = (*src).clone();
-                    params.apply_in_place(&mut adjusted);
-                    Self::blend_layer(&mut out, target, &adjusted, ox, oy, layer.opacity);
-                }
-                _ => Self::blend_layer(&mut out, target, &src, ox, oy, layer.opacity),
-            }
-        }
+        self.blend_upper_layers(doc, &mut out, target, sx, sy, Some(layer_index), adjust);
         if drag_opacity > 0.0 {
             let Some(layer) = doc.layers.get(layer_index) else {
                 return out;
             };
             // 起手参数（手势不写文档，layer.transform 就是 begin 状态）。
-            let base = layer.transform.clone().unwrap_or_else(|| {
-                editcore::LayerTransform::from_offset(layer.image.clone(), layer.offset.0, layer.offset.1)
+            let Some(lr) = layer.raster() else {
+                return out;
+            };
+            let base = lr.transform.clone().unwrap_or_else(|| {
+                editcore::LayerTransform::from_offset(lr.image.clone(), lr.offset.0, lr.offset.1)
             });
             let (sw, sh) = base.source_size();
             let nw = ((sw * base.scale.0.abs() * sx).round() as u32).max(1);
@@ -665,7 +697,6 @@ impl PreviewComposer {
             };
             Self::blend_layer(&mut out, target, &stretched, 0, 0, drag_opacity);
         }
-        Self::draw_marks(doc, &mut out, sx, sy);
         out
     }
 
@@ -693,22 +724,7 @@ impl PreviewComposer {
         if let Some((AdjustTarget::Base, params)) = adjust {
             params.apply_in_place(&mut out);
         }
-        for (li, layer) in doc.layers.iter().enumerate() {
-            if !layer.visible || layer.opacity <= 0.0 || li == layer_index {
-                continue;
-            }
-            let src = self.scaled_layer(li, &layer.image, sx, sy);
-            let ox = (layer.offset.0 as f64 * sx).round() as i32;
-            let oy = (layer.offset.1 as f64 * sy).round() as i32;
-            match adjust {
-                Some((AdjustTarget::Layer(index), params)) if index == li => {
-                    let mut adjusted = (*src).clone();
-                    params.apply_in_place(&mut adjusted);
-                    Self::blend_layer(&mut out, target, &adjusted, ox, oy, layer.opacity);
-                }
-                _ => Self::blend_layer(&mut out, target, &src, ox, oy, layer.opacity),
-            }
-        }
+        self.blend_upper_layers(doc, &mut out, target, sx, sy, Some(layer_index), adjust);
         if drag_opacity > 0.0 {
             // 预览尺度下的图层尺寸：Triangle 是「每个输出像素读 2×2」，代价
             // 随输出走，不会因为原图巨大而爆炸。
@@ -766,7 +782,6 @@ impl PreviewComposer {
             };
             Self::blend_layer(&mut out, target, &src, ox, oy, drag_opacity);
         }
-        Self::draw_marks(doc, &mut out, sx, sy);
         out
     }
 }

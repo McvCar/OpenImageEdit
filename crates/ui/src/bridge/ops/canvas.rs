@@ -239,7 +239,7 @@ session
             match guard.as_mut() {
                 None => Ok(false),
                 Some(session) => {
-                    let base = session.doc.base.dimensions();
+                    let base = session.doc.base_image().dimensions();
                     let is_full =
                         session.doc.view.x == 0
                             && session.doc.view.y == 0

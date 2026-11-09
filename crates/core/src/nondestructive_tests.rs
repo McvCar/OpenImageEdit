@@ -25,12 +25,12 @@ fn scale_down_then_up_samples_the_original_pixels() {
     let src = checker(80, 80);
     let mut doc = doc_with_layer(src.clone());
 
-    doc.scale_layer(0, Size::new(40, 40), (0, 0)).unwrap();
-    assert_eq!(doc.layers[0].image.dimensions(), (40, 40));
-    assert!(doc.layers[0].transform.is_some(), "缩放后必须保留原始像素");
+    doc.scale_layer(1, Size::new(40, 40), (0, 0)).unwrap();
+    assert_eq!(doc.layers[1].image().unwrap().dimensions(), (40, 40));
+    assert!(doc.layers[1].raster().unwrap().transform.is_some(), "缩放后必须保留原始像素");
 
-    doc.scale_layer(0, Size::new(80, 80), (0, 0)).unwrap();
-    assert_eq!(doc.layers[0].image.dimensions(), (80, 80));
+    doc.scale_layer(1, Size::new(80, 80), (0, 0)).unwrap();
+    assert_eq!(doc.layers[1].image().unwrap().dimensions(), (80, 80));
 
     // P0-2a：回到原始尺寸走 1:1 索引拷贝，连「从原图做一次 80→80 的
     // Lanczos3」都不做 —— 后者带负旁瓣，会把单像素细线 / 文字笔画抹软。
@@ -41,26 +41,26 @@ fn scale_down_then_up_samples_the_original_pixels() {
         image::imageops::FilterType::Lanczos3,
     );
     assert_eq!(
-        doc.layers[0].image.as_raw(),
+        doc.layers[1].image().unwrap().as_raw(),
         src.as_raw(),
         "缩放→放大回原尺寸必须逐像素等于原图"
     );
     assert!(
-        doc.layers[0]
-            .transform
+        doc.layers[1]
+            .raster().unwrap().transform
             .as_ref()
             .unwrap()
             .is_identity_fast_path(),
         "回到原尺寸后变换状态应是 identity"
     );
     assert_ne!(
-        doc.layers[0].image.as_raw(),
+        doc.layers[1].image().unwrap().as_raw(),
         destructive.as_raw(),
         "不允许再出现两次累积插值"
     );
     // 变换状态里的源图恒为最初那张。
     assert_eq!(
-        doc.layers[0].transform.as_ref().unwrap().source.dimensions(),
+        doc.layers[1].raster().unwrap().transform.as_ref().unwrap().source.dimensions(),
         (80, 80)
     );
 }
@@ -69,56 +69,56 @@ fn scale_down_then_up_samples_the_original_pixels() {
 fn near_original_size_snaps_back_but_real_resizes_do_not() {
     let src = checker(80, 80);
     let mut doc = doc_with_layer(src.clone());
-    doc.scale_layer(0, Size::new(40, 40), (0, 0)).unwrap();
+    doc.scale_layer(1, Size::new(40, 40), (0, 0)).unwrap();
     // QML 手柄把显示像素换算回图像像素后的典型 ±1~2px 误差。
-    doc.scale_layer(0, Size::new(79, 78), (0, 0)).unwrap();
-    assert_eq!(doc.layers[0].image.dimensions(), (80, 80));
-    assert_eq!(doc.layers[0].image.as_raw(), src.as_raw());
+    doc.scale_layer(1, Size::new(79, 78), (0, 0)).unwrap();
+    assert_eq!(doc.layers[1].image().unwrap().dimensions(), (80, 80));
+    assert_eq!(doc.layers[1].image().unwrap().as_raw(), src.as_raw());
 
     // redo 复用同一个 op，吸附必须幂等。
-    let committed = doc.layers[0].clone();
+    let committed = doc.layers[1].clone();
     doc.undo().unwrap();
     doc.redo().unwrap();
-    assert_eq!(doc.layers[0], committed, "吸附后的 undo/redo 必须一致");
+    assert_eq!(doc.layers[1], committed, "吸附后的 undo/redo 必须一致");
 
     // 真的想缩到 77×77 时不能把它强行吸回 80×80。
     let mut doc2 = doc_with_layer(src.clone());
     doc2.scale_layer(0, Size::new(77, 77), (0, 0)).unwrap();
-    assert_eq!(doc2.layers[0].image.dimensions(), (77, 77));
-    assert_ne!(doc2.layers[0].image.as_raw(), src.as_raw());
+    assert_eq!(doc2.layers[0].image().unwrap().dimensions(), (77, 77));
+    assert_ne!(doc2.layers[0].image().unwrap().as_raw(), src.as_raw());
 
     // 带镜像时不吸附（1:1 拷贝会丢掉翻转）。
     let mut doc3 = doc_with_layer(src.clone());
     doc3.scale_layer_flipped(0, Size::new(80, 80), (0, 0), (true, false))
         .unwrap();
-    assert_ne!(doc3.layers[0].image.as_raw(), src.as_raw());
+    assert_ne!(doc3.layers[0].image().unwrap().as_raw(), src.as_raw());
 }
 
 #[test]
 fn scale_undo_redo_is_idempotent() {
     let src = checker(64, 48);
     let mut doc = doc_with_layer(src);
-    doc.scale_layer(0, Size::new(32, 24), (5, 7)).unwrap();
-    let committed = doc.layers[0].clone();
+    doc.scale_layer(1, Size::new(32, 24), (5, 7)).unwrap();
+    let committed = doc.layers[1].clone();
     doc.undo().unwrap();
-    assert_eq!(doc.layers[0].image.dimensions(), (64, 48));
-    assert_eq!(doc.layers[0].offset, (0, 0));
-    assert!(doc.layers[0].transform.is_none());
+    assert_eq!(doc.layers[1].image().unwrap().dimensions(), (64, 48));
+    assert_eq!(doc.layers[1].offset(), (0, 0));
+    assert!(doc.layers[1].raster().unwrap().transform.is_none());
     doc.redo().unwrap();
-    assert_eq!(doc.layers[0], committed, "redo 必须与首次提交逐像素一致");
+    assert_eq!(doc.layers[1], committed, "redo 必须与首次提交逐像素一致");
 }
 
 #[test]
 fn pixel_patch_bakes_before_writing() {
     let mut doc = doc_with_layer(checker(64, 64));
-    doc.scale_layer(0, Size::new(32, 32), (0, 0)).unwrap();
-    assert!(doc.layers[0].transform.is_some());
+    doc.scale_layer(1, Size::new(32, 32), (0, 0)).unwrap();
+    assert!(doc.layers[1].raster().unwrap().transform.is_some());
 
     let before = RgbaImage::new(1, 1);
     let mut after = RgbaImage::new(1, 1);
     after.put_pixel(0, 0, image::Rgba([1, 2, 3, 255]));
     doc.execute(EditOp::PixelPatch {
-        target: AdjustTarget::Layer(0),
+        target: AdjustTarget::Layer(1),
         rect: Rect::new(0, 0, 1, 1),
         before,
         after,
@@ -126,16 +126,16 @@ fn pixel_patch_bakes_before_writing() {
     .unwrap();
 
     assert!(
-        doc.layers[0].transform.is_none(),
+        doc.layers[1].raster().unwrap().transform.is_none(),
         "写像素前必须烘焙，否则下次缩放会抹掉编辑结果"
     );
-    assert_eq!(doc.layers[0].image.get_pixel(0, 0).0, [1, 2, 3, 255]);
+    assert_eq!(doc.layers[1].image().unwrap().get_pixel(0, 0).0, [1, 2, 3, 255]);
 
     // 烘焙后的层仍可正常缩放，源图换成「编辑过的当前位图」。
-    doc.scale_layer(0, Size::new(64, 64), (0, 0)).unwrap();
-    assert_eq!(doc.layers[0].image.dimensions(), (64, 64));
+    doc.scale_layer(1, Size::new(64, 64), (0, 0)).unwrap();
+    assert_eq!(doc.layers[1].image().unwrap().dimensions(), (64, 64));
     assert_eq!(
-        doc.layers[0].transform.as_ref().unwrap().source.dimensions(),
+        doc.layers[1].raster().unwrap().transform.as_ref().unwrap().source.dimensions(),
         (32, 32)
     );
 }
@@ -148,17 +148,17 @@ fn set_layer_transform_is_one_history_step_and_roundtrips() {
     t.scale = (2.0, 2.0);
     t.center = (50.0, 50.0);
 
-    doc.set_layer_transform(0, Some(t.clone())).unwrap();
-    assert_eq!(doc.layers[0].image.dimensions(), (80, 80));
-    assert_eq!(doc.layers[0].offset, (10, 10));
-    assert_eq!(doc.layers[0].transform.as_ref().unwrap().scale, (2.0, 2.0));
+    doc.set_layer_transform(1, Some(t.clone())).unwrap();
+    assert_eq!(doc.layers[1].image().unwrap().dimensions(), (80, 80));
+    assert_eq!(doc.layers[1].offset(), (10, 10));
+    assert_eq!(doc.layers[1].raster().unwrap().transform.as_ref().unwrap().scale, (2.0, 2.0));
 
     doc.undo().unwrap();
-    assert_eq!(doc.layers[0].image.dimensions(), (40, 40));
-    assert_eq!(doc.layers[0].offset, (0, 0));
+    assert_eq!(doc.layers[1].image().unwrap().dimensions(), (40, 40));
+    assert_eq!(doc.layers[1].offset(), (0, 0));
     assert!(
-        doc.layers[0]
-            .transform
+        doc.layers[1]
+            .raster().unwrap().transform
             .as_ref()
             .unwrap()
             .is_identity_fast_path(),
@@ -166,8 +166,8 @@ fn set_layer_transform_is_one_history_step_and_roundtrips() {
     );
 
     doc.redo().unwrap();
-    assert_eq!(doc.layers[0].image.dimensions(), (80, 80));
-    assert_eq!(doc.layers[0].transform.as_ref().unwrap().scale, (2.0, 2.0));
+    assert_eq!(doc.layers[1].image().unwrap().dimensions(), (80, 80));
+    assert_eq!(doc.layers[1].raster().unwrap().transform.as_ref().unwrap().scale, (2.0, 2.0));
 }
 
 #[test]
@@ -175,9 +175,9 @@ fn transform_does_not_change_export_size() {
     let src = checker(60, 50);
     let mut doc = doc_with_layer(src);
     // 把图层缩到画布外也不改变导出尺寸（P0-3 之前仍按画布裁剪）。
-    doc.scale_layer(0, Size::new(120, 100), (-20, -10)).unwrap();
+    doc.scale_layer(1, Size::new(120, 100), (-20, -10)).unwrap();
     assert_eq!(doc.flatten().dimensions(), (60, 50));
-    doc.scale_layer(0, Size::new(20, 20), (5, 5)).unwrap();
+    doc.scale_layer(1, Size::new(20, 20), (5, 5)).unwrap();
     assert_eq!(doc.flatten().dimensions(), (60, 50));
 }
 
@@ -227,14 +227,14 @@ fn panel_x_y_are_plain_translations_and_undo_is_one_step() {
     assert_eq!(t.scale, (1.0, 1.0), "平移不应改 scale");
 
     let mut doc = doc_with_layer(checker(60, 50));
-    let mut to = doc.layers[0].transform.clone().unwrap_or_else(|| {
-        LayerTransform::from_offset(doc.layers[0].image.clone(), 0, 0)
+    let mut to = doc.layers[1].raster().unwrap().transform.clone().unwrap_or_else(|| {
+        LayerTransform::from_offset(doc.layers[1].image().unwrap().clone(), 0, 0)
     });
     to.set_panel_value(Field::X, 12.0, ReferencePoint::TopLeft);
     let before = doc.history_len();
-    doc.set_layer_transform(0, Some(to)).unwrap();
+    doc.set_layer_transform(1, Some(to)).unwrap();
     assert_eq!(doc.history_len(), before + 1, "一次写入 = 一条历史");
     doc.undo().unwrap();
-    let q = doc.layers[0].transform_state().panel_values();
+    let q = doc.layers[1].transform_state().panel_values();
     assert_eq!(q.x, 0.0);
 }

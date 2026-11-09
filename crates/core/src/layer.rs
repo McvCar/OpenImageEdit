@@ -1,19 +1,28 @@
 // crates/core/src/layer.rs
 use super::*;
+use std::sync::atomic::{AtomicU32, Ordering};
 
+/// 稳定图层 id。
+///
+/// 索引（`Vec` 下标）会随插入 / 删除 / 排序变化，UI 的多选集合、缩略图缓存
+/// 与日志都必须用 id；历史记录（`EditOp`）内部仍用 index —— undo/redo 按栈
+/// 顺序 apply，栈内索引天然自洽。
+pub type LayerId = u32;
+
+static NEXT_LAYER_ID: AtomicU32 = AtomicU32::new(1);
+
+fn next_layer_id() -> LayerId {
+    NEXT_LAYER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// 位图内容：像素 + 画布相对偏移 + 非破坏性变换参数。
 #[derive(Debug, Clone, PartialEq)]
-pub struct Layer {
-    pub name: String,
+pub struct RasterLayer {
     pub image: RgbaImage,
     pub offset: (i32, i32),
-    pub opacity: f32,
-    pub visible: bool,
-    /// UI-only guard: locked layers reject move / scale / delete in the
-    /// bridge. Plain flag, not part of undo history.
-    pub locked: bool,
-    /// P0-1: 非破坏性变换状态。`Some` 表示本层还保留着未插值的原图
-    /// (`LayerTransform::source`) 与累计参数，`image` 是它当前的显示缓存；
-    /// `None` 表示已经烘焙（做过像素编辑 / 旋转），`image` 是唯一真值。
+    /// P0-1：`Some` 表示本层还保留着未插值的原图（`LayerTransform::source`）
+    /// 与累计参数，`image` 是当前的显示缓存；`None` 表示已经烘焙（做过像素
+    /// 编辑 / 旋转），`image` 是唯一真值。
     ///
     /// 约定（§2.4 等价性契约）：任何**写 `image` 的像素操作之前**必须调用
     /// `ensure_baked()`，否则后续变换会从过期的原始像素重新采样，把编辑
@@ -21,36 +30,192 @@ pub struct Layer {
     pub transform: Option<LayerTransform>,
 }
 
+/// 图层内容：位图 or 矢量标记。
+///
+/// 两者共享外层的「可见 / 锁定 / 不透明度 / 顺序 / 名字」，因此面板、批量
+/// 操作、排序与撤销只需要一套逻辑。
+#[derive(Debug, Clone, PartialEq)]
+pub enum LayerContent {
+    Raster(RasterLayer),
+    /// 矢量标记（矩形 / 椭圆 / 箭头 / 画笔 / 文本 / 马赛克）。
+    Mark(Mark),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Layer {
+    pub id: LayerId,
+    pub name: String,
+    pub visible: bool,
+    pub locked: bool,
+    pub opacity: f32,
+    /// 仅 `layers[0]` 可为 true：文档背景层。仍可隐藏 / 解锁 / 移动，
+    /// 「删除」= 清空像素（见 `EditOp::ClearBackground`）。
+    pub background: bool,
+    pub content: LayerContent,
+}
+
 impl Layer {
     pub fn new(name: impl Into<String>, image: RgbaImage) -> Self {
         Self {
+            id: next_layer_id(),
             name: name.into(),
-            image,
-            offset: (0, 0),
-            opacity: 1.0,
             visible: true,
             locked: false,
-            transform: None,
+            opacity: 1.0,
+            background: false,
+            content: LayerContent::Raster(RasterLayer {
+                image,
+                offset: (0, 0),
+                transform: None,
+            }),
         }
     }
 
+    /// 文档背景层：默认锁定，`background = true`。
+    pub fn background(image: RgbaImage) -> Self {
+        Self {
+            locked: true,
+            background: true,
+            ..Self::new("背景", image)
+        }
+    }
+
+    /// 矢量标记图层。
+    pub fn from_mark(mark: Mark) -> Self {
+        Self {
+            id: next_layer_id(),
+            name: mark.display_name(),
+            visible: true,
+            locked: false,
+            opacity: 1.0,
+            background: false,
+            content: LayerContent::Mark(mark),
+        }
+    }
+
+    // ---- 内容判别 ----------------------------------------------------
+
+    pub fn is_mark(&self) -> bool {
+        matches!(self.content, LayerContent::Mark(_))
+    }
+
+    pub fn is_raster(&self) -> bool {
+        matches!(self.content, LayerContent::Raster(_))
+    }
+
+    pub fn raster(&self) -> Option<&RasterLayer> {
+        match &self.content {
+            LayerContent::Raster(r) => Some(r),
+            LayerContent::Mark(_) => None,
+        }
+    }
+
+    pub fn raster_mut(&mut self) -> Option<&mut RasterLayer> {
+        match &mut self.content {
+            LayerContent::Raster(r) => Some(r),
+            LayerContent::Mark(_) => None,
+        }
+    }
+
+    pub fn mark(&self) -> Option<&Mark> {
+        match &self.content {
+            LayerContent::Mark(m) => Some(m),
+            LayerContent::Raster(_) => None,
+        }
+    }
+
+    pub fn mark_mut(&mut self) -> Option<&mut Mark> {
+        match &mut self.content {
+            LayerContent::Mark(m) => Some(m),
+            LayerContent::Raster(_) => None,
+        }
+    }
+
+    pub fn image(&self) -> Option<&RgbaImage> {
+        self.raster().map(|r| &r.image)
+    }
+
+    pub fn image_mut(&mut self) -> Option<&mut RgbaImage> {
+        self.raster_mut().map(|r| &mut r.image)
+    }
+
+    /// 位图访问的便利入口（历史代码大量 `layer.image.width()` 这类写法）。
+    ///
+    /// 标记图层没有位图，返回一张 1×1 透明图：调用方本应先用 `is_raster()`
+    /// 判断，这里只是让「图层必有位图」的旧路径不至于 panic。**写像素请走
+    /// [`Layer::image_mut`]**，不要用这个返回值。
+    pub fn img(&self) -> &RgbaImage {
+        static EMPTY: std::sync::OnceLock<RgbaImage> = std::sync::OnceLock::new();
+        match self.image() {
+            Some(img) => img,
+            None => EMPTY.get_or_init(|| RgbaImage::new(1, 1)),
+        }
+    }
+
+    /// 变换参数的只读入口；标记层恒 `None`。
+    pub fn xform(&self) -> Option<&LayerTransform> {
+        self.raster().and_then(|r| r.transform.as_ref())
+    }
+
+    pub fn xform_mut(&mut self) -> Option<&mut LayerTransform> {
+        self.raster_mut().and_then(|r| r.transform.as_mut())
+    }
+
+    /// 图层原点（画布坐标）。标记取它 `rect` 的左上角（整数化）。
+    pub fn offset(&self) -> (i32, i32) {
+        match &self.content {
+            LayerContent::Raster(r) => r.offset,
+            LayerContent::Mark(m) => (m.rect.0.round() as i32, m.rect.1.round() as i32),
+        }
+    }
+
+    /// 只移动图层原点、不改尺寸。标记按整数位移平移（`rect` 保持原样精度）。
+    pub fn set_offset(&mut self, offset: (i32, i32)) {
+        match &mut self.content {
+            LayerContent::Raster(r) => r.offset = offset,
+            LayerContent::Mark(m) => {
+                let (ox, oy) = (m.rect.0.round() as i32, m.rect.1.round() as i32);
+                let (dx, dy) = ((offset.0 - ox) as f32, (offset.1 - oy) as f32);
+                if dx != 0.0 || dy != 0.0 {
+                    *m = m.translated(dx, dy);
+                }
+            }
+        }
+    }
+
+    fn expect_raster(&self) -> &RasterLayer {
+        debug_assert!(self.is_raster(), "raster-only API called on a mark layer");
+        self.raster().expect("raster layer")
+    }
+
+    fn expect_raster_mut(&mut self) -> &mut RasterLayer {
+        debug_assert!(self.is_raster(), "raster-only API called on a mark layer");
+        self.raster_mut().expect("raster layer")
+    }
+
+    // ---- 几何 --------------------------------------------------------
+
+    /// 图层占位框（画布坐标）：位图用 offset + 尺寸，标记用 `mark.rect`。
     pub fn bounds(&self) -> Rect {
-        Rect::new(
-            self.offset.0,
-            self.offset.1,
-            self.image.width(),
-            self.image.height(),
-        )
+        match &self.content {
+            LayerContent::Raster(r) => Rect::new(
+                r.offset.0,
+                r.offset.1,
+                r.image.width(),
+                r.image.height(),
+            ),
+            LayerContent::Mark(m) => m.canvas_rect(),
+        }
     }
 
     /// 不透明内容的包围盒（**源图**像素坐标 `(x, y, w, h)`）。
-    ///
     /// 有变换参数时取 `transform.source`（未插值原图），否则直接扫 `image`。
-    /// 全透明层返回 `None`。
+    /// 标记与全透明层返回 `None`。
     pub fn content_bbox(&self, threshold: u8) -> Option<(u32, u32, u32, u32)> {
-        let img = match self.transform.as_ref() {
+        let r = self.raster()?;
+        let img = match r.transform.as_ref() {
             Some(t) => &t.source,
-            None => &self.image,
+            None => &r.image,
         };
         crate::alpha_fit::alpha_bbox(img, threshold)
     }
@@ -60,9 +225,10 @@ impl Layer {
     /// 只有未旋转（且无斜切 / 透视）时才有意义 —— 旋转后内容框是斜的，
     /// 投影吸附会失真，这里返回 `None` 让调用方退回外框吸附。
     pub fn content_bounds(&self, threshold: u8) -> Option<RectF> {
+        let r = self.raster()?;
         let (cx, cy, cw, ch) = self.content_bbox(threshold)?;
         let (cx, cy, cw, ch) = (cx as f64, cy as f64, cw as f64, ch as f64);
-        match self.transform.as_ref() {
+        match r.transform.as_ref() {
             Some(t) => {
                 if !t.is_affine() || t.rotation.abs() > 1e-6 || t.skew.0 != 0.0 || t.skew.1 != 0.0 {
                     return None;
@@ -77,29 +243,32 @@ impl Layer {
                 Some(RectF::from_points(&pts))
             }
             None => Some(RectF::new(
-                self.offset.0 as f64 + cx,
-                self.offset.1 as f64 + cy,
+                r.offset.0 as f64 + cx,
+                r.offset.1 as f64 + cy,
                 cw,
                 ch,
             )),
         }
     }
 
+    // ---- 变换状态 ----------------------------------------------------
+
     /// 取得（或就地建立）本层的变换状态。已烘焙层用当前 `image` 作为新原图，
     /// identity 参数对齐 `offset`，因此第一次变换前后的几何完全一致。
     pub fn transform_state(&mut self) -> LayerTransform {
-        if let Some(t) = &self.transform {
+        let r = self.expect_raster_mut();
+        if let Some(t) = &r.transform {
             return t.clone();
         }
-        let t = LayerTransform::from_offset(self.image.clone(), self.offset.0, self.offset.1);
-        self.transform = Some(t.clone());
+        let t = LayerTransform::from_offset(r.image.clone(), r.offset.0, r.offset.1);
+        r.transform = Some(t.clone());
         t
     }
 
-    /// 记录新的变换状态。P0-1 的显示位图由变换入口用既有插值算法生成后
-    /// 通过 `set_transform_pixels` 写入；这里只负责同步参数与状态。
+    /// 记录新的变换状态。显示位图由变换入口用既有插值算法生成后通过
+    /// `set_transform_pixels` 写入；这里只负责同步参数与状态。
     pub fn set_transform_state(&mut self, t: LayerTransform) {
-        self.transform = Some(t);
+        self.expect_raster_mut().transform = Some(t);
     }
 
     /// 变换入口生成好显示位图后调用：同时更新 `image` / `offset` / 变换参数，
@@ -110,9 +279,10 @@ impl Layer {
         offset: (i32, i32),
         t: LayerTransform,
     ) {
-        self.image = image;
-        self.offset = offset;
-        self.transform = Some(t);
+        let r = self.expect_raster_mut();
+        r.image = image;
+        r.offset = offset;
+        r.transform = Some(t);
     }
 
     /// 自动烘焙（D11）：像素类操作写 `image` 之前调用。`image` 本身已经是
@@ -120,6 +290,8 @@ impl Layer {
     /// 不需要再采样一次（§2.4 陷阱 2：烘焙成 identity 后再插值会清掉透明
     /// 像素的 RGB 并让整层发糊）。
     pub fn ensure_baked(&mut self) {
-        self.transform = None;
+        if let Some(r) = self.raster_mut() {
+            r.transform = None;
+        }
     }
 }

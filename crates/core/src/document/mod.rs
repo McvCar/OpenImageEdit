@@ -5,26 +5,14 @@ use super::*;
 pub struct Document {
     pub source: Option<std::path::PathBuf>,
     pub canvas: Size,
-    pub base: RgbaImage,
-    /// Visible region of `base`, in `base` coordinates. Cropping only shrinks
-    /// this rect (no pixel copy), so crop is O(1) and reversible.
+    /// 裁剪窗口：`view` 是背景图里当前可见的那一块（`layers[0]` 保存完整
+    /// 像素，offset 恒为 `(-view.x, -view.y)`）。只用于「重置裁剪」与
+    /// 坐标换算，不参与合成。
     pub view: Rect,
+    /// 图层栈：索引 0 = 最底（背景），`len-1` = 最顶。
+    /// 背景层 `background == true`、默认锁定；矢量标记作为 `LayerContent::Mark`
+    /// 与位图图层同栈、同排序、同可见性 / 锁定 / 不透明度。
     pub layers: Vec<Layer>,
-    /// True while the base layer has been "deleted" (fully transparent
-    /// canvas). Tracked so the panel can grey out the base row.
-    pub base_deleted: bool,
-    /// True while the base layer is hidden by the user (eye toggle in the
-    /// panel). Non-destructive and undoable.
-    pub base_hidden: bool,
-    /// True once the base image has been converted into a regular layer
-    /// ("unlock" in the panel): it becomes movable / scalable / deletable
-    /// like any other layer, and the synthetic base row disappears. The
-    /// base field stays as a transparent canvas of the same size so crop /
-    /// rotate / canvas-resize keep working unchanged.
-    pub base_converted: bool,
-    /// Vector markup annotations (rect / ellipse / arrow / brush / …) drawn
-    /// on top of the composite at render time. Canvas-space coordinates.
-    pub marks: Vec<Mark>,
     /// Active selection (PS-style alpha coverage map, canvas coordinates).
     /// Lives here instead of on the UI session so Ctrl+Z walks it back in the
     /// same history as pixel edits. `None` = nothing selected.
@@ -42,51 +30,95 @@ pub struct Document {
     pub(crate) history: History,
 }
 
-
 /// Full document state taken before a pixel-modifying op, so undo can restore
 /// it exactly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocumentSnapshot {
     pub canvas: Size,
-    pub base: RgbaImage,
     pub view: Rect,
     pub layers: Vec<Layer>,
-    /// True while the base has been "deleted" (fully transparent canvas).
-    pub base_deleted: bool,
-    /// Base hidden by the user (eye toggle).
-    pub base_hidden: bool,
-    /// Base already converted into a regular layer (panel unlock).
-    pub base_converted: bool,
-    /// Vector markup annotations.
-    pub marks: Vec<Mark>,
 }
 
 impl Document {
     pub fn snapshot(&self) -> DocumentSnapshot {
         DocumentSnapshot {
             canvas: self.canvas,
-            base: self.base.clone(),
             view: self.view,
             layers: self.layers.clone(),
-            base_deleted: self.base_deleted,
-            base_hidden: self.base_hidden,
-            base_converted: self.base_converted,
-            marks: self.marks.clone(),
         }
     }
 
     /// Replace everything except history (used when undoing a pixel op).
     pub fn restore(&mut self, snapshot: DocumentSnapshot) {
         self.canvas = snapshot.canvas;
-        self.base = snapshot.base;
         self.view = snapshot.view;
         self.layers = snapshot.layers;
-        self.base_deleted = snapshot.base_deleted;
-        self.base_hidden = snapshot.base_hidden;
-        self.base_converted = snapshot.base_converted;
-        self.marks = snapshot.marks;
+    }
+
+    // ---- 背景层访问（`layers[0]`，恒存在）----------------------------
+
+    pub fn background(&self) -> &Layer {
+        &self.layers[0]
+    }
+
+    pub fn background_mut(&mut self) -> &mut Layer {
+        &mut self.layers[0]
+    }
+
+    pub fn base_image(&self) -> &RgbaImage {
+        self.layers[0].image().expect("background layer is raster")
+    }
+
+    pub fn base_image_mut(&mut self) -> &mut RgbaImage {
+        self.layers[0]
+            .image_mut()
+            .expect("background layer is raster")
+    }
+
+    /// 覆盖背景像素并保持它对齐 `view`（不做额外位移）。
+    pub fn set_base_image(&mut self, image: RgbaImage) {
+        if let Some(r) = self.layers[0].raster_mut() {
+            r.image = image;
+            r.transform = None;
+            r.offset = (-self.view.x, -self.view.y);
+        }
+    }
+
+    pub fn base_visible(&self) -> bool {
+        self.layers[0].visible
+    }
+
+    pub fn base_hidden(&self) -> bool {
+        !self.layers[0].visible
+    }
+
+    /// 背景像素是否已全部透明（面板显示"已删除"用）。
+    ///
+    /// 这是**内容**判断而不是结构状态：没有单独标志位，避免出现「标志说
+    /// 删了、像素还在」的不一致。只用于面板展示，按行抽样（每 16 行一次）
+    /// 以避开整幅扫描。
+    pub fn base_deleted(&self) -> bool {
+        let Some(img) = self.layers[0].image() else {
+            return true;
+        };
+        let step = (img.height() / 64).max(1);
+        let mut y = 0;
+        while y < img.height() {
+            for x in (0..img.width()).step_by(16) {
+                if img.get_pixel(x, y).0[3] != 0 {
+                    return false;
+                }
+            }
+            y += step;
+        }
+        true
+    }
+
+    pub fn base_converted(&self) -> bool {
+        !self.layers[0].locked
     }
 }
+
 
 
 
@@ -96,14 +128,9 @@ impl Document {
         Self {
             source: None,
             canvas,
-            base: image,
             view: Rect::new(0, 0, canvas.width, canvas.height),
-            layers: Vec::new(),
-            marks: Vec::new(),
+            layers: vec![Layer::background(image)],
             selection: None,
-            base_deleted: false,
-            base_hidden: false,
-            base_converted: false,
             edit_epoch: 0,
             next_layer_seq: 0,
             history: History::new(256),
@@ -212,16 +239,17 @@ impl Document {
 
     /// Undo every crop, showing the full base image again.
     pub fn reset_crop(&mut self) -> Result<(), EditError> {
-        if self.view.x == 0
-            && self.view.y == 0
-            && self.view.width == self.base.width()
-            && self.view.height == self.base.height()
-        {
+        let (bw, bh) = self
+            .layers[0]
+            .image()
+            .map(|img| (img.width(), img.height()))
+            .unwrap_or((self.canvas.width, self.canvas.height));
+        if self.view.x == 0 && self.view.y == 0 && self.view.width == bw && self.view.height == bh {
             return Ok(());
         }
         self.execute(EditOp::CropDocument {
             from: self.view,
-            to: Rect::new(0, 0, self.base.width(), self.base.height()),
+            to: Rect::new(0, 0, bw, bh),
         })
     }
 
@@ -257,43 +285,96 @@ impl Document {
         Ok(index)
     }
 
-    /// Append a markup annotation (drawn on top of the composite). Returns
-    /// its index (creation order, topmost last).
+    /// Append a markup annotation as a new topmost layer. Returns the mark's
+    /// ordinal among marks (0-based, z order) — the same numbering the panel
+    /// and the `mark-*` script ops use.
     pub fn add_mark(&mut self, mark: Mark) -> Result<usize, EditError> {
-        let index = self.marks.len();
-        self.execute(EditOp::AddMark { index, mark })?;
-        Ok(index)
+        let ordinal = self.mark_count();
+        let layer = Layer::from_mark(mark);
+        self.execute(EditOp::AddLayer {
+            layer,
+            index: self.layers.len(),
+        })?;
+        Ok(ordinal)
     }
 
     /// Replace a markup annotation (move / resize / restyle), undoable.
+    /// `index` is the **mark ordinal** (see [`Document::mark_layer_index`]).
     pub fn update_mark(&mut self, index: usize, to: Mark) -> Result<(), EditError> {
-        let from = self
-            .marks
-            .get(index)
+        let li = self
+            .mark_layer_index(index)
+            .ok_or(EditError::MarkIndex(index))?;
+        let from = self.layers[li]
+            .mark()
             .cloned()
             .ok_or(EditError::MarkIndex(index))?;
-        self.execute(EditOp::UpdateMark { index, from, to })
+        self.execute(EditOp::UpdateMark {
+            index: li,
+            from,
+            to,
+        })
     }
 
     /// History-free live preview of [`Document::update_mark`] for handle
     /// drags; the committing call records the true pre-drag mark.
     pub fn update_mark_live(&mut self, index: usize, mark: Mark) -> Result<(), EditError> {
-        let m = self
-            .marks
-            .get_mut(index)
+        let li = self
+            .mark_layer_index(index)
             .ok_or(EditError::MarkIndex(index))?;
-        *m = mark;
-        Ok(())
+        match &mut self.layers[li].content {
+            LayerContent::Mark(m) => {
+                *m = mark;
+                Ok(())
+            }
+            LayerContent::Raster(_) => Err(EditError::MarkIndex(index)),
+        }
     }
 
     /// Remove a markup annotation, undoable.
     pub fn delete_mark(&mut self, index: usize) -> Result<(), EditError> {
-        let mark = self
-            .marks
-            .get(index)
-            .cloned()
+        let li = self
+            .mark_layer_index(index)
             .ok_or(EditError::MarkIndex(index))?;
-        self.execute(EditOp::DeleteMark { index, mark })
+        let layer = self.layers[li].clone();
+        self.execute(EditOp::RemoveLayer {
+            layer,
+            index: li,
+        })
+    }
+
+    // ---- 标记视图（标记现在是图层，这里按 z 序暴露序号 ↔ 图层下标）------
+
+    /// 全部标记图层的图层下标，按 z 序（底 → 顶）。
+    pub fn mark_layer_indices(&self) -> Vec<usize> {
+        self.layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.is_mark())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn mark_count(&self) -> usize {
+        self.layers.iter().filter(|l| l.is_mark()).count()
+    }
+
+    /// 第 `k` 个标记（z 序）对应的图层下标。
+    pub fn mark_layer_index(&self, k: usize) -> Option<usize> {
+        self.mark_layer_indices().get(k).copied()
+    }
+
+    pub fn mark(&self, k: usize) -> Option<&Mark> {
+        self.mark_layer_index(k)
+            .and_then(|i| self.layers[i].mark())
+    }
+
+    pub fn mark_mut(&mut self, k: usize) -> Option<&mut Mark> {
+        let i = self.mark_layer_index(k)?;
+        self.layers[i].mark_mut()
+    }
+
+    pub fn marks(&self) -> impl Iterator<Item = &Mark> {
+        self.layers.iter().filter_map(|l| l.mark())
     }
 
     pub fn remove_layer(&mut self, index: usize) -> Result<(), EditError> {
@@ -322,6 +403,22 @@ impl Document {
         })
     }
 
+    pub fn set_layer_locked(&mut self, index: usize, locked: bool) -> Result<(), EditError> {
+        let from = self
+            .layers
+            .get(index)
+            .ok_or(EditError::LayerIndex(index))?
+            .locked;
+        if from == locked {
+            return Ok(());
+        }
+        self.execute(EditOp::SetLocked {
+            index,
+            from,
+            to: locked,
+        })
+    }
+
     pub fn set_layer_opacity(&mut self, index: usize, opacity: f32) -> Result<(), EditError> {
         let from = self
             .layers
@@ -346,8 +443,15 @@ impl Document {
             .layers
             .get(index)
             .ok_or(EditError::LayerIndex(index))?;
-        let mut to = layer.transform.clone().unwrap_or_else(|| {
-            LayerTransform::from_offset(layer.image.clone(), layer.offset.0, layer.offset.1)
+        if layer.is_mark() {
+            // 标记没有 offset，直接平移几何。
+            let from = layer.offset();
+            let to = (from.0 + dx, from.1 + dy);
+            return self.execute(EditOp::TranslateLayer { index, from, to });
+        }
+        let r = layer.raster().ok_or(EditError::LayerIndex(index))?;
+        let mut to = r.transform.clone().unwrap_or_else(|| {
+            LayerTransform::from_offset(r.image.clone(), r.offset.0, r.offset.1)
         });
         to.center.0 += dx as f64;
         to.center.1 += dy as f64;
@@ -368,10 +472,12 @@ impl Document {
         // 「变换前是普通位图图层」也必须留下可恢复的状态，否则 undo 时
         // 没有位图可还原（只有 None 会让 image 停在变换后的尺寸）。用当前
         // image 建一个 identity 状态，撤销走 1:1 索引快路径精确还原。
-        let from = self.layers[index].transform.clone().unwrap_or_else(|| {
-            let l = &self.layers[index];
-            LayerTransform::from_offset(l.image.clone(), l.offset.0, l.offset.1)
-        });
+        let from = match self.layers[index].raster() {
+            Some(r) => r.transform.clone().unwrap_or_else(|| {
+                LayerTransform::from_offset(r.image.clone(), r.offset.0, r.offset.1)
+            }),
+            None => return Err(EditError::LayerIndex(index)),
+        };
         if to.as_ref() == Some(&from) {
             return Ok(());
         }
@@ -447,37 +553,23 @@ impl Document {
         self.execute(EditOp::TransformLayer { index, transform })
     }
 
-    /// "Delete" the base layer: the canvas becomes fully transparent while
-    /// layers stay untouched. Requires at least one layer to remain.
+    /// "Delete" the background: its pixels become fully transparent while the
+    /// layer entries (and therefore the layer stack) stay untouched.
     pub fn delete_base(&mut self) -> Result<(), EditError> {
-        if self.layers.is_empty() {
-            return Err(EditError::BaseRequired);
-        }
         let from = self.snapshot();
         self.execute(EditOp::DeleteBase { from })
     }
 
-    /// Hide/show the base layer. No-op (no history entry) when the state
-    /// already matches.
+    /// Hide/show the background layer. No-op (no history entry) when the
+    /// state already matches.
     pub fn set_base_visible(&mut self, visible: bool) -> Result<(), EditError> {
-        let from = self.base_hidden;
-        let to = !visible;
-        if from == to {
+        if self.layers[0].visible == visible {
             return Ok(());
         }
-        self.execute(EditOp::SetBaseVisible { from, to })
-    }
-
-    /// "Unlock" the base layer: convert it into a regular layer at the
-    /// bottom of the stack so it can be moved / scaled / deleted / renamed
-    /// like any other layer. Idempotent: converting twice is a no-op (the
-    /// second call adds no history entry).
-    pub fn convert_base_to_layer(&mut self) -> Result<(), EditError> {
-        if self.base_converted {
-            return Ok(());
-        }
-        let from = self.snapshot();
-        self.execute(EditOp::BaseToLayer { from })
+        self.execute(EditOp::SetBaseVisible {
+            from: !visible,
+            to: visible,
+        })
     }
 
     pub fn undo(&mut self) -> Result<(), EditError> {
@@ -541,7 +633,7 @@ impl Document {
             return Err(EditError::EmptySelection);
         }
         let mut layer = Layer::new("Selection", image);
-        layer.offset = (bounds.x, bounds.y);
+        layer.set_offset((bounds.x, bounds.y));
         Ok(layer)
     }
 
@@ -596,12 +688,16 @@ impl Document {
             .intersect(canvas_rect)
             .ok_or(EditError::EmptySelection)?;
         if let AdjustTarget::Layer(index) = target {
-            let layer = self.layers.get(index).ok_or(EditError::LayerIndex(index))?;
+            let r = self
+                .layers
+                .get(index)
+                .and_then(|l| l.raster())
+                .ok_or(EditError::LayerIndex(index))?;
             let layer_rect = Rect::new(
-                layer.offset.0,
-                layer.offset.1,
-                layer.image.width(),
-                layer.image.height(),
+                r.offset.0,
+                r.offset.1,
+                r.image.width(),
+                r.image.height(),
             );
             bounds = bounds
                 .intersect(layer_rect)
@@ -638,7 +734,7 @@ impl Document {
             return Err(EditError::EmptySelection);
         }
         let mut layer = Layer::new("Selection", image);
-        layer.offset = (bounds.x, bounds.y);
+        layer.set_offset((bounds.x, bounds.y));
         Ok(layer)
     }
 
@@ -671,12 +767,13 @@ impl Document {
         if layer.locked {
             return Err(EditError::LayerIndex(index));
         }
+        let r = layer.raster().ok_or(EditError::LayerIndex(index))?;
         let canvas_rect = Rect::new(0, 0, self.canvas.width, self.canvas.height);
         let layer_rect = Rect::new(
-            layer.offset.0,
-            layer.offset.1,
-            layer.image.width(),
-            layer.image.height(),
+            r.offset.0,
+            r.offset.1,
+            r.image.width(),
+            r.image.height(),
         );
         let area = selection
             .bounds
@@ -686,10 +783,10 @@ impl Document {
         if area.is_empty() || selection.area() == 0 {
             return Err(EditError::EmptySelection);
         }
-        let lx = area.x - layer.offset.0;
-        let ly = area.y - layer.offset.1;
+        let lx = area.x - r.offset.0;
+        let ly = area.y - r.offset.1;
         let (rect, before) = crop_region(
-            &layer.image,
+            &r.image,
             Rect::new(lx, ly, area.width, area.height),
         );
         if rect.is_empty() {
@@ -714,10 +811,11 @@ impl Document {
 
 
     /// Pixels a color adjustment would touch (histogram source / live scope).
+    /// `AdjustTarget::Base` 恒指背景层（`layers[0]`）。
     pub fn scope_image(&self, target: AdjustTarget) -> Option<&RgbaImage> {
         match target {
-            AdjustTarget::Base => Some(&self.base),
-            AdjustTarget::Layer(index) => self.layers.get(index).map(|layer| &layer.image),
+            AdjustTarget::Base => self.layers[0].image(),
+            AdjustTarget::Layer(index) => self.layers.get(index).and_then(|layer| layer.image()),
         }
     }
 
@@ -734,11 +832,12 @@ impl Document {
         params: &Adjust,
     ) -> Result<(), EditError> {
         let from = match target {
-            AdjustTarget::Base => self.base.clone(),
+            AdjustTarget::Base => self.base_image().clone(),
             AdjustTarget::Layer(index) => self
                 .layers
                 .get(index)
-                .map(|layer| layer.image.clone())
+                .and_then(|layer| layer.image())
+                .map(|img| img.clone())
                 .ok_or(EditError::LayerIndex(index))?,
         };
         if params.is_identity() {
@@ -829,15 +928,22 @@ impl Document {
             return Ok(());
         }
         let before = layer.clone();
+        let prev = layer.raster().ok_or(EditError::LayerIndex(index))?;
         // 落定用双三次：双线性转完一圈下来整层会明显发软（只此一次，代价
         // 摊不进拖动帧，没有理由省）。
-        let (image, delta) = rotate_image_hq(&layer.image, degrees, expand);
+        let (image, delta) = rotate_image_hq(&prev.image, degrees, expand);
         let mut after = before.clone();
         // after 的位图是从 before.image 重新旋转出来的，原始像素已经不再
         // 对应新的内容，烘焙掉非破坏性状态（P0-2 会把旋转也参数化）。
         after.ensure_baked();
-        after.image = image;
-        after.offset = (before.offset.0 + delta.0, before.offset.1 + delta.1);
+        let (po, pi) = (prev.offset, image.clone());
+        match &mut after.content {
+            LayerContent::Raster(r) => {
+                r.image = pi;
+                r.offset = (po.0 + delta.0, po.1 + delta.1);
+            }
+            LayerContent::Mark(_) => return Err(EditError::LayerIndex(index)),
+        }
         if after == before {
             return Ok(());
         }
@@ -848,42 +954,34 @@ impl Document {
         })
     }
 
-    pub fn composite_pixel(&self, x: i32, y: i32) -> image::Rgba<u8> {        if x < 0 || y < 0 || x >= self.canvas.width as i32 || y >= self.canvas.height as i32 {
+    /// 单点合成（**只含位图图层**）。
+    ///
+    /// 矢量标记不参与逐像素采样 —— 与统一模型之前的行为一致（旧实现的
+    /// `composite_pixel` 也只看 base + layers，标记仅在 `flatten` 里绘制）。
+    /// 魔术棒「取样全部图层」因此不会把标记颜色算进去。
+    pub fn composite_pixel(&self, x: i32, y: i32) -> image::Rgba<u8> {
+        if x < 0 || y < 0 || x >= self.canvas.width as i32 || y >= self.canvas.height as i32 {
             return image::Rgba([0, 0, 0, 0]);
         }
-        let bx = (self.view.x + x) as u32;
-        let by = (self.view.y + y) as u32;
-        let mut out = if !self.base_hidden
-            && bx < self.base.width()
-            && by < self.base.height()
-        {
-            self.base.get_pixel(bx, by).0
-        } else {
-            [0, 0, 0, 0]
-        };
+        let mut out = [0u8, 0, 0, 0];
         for layer in &self.layers {
             if !layer.visible || layer.opacity <= 0.0 {
                 continue;
             }
-            let lx = x - layer.offset.0;
-            let ly = y - layer.offset.1;
+            let Some(r) = layer.raster() else {
+                continue;
+            };
+            let lx = x - r.offset.0;
+            let ly = y - r.offset.1;
             if lx < 0
                 || ly < 0
-                || lx >= layer.image.width() as i32
-                || ly >= layer.image.height() as i32
+                || lx >= r.image.width() as i32
+                || ly >= r.image.height() as i32
             {
                 continue;
             }
-            let src = layer.image.get_pixel(lx as u32, ly as u32).0;
-            let a = (src[3] as f32 / 255.0) * layer.opacity;
-            if a <= 0.0 {
-                continue;
-            }
-            let inv = 1.0 - a;
-            for c in 0..3 {
-                out[c] = (src[c] as f32 * a + out[c] as f32 * inv).round() as u8;
-            }
-            out[3] = ((a + out[3] as f32 / 255.0 * inv) * 255.0).round() as u8;
+            let src = r.image.get_pixel(lx as u32, ly as u32).0;
+            blend_over(&mut out, src, layer.opacity);
         }
         image::Rgba(out)
     }
@@ -943,20 +1041,24 @@ impl Document {
         }
     }
 
-    /// 背景像素（画布坐标 → 原始位图坐标，算上裁剪视图的偏移）。
+    /// 背景像素（画布坐标 → 背景层坐标）。不可见 / 越界 = 全透明。
     pub fn base_pixel_at(&self, x: i32, y: i32) -> [u8; 4] {
-        if self.base_hidden {
+        let bg = &self.layers[0];
+        if !bg.visible {
             return [0, 0, 0, 0];
         }
-        let bx = self.view.x + x;
-        let by = self.view.y + y;
-        if bx < 0 || by < 0 || bx as u32 >= self.base.width() || by as u32 >= self.base.height() {
+        let Some(r) = bg.raster() else {
+            return [0, 0, 0, 0];
+        };
+        let bx = x - r.offset.0;
+        let by = y - r.offset.1;
+        if bx < 0 || by < 0 || bx as u32 >= r.image.width() || by as u32 >= r.image.height() {
             return [0, 0, 0, 0];
         }
-        self.base.get_pixel(bx as u32, by as u32).0
+        r.image.get_pixel(bx as u32, by as u32).0
     }
 
-    /// 单个图层的像素（画布坐标 → 图层坐标）。不可见 / 图层外 = 全透明。
+    /// 单个图层的像素（画布坐标 → 图层坐标）。不可见 / 图层外 / 标记 = 全透明。
     pub fn layer_pixel(&self, index: usize, x: i32, y: i32) -> [u8; 4] {
         let Some(layer) = self.layers.get(index) else {
             return [0, 0, 0, 0];
@@ -964,30 +1066,96 @@ impl Document {
         if !layer.visible || layer.opacity <= 0.0 {
             return [0, 0, 0, 0];
         }
-        let lx = x - layer.offset.0;
-        let ly = y - layer.offset.1;
-        if lx < 0 || ly < 0 || lx as u32 >= layer.image.width() || ly as u32 >= layer.image.height() {
+        let Some(r) = layer.raster() else {
+            return [0, 0, 0, 0];
+        };
+        let lx = x - r.offset.0;
+        let ly = y - r.offset.1;
+        if lx < 0 || ly < 0 || lx as u32 >= r.image.width() || ly as u32 >= r.image.height() {
             return [0, 0, 0, 0];
         }
-        let mut p = layer.image.get_pixel(lx as u32, ly as u32).0;
+        let mut p = r.image.get_pixel(lx as u32, ly as u32).0;
         p[3] = (p[3] as f32 * layer.opacity).round().clamp(0.0, 255.0) as u8;
         p
     }
 
+    /// 全幅合成：按 `layers` 顺序自底向上，位图按 offset + 不透明度混合，
+    /// 标记按不透明度栅格化到累积图。**顺序即 z 序** —— 标记不再天然置顶。
     pub fn flatten(&self) -> RgbaImage {
         let mut out = RgbaImage::new(self.canvas.width, self.canvas.height);
-        for y in 0..self.canvas.height {
-            for x in 0..self.canvas.width {
-                out.put_pixel(x, y, self.composite_pixel(x as i32, y as i32));
+        for layer in &self.layers {
+            if !layer.visible || layer.opacity <= 0.0 {
+                continue;
             }
-        }
-        // Markup annotations always sit on top of every layer.
-        for mark in &self.marks {
-            if mark.visible {
-                mark.draw(&mut out);
+            match &layer.content {
+                LayerContent::Raster(r) => blend_raster_into(&mut out, r, layer.opacity),
+                LayerContent::Mark(m) => {
+                    if layer.opacity >= 0.999 {
+                        m.draw(&mut out);
+                    } else {
+                        // 标记的不透明度：先画到副本，再按系数回混。
+                        let mut tmp = out.clone();
+                        m.draw(&mut tmp);
+                        for (dst, src) in out.pixels_mut().zip(tmp.pixels()) {
+                            let p = dst.0;
+                            dst.0 = [
+                                (p[0] as f32 * (1.0 - layer.opacity)
+                                    + src.0[0] as f32 * layer.opacity)
+                                    .round() as u8,
+                                (p[1] as f32 * (1.0 - layer.opacity)
+                                    + src.0[1] as f32 * layer.opacity)
+                                    .round() as u8,
+                                (p[2] as f32 * (1.0 - layer.opacity)
+                                    + src.0[2] as f32 * layer.opacity)
+                                    .round() as u8,
+                                (p[3] as f32 * (1.0 - layer.opacity)
+                                    + src.0[3] as f32 * layer.opacity)
+                                    .round() as u8,
+                            ];
+                        }
+                    }
+                }
             }
         }
         out
+    }
+}
+
+/// 把 `src` 按 `opacity` 叠到 `out` 上（与旧 `composite_pixel` 逐像素一致）。
+fn blend_over(out: &mut [u8; 4], src: [u8; 4], opacity: f32) {
+    let a = (src[3] as f32 / 255.0) * opacity;
+    if a <= 0.0 {
+        return;
+    }
+    let inv = 1.0 - a;
+    for c in 0..3 {
+        out[c] = (src[c] as f32 * a + out[c] as f32 * inv).round() as u8;
+    }
+    out[3] = ((a + out[3] as f32 / 255.0 * inv) * 255.0).round() as u8;
+}
+
+/// 把一个位图图层按 offset 混合进整幅画布。
+fn blend_raster_into(out: &mut RgbaImage, r: &RasterLayer, opacity: f32) {
+    let (ox, oy) = r.offset;
+    let x0 = ox.max(0);
+    let y0 = oy.max(0);
+    let x1 = (ox + r.image.width() as i32).min(out.width() as i32);
+    let y1 = (oy + r.image.height() as i32).min(out.height() as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let src = r
+                .image
+                .get_pixel((x - ox) as u32, (y - oy) as u32)
+                .0;
+            if src[3] == 0 {
+                continue;
+            }
+            let px = out.get_pixel_mut(x as u32, y as u32);
+            blend_over(&mut px.0, src, opacity);
+        }
     }
 }
 

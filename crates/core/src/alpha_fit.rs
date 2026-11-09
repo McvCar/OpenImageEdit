@@ -77,7 +77,8 @@ impl Occupancy {
         if !layer.visible || layer.opacity <= 0.0 {
             return;
         }
-        match layer.transform.as_ref() {
+        let Some(r) = layer.raster() else { return };
+        match r.transform.as_ref() {
             Some(t) => {
                 let Some(inv) = t.inverse() else { return };
                 let b = t.bounds();
@@ -105,7 +106,7 @@ impl Occupancy {
                     }
                 }
             }
-            None => self.stamp_image(&layer.image, layer.offset.0, layer.offset.1, threshold),
+            None => self.stamp_image(&r.image, r.offset.0, r.offset.1, threshold),
         }
     }
 
@@ -642,16 +643,19 @@ pub fn layer_holes(
     if !layer.visible || layer.opacity <= 0.0 || limit == 0 {
         return Vec::new();
     }
-    let img = match layer.transform.as_ref() {
+    let Some(r) = layer.raster() else {
+        return Vec::new();
+    };
+    let img = match r.transform.as_ref() {
         Some(t) => &t.source,
-        None => &layer.image,
+        None => &r.image,
     };
     let rects = hole_rects(img, threshold, limit * 4);
     if rects.is_empty() {
         return Vec::new();
     }
     let mut out = Vec::with_capacity(rects.len().min(limit));
-    match layer.transform.as_ref() {
+    match r.transform.as_ref() {
         Some(t) => {
             if !t.is_affine()
                 || t.rotation.abs() > 1e-6
@@ -682,8 +686,8 @@ pub fn layer_holes(
             for (x, y, w, h) in rects {
                 if w as f64 >= min_side && h as f64 >= min_side {
                     out.push((
-                        layer.offset.0 as f64 + x as f64,
-                        layer.offset.1 as f64 + y as f64,
+                        r.offset.0 as f64 + x as f64,
+                        r.offset.1 as f64 + y as f64,
                         w as f64,
                         h as f64,
                     ));
@@ -784,7 +788,7 @@ mod tests {
         let mut occ = Occupancy::default();
         occ.reset(rect);
         let mut l = Layer::new("t", img.clone());
-        l.offset = (0, 0);
+        l.set_offset((0, 0));
         occ.stamp(&l, ALPHA_THRESHOLD);
         occ
     }
@@ -871,7 +875,7 @@ mod tests {
         let mut occ = Occupancy::default();
         occ.reset((0.0, 0.0, 50.0, 50.0));
         let mut l = Layer::new("t", img.clone());
-        l.offset = (0, 0);
+        l.set_offset((0, 0));
         occ.stamp(&l, ALPHA_THRESHOLD);
         assert_eq!(occ.occupied_in((0.0, 0.0, 50.0, 50.0)), 0);
     }
@@ -985,7 +989,7 @@ mod tests {
     #[test]
     fn layer_holes_map_through_offset() {
         let mut l = Layer::new("t", padded_with_hole());
-        l.offset = (100, 50);
+        l.set_offset((100, 50));
         let rs = layer_holes(&l, ALPHA_THRESHOLD, 8.0, 4);
         assert_eq!(rs.len(), 1);
         assert!((rs[0].0 - 250.0).abs() < 1e-9, "{rs:?}");

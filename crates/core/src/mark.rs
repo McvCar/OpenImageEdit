@@ -42,9 +42,6 @@ pub struct Mark {
     /// Text only: underline every line; alignment 0 left / 1 center / 2 right.
     pub underline: bool,
     pub align: u8,
-    /// Hidden marks stay in the document (and the panel list) but are not
-    /// rasterized onto the canvas.
-    pub visible: bool,
 }
 
 impl Mark {
@@ -67,7 +64,6 @@ impl Mark {
             italic: false,
             underline: false,
             align: 0,
-            visible: true,
         }
     }
 }
@@ -129,6 +125,39 @@ impl Mark {
     /// Rasterize onto a preview image (`sx`/`sy` = preview px per image px).
     pub fn draw_scaled(&self, img: &mut RgbaImage, sx: f32, sy: f32) {
         draw_mark(img, self, sx, sy);
+    }
+
+    /// 占位框（画布坐标，整数）：面板 / 对齐 / 命中测试统一用它。
+    pub fn canvas_rect(&self) -> Rect {
+        let (x0, y0, x1, y1) = norm_rect(self.rect);
+        Rect::new(
+            x0.floor() as i32,
+            y0.floor() as i32,
+            ((x1 - x0).ceil() as i32).max(1) as u32,
+            ((y1 - y0).ceil() as i32).max(1) as u32,
+        )
+    }
+
+    /// 面板与图层列表显示用的类型名。
+    pub fn kind_label(&self) -> &'static str {
+        match self.kind {
+            MarkKind::Rect => "矩形",
+            MarkKind::Ellipse => "椭圆",
+            MarkKind::Arrow => "箭头",
+            MarkKind::Brush => "画笔",
+            MarkKind::Mosaic => "马赛克",
+            MarkKind::Text => "文本",
+        }
+    }
+
+    /// 图层默认名字：`矩形` / `文本：标题…`（文本截断到 8 个字符）。
+    pub fn display_name(&self) -> String {
+        if self.kind == MarkKind::Text && !self.text.trim().is_empty() {
+            let trimmed: String = self.text.trim().chars().take(8).collect();
+            let ellipsis = if self.text.trim().chars().count() > 8 { "…" } else { "" };
+            return format!("{}：{}{}", self.kind_label(), trimmed, ellipsis);
+        }
+        self.kind_label().to_string()
     }
 }
 

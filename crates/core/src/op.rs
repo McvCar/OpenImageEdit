@@ -36,6 +36,9 @@ pub enum EditOp {
     RemoveLayer { layer: Layer, index: usize },
     MoveLayer { from: usize, to: usize },
     SetVisible { index: usize, from: bool, to: bool },
+    /// 图层锁定开关（可撤销）。锁定的层拒绝移动 / 缩放 / 删除 / 排序，
+    /// 现在它也进历史 —— 误锁一下能 Ctrl+Z 回来。
+    SetLocked { index: usize, from: bool, to: bool },
     SetOpacity { index: usize, from: f32, to: f32 },
     TranslateLayer { index: usize, from: (i32, i32), to: (i32, i32) },
     /// P0-1 参数化变换历史：from/to 只存参数 + `Arc<原图>` 的浅引用，
@@ -71,30 +74,19 @@ pub enum EditOp {
     /// layer occupies the same box, its pixels are just mirrored inside it.
     /// Purely self-inverse for flips; rotations undo through `inverted()`.
     TransformLayer { index: usize, transform: Transform },
-    /// "Delete" the base layer: the canvas becomes fully transparent while
-    /// layers stay untouched. Undo restores the previous base pixels.
+    /// "删除背景"：像素清空成透明，图层条目本身保留（栈结构不变）。
+    /// 撤销用快照精确还原。
     DeleteBase { from: DocumentSnapshot },
-    /// Hide/show the base layer (eye toggle in the panel). Cheap flag flip,
-    /// no pixels involved; snapshot-free undo via from/to.
+    /// 显示 / 隐藏背景层（眼睛图标）。纯标志翻转，不走快照。
     SetBaseVisible { from: bool, to: bool },
     /// Change the canvas resolution WITHOUT resampling any pixels: content
     /// keeps its size and is re-anchored to the center of the new canvas
     /// (clipped when shrinking, transparent padding when growing). The
     /// pre-op snapshot makes undo exact (same pattern as `ResizeDocument`).
     CanvasResize { from: DocumentSnapshot, to: Size },
-    /// "Unlock" the base layer: its pixels become a regular layer at the
-    /// bottom of the stack (movable / scalable / deletable like any other
-    /// layer) and the base itself becomes a transparent canvas of the same
-    /// size. The pre-op snapshot makes undo exact.
-    BaseToLayer { from: DocumentSnapshot },
-    /// Add a markup annotation on top of the composition. `index` is always
-    /// the current list length (marks stack in creation order).
-    AddMark { index: usize, mark: Mark },
-    /// Restyle / move / resize an existing annotation. `from` is the mark
-    /// before the change (undo restores it verbatim).
+    /// Restyle / move / resize a markup layer. `index` is the **layer index**,
+    /// `from`/`to` are the mark before and after (layer attributes untouched).
     UpdateMark { index: usize, from: Mark, to: Mark },
-    /// Remove an annotation; the removed mark is kept for undo.
-    DeleteMark { index: usize, mark: Mark },
     /// Bake a color adjustment into the target's pixels ("调整颜色" panel).
     /// Only the pre-op image of the scope is stored; redo recomputes
     /// `adjust(from)`, so a 50 MP base costs one extra image instead of two.
@@ -174,21 +166,23 @@ impl EditOp {
                 Ok(())
             }
             EditOp::AddLayer { layer, index } => {
-                if *index > doc.layers.len() {
+                // 背景层恒占 0 号位：往 0 号插入会把背景挤到 1 号，破坏
+                // 「layers[0] 是背景」这条不变量。
+                if *index == 0 || *index > doc.layers.len() {
                     return Err(EditError::LayerIndex(*index));
                 }
                 doc.layers.insert(*index, layer.clone());
                 Ok(())
             }
             EditOp::RemoveLayer { index, .. } => {
-                if *index >= doc.layers.len() {
+                if *index == 0 || *index >= doc.layers.len() {
                     return Err(EditError::LayerIndex(*index));
                 }
                 doc.layers.remove(*index);
                 Ok(())
             }
             EditOp::MoveLayer { from, to } => {
-                if *from >= doc.layers.len() || *to >= doc.layers.len() {
+                if *from >= doc.layers.len() || *to >= doc.layers.len() || *from == 0 || *to == 0 {
                     return Err(EditError::LayerIndex((*from).max(*to)));
                 }
                 let layer = doc.layers.remove(*from);
@@ -203,6 +197,14 @@ impl EditOp {
                 layer.visible = *to;
                 Ok(())
             }
+            EditOp::SetLocked { index, to, .. } => {
+                let layer = doc
+                    .layers
+                    .get_mut(*index)
+                    .ok_or(EditError::LayerIndex(*index))?;
+                layer.locked = *to;
+                Ok(())
+            }
             EditOp::SetOpacity { index, to, .. } => {
                 let layer = doc
                     .layers
@@ -211,12 +213,19 @@ impl EditOp {
                 layer.opacity = to.clamp(0.0, 1.0);
                 Ok(())
             }
-            EditOp::TranslateLayer { index, to, .. } => {
+            EditOp::TranslateLayer { index, from, to } => {
                 let layer = doc
                     .layers
                     .get_mut(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
-                layer.offset = *to;
+                // 位图层的 `offset` 是绝对坐标；标记图层没有 offset，按
+                // from → to 的差值平移几何。
+                match &mut layer.content {
+                    LayerContent::Raster(r) => r.offset = *to,
+                    LayerContent::Mark(m) => {
+                        *m = m.translated((to.0 - from.0) as f32, (to.1 - from.1) as f32);
+                    }
+                }
                 Ok(())
             }
             EditOp::SetLayerTransform { index, to, .. } => {
@@ -224,6 +233,9 @@ impl EditOp {
                     .layers
                     .get_mut(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
+                if !layer.is_raster() {
+                    return Err(EditError::LayerIndex(*index));
+                }
                 match to {
                     Some(t) => {
                         // P0-2b2：统一用兼容后端，落定像素与旧三条路径逐像素一致。
@@ -257,6 +269,7 @@ impl EditOp {
                     .layers
                     .get(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
+                let prev = prev.raster().ok_or(EditError::LayerIndex(*index))?;
                 let mut t = prev.transform.clone().unwrap_or_else(|| {
                     LayerTransform::from_offset(prev.image.clone(), prev.offset.0, prev.offset.1)
                 });
@@ -309,7 +322,10 @@ impl EditOp {
                     .get_mut(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
                 layer.ensure_baked();
-                layer.image = transform.apply_to_image(&layer.image);
+                let Some(img) = layer.image_mut() else {
+                    return Err(EditError::LayerIndex(*index));
+                };
+                *img = transform.apply_to_image(img);
                 Ok(())
             }
             EditOp::DeleteBase { .. } => {
@@ -317,7 +333,7 @@ impl EditOp {
                 Ok(())
             }
             EditOp::SetBaseVisible { to, .. } => {
-                doc.base_hidden = *to;
+                doc.layers[0].visible = *to;
                 Ok(())
             }
             EditOp::CanvasResize { to, .. } => {
@@ -325,31 +341,18 @@ impl EditOp {
                 doc.selection = None;
                 Ok(())
             }
-            EditOp::BaseToLayer { .. } => {
-                apply_base_to_layer(doc);
-                Ok(())
-            }
-            EditOp::AddMark { index, mark } => {
-                if *index > doc.marks.len() {
-                    return Err(EditError::MarkIndex(*index));
-                }
-                doc.marks.insert(*index, mark.clone());
-                Ok(())
-            }
             EditOp::UpdateMark { index, to, .. } => {
-                let m = doc
-                    .marks
+                let layer = doc
+                    .layers
                     .get_mut(*index)
                     .ok_or(EditError::MarkIndex(*index))?;
-                *m = to.clone();
-                Ok(())
-            }
-            EditOp::DeleteMark { index, .. } => {
-                if *index >= doc.marks.len() {
-                    return Err(EditError::MarkIndex(*index));
+                match &mut layer.content {
+                    LayerContent::Mark(m) => {
+                        *m = to.clone();
+                        Ok(())
+                    }
+                    LayerContent::Raster(_) => Err(EditError::MarkIndex(*index)),
                 }
-                doc.marks.remove(*index);
-                Ok(())
             }
             EditOp::AdjustPixels {
                 target, from, params,
@@ -357,8 +360,14 @@ impl EditOp {
                 let adjusted = params.apply_to(from);
                 match target {
                     AdjustTarget::Base => {
-                        doc.base = adjusted;
-                        Ok(())
+                        doc.layers[0].ensure_baked();
+                        match doc.layers[0].image_mut() {
+                            Some(img) => {
+                                *img = adjusted;
+                                Ok(())
+                            }
+                            None => Err(EditError::LayerIndex(0)),
+                        }
                     }
                     AdjustTarget::Layer(index) => {
                         let layer = doc
@@ -366,8 +375,13 @@ impl EditOp {
                             .get_mut(*index)
                             .ok_or(EditError::LayerIndex(*index))?;
                         layer.ensure_baked();
-                        layer.image = adjusted;
-                        Ok(())
+                        match layer.image_mut() {
+                            Some(img) => {
+                                *img = adjusted;
+                                Ok(())
+                            }
+                            None => Err(EditError::LayerIndex(*index)),
+                        }
                     }
                 }
             }
@@ -432,14 +446,14 @@ impl EditOp {
                 Ok(())
             }
             EditOp::RemoveLayer { layer, index } => {
-                if *index > doc.layers.len() {
+                if *index == 0 || *index > doc.layers.len() {
                     return Err(EditError::LayerIndex(*index));
                 }
                 doc.layers.insert(*index, layer.clone());
                 Ok(())
             }
             EditOp::MoveLayer { from, to } => {
-                if *from >= doc.layers.len() || *to >= doc.layers.len() {
+                if *from >= doc.layers.len() || *to >= doc.layers.len() || *from == 0 || *to == 0 {
                     return Err(EditError::LayerIndex((*from).max(*to)));
                 }
                 let layer = doc.layers.remove(*to);
@@ -454,6 +468,14 @@ impl EditOp {
                 layer.visible = *from;
                 Ok(())
             }
+            EditOp::SetLocked { index, from, .. } => {
+                let layer = doc
+                    .layers
+                    .get_mut(*index)
+                    .ok_or(EditError::LayerIndex(*index))?;
+                layer.locked = *from;
+                Ok(())
+            }
             EditOp::SetOpacity { index, from, .. } => {
                 let layer = doc
                     .layers
@@ -462,12 +484,17 @@ impl EditOp {
                 layer.opacity = *from;
                 Ok(())
             }
-            EditOp::TranslateLayer { index, from, .. } => {
+            EditOp::TranslateLayer { index, from, to } => {
                 let layer = doc
                     .layers
                     .get_mut(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
-                layer.offset = *from;
+                match &mut layer.content {
+                    LayerContent::Raster(r) => r.offset = *from,
+                    LayerContent::Mark(m) => {
+                        *m = m.translated((from.0 - to.0) as f32, (from.1 - to.1) as f32);
+                    }
+                }
                 Ok(())
             }
             EditOp::SetLayerTransform { index, from, .. } => {
@@ -475,6 +502,9 @@ impl EditOp {
                     .layers
                     .get_mut(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
+                if !layer.is_raster() {
+                    return Err(EditError::LayerIndex(*index));
+                }
                 match from {
                     Some(t) => {
                         // P0-2b2：统一用兼容后端，落定像素与旧三条路径逐像素一致。
@@ -507,7 +537,10 @@ impl EditOp {
                     .get_mut(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
                 layer.ensure_baked();
-                layer.image = transform.inverted().apply_to_image(&layer.image);
+                let Some(img) = layer.image_mut() else {
+                    return Err(EditError::LayerIndex(*index));
+                };
+                *img = transform.inverted().apply_to_image(img);
                 Ok(())
             }
             EditOp::DeleteBase { from } => {
@@ -515,7 +548,7 @@ impl EditOp {
                 Ok(())
             }
             EditOp::SetBaseVisible { from, .. } => {
-                doc.base_hidden = *from;
+                doc.layers[0].visible = *from;
                 Ok(())
             }
             EditOp::CanvasResize { from, .. } => {
@@ -523,37 +556,30 @@ impl EditOp {
                 doc.selection = None;
                 Ok(())
             }
-            EditOp::BaseToLayer { from } => {
-                doc.restore(from.clone());
-                Ok(())
-            }
-            EditOp::AddMark { index, .. } => {
-                if *index >= doc.marks.len() {
-                    return Err(EditError::MarkIndex(*index));
-                }
-                doc.marks.remove(*index);
-                Ok(())
-            }
             EditOp::UpdateMark { index, from, .. } => {
-                let m = doc
-                    .marks
+                let layer = doc
+                    .layers
                     .get_mut(*index)
                     .ok_or(EditError::MarkIndex(*index))?;
-                *m = from.clone();
-                Ok(())
-            }
-            EditOp::DeleteMark { index, mark } => {
-                if *index > doc.marks.len() {
-                    return Err(EditError::MarkIndex(*index));
+                match &mut layer.content {
+                    LayerContent::Mark(m) => {
+                        *m = from.clone();
+                        Ok(())
+                    }
+                    LayerContent::Raster(_) => Err(EditError::MarkIndex(*index)),
                 }
-                doc.marks.insert(*index, mark.clone());
-                Ok(())
             }
             EditOp::AdjustPixels { target, from, .. } => {
                 match target {
                     AdjustTarget::Base => {
-                        doc.base = from.clone();
-                        Ok(())
+                        doc.layers[0].ensure_baked();
+                        match doc.layers[0].image_mut() {
+                            Some(img) => {
+                                *img = from.clone();
+                                Ok(())
+                            }
+                            None => Err(EditError::LayerIndex(0)),
+                        }
                     }
                     AdjustTarget::Layer(index) => {
                         let layer = doc
@@ -561,8 +587,13 @@ impl EditOp {
                             .get_mut(*index)
                             .ok_or(EditError::LayerIndex(*index))?;
                         layer.ensure_baked();
-                        layer.image = from.clone();
-                        Ok(())
+                        match layer.image_mut() {
+                            Some(img) => {
+                                *img = from.clone();
+                                Ok(())
+                            }
+                            None => Err(EditError::LayerIndex(*index)),
+                        }
                     }
                 }
             }

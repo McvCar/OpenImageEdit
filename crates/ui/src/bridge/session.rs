@@ -9,8 +9,6 @@ pub(in crate::bridge) struct Session {
     pub(in crate::bridge) fit: bool,
     pub(in crate::bridge) render_count: u32,
     pub(in crate::bridge) dirty: bool,
-    /// UI lock for the base row (blocks delete). Plain flag, not undoable.
-    pub(in crate::bridge) base_locked: bool,
     /// Save quality snapshot from AppConfig at session creation (updated
     /// live by `update_save_quality`).
     pub(in crate::bridge) save_quality: u8,
@@ -249,7 +247,7 @@ impl Session {
             };
             if o.index != ix
                 || o.degrees.abs() < 0.001
-                || o.committed.image != *before_image
+                || o.committed.img() != before_image
             {
                 return;
             }
@@ -261,12 +259,12 @@ impl Session {
         }
         let sx = to.width as f64 / before_image.width().max(1) as f64;
         let sy = to.height as f64 / before_image.height().max(1) as f64;
-        let ow = (origin_layer.image.width() as f64 * sx).round().max(1.0) as u32;
-        let oh = (origin_layer.image.height() as f64 * sy).round().max(1.0) as u32;
-        let old = (origin_layer.image.width(), origin_layer.image.height());
+        let ow = (origin_layer.img().width() as f64 * sx).round().max(1.0) as u32;
+        let oh = (origin_layer.img().height() as f64 * sy).round().max(1.0) as u32;
+        let old = (origin_layer.img().width(), origin_layer.img().height());
         // 锚点是「已缩放的原图」克隆，不再是任何 transform 的有效缓存。
         origin_layer.ensure_baked();
-        origin_layer.image = render::resize_to(&origin_layer.image, Size::new(ow, oh));
+        *origin_layer.image_mut().unwrap() = render::resize_to(origin_layer.img(), Size::new(ow, oh));
         let committed = match self.doc.layers.get(ix) {
             Some(layer) => std::rc::Rc::new(layer.clone()),
             None => return,
@@ -591,7 +589,6 @@ impl Session {
                 fit: true,
                 render_count: 0,
                 dirty: false,
-                base_locked: true,
                 save_quality,
                 preview_hidden_mark: -1,
                 transform: None,
@@ -735,15 +732,18 @@ impl Session {
             .adjust
             .map(|state| (state.target, state.params));
         let hidden_idx = self.preview_hidden_mark;
-        let image = if hidden_idx >= 0
-            && (hidden_idx as usize) < self.doc.marks.len()
-        {
-            let idx = hidden_idx as usize;
-            let saved = self.doc.marks[idx].visible;
-            self.doc.marks[idx].visible = false;
-            let img = self.composite_for_preview(target, adjust);
-            self.doc.marks[idx].visible = saved;
-            img
+        let image = if hidden_idx >= 0 {
+            // 预览时临时隐藏某个标记：可见性在图层上，绕开历史直接改。
+            match self.doc.mark_layer_index(hidden_idx as usize) {
+                Some(li) => {
+                    let saved = self.doc.layers[li].visible;
+                    self.doc.layers[li].visible = false;
+                    let img = self.composite_for_preview(target, adjust);
+                    self.doc.layers[li].visible = saved;
+                    img
+                }
+                None => self.composite_for_preview(target, adjust),
+            }
         } else {
             self.composite_for_preview(target, adjust)
         };
@@ -857,7 +857,7 @@ impl Session {
                     &self.doc,
                     target,
                     lr.index,
-                    &lr.snapshot.image,
+                    lr.snapshot.img(),
                     lr.center,
                     lr.degrees,
                     lr.expand,
@@ -913,9 +913,7 @@ impl Session {
         if selected_layer >= 0 && (selected_layer as usize) < self.doc.layers.len() {
             return AdjustTarget::Layer(selected_layer as usize);
         }
-        if self.doc.base_converted && !self.doc.layers.is_empty() {
-            return AdjustTarget::Layer(0);
-        }
+        // 背景就是 layers[0]，`AdjustTarget::Base` 恒指向它，不需要迁移特判。
         AdjustTarget::Base
     }
 
@@ -965,31 +963,41 @@ impl Session {
         std::fs::write(path, bytes).map_err(|e| e.to_string())
     }
 
+    /// 面板用的图层列表（显示顺序 = 顶 → 底）。
+    ///
+    /// 统一模型后**每一行都是真图层**：背景是 `layers[0]`，标记是
+    /// `kind:"mark"` 的图层。`i` 是文档索引（可直接回传给 `select_layer`
+    /// 等入口），`id` 是稳定 id（多选集合 / 缩略图缓存用）。
+    /// 兼容字段：背景行仍带 `base:true` / `bd`，脚本探针不至于全废。
     pub(in crate::bridge) fn layers_json(&self) -> String {
-        let (base_deleted, base_locked) = (self.doc.base_deleted, self.base_locked);
+        let base_deleted = self.doc.base_deleted();
         let mut parts: Vec<String> = Vec::new();
         for (i, layer) in self.doc.layers.iter().enumerate().rev() {
             let name = layer.name.replace('\\', "\\\\").replace('"', "\\\"");
             let bounds = layer.bounds();
-            // o: opacity in percent (0-100); x/y/w/h: bounds in image pixels
-            // (the QML side uses them for the live layer outline while dragging);
-            // l: locked (blocks move / scale / delete in the UI).
-            // P0-2b2：a = 累计旋转角（参数层真值）。QML 不再用 rotateFrames
-            // 按位图尺寸反推角度，撤销 / 重做 / 缩放后天然同步。
-            let angle = layer
-                .transform
-                .as_ref()
-                .map(|t| t.rotation)
-                .unwrap_or(0.0);
-            // sw/sh = 变换前原图尺寸；QML 用它 + 角度画倾斜框，不再靠
-            // rotateFrames 按位图尺寸反推（撤销 / 缩放后必然不同步）。
-            let (sw, sh) = layer
-                .transform
-                .as_ref()
-                .map(|t| (t.source.width(), t.source.height()))
-                .unwrap_or((layer.image.width(), layer.image.height()));
+            // a = 累计旋转角；sw/sh = 变换前原图尺寸（QML 画倾斜框用）。
+            // 标记没有位图（`img()` 只是给旧代码兜底的 1×1 透明图），
+            // 这里按它的画布外接框报，别让面板以为原图是 1×1。
+            let angle = layer.xform().map(|t| t.rotation).unwrap_or(0.0);
+            let swsh = layer.xform().map(|t| (t.source.width(), t.source.height()));
+            let (sw, sh) = swsh.unwrap_or_else(|| match layer.raster() {
+                Some(r) => (r.image.width(), r.image.height()),
+                None => (
+                    bounds.width.max(0) as u32,
+                    bounds.height.max(0) as u32,
+                ),
+            });
+            let kind = if layer.is_mark() { "mark" } else { "raster" };
+            let extra = if layer.background {
+                format!(
+                    ",\"base\":true,\"bg\":true,\"bd\":{base_deleted}"
+                )
+            } else {
+                String::new()
+            };
             parts.push(format!(
-                "{{\"i\":{i},\"n\":\"{name}\",\"v\":{},\"o\":{},\"l\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"a\":{:.3},\"sw\":{},\"sh\":{}}}",
+                "{{\"i\":{i},\"id\":{},\"n\":\"{name}\",\"v\":{},\"o\":{},\"l\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"a\":{:.3},\"sw\":{},\"sh\":{},\"k\":\"{kind}\"{extra}}}",
+                layer.id,
                 layer.visible,
                 (layer.opacity * 100.0).round() as i32,
                 layer.locked,
@@ -1000,23 +1008,6 @@ impl Session {
                 angle,
                 sw,
                 sh
-            ));
-        }
-        // The base image is listed last (display order = top first) as a
-        // locked-by-default row: not reorderable, not deletable while locked
-        // (see §4.8 of the UX plan). v reports visibility (deleted/hidden),
-        // bd reports base_deleted so the panel can distinguish "hidden" from
-        // "deleted" (Delete key flow) for the base row. Once the base has
-        // been converted into a regular layer (panel unlock) the synthetic
-        // row disappears entirely — the layer row speaks for itself.
-        if !self.doc.base_converted {
-            parts.push(format!(
-                "{{\"i\":-1,\"n\":\"背景\",\"v\":{},\"bd\":{},\"o\":100,\"l\":{},\"x\":0,\"y\":0,\"w\":{},\"h\":{},\"base\":true}}",
-                !base_deleted && !self.doc.base_hidden,
-                base_deleted,
-                base_locked,
-                self.doc.canvas.width,
-                self.doc.canvas.height
             ));
         }
         format!("[{}]", parts.join(","))
@@ -1042,7 +1033,7 @@ impl Session {
         if self.adjust.is_some()
             || self.quick_mask
             || self.preview_hidden_mark >= 0
-            || self.doc.marks.iter().any(|m| m.visible)
+            || self.doc.layers.iter().any(|l| l.is_mark() && l.visible)
             || !(disp_scale > 0.0)
         {
             return false;
@@ -1059,7 +1050,7 @@ impl Session {
         if target.pixels() == 0 {
             return false;
         }
-        let active_img = layer.image.clone();
+        let active_img = layer.img().clone();
         let opacity = layer.opacity;
         let saved = self.doc.layers[index].visible;
         self.doc.layers[index].visible = false;
@@ -1083,8 +1074,8 @@ impl Session {
         self.gpu_active_url = file_url(&pa);
         self.gpu_index = index;
         self.gpu_rect = (
-            self.doc.layers[index].offset.0 as f64 * disp_scale,
-            self.doc.layers[index].offset.1 as f64 * disp_scale,
+            self.doc.layers[index].offset().0 as f64 * disp_scale,
+            self.doc.layers[index].offset().1 as f64 * disp_scale,
             active_img.width() as f64 * disp_scale,
             active_img.height() as f64 * disp_scale,
             opacity as f64,
@@ -1103,8 +1094,8 @@ impl Session {
             return;
         }
         if let Some(layer) = self.doc.layers.get(self.gpu_index) {
-            self.gpu_rect.0 = layer.offset.0 as f64 * disp_scale;
-            self.gpu_rect.1 = layer.offset.1 as f64 * disp_scale;
+            self.gpu_rect.0 = layer.offset().0 as f64 * disp_scale;
+            self.gpu_rect.1 = layer.offset().1 as f64 * disp_scale;
             self.gpu_rect.4 = layer.opacity as f64;
         }
     }
@@ -1127,7 +1118,7 @@ impl Session {
             return "{\"has\":false}".to_string();
         };
         // 不要为「读一次数值」clone 整张位图：identity 层直接由 offset/尺寸报。
-        let (x, y, w, h, rot, sx, sy, fx, fy, param) = match layer.transform.as_ref() {
+        let (x, y, w, h, rot, sx, sy, fx, fy, param) = match layer.xform().as_ref() {
             Some(t) => {
                 let p = t.panel_values();
                 (
@@ -1136,10 +1127,10 @@ impl Session {
                 )
             }
             None => (
-                layer.offset.0 as f64,
-                layer.offset.1 as f64,
-                layer.image.width() as f64,
-                layer.image.height() as f64,
+                layer.offset().0 as f64,
+                layer.offset().1 as f64,
+                layer.img().width() as f64,
+                layer.img().height() as f64,
                 0.0,
                 1.0,
                 1.0,
@@ -1182,8 +1173,7 @@ impl Session {
         };
         let parts: Vec<String> = self
             .doc
-            .marks
-            .iter()
+            .marks()
             .enumerate()
             .map(|(i, m)| {
                 let (x0, y0, x1, y1) = m.rect;
@@ -1210,7 +1200,10 @@ impl Session {
                     hex(m.color),
                     m.fill,
                     hex(m.fill_color),
-                    m.visible
+                    self.doc
+                        .mark_layer_index(i)
+                        .map(|li| self.doc.layers[li].visible)
+                        .unwrap_or(false)
                 )
                 .replace("}", &format!("{}}}", extra))
             })

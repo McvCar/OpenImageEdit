@@ -15,14 +15,14 @@ fn target_origin(doc: &Document, target: AdjustTarget) -> (i32, i32) {
     match target {
         // base 的可见区域从 view 开始：base 坐标 = 画布 + view。
         AdjustTarget::Base => (-doc.view.x, -doc.view.y),
-        AdjustTarget::Layer(i) => doc.layers.get(i).map(|l| l.offset).unwrap_or((0, 0)),
+        AdjustTarget::Layer(i) => doc.layers.get(i).map(|l| l.offset()).unwrap_or((0, 0)),
     }
 }
 
 fn target_image<'a>(doc: &'a Document, target: AdjustTarget) -> Option<&'a RgbaImage> {
     match target {
-        AdjustTarget::Base => Some(&doc.base),
-        AdjustTarget::Layer(i) => doc.layers.get(i).map(|l| &l.image),
+        AdjustTarget::Base => Some(doc.base_image()),
+        AdjustTarget::Layer(i) => doc.layers.get(i).map(|l| l.img()),
     }
 }
 
@@ -611,21 +611,17 @@ impl qobject::Bridge {
         // 一遍 → 包围盒一路长大」。
         let current = &session.doc.layers[ix];
         let start = std::rc::Rc::new(current.clone());
-        let base = current
-            .transform
-            .as_ref()
-            .map(|t| t.rotation as f32)
-            .unwrap_or(0.0);
+        let base = current.xform().map(|t| t.rotation as f32).unwrap_or(0.0);
         // ★精确中心：有 params 时它就是唯一真值；普通位图图层才用
         // `offset + 尺寸/2`（此时两者本来就相等，且是整/半像素，不会被量化）。
-        let start_center = match current.transform.as_ref() {
+        let start_center = match current.xform() {
             Some(t) => t.center,
             None => (
-                current.offset.0 as f64 + current.image.width() as f64 / 2.0,
-                current.offset.1 as f64 + current.image.height() as f64 / 2.0,
+                current.offset().0 as f64 + current.img().width() as f64 / 2.0,
+                current.offset().1 as f64 + current.img().height() as f64 / 2.0,
             ),
         };
-        let before = match current.transform.as_ref() {
+        let before = match current.xform() {
             Some(t) => {
                 let mut pristine = (*start).clone();
                 // ★预览的快照必须是「**当前尺寸**的未插值图」，不是裸原图：
@@ -635,13 +631,15 @@ impl qobject::Bridge {
                 //   （一次 Lanczos），旋转本身仍然交给合成器实时转。
                 let no_scale = (t.scale.0 - 1.0).abs() < 1e-9
                     && (t.scale.1 - 1.0).abs() < 1e-9;
-                if no_scale {
-                    pristine.image = (*t.source).clone();
+                let image = if no_scale {
+                    (*t.source).clone()
                 } else {
                     let mut flat = t.clone();
                     flat.rotation = 0.0;
-                    let (image, _) = flat.render_compatible();
-                    pristine.image = image;
+                    flat.render_compatible().0
+                };
+                if let Some(r) = pristine.raster_mut() {
+                    r.image = image;
                 }
                 std::rc::Rc::new(pristine)
             }
@@ -649,7 +647,7 @@ impl qobject::Bridge {
         };
         println!(
             "{{\"phase\":\"ui\",\"event\":\"rotate-anchor\",\"reuse\":{},\"base\":{:.2}}}",
-            current.transform.is_some(),
+            current.xform().is_some(),
             base
         );
         let keep = keep_session;
@@ -729,7 +727,7 @@ impl qobject::Bridge {
                     editcore::round_center(scy),
                 )
             } else {
-                let (sw, sh) = snapshot.image.dimensions();
+                let (sw, sh) = snapshot.img().dimensions();
                 (
                     editcore::round_center(scx - sw as f64 / 2.0) + sw as f64 / 2.0,
                     editcore::round_center(scy - sh as f64 / 2.0) + sh as f64 / 2.0,
@@ -810,8 +808,8 @@ impl qobject::Bridge {
                 // 重新量化一次，转两三次就漂 1px）。
                 let (cx, cy) = st.start_center;
                 let (start_offset, start_size) = (
-                    st.start.offset,
-                    (st.start.image.width(), st.start.image.height()),
+                    st.start.offset(),
+                    (st.start.img().width(), st.start.img().height()),
                 );
                 // ★P0-2b2：旋转落定统一成一条 `SetLayerTransform`。
                 // `source` 恒为未插值原图、rotation 是累计角度，所以：
@@ -822,18 +820,18 @@ impl qobject::Bridge {
                 // 旋转烘焙进位图（该选项的固有代价，用户显式勾选才走）。
                 if expand {
                     let layer = &session.doc.layers[st.index];
-                    let mut t = layer.transform.clone().unwrap_or_else(|| {
+                    let mut t = layer.xform().cloned().unwrap_or_else(|| {
                         LayerTransform::from_offset(
-                            layer.image.clone(),
-                            layer.offset.0,
-                            layer.offset.1,
+                            layer.img().clone(),
+                            layer.offset().0,
+                            layer.offset().1,
                         )
                     });
                     t.rotation = total as f64;
                     t.center = (cx, cy);
                     if session.doc.set_layer_transform(st.index, Some(t)).is_ok() {
-                        let placed = session.doc.layers[st.index].offset;
-                        let new_size = session.doc.layers[st.index].image.dimensions();
+                        let placed = session.doc.layers[st.index].offset();
+                        let new_size = session.doc.layers[st.index].img().dimensions();
                         println!(
                             "{{\"phase\":\"ui\",\"event\":\"rotate-place\",\"start\":[{},{}],\"start_size\":[{}x{}],\
                              \"new_size\":[{}x{}],\"placed\":[{},{}],\"center\":[{:.3},{:.3}]}}",
@@ -842,21 +840,18 @@ impl qobject::Bridge {
                         );
                     }
                 } else {
-                    let (image, _delta) = editcore::rotate_image_hq(&st.before.image, total, false);
+                    let (image, _delta) = editcore::rotate_image_hq(&st.before.img(), total, false);
                     // 「不扩展」也要用同一个中心量化（见 core::round_center）。
                     let offset = (
                         editcore::round_center(cx - image.width() as f64 / 2.0) as i32,
                         editcore::round_center(cy - image.height() as f64 / 2.0) as i32,
                     );
-                    let after = Layer {
-                        name: st.start.name.clone(),
-                        image,
-                        offset,
-                        opacity: st.start.opacity,
-                        visible: st.start.visible,
-                        locked: st.start.locked,
-                        transform: None,
-                    };
+                    let mut after = (*st.start).clone();
+                    if let Some(r) = after.raster_mut() {
+                        r.image = image;
+                        r.offset = offset;
+                        r.transform = None;
+                    }
                     if *st.start != after {
                         let _ = session
                             .doc
@@ -898,8 +893,8 @@ impl qobject::Bridge {
             // 裁剪烘焙进位图（仿射表达不了裁剪），走旧的破坏性路径。
             let params_ok = if expand {
                 let next = session.doc.layers.get(ix).map(|l| {
-                    let mut t = l.transform.clone().unwrap_or_else(|| {
-                        LayerTransform::from_offset(l.image.clone(), l.offset.0, l.offset.1)
+                    let mut t = l.xform().cloned().unwrap_or_else(|| {
+                        LayerTransform::from_offset(l.img().clone(), l.offset().0, l.offset().1)
                     });
                     t.rotation += degrees;
                     // ★中心**不动**：转轴就是中心，角度变化不改变中心。

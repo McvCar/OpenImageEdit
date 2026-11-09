@@ -32,7 +32,7 @@ pub use selection::{
     QuickSelectOptions, SelOps, SelShape, SelectionMask, SelectionState, WandOptions,
 };
 pub use mark::{MarkKind, Mark};
-pub use layer::Layer;
+pub use layer::{Layer, LayerContent, LayerId, RasterLayer};
 pub use layer_transform::{
     probe_lines as transform_probe_lines, Affine2, BoundsSolve, Field, LayerTransform, PanelValues,
     RectF, ReferencePoint, TransformParams, TRANSFORM_SERIAL_VERSION,
@@ -55,7 +55,7 @@ pub(crate) use mark::norm_rect;
 pub(crate) use transform::transform_document;
 pub(crate) use op::History;
 pub(crate) use ops::{
-    apply_base_to_layer, apply_canvas_resize, apply_delete_base, apply_region, apply_resize,
+    apply_canvas_resize, apply_delete_base, apply_region, apply_resize,
     apply_view, clear_outside_selection, erase_base_pixels,
 };
 
@@ -83,11 +83,11 @@ mod tests {
             .extract_selection(&SelectionMask::rect(Rect::new(8, 4, 16, 12)))
             .unwrap();
         let layer = &doc.layers[index];
-        assert_eq!(layer.image.width(), 16);
-        assert_eq!(layer.image.height(), 12);
-        assert_eq!(layer.offset, (8, 4));
-        assert_eq!(layer.image.get_pixel(0, 0).0, [0, 0, 255, 255]);
-        assert_eq!(layer.image.get_pixel(0, 4).0, [255, 0, 0, 255]);
+        assert_eq!(layer.image().unwrap().width(), 16);
+        assert_eq!(layer.image().unwrap().height(), 12);
+        assert_eq!(layer.offset(), (8, 4));
+        assert_eq!(layer.image().unwrap().get_pixel(0, 0).0, [0, 0, 255, 255]);
+        assert_eq!(layer.image().unwrap().get_pixel(0, 4).0, [255, 0, 0, 255]);
     }
 
     #[test]
@@ -96,8 +96,8 @@ mod tests {
         let layer = doc
             .selection_layer(&SelectionMask::ellipse(Rect::new(0, 0, 64, 64)))
             .unwrap();
-        assert_eq!(layer.image.get_pixel(0, 0).0[3], 0);
-        assert_eq!(layer.image.get_pixel(32, 32).0[3], 255);
+        assert_eq!(layer.image().unwrap().get_pixel(0, 0).0[3], 0);
+        assert_eq!(layer.image().unwrap().get_pixel(32, 32).0[3], 255);
     }
 
     #[test]
@@ -116,12 +116,13 @@ mod tests {
     #[test]
     fn history_roundtrips_layer_ops() {
         let mut doc = Document::from_image(checker(16, 16));
+        assert_eq!(doc.layers.len(), 1); // 背景
         doc.add_layer(Layer::new("clip", checker(4, 4))).unwrap();
-        assert_eq!(doc.layers.len(), 1);
+        assert_eq!(doc.layers.len(), 2);
         doc.undo().unwrap();
-        assert_eq!(doc.layers.len(), 0);
-        doc.redo().unwrap();
         assert_eq!(doc.layers.len(), 1);
+        doc.redo().unwrap();
+        assert_eq!(doc.layers.len(), 2);
     }
 
     #[test]
@@ -136,7 +137,7 @@ mod tests {
         doc.undo().unwrap();
         assert_eq!(doc.layers[index].name, "clip");
         doc.undo().unwrap();
-        assert_eq!(doc.layers[index].offset, (0, 0));
+        assert_eq!(doc.layers[index].offset(), (0, 0));
         doc.undo().unwrap();
         assert!(doc.layers[index].visible);
         doc.undo().unwrap();
@@ -153,8 +154,8 @@ mod tests {
 
         let mut dst = Document::from_image(checker(16, 16));
         let pasted = dst.add_layer(layer).unwrap();
-        assert_eq!(dst.layers[pasted].offset, (4, 6));
-        assert_eq!(dst.layers[pasted].image.width(), 8);
+        assert_eq!(dst.layers[pasted].offset(), (4, 6));
+        assert_eq!(dst.layers[pasted].image().unwrap().width(), 8);
         assert_eq!(dst.composite_pixel(4, 6).0, [255, 0, 0, 255]);
     }
 
@@ -173,7 +174,7 @@ mod tests {
         // Outside the selection the base is untouched.
         assert_eq!(doc.composite_pixel(0, 0).0[3], 255);
         // The layer extracted before erasing is untouched.
-        assert_eq!(doc.layers[index].image.get_pixel(0, 0).0[3], 255);
+        assert_eq!(doc.layers[index].image().unwrap().get_pixel(0, 0).0[3], 255);
         assert_eq!(doc.composite_pixel(20, 2).0[3], 255);
     }
 
@@ -281,7 +282,7 @@ mod tests {
             .unwrap();
         assert_eq!(doc.composite_pixel(0, 0).0, [0, 0, 0, 0]);
         // base pixel at (8,8) is what canvas (0,0) maps to.
-        assert_eq!(doc.base.get_pixel(8, 8).0, [0, 0, 0, 0]);
+        assert_eq!(doc.base_image().get_pixel(8, 8).0, [0, 0, 0, 0]);
         assert_eq!(doc.composite_pixel(4, 4).0, [12, 12, 0, 255]);
     }
 
@@ -295,17 +296,17 @@ mod tests {
 
         doc.scale_layer(index, Size::new(16, 8), (5, 3)).unwrap();
         let layer = &doc.layers[index];
-        assert_eq!(layer.image.width(), 16);
-        assert_eq!(layer.image.height(), 8);
+        assert_eq!(layer.image().unwrap().width(), 16);
+        assert_eq!(layer.image().unwrap().height(), 8);
         // Offset (top-left anchor) is untouched by scaling.
-        assert_eq!(layer.offset, (5, 3));
+        assert_eq!(layer.offset(), (5, 3));
 
         doc.undo().unwrap();
-        assert_eq!(doc.layers[index].image.width(), 8);
-        assert_eq!(doc.layers[index].image.height(), 4);
-        assert_eq!(doc.layers[index].offset, (5, 3));
+        assert_eq!(doc.layers[index].image().unwrap().width(), 8);
+        assert_eq!(doc.layers[index].image().unwrap().height(), 4);
+        assert_eq!(doc.layers[index].offset(), (5, 3));
         doc.redo().unwrap();
-        assert_eq!(doc.layers[index].image.width(), 16);
+        assert_eq!(doc.layers[index].image().unwrap().width(), 16);
     }
 
     #[test]
@@ -324,20 +325,20 @@ mod tests {
 
         doc.transform_layer(index, Transform::FlipHorizontal).unwrap();
         let layer = &doc.layers[index];
-        assert_eq!(layer.image.get_pixel(0, 0), &image::Rgba([0, 0, 255, 255]));
-        assert_eq!(layer.image.get_pixel(3, 0), &image::Rgba([255, 0, 0, 255]));
+        assert_eq!(layer.image().unwrap().get_pixel(0, 0), &image::Rgba([0, 0, 255, 255]));
+        assert_eq!(layer.image().unwrap().get_pixel(3, 0), &image::Rgba([255, 0, 0, 255]));
         // 图层自身的框不动（以自身为轴翻转），base 一个像素都没变。
-        assert_eq!(layer.offset, (0, 0));
-        assert_eq!(doc.base, base);
+        assert_eq!(layer.offset(), (0, 0));
+        assert_eq!(*doc.base_image(), base);
 
         doc.undo().unwrap();
         assert_eq!(
-            doc.layers[index].image.get_pixel(0, 0),
+            doc.layers[index].image().unwrap().get_pixel(0, 0),
             &image::Rgba([255, 0, 0, 255])
         );
         doc.redo().unwrap();
         assert_eq!(
-            doc.layers[index].image.get_pixel(0, 0),
+            doc.layers[index].image().unwrap().get_pixel(0, 0),
             &image::Rgba([0, 0, 255, 255])
         );
     }
@@ -356,9 +357,9 @@ mod tests {
 
         doc.scale_layer_flipped(index, Size::new(8, 4), (0, 0), (true, false))
             .unwrap();
-        let px = *doc.layers[index].image.get_pixel(0, 0);
+        let px = *doc.layers[index].image().unwrap().get_pixel(0, 0);
         assert!(px[2] > 192 && px[0] < 64, "left edge should be blue: {px:?}");
-        let right = *doc.layers[index].image.get_pixel(7, 0);
+        let right = *doc.layers[index].image().unwrap().get_pixel(7, 0);
         assert!(
             right[0] > 192 && right[2] < 64,
             "right edge should be red: {right:?}"
@@ -366,7 +367,7 @@ mod tests {
 
         // 撤销回到翻转前（左红）。
         doc.undo().unwrap();
-        let px = *doc.layers[index].image.get_pixel(0, 0);
+        let px = *doc.layers[index].image().unwrap().get_pixel(0, 0);
         assert!(px[0] > 192 && px[2] < 64, "undo should restore red: {px:?}");
     }
 
@@ -385,22 +386,22 @@ mod tests {
         );
         // Rejected calls must not touch the history stack.
         assert_eq!(doc.history.undo.len(), undo_depth);
-        assert_eq!(doc.layers[index].image.width(), 4);
+        assert_eq!(doc.layers[index].image().unwrap().width(), 4);
     }
 
     #[test]
     fn set_base_visible_roundtrips_and_affects_composite() {
         let mut doc = Document::from_image(checker(8, 8));
         doc.set_base_visible(false).unwrap();
-        assert!(doc.base_hidden);
+        assert!(doc.base_hidden());
         // Hidden base composites as fully transparent.
         assert_eq!(doc.composite_pixel(0, 0).0, [0, 0, 0, 0]);
 
         doc.undo().unwrap();
-        assert!(!doc.base_hidden);
+        assert!(!doc.base_hidden());
         assert_eq!(doc.composite_pixel(0, 0).0[3], 255);
         doc.redo().unwrap();
-        assert!(doc.base_hidden);
+        assert!(doc.base_hidden());
 
         // Setting the same state again must not push a history entry.
         let depth = doc.history.undo.len();
@@ -408,35 +409,33 @@ mod tests {
         assert_eq!(doc.history.undo.len(), depth);
         doc.set_base_visible(true).unwrap();
         assert_eq!(doc.history.undo.len(), depth + 1);
-        assert!(!doc.base_hidden);
+        assert!(!doc.base_hidden());
     }
 
     #[test]
-    fn delete_base_requires_layers_and_roundtrips() {
+    fn delete_base_clears_pixels_and_roundtrips() {
         let mut doc = Document::from_image(checker(16, 16));
-        // No layers yet: deleting the base is rejected.
-        assert_eq!(doc.delete_base(), Err(EditError::BaseRequired));
-
+        // 背景是一层：即使只有它一个，「删除背景」也只是把像素清空。
         let index = doc.add_layer(Layer::new("top", checker(4, 4))).unwrap();
         doc.delete_base().unwrap();
-        assert!(doc.base_deleted);
-        assert_eq!(doc.base.width(), 16);
-        assert_eq!(doc.base.get_pixel(0, 0).0, [0, 0, 0, 0]);
-        assert_eq!(doc.layers[index].image.width(), 4);
+        assert!(doc.base_deleted());
+        assert_eq!(doc.base_image().width(), 16);
+        assert_eq!(doc.base_image().get_pixel(0, 0).0, [0, 0, 0, 0]);
+        assert_eq!(doc.layers[index].image().unwrap().width(), 4);
 
         doc.undo().unwrap();
-        assert!(!doc.base_deleted);
-        assert_eq!(doc.base.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert!(!doc.base_deleted());
+        assert_eq!(doc.base_image().get_pixel(0, 0).0, [255, 0, 0, 255]);
         doc.redo().unwrap();
-        assert!(doc.base_deleted);
-        assert_eq!(doc.base.get_pixel(15, 15).0, [0, 0, 0, 0]);
+        assert!(doc.base_deleted());
+        assert_eq!(doc.base_image().get_pixel(15, 15).0, [0, 0, 0, 0]);
     }
 
     #[test]
     fn crop_shifts_layers_and_marks_with_the_content() {
         let mut doc = Document::from_image(checker(100, 100));
         let mut layer = Layer::new("dot", checker(10, 10));
-        layer.offset = (30, 30);
+        layer.set_offset((30, 30));
         doc.add_layer(layer).unwrap();
         let mut mark = Mark::new(MarkKind::Rect);
         mark.rect = (40.0, 40.0, 60.0, 50.0);
@@ -445,14 +444,14 @@ mod tests {
         doc.crop(Rect::new(20, 20, 50, 50)).unwrap();
         // The layer kept its place relative to the image content: its canvas
         // offset moved by -(crop origin).
-        assert_eq!(doc.layers[0].offset, (10, 10));
+        assert_eq!(doc.layers[1].offset(), (10, 10));
         // mark.rect is (x1, y1, x2, y2) corner coordinates.
-        assert_eq!(doc.marks[0].rect, (20.0, 20.0, 40.0, 30.0));
+        assert_eq!(doc.mark(0).unwrap().rect, (20.0, 20.0, 40.0, 30.0));
         // Flatten now equals the pre-crop composite cropped to the rect.
         let cropped_view = {
             let mut d = Document::from_image(checker(100, 100));
             let mut l = Layer::new("dot", checker(10, 10));
-            l.offset = (30, 30);
+            l.set_offset((30, 30));
             d.add_layer(l).unwrap();
             let mut m = Mark::new(MarkKind::Rect);
             m.rect = (40.0, 40.0, 60.0, 50.0);
@@ -463,77 +462,58 @@ mod tests {
 
         // Undo puts everything back at the original canvas position.
         doc.undo().unwrap();
-        assert_eq!(doc.layers[0].offset, (30, 30));
-        assert_eq!(doc.marks[0].rect, (40.0, 40.0, 60.0, 50.0));
+        assert_eq!(doc.layers[1].offset(), (30, 30));
+        assert_eq!(doc.mark(0).unwrap().rect, (40.0, 40.0, 60.0, 50.0));
     }
 
     #[test]
-    fn convert_base_to_layer_composites_identically_after_crop() {
+    fn background_offset_tracks_crop() {
         let mut doc = Document::from_image(checker(64, 64));
         doc.crop(Rect::new(12, 8, 40, 30)).unwrap();
-        let cropped = doc.flatten();
-
-        doc.convert_base_to_layer().unwrap();
-        // Uncropped documents keep offset (0,0); after a crop the layer's
-        // top-left sits at (-view.x, -view.y) so base[view.x + x] shows at
-        // canvas x and the composite stays pixel-identical.
-        assert_eq!(doc.layers[0].offset, (-12, -8));
-        assert_eq!(doc.flatten(), cropped);
+        // 背景是普通图层：裁剪只是平移画布原点，像素原封不动，
+        // offset 恒等于 (-view.x, -view.y)，与其它位图图层同一套规则。
+        assert_eq!(doc.layers[0].offset(), (-12, -8));
+        assert!(doc.layers[0].background);
+        assert!(doc.layers[0].locked);
+        assert_eq!(doc.layers[0].image().unwrap().dimensions(), (64, 64));
+        assert_eq!(doc.canvas, Size::new(40, 30));
     }
 
     #[test]
-    fn convert_base_to_layer_roundtrips_and_composites_identically() {
+    fn background_is_a_regular_locked_layer() {
         let mut doc = Document::from_image(checker(16, 16));
         let before = doc.flatten();
-
-        doc.convert_base_to_layer().unwrap();
-        assert!(doc.base_converted);
-        // The base pixels now live in a regular bottom layer named 背景.
         assert_eq!(doc.layers.len(), 1);
         assert_eq!(doc.layers[0].name, "背景");
-        assert_eq!(doc.layers[0].offset, (0, 0));
-        assert_eq!(doc.layers[0].image.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert!(doc.layers[0].locked && doc.layers[0].background);
+        assert_eq!(doc.flatten(), before);
+
+        // 解锁 = 一条可撤销的锁定属性变更，不改结构、不动索引。
+        doc.set_layer_locked(0, false).unwrap();
         assert!(!doc.layers[0].locked);
-        // The base itself is a transparent canvas of the same size; the
-        // composite output is pixel-identical.
-        assert_eq!(doc.base.width(), 16);
-        assert_eq!(doc.base.get_pixel(0, 0).0, [0, 0, 0, 0]);
-        assert_eq!(doc.canvas.width, 16);
+        assert_eq!(doc.layers.len(), 1);
         assert_eq!(doc.flatten(), before);
+        doc.undo().unwrap();
+        assert!(doc.layers[0].locked);
 
-        // Converting twice must not push a second history entry.
-        let depth = doc.history.undo.len();
-        doc.convert_base_to_layer().unwrap();
-        assert_eq!(doc.history.undo.len(), depth);
-
-        // The converted layer behaves like any other layer: movable and
-        // deletable. After deletion no trace remains in the layer list.
+        // 解锁后它就是普通图层：可移动、可改不透明度、可隐藏。
+        doc.set_layer_locked(0, false).unwrap();
         doc.translate_layer(0, 4, 2).unwrap();
-        assert_eq!(doc.layers[0].offset, (4, 2));
-        doc.remove_layer(0).unwrap();
-        assert!(doc.layers.is_empty());
-        assert_eq!(doc.flatten(), RgbaImage::new(16, 16));
+        assert_eq!(doc.layers[0].offset(), (4, 2));
+        doc.set_layer_visible(0, false).unwrap();
+        assert!(!doc.layers[0].visible);
+        doc.set_layer_visible(0, true).unwrap();
 
-        // Undo the deletion: the layer (still converted) comes back.
-        doc.undo().unwrap();
+        // 背景层不能从栈里删除（RemoveLayer 恒拒绝 0 号位）。
+        assert!(doc.remove_layer(0).is_err());
         assert_eq!(doc.layers.len(), 1);
-        assert_eq!(doc.layers[0].offset, (4, 2));
-        assert!(doc.base_converted);
 
-        // Undo past translate AND the conversion restores the original
-        // locked-in-base state exactly.
-        doc.undo().unwrap();
-        doc.undo().unwrap();
-        assert!(!doc.base_converted);
-        assert!(doc.layers.is_empty());
-        assert_eq!(doc.base.get_pixel(0, 0).0, [255, 0, 0, 255]);
-        assert_eq!(doc.flatten(), before);
-
-        // Redo re-applies the conversion.
-        doc.redo().unwrap();
-        assert!(doc.base_converted);
+        // 「删除背景」= 清空像素，图层条目保留。
+        doc.delete_base().unwrap();
+        assert_eq!(doc.base_image().get_pixel(0, 0).0, [0, 0, 0, 0]);
         assert_eq!(doc.layers.len(), 1);
-        assert_eq!(doc.layers[0].image.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        doc.undo().unwrap();
+        assert_eq!(doc.layers[0].image().unwrap().get_pixel(0, 0).0, [255, 0, 0, 255]);
     }
 
     #[test]
@@ -544,13 +524,14 @@ mod tests {
         doc.add_layer(Layer::new("b", checker(2, 2))).unwrap();
         doc.add_layer(Layer::new("c", checker(2, 2))).unwrap();
 
-        doc.move_layer(2, 0).unwrap();
+        // 0 号位是背景，不可被占用：用户层在 1.. 之间排序。
+        doc.move_layer(3, 1).unwrap();
         let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
-        assert_eq!(names, ["c", "a", "b"]);
+        assert_eq!(names, ["背景", "c", "a", "b"]);
 
         doc.undo().unwrap();
         let names: Vec<&str> = doc.layers.iter().map(|l| l.name.as_str()).collect();
-        assert_eq!(names, ["a", "b", "c"]);
+        assert_eq!(names, ["背景", "a", "b", "c"]);
     }
 
     #[test]
@@ -605,22 +586,22 @@ mod tests {
             "dot",
             RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 255, 255])),
         );
-        layer.offset = (1, 1);
+        layer.set_offset((1, 1));
         doc.add_layer(layer).unwrap();
 
         doc.apply_transform(Transform::Rotate90Cw).unwrap();
         assert_eq!(doc.canvas, Size::new(10, 20));
-        assert_eq!(doc.layers[0].offset, (10 - (1 + 2), 1));
+        assert_eq!(doc.layers[1].offset(), (10 - (1 + 2), 1));
         assert_eq!(doc.composite_pixel(7, 1).0, [255, 255, 255, 255]);
 
         doc.undo().unwrap();
         assert_eq!(doc.canvas, Size::new(20, 10));
-        assert_eq!(doc.layers[0].offset, (1, 1));
+        assert_eq!(doc.layers[1].offset(), (1, 1));
         assert_eq!(doc.composite_pixel(1, 1).0, [255, 255, 255, 255]);
 
         doc.redo().unwrap();
         assert_eq!(doc.canvas, Size::new(10, 20));
-        assert_eq!(doc.layers[0].offset, (7, 1));
+        assert_eq!(doc.layers[1].offset(), (7, 1));
     }
 
     #[test]
@@ -634,12 +615,12 @@ mod tests {
             "dot",
             RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 255, 255])),
         );
-        layer.offset = (1, 1);
+        layer.set_offset((1, 1));
         doc.add_layer(layer).unwrap();
 
         doc.apply_transform(Transform::Rotate90Ccw).unwrap();
         assert_eq!(doc.canvas, Size::new(10, 20));
-        assert_eq!(doc.layers[0].offset, (1, 20 - 1 - 2));
+        assert_eq!(doc.layers[1].offset(), (1, 20 - 1 - 2));
         assert_eq!(doc.composite_pixel(1, 17).0, [255, 255, 255, 255]);
     }
 
@@ -662,7 +643,7 @@ mod tests {
 
         assert_eq!(doc.canvas, Size::new(20, 12));
         assert_eq!(doc.view, Rect::new(10, 6, 20, 12));
-        assert_eq!(doc.base.width(), 64);
+        assert_eq!(doc.base_image().width(), 64);
         assert_eq!(doc.composite_pixel(0, 0).0, [10, 6, 0, 255]);
         assert_eq!(doc.composite_pixel(19, 11).0, [29, 17, 0, 255]);
     }
@@ -721,7 +702,7 @@ mod tests {
             "dot",
             RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255])),
         );
-        layer.offset = (2, 3);
+        layer.set_offset((2, 3));
         doc.add_layer(layer).unwrap();
 
         doc.crop(Rect::new(5, 5, 20, 20)).unwrap();
@@ -729,11 +710,11 @@ mod tests {
         // 图层跟着内容走：画布原点移到 (5,5)，图层的画布偏移同步平移
         // -(5,5)，所以它相对图像内容的位置不变（画布 (0,0) 露出的是
         // 原图像 (5,5) 的像素，白点正好压在这个角上）。
-        assert_eq!(doc.layers[0].offset, (-3, -2));
+        assert_eq!(doc.layers[1].offset(), (-3, -2));
         assert_eq!(doc.composite_pixel(0, 0).0, [255, 255, 255, 255]);
 
         doc.reset_crop().unwrap();
-        assert_eq!(doc.layers[0].offset, (2, 3));
+        assert_eq!(doc.layers[1].offset(), (2, 3));
         assert_eq!(doc.composite_pixel(2, 3).0, [255, 255, 255, 255]);
     }
 
@@ -771,13 +752,13 @@ mod tests {
         // 图层盖满整块画布：轮廓外的部分也必须透明，否则"裁剪"看起来没生效。
         let mut doc = Document::from_image(solid(40, 30, [0, 0, 0, 255]));
         let mut layer = Layer::new("full", solid(40, 30, [255, 255, 255, 255]));
-        layer.offset = (0, 0);
+        layer.set_offset((0, 0));
         doc.add_layer(layer).unwrap();
 
         doc.crop_to_selection(&SelectionMask::ellipse(Rect::new(5, 5, 20, 16)))
             .unwrap();
         assert_eq!(doc.canvas, Size::new(20, 16));
-        assert_eq!(doc.layers[0].offset, (-5, -5));
+        assert_eq!(doc.layers[0].offset(), (-5, -5));
         // 角落在椭圆外：图层像素已挖空 → 合成 alpha 0（不再是白点）。
         assert_eq!(doc.composite_pixel(0, 0).0[3], 0);
         assert_eq!(doc.composite_pixel(10, 8).0[3], 255);
@@ -812,7 +793,7 @@ mod tests {
         doc.resize(Size::new(16, 12)).unwrap();
         assert_eq!(doc.canvas, Size::new(16, 12));
         assert_eq!(doc.view, Rect::new(0, 0, 16, 12));
-        assert_eq!(doc.base.dimensions(), (16, 12));
+        assert_eq!(doc.base_image().dimensions(), (16, 12));
         assert_eq!(doc.composite_pixel(0, 0).0, [10, 20, 30, 255]);
     }
 
@@ -821,7 +802,7 @@ mod tests {
         let mut doc = Document::from_image(solid(10, 5, [1, 2, 3, 255]));
         doc.resize(Size::new(30, 15)).unwrap();
         assert_eq!(doc.canvas, Size::new(30, 15));
-        assert_eq!(doc.base.dimensions(), (30, 15));
+        assert_eq!(doc.base_image().dimensions(), (30, 15));
         assert_eq!(doc.composite_pixel(29, 14).0, [1, 2, 3, 255]);
     }
 
@@ -832,7 +813,7 @@ mod tests {
             "dot",
             RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255])),
         );
-        layer.offset = (6, 6);
+        layer.set_offset((6, 6));
         doc.add_layer(layer).unwrap();
         let original = doc.flatten();
         let original_layers = doc.layers.clone();
@@ -842,7 +823,7 @@ mod tests {
 
         doc.undo().unwrap();
         assert_eq!(doc.canvas, Size::new(64, 48));
-        assert_eq!(doc.base.dimensions(), (64, 48));
+        assert_eq!(doc.base_image().dimensions(), (64, 48));
         assert_eq!(doc.layers, original_layers);
         assert_eq!(doc.flatten(), original);
 
@@ -871,13 +852,13 @@ mod tests {
             "dot",
             RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255])),
         );
-        layer.offset = (10, 5);
+        layer.set_offset((10, 5));
         doc.add_layer(layer).unwrap();
 
         doc.resize(Size::new(20, 10)).unwrap();
-        let l = &doc.layers[0];
-        assert_eq!(l.offset, (5, 3));
-        assert_eq!(l.image.dimensions(), (2, 2));
+        let l = &doc.layers[1];
+        assert_eq!(l.offset(), (5, 3));
+        assert_eq!(l.image().unwrap().dimensions(), (2, 2));
         assert_eq!(doc.composite_pixel(5, 3).0, [255, 255, 255, 255]);
     }
 
@@ -889,7 +870,7 @@ mod tests {
         doc.resize_canvas(Size::new(12, 12)).unwrap();
         assert_eq!(doc.canvas, Size::new(12, 12));
         assert_eq!(doc.view, Rect::new(0, 0, 12, 12));
-        assert_eq!(doc.base.dimensions(), (12, 12));
+        assert_eq!(doc.base_image().dimensions(), (12, 12));
         // Old content is re-anchored to the center (offset +2/+2) and every
         // pixel is copied verbatim (no resampling).
         for y in 0..8 {
@@ -912,7 +893,7 @@ mod tests {
             "dot",
             RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 255, 255])),
         );
-        layer.offset = (0, 0);
+        layer.set_offset((0, 0));
         doc.add_layer(layer).unwrap();
         let original = doc.flatten();
         let original_layers = doc.layers.clone();
@@ -929,13 +910,83 @@ mod tests {
             }
         }
         // Layer shifted by (-2, -2); its pixels are untouched (still 2x2).
-        assert_eq!(doc.layers[0].offset, (-2, -2));
-        assert_eq!(doc.layers[0].image.dimensions(), (2, 2));
+        assert_eq!(doc.layers[1].offset(), (-2, -2));
+        assert_eq!(doc.layers[1].image().unwrap().dimensions(), (2, 2));
 
         doc.undo().unwrap();
         assert_eq!(doc.canvas, Size::new(8, 8));
         assert_eq!(doc.layers, original_layers);
         assert_eq!(doc.flatten(), original);
+    }
+
+    /// ★P0 验收：`flatten` 与改造前的算法逐像素一致。
+    ///
+    /// 改造前 = 背景（按 view 对齐）+ layers[1..] 依次叠加 + 最后统一画
+    /// 所有标记。这里用 `image::imageops::overlay` 独立复算一遍当参照，
+    /// 而不是拿新代码跟自己比。
+    #[test]
+    fn flatten_matches_legacy_composition() {
+        let mut doc = Document::from_image(RgbaImage::from_pixel(
+            24,
+            24,
+            image::Rgba([10, 20, 30, 255]),
+        ));
+        let mut layer = Layer::new(
+            "patch",
+            RgbaImage::from_pixel(6, 6, image::Rgba([200, 100, 50, 255])),
+        );
+        layer.set_offset((4, 4));
+        doc.add_layer(layer).unwrap();
+        doc.add_mark(rect_mark(true)).unwrap();
+
+        let mut legacy = doc.base_image().clone();
+        image::imageops::overlay(&mut legacy, doc.layers[1].img(), 4, 4);
+        doc.mark(0).unwrap().draw(&mut legacy);
+
+        assert_eq!(doc.flatten(), legacy);
+    }
+
+    /// 标记进入 z 序之后才有的能力：它会被后加的位图图层盖住，也能自己
+    /// 挪回上面。改造前标记恒在最顶层，这两个断言都不可能成立。
+    #[test]
+    fn mark_takes_part_in_z_order() {
+        let mut doc = Document::from_image(blank(16, 16));
+        let mi = doc.add_mark(rect_mark(true)).unwrap();
+        let mark_layer = doc.mark_layer_index(mi).unwrap();
+        let mut patch = Layer::new(
+            "patch",
+            RgbaImage::from_pixel(16, 16, image::Rgba([9, 9, 9, 255])),
+        );
+        patch.set_offset((0, 0));
+        let patch_layer = doc.add_layer(patch).unwrap();
+
+        // 后加的位图图层在标记之上 → 实心绿标记被整块盖住。
+        assert_eq!(doc.flatten().get_pixel(5, 5).0, [9, 9, 9, 255]);
+
+        // 把位图图层挪到标记下面 → 标记重新露出来（实心填充色）。
+        doc.move_layer(patch_layer, mark_layer).unwrap();
+        assert_eq!(doc.flatten().get_pixel(5, 5).0, [0, 255, 0, 255]);
+    }
+
+    /// 标记图层也走统一的 `offset` / `translate_layer`：拖动标记必须真的
+    /// 动，而且能撤销（以前标记不在 layers 里，`offset()` 恒 (0,0)，拖动
+    /// 被判定成「没位移」直接回滚）。
+    #[test]
+    fn mark_layer_moves_through_layer_api() {
+        let mut doc = Document::from_image(blank(32, 32));
+        doc.add_mark(rect_mark(false)).unwrap();
+        let li = doc.mark_layer_index(0).unwrap();
+        assert_eq!(doc.layers[li].offset(), (2, 2));
+
+        // 直接改 offset：按位移平移标记。
+        doc.layers[li].set_offset((10, 12));
+        assert_eq!(doc.mark(0).unwrap().rect, (10.0, 12.0, 18.0, 18.0));
+
+        // 走带历史的那条路：拖动落定 + 撤销。
+        doc.translate_layer(li, 4, -2).unwrap();
+        assert_eq!(doc.layers[li].offset(), (14, 10));
+        doc.undo().unwrap();
+        assert_eq!(doc.layers[li].offset(), (10, 12));
     }
 
     #[test]
@@ -949,7 +1000,7 @@ mod tests {
             "dot",
             RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 255, 255])),
         );
-        layer.offset = (5, 5);
+        layer.set_offset((5, 5));
         doc.add_layer(layer).unwrap();
         let flat = doc.flatten();
         assert_eq!(flat.get_pixel(5, 5).0, [255, 255, 255, 255]);
@@ -985,26 +1036,26 @@ mod tests {
         assert_eq!(flat.get_pixel(0, 0).0, [0, 0, 0, 255]);
 
         // Move + undo + redo roundtrip.
-        let moved = doc.marks[0].translated(3.0, 1.0);
+        let moved = doc.mark(0).unwrap().translated(3.0, 1.0);
         doc.update_mark(0, moved.clone()).unwrap();
-        assert_eq!(doc.marks[0].rect, (5.0, 3.0, 13.0, 9.0));
+        assert_eq!(doc.mark(0).unwrap().rect, (5.0, 3.0, 13.0, 9.0));
         doc.undo().unwrap();
-        assert_eq!(doc.marks[0].rect, (2.0, 2.0, 10.0, 8.0));
+        assert_eq!(doc.mark(0).unwrap().rect, (2.0, 2.0, 10.0, 8.0));
         doc.redo().unwrap();
-        assert_eq!(doc.marks[0].rect, (5.0, 3.0, 13.0, 9.0));
+        assert_eq!(doc.mark(0).unwrap().rect, (5.0, 3.0, 13.0, 9.0));
 
         // Delete + undo restores the exact mark.
         doc.delete_mark(0).unwrap();
-        assert!(doc.marks.is_empty());
+        assert!(doc.mark_count() == 0);
         doc.undo().unwrap();
-        assert_eq!(doc.marks.len(), 1);
-        assert_eq!(doc.marks[0], moved);
+        assert_eq!(doc.mark_count(), 1);
+        assert_eq!(*doc.mark(0).unwrap(), moved);
         // add→update→undo→redo left undo = [add, update]; three undos walk
         // back delete → update → add, leaving an empty (pre-add) state with
         // the whole chain replayable via redo.
         doc.undo().unwrap();
         doc.undo().unwrap();
-        assert!(doc.marks.is_empty() && doc.can_redo());
+        assert!(doc.mark_count() == 0 && doc.can_redo());
     }
 
     #[test]
@@ -1024,14 +1075,14 @@ mod tests {
         // (3,3) sits in the 2px stroke ring of rect (2,2)-(10,8).
         assert_eq!(doc.flatten().get_pixel(3, 3).0, [255, 0, 0, 255]);
 
-        let mut hidden = mark.clone();
-        hidden.visible = false;
-        doc.update_mark(0, hidden).unwrap();
+        // 可见性现在是图层属性（Mark 不再自带 visible 字段）。
+        let li = doc.mark_layer_index(0).unwrap();
+        doc.set_layer_visible(li, false).unwrap();
         assert_eq!(doc.flatten().get_pixel(3, 3).0, [0, 0, 0, 255]);
 
         doc.undo().unwrap();
         assert_eq!(doc.flatten().get_pixel(3, 3).0, [255, 0, 0, 255]);
-        assert!(doc.marks[0].visible);
+        assert!(doc.layers[li].visible);
     }
 
     #[test]
@@ -1227,17 +1278,17 @@ mod tests {
 
         doc.apply_transform(Transform::Rotate90Cw).unwrap();
         // Canvas is 10x20 now; the mark maps with the same point transform.
-        let m = &doc.marks[0];
+        let m = &doc.mark(0).unwrap();
         assert_eq!(m.rect.0.min(m.rect.2), 2.0); // old x0 == new y0 side
         assert_eq!(doc.canvas, Size::new(10, 20));
 
         doc.undo().unwrap();
-        let before = doc.marks[0].clone();
+        let before = doc.mark(0).unwrap().clone();
         doc.resize_canvas(Size::new(30, 20)).unwrap();
         // Center anchor: dx = (30-20)/2 = 5, dy = (20-10)/2 = 5.
-        assert_eq!(doc.marks[0].rect, (7.0, 7.0, 15.0, 13.0));
+        assert_eq!(doc.mark(0).unwrap().rect, (7.0, 7.0, 15.0, 13.0));
         doc.undo().unwrap();
-        assert_eq!(doc.marks[0], before);
+        assert_eq!(*doc.mark(0).unwrap(), before);
     }
 
     #[test]
@@ -1245,8 +1296,8 @@ mod tests {
         let mut doc = Document::from_image(blank(20, 10));
         doc.add_mark(rect_mark(false)).unwrap();
         doc.resize(Size::new(40, 20)).unwrap();
-        assert_eq!(doc.marks[0].rect, (4.0, 4.0, 20.0, 16.0));
-        assert_eq!(doc.marks[0].stroke, 4);
+        assert_eq!(doc.mark(0).unwrap().rect, (4.0, 4.0, 20.0, 16.0));
+        assert_eq!(doc.mark(0).unwrap().stroke, 4);
     }
 
     // ---- 调整颜色 (color adjustment) ----
@@ -1261,34 +1312,34 @@ mod tests {
     #[test]
     fn adjust_base_pixels_roundtrips_undo_and_redo() {
         let mut doc = Document::from_image(grey_ramp(32, 8));
-        let before = doc.base.clone();
+        let before = doc.base_image().clone();
         let params = Adjust {
             exposure: 0.5,
             ..Adjust::identity()
         };
         doc.adjust_pixels(AdjustTarget::Base, &params).unwrap();
 
-        assert!(doc.base.get_pixel(10, 0).0[0] > before.get_pixel(10, 0).0[0]);
+        assert!(doc.base_image().get_pixel(10, 0).0[0] > before.get_pixel(10, 0).0[0]);
         assert!(doc.can_undo());
         assert_eq!(doc.canvas, Size::new(32, 8));
 
         doc.undo().unwrap();
-        assert_eq!(doc.base.as_raw(), before.as_raw());
+        assert_eq!(doc.base_image().as_raw(), before.as_raw());
         doc.redo().unwrap();
         // Redo recomputes from the stored pre-op image: deterministic.
-        assert!(doc.base.get_pixel(10, 0).0[0] > before.get_pixel(10, 0).0[0]);
+        assert!(doc.base_image().get_pixel(10, 0).0[0] > before.get_pixel(10, 0).0[0]);
     }
 
     #[test]
     fn adjust_layer_pixels_only_touch_that_layer() {
         let mut doc = Document::from_image(grey_ramp(16, 4));
         let mut layer = Layer::new("1", RgbaImage::from_pixel(8, 4, image::Rgba([90, 90, 90, 255])));
-        layer.offset = (2, 0);
+        layer.set_offset((2, 0));
         doc.add_layer(layer).unwrap();
-        let base_before = doc.base.clone();
+        let base_before = doc.base_image().clone();
 
         doc.adjust_pixels(
-            AdjustTarget::Layer(0),
+            AdjustTarget::Layer(1),
             &Adjust {
                 saturation: -1.0,
                 exposure: 0.4,
@@ -1297,8 +1348,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(doc.base.as_raw(), base_before.as_raw());
-        let px = doc.layers[0].image.get_pixel(0, 0).0;
+        assert_eq!(doc.base_image().as_raw(), base_before.as_raw());
+        let px = doc.layers[1].image().unwrap().get_pixel(0, 0).0;
         assert!(px[0] > 90);
         assert_eq!(px[0], px[1]);
         assert_eq!(px[1], px[2]);
@@ -1320,11 +1371,11 @@ mod tests {
     fn scope_histogram_tracks_the_selected_scope() {
         let mut doc = Document::from_image(blank(16, 16));
         let mut layer = Layer::new("1", RgbaImage::from_pixel(16, 16, image::Rgba([255, 0, 0, 255])));
-        layer.offset = (0, 0);
+        layer.set_offset((0, 0));
         doc.add_layer(layer).unwrap();
 
         let base_hist = doc.scope_histogram(AdjustTarget::Base).unwrap();
-        let layer_hist = doc.scope_histogram(AdjustTarget::Layer(0)).unwrap();
+        let layer_hist = doc.scope_histogram(AdjustTarget::Layer(1)).unwrap();
         // Base is opaque black: every pixel lands in bin 0.
         assert_eq!(base_hist.bin_counts(0)[0], 256);
         // The red layer: R saturates the top bin, G/B sit at the bottom.
@@ -1669,7 +1720,7 @@ mod paint_tests {
         .unwrap();
         let before = doc.layers[0].clone();
         doc.rotate_layer_angle(0, 30.0, true).unwrap();
-        assert!(doc.layers[0].image.width() > 8);
+        assert!(doc.layers[0].image().unwrap().width() > 8);
         doc.undo().unwrap();
         assert_eq!(doc.layers[0], before);
     }
@@ -1681,14 +1732,14 @@ mod paint_tests {
             20,
             image::Rgba([10, 10, 10, 255]),
         ));
-        let before = crop_region(&doc.base, Rect::new(4, 4, 6, 6));
+        let before = crop_region(doc.base_image(), Rect::new(4, 4, 6, 6));
         let after = RgbaImage::from_pixel(6, 6, image::Rgba([200, 0, 0, 255]));
         doc.commit_patch(AdjustTarget::Base, before.0, before.1, after)
             .unwrap();
-        assert_eq!(doc.base.get_pixel(5, 5).0, [200, 0, 0, 255]);
+        assert_eq!(doc.base_image().get_pixel(5, 5).0, [200, 0, 0, 255]);
         doc.undo().unwrap();
-        assert_eq!(doc.base.get_pixel(5, 5).0, [10, 10, 10, 255]);
-        assert_eq!(doc.base.get_pixel(0, 0).0, [10, 10, 10, 255]);
+        assert_eq!(doc.base_image().get_pixel(5, 5).0, [10, 10, 10, 255]);
+        assert_eq!(doc.base_image().get_pixel(0, 0).0, [10, 10, 10, 255]);
     }
 }
 

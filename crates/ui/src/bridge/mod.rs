@@ -1631,7 +1631,7 @@ impl qobject::Bridge {
             let guard = self.session.borrow();
             guard
                 .as_ref()
-                .map(|s| s.doc.marks.len())
+                .map(|s| s.doc.mark_count())
                 .unwrap_or(0)
         } as i32;
         self.as_mut().set_selected_mark(count - 1);
@@ -1813,7 +1813,7 @@ impl qobject::Bridge {
                         let guard = self.session.borrow();
                         guard
                             .as_ref()
-                            .map(|s| s.doc.marks.len())
+                            .map(|s| s.doc.mark_count())
                             .unwrap_or(0)
                     } as i32;
                     if *self.selected_mark() < -1 || *self.selected_mark() >= count {

@@ -123,7 +123,7 @@ impl qobject::Bridge {
                             path = dir.join(format!("layout_{}_{}.png", number, suffix));
                             suffix += 1;
                         }
-                        let write_result = encode(&layer.image, Format::Png, session.save_quality)
+                        let write_result = encode(&layer.img(), Format::Png, session.save_quality)
                             .map_err(|e| e.to_string())
                             .and_then(|bytes| {
                                 std::fs::write(&path, bytes).map_err(|e| e.to_string())

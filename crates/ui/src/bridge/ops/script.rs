@@ -319,7 +319,7 @@ impl qobject::Bridge {
                             let guard = self.session.borrow();
                             guard
                                 .as_ref()
-                                .map(|s| s.doc.marks.len())
+                                .map(|s| s.doc.mark_count())
                                 .unwrap_or(0)
                         },
                         self.selected_mark(),
@@ -351,7 +351,7 @@ impl qobject::Bridge {
                             let guard = self.session.borrow();
                             guard
                                 .as_ref()
-                                .map(|s| s.doc.marks.len())
+                                .map(|s| s.doc.mark_count())
                                 .unwrap_or(0)
                         },
                     );
@@ -374,7 +374,7 @@ impl qobject::Bridge {
                             let guard = self.session.borrow();
                             guard
                                 .as_ref()
-                                .map(|s| s.doc.marks.len())
+                                .map(|s| s.doc.mark_count())
                                 .unwrap_or(0)
                         },
                     );
@@ -443,7 +443,7 @@ impl qobject::Bridge {
                             let guard = self.session.borrow();
                             guard
                                 .as_ref()
-                                .map(|s| s.doc.marks.len())
+                                .map(|s| s.doc.mark_count())
                                 .unwrap_or(0)
                         }
                     );
@@ -466,7 +466,7 @@ impl qobject::Bridge {
                             let guard = self.session.borrow();
                             guard
                                 .as_ref()
-                                .and_then(|s| s.doc.marks.first())
+                                .and_then(|s| s.doc.marks().next())
                                 .map(|m| m.rect)
                         }
                     );
@@ -824,8 +824,8 @@ impl qobject::Bridge {
                             let guard = self.session.borrow();
                             guard.as_ref().and_then(|s| s.doc.layers.get(ix)).map(|l| {
                                 (
-                                    l.offset.0 as f64 + l.image.width() as f64 / 2.0,
-                                    l.offset.1 as f64 + l.image.height() as f64 / 2.0,
+                                    l.offset().0 as f64 + l.img().width() as f64 / 2.0,
+                                    l.offset().1 as f64 + l.img().height() as f64 / 2.0,
                                 )
                             })
                         };
@@ -866,8 +866,8 @@ impl qobject::Bridge {
                                 let guard = self.session.borrow();
                                 guard.as_ref().and_then(|s| s.doc.layers.get(ix)).map(|l| {
                                     (
-                                        l.offset.0 as f64 + l.image.width() as f64 / 2.0,
-                                        l.offset.1 as f64 + l.image.height() as f64 / 2.0,
+                                        l.offset().0 as f64 + l.img().width() as f64 / 2.0,
+                                        l.offset().1 as f64 + l.img().height() as f64 / 2.0,
                                     )
                                 })
                             };
@@ -917,8 +917,8 @@ impl qobject::Bridge {
                         let guard = self.session.borrow();
                         guard.as_ref().and_then(|s| s.doc.layers.get(ix.max(0) as usize)).map(|l| {
                             (
-                                l.offset.0 as f64 + l.image.width() as f64 / 2.0,
-                                l.offset.1 as f64 + l.image.height() as f64 / 2.0,
+                                l.offset().0 as f64 + l.img().width() as f64 / 2.0,
+                                l.offset().1 as f64 + l.img().height() as f64 / 2.0,
                             )
                         })
                     };
@@ -954,8 +954,8 @@ impl qobject::Bridge {
                     let start = {
                         let guard = self.session.borrow();
                         guard.as_ref().and_then(|s| s.doc.layers.get(ix.max(0) as usize)).map(|l| {
-                            (l.offset.0 as f64 + l.image.width() as f64 / 2.0,
-                             l.offset.1 as f64 + l.image.height() as f64 / 2.0)
+                            (l.offset().0 as f64 + l.img().width() as f64 / 2.0,
+                             l.offset().1 as f64 + l.img().height() as f64 / 2.0)
                         })
                     };
                     if let Some((cx, cy)) = start {
@@ -974,7 +974,7 @@ impl qobject::Bridge {
                                     s.doc
                                         .layers
                                         .get(ix.max(0) as usize)
-                                        .map(|l| l.offset)
+                                        .map(|l| l.offset())
                                         .unwrap_or((0, 0)),
                                     s.snap.guides.len(),
                                 ),
@@ -1118,7 +1118,7 @@ impl qobject::Bridge {
                             // `offset + 位图尺寸/2`（此时它等价于 params 中心），
                             // 否则「旋转前 / 旋转后」的漂移回归会拿 0 当基线。
                             let (rot, cx, cy, sx, sy, sw, sh, has_t) =
-                                match layer.transform.as_ref() {
+                                match layer.xform().as_ref() {
                                     Some(t) => (
                                         t.rotation,
                                         t.center.0,
@@ -1131,12 +1131,12 @@ impl qobject::Bridge {
                                     ),
                                     None => (
                                         0.0,
-                                        layer.offset.0 as f64 + layer.image.width() as f64 / 2.0,
-                                        layer.offset.1 as f64 + layer.image.height() as f64 / 2.0,
+                                        layer.offset().0 as f64 + layer.img().width() as f64 / 2.0,
+                                        layer.offset().1 as f64 + layer.img().height() as f64 / 2.0,
                                         1.0,
                                         1.0,
-                                        layer.image.width(),
-                                        layer.image.height(),
+                                        layer.img().width(),
+                                        layer.img().height(),
                                         false,
                                     ),
                                 };
@@ -1146,10 +1146,10 @@ impl qobject::Bridge {
                                  \"rot\":{rot:.4},\"cx\":{cx:.3},\"cy\":{cy:.3},\
                                  \"sx\":{sx:.6},\"sy\":{sy:.6},\"sw\":{sw},\"sh\":{sh},\
                                  \"params\":{has_t}}}",
-                                layer.image.width(),
-                                layer.image.height(),
-                                layer.offset.0,
-                                layer.offset.1,
+                                layer.img().width(),
+                                layer.img().height(),
+                                layer.offset().0,
+                                layer.offset().1,
                                 session.doc.history_len()
                             );
                         }
@@ -1166,7 +1166,7 @@ impl qobject::Bridge {
                         if let Some(layer) = session.doc.layers.get(ix.max(0) as usize) {
                             let mut sum: u64 = 0;
                             let mut opaque: u64 = 0;
-                            for px in layer.image.pixels() {
+                            for px in layer.img().pixels() {
                                 sum += px.0[3] as u64;
                                 if px.0[3] > 0 {
                                     opaque += 1;
@@ -1179,6 +1179,21 @@ impl qobject::Bridge {
                         }
                     }
                 }
+                // `layers-dump` —— 把 `layers_json()` 原样打出来（面板看到
+                // 的就是这一份）。图层重构后验 z 序 / 背景行 / 多选缓存都
+                // 靠它，别再靠截图猜。
+                "layers-dump" => {
+                    let json = {
+                        let guard = self.session.borrow();
+                        guard
+                            .as_ref()
+                            .map(|s| s.layers_json())
+                            .unwrap_or_else(|| "[]".to_string())
+                    };
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"layers-dump\",\"layers\":{json}}}"
+                    );
+                }
                 // `layer-dump:index:path` —— 把图层位图原样存成 PNG。
                 // 诊断「拖动帧里图层那一块是空的」时，先确认图层位图本身有
                 // 没有内容（别把「合成没画」当成「位图透明」）。
@@ -1189,12 +1204,12 @@ impl qobject::Bridge {
                         let guard = self.session.borrow();
                         if let Some(session) = guard.as_ref() {
                             if let Some(layer) = session.doc.layers.get(ix) {
-                                let ok = layer.image.save(path.trim()).is_ok();
+                                let ok = layer.img().save(path.trim()).is_ok();
                                 println!(
                                     "{{\"phase\":\"ui\",\"event\":\"layer-dump\",\"index\":{ix},\
                                      \"ok\":{ok},\"w\":{},\"h\":{}}}",
-                                    layer.image.width(),
-                                    layer.image.height()
+                                    layer.img().width(),
+                                    layer.img().height()
                                 );
                             }
                         }
@@ -1267,7 +1282,7 @@ impl qobject::Bridge {
                             guard
                                 .as_ref()
                                 .and_then(|s| s.doc.layers.get(ix.max(0) as usize))
-                                .and_then(|l| l.transform.as_ref())
+                                .and_then(|l| l.xform())
                                 .map(|t| t.rotation)
                                 .unwrap_or(0.0)
                         };

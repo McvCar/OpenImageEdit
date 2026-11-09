@@ -56,7 +56,7 @@ impl qobject::Bridge {
             let guard = self.session.borrow();
             guard
                 .as_ref()
-                .map(|s| s.doc.marks.len())
+                .map(|s| s.doc.mark_count())
                 .unwrap_or(0)
         } as i32;
         self.as_mut().set_selected_mark(count - 1);
@@ -112,7 +112,7 @@ impl qobject::Bridge {
             let guard = self.session.borrow();
             guard
                 .as_ref()
-                .map(|s| s.doc.marks.len())
+                .map(|s| s.doc.mark_count())
                 .unwrap_or(0)
         } as i32;
         self.as_mut().set_selected_mark(count - 1);
@@ -250,7 +250,7 @@ impl qobject::Bridge {
         let Some(session) = guard.as_mut() else {
             return;
         };
-        let Some(mark) = session.doc.marks.get(index as usize).cloned() else {
+        let Some(mark) = session.doc.mark(index as usize).cloned() else {
             return;
         };
         if mark.kind != MarkKind::Mosaic || mark.cell == cell.clamp(2, 255) as u8 {
@@ -286,7 +286,7 @@ impl qobject::Bridge {
             let Some(session) = guard.as_mut() else {
                 return;
             };
-            let Some(mark) = session.doc.marks.get(index as usize).cloned() else {
+            let Some(mark) = session.doc.mark(index as usize).cloned() else {
                 return;
             };
             if mark.kind != MarkKind::Text {
@@ -320,7 +320,7 @@ impl qobject::Bridge {
             let mut guard = self.session.borrow_mut();
             if let Some(session) = guard.as_mut() {
                 let idx = if index >= 0
-                    && (index as usize) < session.doc.marks.len()
+                    && (index as usize) < session.doc.mark_count()
                 {
                     index
                 } else {
@@ -347,7 +347,7 @@ impl qobject::Bridge {
         let Some(session) = guard.as_mut() else {
             return;
         };
-        let Some(mark) = session.doc.marks.get(index as usize).cloned() else {
+        let Some(mark) = session.doc.mark(index as usize).cloned() else {
             return;
         };
         if mark.kind != MarkKind::Text || mark.text == text {
@@ -377,7 +377,7 @@ impl qobject::Bridge {
         let grabbed = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
-                Some(session) => session.doc.marks.get(index as usize).cloned(),
+                Some(session) => session.doc.mark(index as usize).cloned(),
                 None => None,
             }
         };
@@ -450,7 +450,7 @@ impl qobject::Bridge {
             return;
         }
         // `from` is the pre-drag snapshot, so undo restores it verbatim.
-        let to = match session.doc.marks.get(index) {
+        let to = match session.doc.mark(index) {
             Some(m) => m.clone(),
             None => return,
         };
@@ -462,7 +462,7 @@ impl qobject::Bridge {
             println!(
                 "{{\"phase\":\"ui\",\"event\":\"mark-drag-end\",\"index\":{index},\"from\":[{},{},{},{}],\"now\":{:?}}}",
                 from_rect.0, from_rect.1, from_rect.2, from_rect.3,
-                session.doc.marks.get(index).map(|m| m.rect)
+                session.doc.mark(index).map(|m| m.rect)
             );
         }
         drop(guard);
@@ -497,20 +497,17 @@ impl qobject::Bridge {
             let Some(session) = guard.as_mut() else {
                 return;
             };
-            let Some(mark) = session.doc.marks.get(index as usize).cloned() else {
+            // 标记的可见性现在归它所在的图层持有：先按标记序号找到图层下标。
+            let Some(li) = session.doc.mark_layer_index(index as usize) else {
                 return;
             };
-            if mark.visible == visible {
+            if session.doc.layers[li].visible == visible {
                 return;
             }
-            let mut to = mark.clone();
-            to.visible = visible;
-            session.dirty = true;
-            let _ = session.doc.execute(editcore::EditOp::UpdateMark {
-                index: index as usize,
-                from: mark,
-                to,
-            });
+            match session.doc.set_layer_visible(li, visible) {
+                Ok(()) => session.dirty = true,
+                Err(_) => return,
+            }
         }
         self.as_mut().refresh_preview();
     }
@@ -533,7 +530,7 @@ impl qobject::Bridge {
             let Some(session) = guard.as_mut() else {
                 return;
             };
-            let Some(mark) = session.doc.marks.get(index as usize).cloned() else {
+            let Some(mark) = session.doc.mark(index as usize).cloned() else {
                 return;
             };
             let mut to = mark.clone();

@@ -52,47 +52,67 @@ fn transform_rect(rect: Rect, transform: Transform, canvas: Size) -> Rect {
 
 pub(crate) fn transform_document(doc: &mut Document, transform: Transform) {
     let canvas = doc.canvas;
-    for layer in &mut doc.layers {
-        let bounds = layer.bounds();
-        let (ox, oy) = (bounds.x, bounds.y);
-        let (lw, lh) = (bounds.width as i32, bounds.height as i32);
-        let (cw, ch) = (canvas.width as i32, canvas.height as i32);
-        // 文档级旋转 / 翻转直接改每层位图，先烘焙掉非破坏性状态。
-        layer.ensure_baked();
-        layer.image = transform.apply_to_image(&layer.image);
-        layer.offset = match transform {
-            Transform::Rotate90Cw => (ch - (oy + lh), ox),
-            Transform::Rotate90Ccw => (oy, cw - (ox + lw)),
-            Transform::Rotate180 => (cw - (ox + lw), ch - (oy + lh)),
-            Transform::FlipHorizontal => (cw - (ox + lw), oy),
-            Transform::FlipVertical => (ox, ch - (oy + lh)),
-        };
-    }
-    // Marks live in canvas coordinates, so they follow the exact same
-    // mapping as layer offsets (f32 points; the rect re-normalizes).
-    let (cw, ch) = (canvas.width as f32, canvas.height as f32);
+    let (cw, ch) = (canvas.width as i32, canvas.height as i32);
+    // Marks live in canvas coordinates: same mapping as layer offsets.
+    let (cwf, chf) = (canvas.width as f32, canvas.height as f32);
     let map_pt = |x: f32, y: f32| -> (f32, f32) {
         match transform {
-            Transform::Rotate90Cw => (ch - y, x),
-            Transform::Rotate90Ccw => (y, cw - x),
-            Transform::Rotate180 => (cw - x, ch - y),
-            Transform::FlipHorizontal => (cw - x, y),
-            Transform::FlipVertical => (x, ch - y),
+            Transform::Rotate90Cw => (chf - y, x),
+            Transform::Rotate90Ccw => (y, cwf - x),
+            Transform::Rotate180 => (cwf - x, chf - y),
+            Transform::FlipHorizontal => (cwf - x, y),
+            Transform::FlipVertical => (x, chf - y),
         }
     };
-    for mark in &mut doc.marks {
-        let (x0, y0) = map_pt(mark.rect.0, mark.rect.1);
-        let (x1, y1) = map_pt(mark.rect.2, mark.rect.3);
-        mark.rect = norm_rect((x0, y0, x1, y1));
-        for p in &mut mark.points {
-            *p = map_pt(p.0, p.1);
+
+    // 背景层：图像按 `base` 语义旋转 / 翻转，`view` 在 base 坐标里跟着变换，
+    // offset 由新的 view 反推 —— 与统一模型之前的几何完全一致。
+    let base_before = Size::new(
+        doc.layers[0].image().map(|i| i.width()).unwrap_or(canvas.width),
+        doc.layers[0].image().map(|i| i.height()).unwrap_or(canvas.height),
+    );
+    doc.layers[0].ensure_baked();
+    if let Some(r) = doc.layers[0].raster_mut() {
+        r.image = transform.apply_to_image(&r.image);
+    }
+    doc.view = transform_rect(doc.view, transform, base_before);
+    if let Some(r) = doc.layers[0].raster_mut() {
+        r.offset = (-doc.view.x, -doc.view.y);
+    }
+
+    // 其余图层：位图按画布尺寸做同样的刚体变换，标记走点位映射。
+    for layer in doc.layers.iter_mut().skip(1) {
+        match &mut layer.content {
+            LayerContent::Raster(r) => {
+                let bounds = Rect::new(
+                    r.offset.0,
+                    r.offset.1,
+                    r.image.width(),
+                    r.image.height(),
+                );
+                let (ox, oy) = (bounds.x, bounds.y);
+                let (lw, lh) = (bounds.width as i32, bounds.height as i32);
+                // 文档级旋转 / 翻转直接改每层位图，先烘焙掉非破坏性状态。
+                r.transform = None;
+                r.image = transform.apply_to_image(&r.image);
+                r.offset = match transform {
+                    Transform::Rotate90Cw => (ch - (oy + lh), ox),
+                    Transform::Rotate90Ccw => (oy, cw - (ox + lw)),
+                    Transform::Rotate180 => (cw - (ox + lw), ch - (oy + lh)),
+                    Transform::FlipHorizontal => (cw - (ox + lw), oy),
+                    Transform::FlipVertical => (ox, ch - (oy + lh)),
+                };
+            }
+            LayerContent::Mark(m) => {
+                let (x0, y0) = map_pt(m.rect.0, m.rect.1);
+                let (x1, y1) = map_pt(m.rect.2, m.rect.3);
+                m.rect = norm_rect((x0, y0, x1, y1));
+                for p in &mut m.points {
+                    *p = map_pt(p.0, p.1);
+                }
+            }
         }
     }
-    // `view` lives in base coordinates, so it maps against the base dimensions
-    // (layers use canvas dimensions, since their offsets are canvas-relative).
-    let base_before = Size::new(doc.base.width(), doc.base.height());
-    doc.view = transform_rect(doc.view, transform, base_before);
-    doc.base = transform.apply_to_image(&doc.base);
     if transform.swaps_axes() {
         doc.canvas = Size::new(canvas.height, canvas.width);
     }

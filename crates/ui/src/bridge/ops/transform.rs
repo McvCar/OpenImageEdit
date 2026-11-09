@@ -79,10 +79,10 @@ fn prepare_snap(session: &mut Session, moving: usize) {
         }
     }
     // 默认背景同理：它抠出来的洞是最常见的「往里放东西」的地方。
-    if !session.doc.base_hidden && !session.doc.base_deleted {
+    if !session.doc.base_hidden() && !session.doc.base_deleted() {
         let (bx, by) = (-session.doc.view.x as f64, -session.doc.view.y as f64);
         for h in editcore::alpha_fit::image_holes(
-            &session.doc.base,
+            &session.doc.base_image(),
             (bx, by),
             ALPHA_THRESHOLD,
             MIN_HOLE_SIDE,
@@ -154,8 +154,8 @@ fn solve_fit(session: &mut Session, disp: (f64, f64), threshold: f64) -> FitResu
         let occ = &mut session.fit_occ;
         // 默认背景也参与：它的不透明像素同样是墙。整块盖满窗口时不盖
         // （那是垫底，盖进去空窗全灭 = 咬合失效），只有透出空白才算数。
-        let base = &session.doc.base;
-        if !session.doc.base_hidden && !session.doc.base_deleted {
+        let base = &session.doc.base_image();
+        if !session.doc.base_hidden() && !session.doc.base_deleted() {
             let (bx, by) = (-session.doc.view.x, -session.doc.view.y);
             let canvas = (
                 0.0,
@@ -232,10 +232,10 @@ impl qobject::Bridge {
             };
             if let TransformSession::Move { index, start, start_center, .. } = ts {
                 if let Some(layer) = session.doc.layers.get_mut(index) {
-                    layer.offset = start;
+                    layer.set_offset(start);
                     // 与 drag_translate_update 配对的回滚：手势期间 center 也跟着
                     // 位移了，只还原 offset 会让框和内容错开。
-                    if let (Some(c), Some(t)) = (start_center, layer.transform.as_mut()) {
+                    if let (Some(c), Some(t)) = (start_center, layer.xform_mut()) {
                         t.center = c;
                     }
                 }
@@ -538,7 +538,7 @@ impl qobject::Bridge {
         let rects = if index < 0 {
             let (bx, by) = (-session.doc.view.x as f64, -session.doc.view.y as f64);
             editcore::alpha_fit::image_holes(
-                &session.doc.base,
+                &session.doc.base_image(),
                 (bx, by),
                 ALPHA_THRESHOLD,
                 min_side,
@@ -670,8 +670,8 @@ impl qobject::Bridge {
             let Some(layer) = session.doc.layers.get(ix) else {
                 return false;
             };
-            let mut t = layer.transform.clone().unwrap_or_else(|| {
-                LayerTransform::from_offset(layer.image.clone(), layer.offset.0, layer.offset.1)
+            let mut t = layer.xform().cloned().unwrap_or_else(|| {
+                LayerTransform::from_offset(layer.img().clone(), layer.offset().0, layer.offset().1)
             });
             let solve = if lock_ratio {
                 BoundsSolve::Uniform
@@ -757,7 +757,7 @@ impl qobject::Bridge {
                 .layers
                 .get(ix)
                 .map(|l| {
-                    l.transform
+                    l.xform()
                         .as_ref()
                         .map(|t| (t.scale.0.max(1e-6), t.scale.1.max(1e-6)))
                         .unwrap_or((1.0, 1.0))
