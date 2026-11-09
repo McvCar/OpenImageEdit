@@ -187,7 +187,7 @@ Item {
                 }
             }
 
-            // 第一排：新建 / 复制 / 合并 / 拼合 …… 删除（右端独立，危险色）
+            // 第一排：新建 / 复制 / 合并选中层 …… 删除（右端独立，危险色）
             Item {
                 width: parent.width
                 height: 24
@@ -210,31 +210,13 @@ Item {
                     onActivated: bridge.duplicate_selected_layer()
                 }
                 PanelButton {
-                    id: btnMergeDown
+                    id: btnMerge
                     anchors.left: btnDup.right
                     anchors.leftMargin: 4
                     glyph: "⤓"
-                    tip: "向下合并"
-                    usable: bridge.selected_layer > 0
-                    onActivated: bridge.merge_selected_down()
-                }
-                PanelButton {
-                    id: btnMergeVis
-                    anchors.left: btnMergeDown.right
-                    anchors.leftMargin: 4
-                    glyph: "⇲"
-                    tip: "合并可见图层"
-                    usable: bridge.layer_count > 2
-                    onActivated: bridge.merge_visible_layers()
-                }
-                PanelButton {
-                    id: btnFlatten
-                    anchors.left: btnMergeVis.right
-                    anchors.leftMargin: 4
-                    glyph: "▣"
-                    tip: "拼合图像（全部合进背景）"
-                    usable: bridge.layer_count > 1
-                    onActivated: bridge.flatten_layers()
+                    tip: "合并选中的图层（Ctrl 点击多选，背景层不参与）"
+                    usable: layerPanel.multiCount >= 2
+                    onActivated: bridge.merge_selected_layers()
                 }
                 PanelButton {
                     anchors.right: parent.right
@@ -670,8 +652,14 @@ Item {
                             } else if (!reordering && layerRow.row && !layerRow.isBase
                                        && !layerRow.locked) {
                                 // Ctrl = 切换，Shift = 连选，普通点击 = 单选。
+                                // 事件自带的 modifiers 在「先松鼠标再松 Ctrl」时
+                                // 偶尔拿不到 Ctrl（释放事件里键盘状态已经是新的），
+                                // 所以再问一次实时键状态（bit0 Shift / bit1 Ctrl）。
+                                const bits = bridge.modifier_bits()
                                 const ctrl = (mouse.modifiers & Qt.ControlModifier) !== 0
+                                             || (bits & 2) !== 0
                                 const shift = (mouse.modifiers & Qt.ShiftModifier) !== 0
+                                              || (bits & 1) !== 0
                                 if (!ctrl && !shift)
                                     bridge.sel_clear()
                                 bridge.select_layer_ex(layerRow.row.i,
@@ -855,27 +843,11 @@ Item {
                 }
             }
             MenuRow {
-                label: "向下合并"
-                active: layerContext.targetIndex > 0
+                label: "合并选中的图层"
+                active: layerPanel.multiCount >= 2
                 onActivated: {
                     layerContext.visible = false
-                    bridge.merge_selected_down()
-                }
-            }
-            MenuRow {
-                label: "合并可见图层"
-                active: bridge.layer_count > 2
-                onActivated: {
-                    layerContext.visible = false
-                    bridge.merge_visible_layers()
-                }
-            }
-            MenuRow {
-                label: "拼合图像"
-                active: bridge.layer_count > 1
-                onActivated: {
-                    layerContext.visible = false
-                    bridge.flatten_layers()
+                    bridge.merge_selected_layers()
                 }
             }
             MenuRow {

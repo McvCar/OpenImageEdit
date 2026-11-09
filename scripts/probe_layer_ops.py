@@ -40,8 +40,8 @@ OPS = [
     "rasterize",             # 标记原地栅格化
     "layers-dump",           # ck5 三层，顶层变位图
     "multi-select:1,2",
-    "align:top",             # 两层顶对齐到画布 y=0
-    "layers-dump",           # ck6 非背景层 y 全 0
+    "align:top",             # 两层顶对齐（参照 = 两层的并集包围盒）
+    "layers-dump",           # ck6 非背景层的 y 一致
     "layers-visible:0",      # 批量隐藏
     "layers-dump",           # ck7 选中的层 v=false
     "layers-visible:1",
@@ -55,6 +55,9 @@ OPS = [
     "layers-dump",           # ck10 只剩背景一层
     "undo",                  # 拼合可撤销
     "layers-dump",           # ck11 层数还原
+    "multi-select:1,2",
+    "layer-merge",           # 合并选中的两层（PS「合并图层」）
+    "layers-dump",           # ck12 三层 → 两层，顶层是 raster
 ]
 
 
@@ -144,8 +147,10 @@ def main():
     if rows6 is not None:
         body = [r for r in rows6 if not r.get("bg")]
         want(len(body) == 2, "ck6 非背景层应 2 个，实际 %d" % len(body))
-        want(all(r["y"] == 0 for r in body),
-             "ck6 顶对齐没落到 y=0: %s" % [(r["n"], r["y"]) for r in body])
+        # 对齐语义（用户定）：选中两层时参照的是**两层自己的并集包围盒**，
+        # 也就是「谁最靠上谁不动」，所以断言的是「两层的 y 一致」，不是 y=0。
+        want(len({r["y"] for r in body}) == 1,
+             "ck6 顶对齐后 y 不一致: %s" % [(r["n"], r["y"]) for r in body])
 
     rows7 = ck(7)
     summary(7, rows7)
@@ -181,6 +186,17 @@ def main():
         want(len(rows11) == len(rows9 or rows11),
              "ck11 撤销拼合后层数应还原: %d → %d"
              % (len(rows9 or rows11), len(rows11)))
+
+    rows12 = ck(12)
+    summary(12, rows12)
+    if rows12 is not None:
+        before = len(rows11 or rows12)
+        want(len(rows12) == before - 1,
+             "ck12 合并选中层后应少一层: %d → %d" % (before, len(rows12)))
+        want(rows12 and rows12[0]["k"] == "raster",
+             "ck12 合并结果应是位图层（顶层 %r）"
+             % (rows12[0]["k"] if rows12 else None))
+        want(rows12 and rows12[-1].get("bg") is True, "ck12 背景被合并掉")
 
     done = parse_events(lines, "script-done")
     if done:

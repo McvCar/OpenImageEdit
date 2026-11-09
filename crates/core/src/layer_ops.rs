@@ -194,6 +194,74 @@ impl Document {
         Ok(below)
     }
 
+    /// 合并**选中的**图层（PS 的「合并图层」，菜单项只在多选时可用）。
+    ///
+    /// 结果落在最高那层的 z 位上，名字 / 锁定状态沿用最高层，内容按 z 序
+    /// 从低到高合成 —— 所以合并前后画面完全一致。背景层（下标 0）永远不
+    /// 参与：它是文档的底，合进去就没有「背景」这个概念了。
+    ///
+    /// 少于两层时返回 [`EditError::BaseRequired`]（UI 会先拦一次给中文提示）。
+    pub fn merge_layers(&mut self, indices: &[usize]) -> Result<usize, EditError> {
+        let mut targets: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&i| i > 0 && i < self.layers.len())
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        if targets.len() < 2 {
+            return Err(EditError::BaseRequired);
+        }
+        // 范围取所有目标的**并集**：图层可能各自偏出去，用单层尺寸会把多出来
+        // 的那块像素裁掉（视觉上「合并后少了东西」）。
+        let (mut x0, mut y0) = (i32::MAX, i32::MAX);
+        let (mut x1, mut y1) = (i32::MIN, i32::MIN);
+        for &i in &targets {
+            let b = self.layers[i].bounds();
+            x0 = x0.min(b.x);
+            y0 = y0.min(b.y);
+            x1 = x1.max(b.x + b.width as i32);
+            y1 = y1.max(b.y + b.height as i32);
+        }
+        if x1 <= x0 || y1 <= y0 {
+            return Err(EditError::BaseRequired);
+        }
+        let mut merged = RgbaImage::new((x1 - x0) as u32, (y1 - y0) as u32);
+        // 由低到高叠：`draw_layer_into` 会把每层自己的不透明度烘焙进去。
+        for &i in &targets {
+            draw_layer_into(&mut merged, (x0, y0), &self.layers[i]);
+        }
+
+        let top = *targets.last().unwrap();
+        let before = self.layers[top].clone();
+        let mut after = before.clone();
+        after.content = LayerContent::Raster(RasterLayer {
+            image: merged,
+            offset: (x0, y0),
+            transform: None,
+        });
+        after.opacity = 1.0;
+        after.visible = true;
+
+        // 被删掉的都在 top 下面（targets 升序），所以先 Replace 再按降序删，
+        // 每次删除都不会影响还没处理的那些下标。
+        let mut ops = vec![EditOp::ReplaceLayer {
+            index: top,
+            before,
+            after,
+        }];
+        for &i in targets.iter().rev() {
+            if i != top {
+                ops.push(EditOp::RemoveLayer {
+                    index: i,
+                    layer: self.layers[i].clone(),
+                });
+            }
+        }
+        self.execute(EditOp::Batch(ops))?;
+        Ok(top - (targets.len() - 1))
+    }
+
     /// 合并所有可见图层（背景层不参与，保持垫底）为一层。
     ///
     /// 结果放在最低那个可见层的 z 位上，名字「合并图层」，不透明度 100%。
@@ -513,6 +581,52 @@ mod tests {
         assert_eq!(doc.layers.len(), 3);
         assert!(doc.layers[1].is_mark());
         assert_eq!(doc.flatten(), before);
+    }
+
+    #[test]
+    fn merge_layers_merges_only_the_selected_ones() {
+        let mut doc = Document::from_image(blank(32, 32));
+        doc.add_layer(dot(2, 2, 8, 8, [0, 0, 255, 255])).unwrap();
+        doc.add_layer(dot(6, 6, 8, 8, [255, 0, 0, 255])).unwrap();
+        doc.add_layer(dot(10, 10, 8, 8, [0, 255, 0, 255])).unwrap();
+        let before = doc.flatten();
+
+        // 只合并下面两层，最上面那层保持独立。
+        let at = doc.merge_layers(&[1, 2]).unwrap();
+        assert_eq!(at, 1);
+        assert_eq!(doc.layers.len(), 3);
+        assert!(doc.layers[1].is_raster());
+        assert_eq!(doc.layers[1].opacity, 1.0);
+        // 合并前后视觉逐像素一致。
+        assert_eq!(doc.flatten(), before);
+
+        doc.undo().unwrap();
+        assert_eq!(doc.layers.len(), 4);
+        assert_eq!(doc.flatten(), before);
+    }
+
+    #[test]
+    fn merge_layers_takes_the_union_of_bounds() {
+        let mut doc = Document::from_image(blank(40, 40));
+        doc.add_layer(dot(0, 0, 4, 4, [10, 20, 30, 255])).unwrap();
+        doc.add_layer(dot(30, 30, 4, 4, [40, 50, 60, 255])).unwrap();
+        let at = doc.merge_layers(&[1, 2]).unwrap();
+        let layer = &doc.layers[at];
+        assert_eq!(layer.offset(), (0, 0));
+        assert_eq!(layer.img().dimensions(), (34, 34));
+        // 右上角那块像素没被裁掉。
+        assert_eq!(doc.flatten().get_pixel(31, 31).0, [40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn merge_layers_needs_two_non_base_layers() {
+        let mut doc = Document::from_image(blank(16, 16));
+        doc.add_layer(dot(0, 0, 4, 4, [1, 2, 3, 255])).unwrap();
+        // 只有一层 / 只有「背景 + 一层」都不够。
+        assert!(doc.merge_layers(&[1]).is_err());
+        assert!(doc.merge_layers(&[0, 1]).is_err());
+        assert!(doc.merge_layers(&[]).is_err());
+        assert_eq!(doc.layers.len(), 2);
     }
 
     #[test]

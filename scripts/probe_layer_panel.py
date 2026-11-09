@@ -87,7 +87,7 @@ def main():
         "select-layer:1",
         "layer-dup",        # 复制标记，得到两个同尺寸图层
         "multi-select:1,2", # 两层一起选中
-        "align:left",       # 批量对齐到画布左边缘
+        "align:left",       # 批量左对齐（参照 = 两层的并集包围盒）
         "layers-dump",
     ]
 
@@ -146,10 +146,11 @@ def main():
         if rows[-1]["i"] != 0:
             print("FAIL 背景不在列表底部")
             ok = False
-        # 对齐之后被选中的两层左边缘应全部落在 0。
+        # 对齐语义：选中两层时参照 = 两层的并集包围盒（最靠左那层不动），
+        # 所以断言「两层左边缘一致」，而不是原先的「都贴到画布 x=0」。
         aligned = [r for r in rows if not r.get("bg")]
-        if not aligned or any(r["x"] != 0 for r in aligned):
-            print("FAIL 对齐没有落到 x=0:", [(r["n"], r["x"]) for r in aligned])
+        if not aligned or len({r["x"] for r in aligned}) != 1:
+            print("FAIL 左对齐后两层左边缘不一致:", [(r["n"], r["x"]) for r in aligned])
             ok = False
 
     thumbs = glob.glob(os.path.join(tempfile.gettempdir(), "imageedit-thumb-*.png"))

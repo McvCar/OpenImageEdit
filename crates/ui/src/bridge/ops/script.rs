@@ -1187,6 +1187,8 @@ impl qobject::Bridge {
                 "layer-new" => self.as_mut().new_layer(),
                 "layer-dup" => self.as_mut().duplicate_selected_layer(),
                 "layer-merge-down" => self.as_mut().merge_selected_down(),
+                // 合并选中的多个图层（面板上的「合并图层」按钮）。
+                "layer-merge" => self.as_mut().merge_selected_layers(),
                 "merge-visible" => self.as_mut().merge_visible_layers(),
                 "flatten" => self.as_mut().flatten_layers(),
                 "rasterize" => self.as_mut().rasterize_selected_mark(),

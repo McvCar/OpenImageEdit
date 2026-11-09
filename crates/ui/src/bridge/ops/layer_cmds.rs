@@ -271,6 +271,66 @@ impl qobject::Bridge {
         }
     }
 
+    /// 合并当前选中的多个图层（PS 的「合并图层」）。
+    ///
+    /// 与「向下合并」的区别：这里只认**选中的那些**，不碰相邻层；结果落在
+    /// 最高选中层的 z 位，名字 / 锁定沿用最高层。
+    pub fn merge_selected_layers(mut self: Pin<&mut Self>) {
+        let targets: Vec<usize> = self
+            .as_mut()
+            .selection_indices()
+            .into_iter()
+            .filter(|&i| i > 0)
+            .collect();
+        if targets.len() < 2 {
+            self.as_mut().set_status(QString::from(
+                "选中两个以上的图层才能合并（背景层不参与，Ctrl 点击可多选）",
+            ));
+            return;
+        }
+        let viewport = *self.viewport.borrow();
+        let result: Result<usize, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => {
+                    if targets
+                        .iter()
+                        .any(|&i| session.doc.layers.get(i).map(|l| l.locked).unwrap_or(true))
+                    {
+                        Err("选中的图层里有锁定层，先解锁再合并".into())
+                    } else {
+                        match session.doc.merge_layers(&targets) {
+                            Ok(at) => {
+                                session.dirty = true;
+                                Ok(at)
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                }
+            }
+        };
+        match result {
+            Ok(at) => {
+                {
+                    let mut guard = self.session.borrow_mut();
+                    if let Some(s) = guard.as_mut() {
+                        s.refit_if_needed(viewport);
+                    }
+                }
+                self.as_mut().set_selected_layer(at as i32);
+                self.as_mut().refresh_preview();
+                self.as_mut().set_selection_indices(&[at]);
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"layers-merged\",\"at\":{at},\"count\":{}}}",
+                    targets.len()
+                );
+            }
+            Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
+        }
+    }
+
     /// 合并所有可见图层为一层（背景层保留垫底）。
     pub fn merge_visible_layers(mut self: Pin<&mut Self>) {
         let viewport = *self.viewport.borrow();
@@ -468,15 +528,26 @@ impl qobject::Bridge {
             match guard.as_mut() {
                 None => Err("no document".into()),
                 Some(session) => {
-                    let reference = session
-                        .doc
-                        .selection
-                        .as_ref()
-                        .map(|s| s.base.bounds)
-                        .filter(|b| b.width > 0 && b.height > 0)
-                        .unwrap_or_else(|| {
+                    // 参照框的取法（用户定的语义）：
+                    //  · 选中两层以上 → 用**这些图层自己的并集包围盒**，也就是
+                    //    「谁最靠边谁不动，其余靠过去」。以前一律按画布对齐，
+                    //    两层挨在一起时会各自被推到画布边缘，完全不是想要的。
+                    //  · 只有一层 → 沿用旧语义（有选区按选区，否则整幅画布）。
+                    let reference = if targets.len() >= 2 {
+                        union_bounds(&session.doc, &targets).unwrap_or_else(|| {
                             Rect::new(0, 0, session.doc.canvas.width, session.doc.canvas.height)
-                        });
+                        })
+                    } else {
+                        session
+                            .doc
+                            .selection
+                            .as_ref()
+                            .map(|s| s.base.bounds)
+                            .filter(|b| b.width > 0 && b.height > 0)
+                            .unwrap_or_else(|| {
+                                Rect::new(0, 0, session.doc.canvas.width, session.doc.canvas.height)
+                            })
+                    };
                     match run(&mut session.doc, targets.clone(), reference) {
                         Ok(()) => {
                             session.dirty = true;
@@ -614,4 +685,29 @@ impl qobject::Bridge {
             Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
         }
     }
+}
+
+/// 一组图层在画布坐标里的并集包围盒（`None` = 没有一层的面积大于 0）。
+///
+/// 对齐/分布没有用 `Document` 的方法来做，因为这里只需要「读」几何：目标层
+/// 可能被锁定（锁定层不动，但它的位置仍是有意义的参照）。
+fn union_bounds(doc: &editcore::Document, indices: &[usize]) -> Option<Rect> {
+    let (mut x0, mut y0) = (i32::MAX, i32::MAX);
+    let (mut x1, mut y1) = (i32::MIN, i32::MIN);
+    let mut any = false;
+    for &i in indices {
+        let Some(layer) = doc.layers.get(i) else {
+            continue;
+        };
+        let b = layer.bounds();
+        if b.width == 0 || b.height == 0 {
+            continue;
+        }
+        any = true;
+        x0 = x0.min(b.x);
+        y0 = y0.min(b.y);
+        x1 = x1.max(b.x + b.width as i32);
+        y1 = y1.max(b.y + b.height as i32);
+    }
+    any.then(|| Rect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32))
 }
