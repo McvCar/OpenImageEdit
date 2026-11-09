@@ -95,6 +95,15 @@ Item {
         return host.topLayerAt(mx, my)
     }
 
+    // 这一层当前是否在多选集合里（按稳定 id 判，重排后下标会变）。
+    function inMultiSet(id) {
+        try {
+            return JSON.parse(bridge.layerSelectionIds).indexOf(id) >= 0
+        } catch (e) {
+            return false
+        }
+    }
+
     // 空白处单击 = 退出「图层 / 选区」选择（PS 的「点空白清选择」）。
     // ★图层优先，一次点击只解一层：否则「图层悄悄不选了、选区还在」这种
     //   看不见的状态会让人以为点击没生效。旧逻辑只在 selTool 为 none 时
@@ -279,6 +288,13 @@ Item {
         //   必须声明在 MouseArea 上：liveTimer 用 `selDragMouse.liveMods`
         //   读它，放根级会读到 undefined → 强转 0 → Ctrl 失效。
         property int liveMods: 0
+        // Ctrl+点画布图层 = 多选切换（和面板里 Ctrl+点行同一套语义）。
+        // pickCtrlIndex >= 0 表示这次手势起手时按着 Ctrl；pickCtrlWasIn 表示
+        // 那一层本来就在多选集合里 —— 松手且没有位移时再把它摘掉。
+        // ★起手时**只加不减**：Ctrl+拖动（A18-1 的临时关吸附）也是从这里
+        //   起手，如果把点中的层从集合里摘掉，拖动就会落到别的层上。
+        property int pickCtrlIndex: -1
+        property bool pickCtrlWasIn: false
 
         // PS 惯例：Shift = 加选，Alt = 减选，Shift+Alt = 相交，否则用
         // 工具条上的粘滞模式。
@@ -389,9 +405,22 @@ Item {
                 // 手势仍然优先。顺带修好 Delete：选区残留会被 onDeleteKey
                 // 抢先当成「删除选区像素」，图层怎么按都删不掉。
                 // 放在 select_layer 之前，避免 sel_clear 的重绘/信号影响选中态。
-                if (host.selExists)
-                    bridge.sel_clear()
-                bridge.select_layer(hit.i)
+                    if (host.selExists)
+                        bridge.sel_clear()
+                    // Ctrl+点 = 多选：只往集合里加、并让它当主选中层，绝不摘。
+                    // 摘除的语义留到「松手且没位移」时补（见 onReleased）——
+                    // 因为按住 Ctrl 拖动时（A18-1 临时关吸附）拖动目标必须
+                    // 是点中的这一层。
+                    const ctrlPick = (mouse.modifiers & Qt.ControlModifier) !== 0
+                    if (ctrlPick) {
+                        pickCtrlIndex = hit.i
+                        pickCtrlWasIn = inMultiSet(hit.id)
+                        bridge.select_layer_ex(hit.i, 3)
+                    } else {
+                        pickCtrlIndex = -1
+                        pickCtrlWasIn = false
+                        bridge.select_layer(hit.i)
+                    }
                 gestureMods = mouse.modifiers
                 liveMods = mouse.modifiers
                 pickDrag = true
@@ -591,6 +620,12 @@ Item {
             //   已经跟着鼠标走完了整段。
             if (pickDrag) {
                 pickDrag = false
+                // Ctrl+点、且没拖动 = 多选切换：起手时只做了「加入」，这里补
+                // 「本来就在集合里 → 摘掉」（与面板 Ctrl+点行一致）。
+                if (!pickMoved && pickCtrlIndex >= 0 && pickCtrlWasIn)
+                    bridge.select_layer_ex(pickCtrlIndex, 1)
+                pickCtrlIndex = -1
+                pickCtrlWasIn = false
                 if (pickMoved) {
                     pickMoved = false
                     liveTimer.stop()

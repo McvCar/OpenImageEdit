@@ -7,6 +7,13 @@ use super::super::*;
 /// 切换，2 = Shift 连选。
 pub(in crate::bridge) const SEL_TOGGLE: i32 = 1;
 pub(in crate::bridge) const SEL_RANGE: i32 = 2;
+/// 画布 Ctrl+点专用：**并进**多选并设为主选中层，绝不从集合里摘掉。
+///
+/// 为什么不用 `SEL_TOGGLE`：画布上的 Ctrl 还兼「拖动时临时关吸附」
+/// （A18-1），起手那一刻分不清用户是要多选还是要多选 + 拖。若在按下时就
+/// 切换，点中的层可能被摘掉、拖动便落到别的层上。于是按下只做加法，
+/// 「摘掉」留到松手且没有位移时再补（见 `CanvasSurface.onReleased`）。
+pub(in crate::bridge) const SEL_ADD_PRIMARY: i32 = 3;
 
 impl qobject::Bridge {
     /// 当前多选在图层的**下标**（升序、去重、已剔除失效条目）。
@@ -135,6 +142,17 @@ impl qobject::Bridge {
                 // 取消掉的是主选中层时，把主选中层让给集合里剩下的最后一层。
                 let primary = if current.contains(&ix) { ix } else { *current.last().unwrap_or(&ix) };
                 self.as_mut().set_selected_layer(primary as i32);
+                self.as_mut().set_selection_indices(&current);
+            }
+            SEL_ADD_PRIMARY => {
+                // 画布 Ctrl+点：并进集合 + 当主选中层，只加不减。
+                let mut current: Vec<usize> = self.as_mut().selection_indices();
+                if !current.contains(&ix) {
+                    current.push(ix);
+                }
+                current.sort_unstable();
+                current.dedup();
+                self.as_mut().set_selected_layer(index);
                 self.as_mut().set_selection_indices(&current);
             }
             SEL_RANGE if prev >= 0 => {

@@ -1207,6 +1207,16 @@ impl qobject::Bridge {
                         }
                     }
                 }
+                // `select-mode:i,mode` —— 走 `select_layer_ex`（0 单选 / 1 切换
+                // / 2 连选 / 3 并进多选并设为主选中层）。画布 Ctrl+点用的是
+                // 3 + 松手补 1，探针要能复现这条路径。
+                other if other.starts_with("select-mode:") => {
+                    let body = other.trim_start_matches("select-mode:");
+                    let mut it = body.split(',');
+                    let ix: i32 = it.next().and_then(|p| p.trim().parse().ok()).unwrap_or(-1);
+                    let mode: i32 = it.next().and_then(|p| p.trim().parse().ok()).unwrap_or(0);
+                    self.as_mut().select_layer_ex(ix, mode);
+                }
                 // `align:left|hcenter|right|top|vcenter|bottom`
                 other if other.starts_with("align:") => {
                     let edge = other.trim_start_matches("align:").trim().to_string();
@@ -1237,6 +1247,18 @@ impl qobject::Bridge {
                     };
                     println!(
                         "{{\"phase\":\"ui\",\"event\":\"layers-dump\",\"layers\":{json}}}"
+                    );
+                }
+                // `layer-sel-dump` —— 多选集合（稳定 id + 下标 + 主选中层）。
+                // `layers-dump` 只看得到图层表，看不到「选了哪几行」。
+                // ★别叫 `sel-dump`：那个名字已经被「像素选区状态」占了。
+                "layer-sel-dump" => {
+                    let ids = self.layer_selection_ids().to_string();
+                    let primary = *self.selected_layer();
+                    let count = *self.selected_layer_count();
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"layer-sel-dump\",\"ids\":{ids},\
+                         \"primary\":{primary},\"count\":{count}}}"
                     );
                 }
                 // `layer-dump:index:path` —— 把图层位图原样存成 PNG。

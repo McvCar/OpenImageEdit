@@ -6,7 +6,8 @@
 
 覆盖：
     新建 / 复制 / 向下合并 / 标记 / 栅格化 / 多选 / 顶对齐 /
-    批量显隐（含撤销重做）/ 背景不可删 / 拼合 / 拼合可撤销
+    批量显隐（含撤销重做）/ 背景不可删 / 拼合 / 拼合可撤销 /
+    合并选中层 / 画布 Ctrl+点（并入 → 松手补摘）
 
 跑法：
     python scripts/probe_layer_ops.py
@@ -58,6 +59,15 @@ OPS = [
     "multi-select:1,2",
     "layer-merge",           # 合并选中的两层（PS「合并图层」）
     "layers-dump",           # ck12 三层 → 两层，顶层是 raster
+    # 画布 Ctrl+点那条路径（CanvasSurface）：按下 `select-mode:i,3` 只并入，
+    # 松手无位移时补一次 `select-mode:i,1` 摘掉。两半都在这里盯住。
+    "layer-new",             # 再补两层：0=背景，1/2 已选，3 留作「Ctrl 点它」
+    "layer-new",
+    "multi-select:1,2",
+    "select-mode:3,3",       # Ctrl+点第 4 层（下标 3）
+    "layer-sel-dump",        # ck13 三选，主选中层 = 3
+    "select-mode:3,1",       # 松手补摘
+    "layer-sel-dump",        # ck14 回到两选
 ]
 
 
@@ -197,6 +207,24 @@ def main():
              "ck12 合并结果应是位图层（顶层 %r）"
              % (rows12[0]["k"] if rows12 else None))
         want(rows12 and rows12[-1].get("bg") is True, "ck12 背景被合并掉")
+
+    # ck13/ck14：画布 Ctrl+点的两步（并入 → 松手补摘）。
+    sels = parse_events(lines, "layer-sel-dump")
+    for n, want_count, want_primary in ((0, 3, 3), (1, 2, None)):
+        if len(sels) <= n:
+            fails.append("ck%d 缺失（只收到 %d 个 layer-sel-dump）" % (13 + n, len(sels)))
+            continue
+        s = sels[n]
+        print("ck%-2d  ids=%s primary=%s count=%s"
+              % (13 + n, s.get("ids"), s.get("primary"), s.get("count")))
+        want(s.get("count") == want_count,
+             "ck%d 选中数应 %d，实际 %s" % (13 + n, want_count, s.get("count")))
+        if want_primary is not None:
+            want(s.get("primary") == want_primary,
+                 "ck%d 主选中层应 %d，实际 %s" % (13 + n, want_primary, s.get("primary")))
+        if n == 1:
+            want(len(s.get("ids") or []) == 2,
+                 "ck14 摘掉后集合应剩 2 层，实际 %s" % (s.get("ids"),))
 
     done = parse_events(lines, "script-done")
     if done:
