@@ -1,7 +1,10 @@
 param(
     [switch]$SkipBuild,
     [switch]$NoPrune,
-    [switch]$SkipVerify
+    [switch]$SkipVerify,
+    [switch]$SkipInstaller,
+    [switch]$NoBump,
+    [string]$Version
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,8 +28,60 @@ function Remove-PathForce([string]$Path) {
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+
+# ---- release version -------------------------------------------------------
+# The repo-root VERSION file is the single source of truth: crates/ui/build.rs
+# stamps it into the exe's FileVersion/ProductVersion, and this script hands
+# the same number to makensis as -DAPP_VERSION. Cargo's own
+# [workspace.package] version is deliberately left alone - changing it would
+# invalidate every crate and force a full workspace recompile on each release.
+#
+# Every run bumps the patch number by default, so each build lands under its
+# own file name:
+#     dist\imageedit-<ver>-win64-setup.exe
+#     dist\imageedit-<ver>-win64.zip
+# Nothing under dist\ is wiped for older versions, so the previously shipped
+# packages stay there as the release archive. Use -NoBump to rebuild the
+# current version, or -Version x.y.z to set one explicitly.
+$versionFile = Join-Path $repoRoot 'VERSION'
+
+$cargoVersion = '0.1.0'
+$manifest = Join-Path $repoRoot 'Cargo.toml'
+if (Test-Path -LiteralPath $manifest) {
+    $m = Select-String -LiteralPath $manifest -Pattern '^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"' |
+        Select-Object -First 1
+    if ($m) { $cargoVersion = $m.Matches[0].Groups[1].Value }
+}
+
+$prevVersion = $cargoVersion
+if (Test-Path -LiteralPath $versionFile) {
+    $raw = (Get-Content -LiteralPath $versionFile -Raw).Trim()
+    if ($raw -match '^[0-9]+\.[0-9]+\.[0-9]+$') { $prevVersion = $raw }
+    elseif ($raw) { throw "VERSION must be x.y.z, got '$raw'" }
+}
+
+if ($Version) {
+    if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+        throw "-Version must be x.y.z, got '$Version'"
+    }
+    $appVersion = $Version
+} elseif ($NoBump) {
+    $appVersion = $prevVersion
+} else {
+    $p = $prevVersion.Split('.')
+    $appVersion = '{0}.{1}.{2}' -f $p[0], $p[1], ([int]$p[2] + 1)
+}
+
+# Written before the build: build.rs reads it to stamp the exe resources.
+Set-Content -LiteralPath $versionFile -Value ($appVersion + "`n") -Encoding Ascii -NoNewline
+if ($appVersion -ne $prevVersion) {
+    Write-Host ("==> version {0} -> {1}" -f $prevVersion, $appVersion) -ForegroundColor Cyan
+} else {
+    Write-Host ("==> version {0} (unchanged)" -f $appVersion) -ForegroundColor Cyan
+}
+
 $distDir = Join-Path $repoRoot 'dist\imageedit'
-$zipPath = Join-Path $repoRoot 'dist\imageedit-0.1-win64.zip'
+$zipPath = Join-Path $repoRoot ("dist\imageedit-{0}-win64.zip" -f $appVersion)
 $benchDir = Join-Path $repoRoot 'bench-data'
 $sample = Join-Path $benchDir 'small-1600x1200.jpg'
 
@@ -253,3 +308,32 @@ Write-Host ("dist: {0} files, {1:N1} MB" -f $files.Count, $totalMb)
 Remove-PathForce $zipPath
 Compress-Archive -Path (Join-Path $distDir '*') -DestinationPath $zipPath -Force
 Write-Host ("zip: {0:N1} MB" -f ((Get-Item -LiteralPath $zipPath).Length / 1MB))
+
+# ---- installer -------------------------------------------------------------
+# makensis is not on PATH; the vendored NSIS lives under tools\. The .nsi
+# writes file associations and shortcuts under HKCU only, so there is no UAC
+# prompt and no admin requirement. Old setup exes are never touched: the output
+# name embeds the version, so every build sits beside the previous ones.
+if (-not $SkipInstaller) {
+    Write-Host '==> installer' -ForegroundColor Cyan
+    $nsis = Join-Path $repoRoot 'tools\nsis-3.11\Bin\makensis.exe'
+    if (-not (Test-Path -LiteralPath $nsis)) { throw "makensis not found: $nsis" }
+    $setupPath = Join-Path $repoRoot ("dist\imageedit-{0}-win64-setup.exe" -f $appVersion)
+    if (Test-Path -LiteralPath $setupPath) { Remove-PathForce $setupPath }
+    Push-Location (Join-Path $repoRoot 'installer')
+    try {
+        # -INPUTCHARSET UTF8: the .nsi carries Chinese UI strings.
+        # Warning 9100 (unicode literal) is expected and harmless.
+        & $nsis -INPUTCHARSET UTF8 "-DAPP_VERSION=$appVersion" 'imageedit.nsi'
+        if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
+    } finally {
+        Pop-Location
+    }
+    Write-Host ("setup: imageedit-{0}-win64-setup.exe  {1:N1} MB" -f `
+        $appVersion, ((Get-Item -LiteralPath $setupPath).Length / 1MB)) -ForegroundColor Green
+}
+
+Write-Host ("==> release {0} ready" -f $appVersion) -ForegroundColor Green
+Get-ChildItem -LiteralPath (Join-Path $repoRoot 'dist') -Filter 'imageedit-*-win64*' -File |
+    Sort-Object LastWriteTime |
+    ForEach-Object { Write-Host ("    {0,-42} {1,8:N1} MB" -f $_.Name, ($_.Length / 1MB)) }

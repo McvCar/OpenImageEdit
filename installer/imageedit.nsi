@@ -9,7 +9,12 @@ Unicode True
 !include "x64.nsh"
 
 !define APP_NAME "ImageEdit"
-!define APP_VERSION "0.1.0"
+; Version comes from the repo-root VERSION file: scripts/package.ps1 passes
+; -DAPP_VERSION=x.y.z on the makensis command line. The fallback below only
+; matters when someone runs makensis by hand without that define.
+!ifndef APP_VERSION
+  !define APP_VERSION "0.1.1"
+!endif
 !define PROG_ID "ImageEdit.Document"
 !define REG_CLASSES "Software\Classes"
 ; Explorer PSD thumbnail handler (crates/thumbnail). Must match
@@ -31,7 +36,7 @@ RequestExecutionLevel user
 InstallDirRegKey HKCU "Software\ImageEdit" "InstallDir"
 
 ; Installer exe icon comes from the manifest resource compiled below.
-VIProductVersion "0.1.0.0"
+VIProductVersion "${APP_VERSION}.0"
 VIAddVersionKey "ProductName" "${APP_NAME}"
 VIAddVersionKey "FileDescription" "${APP_NAME} 安装程序"
 VIAddVersionKey "FileVersion" "${APP_VERSION}"

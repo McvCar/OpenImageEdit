@@ -82,6 +82,19 @@ fn main() {
         res.set_icon("assets/app.ico");
         res.set("FileDescription", "ImageEdit");
         res.set("ProductName", "ImageEdit");
+        // Version shown in Explorer's properties dialog. Single source of truth
+        // is the repo-root VERSION file (scripts/package.ps1 bumps it, the NSIS
+        // installer reads the same number via -DAPP_VERSION). Cargo's own
+        // [workspace.package] version is deliberately left alone so a release
+        // does not force a full workspace recompile.
+        let version = std::fs::read_to_string("../../VERSION")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| std::env::var("CARGO_PKG_VERSION").unwrap_or_default());
+        println!("cargo:rerun-if-changed=../../VERSION");
+        if !version.is_empty() {
+            res.set("FileVersion", &format!("{version}.0"));
+            res.set("ProductVersion", &format!("{version}.0"));
+        }
         // Embed the PerMonitorV2 DPI-awareness manifest. Without it the process
         // is DPI-unaware: at >100% Windows scaling the OS bitmap-stretches the
         // whole window (UI + image) and Qt reports devicePixelRatio == 1.0, so
