@@ -48,10 +48,14 @@ Item {
         visible: host.selExists && !selectionViz.resizingSel
         // 画布比预览图大 1px：轮廓正好落在图像边缘时（全选 / 贴边选区），
         // 1px 描边有一半在 x=0 外被裁掉，左边那一条会"看不见"。
-        x: previewImage.x - 1
-        y: previewImage.y - 1
-        width: previewImage.width + 2
-        height: previewImage.height + 2
+        // ★宽高与位置必须取整：Canvas 的后备纹理按 item 尺寸开，宽高是
+        //   小数（600×400 在 64% 下 previewImage.width = 387.3）时纹理被
+        //   非整数拉伸，画得再准的 1px 线也会被重采样摊成 3~4 行半透明，
+        //   看着像"图像边缘有条缝"。
+        x: Math.round(previewImage.x) - 1
+        y: Math.round(previewImage.y) - 1
+        width: Math.round(previewImage.width) + 2
+        height: Math.round(previewImage.height) + 2
         // 蚂蚁线要在静止场景里持续流动，必须用 Immediate + Image
         //（Cooperative 策略会把单次 requestPaint 丢掉）。
         renderStrategy: Canvas.Immediate
@@ -118,23 +122,36 @@ Item {
                 if (s <= 0)
                     return
                 // 拖动选区时的临时偏移（松手后由 Rust 平移 mask 接管）。
-                // +1.5 = 画布相对预览图的 1px 外扩 + 0.5px 像素中心对齐。
-                const ox = (host.selOffX || 0) + 1.5
-                const oy = (host.selOffY || 0) + 1.5
+                // +1 = 画布相对预览图向外扩的那 1px（见 ants.x/y）。
+                const ox = (host.selOffX || 0) + 1
+                const oy = (host.selOffY || 0) + 1
+                // ★必须对齐到**设备像素中心**再描边。
+                //   以前直接画 ring*s + 1.5：64%/75% 这类非整数缩放下
+                //   ring*s 是小数，描边骑在像素边界上，Qt 把 1px 线摊成
+                //   3~4 行半透明像素（实测 y=321 蓝+15%白、y=322 蓝+40%白、
+                //   y=323 纯白、y=324 蓝+12%白）。剪切→粘贴回原位时蚂蚁线
+                //   正好压在补回来那块内容的边上，看着就像"边缘有空隙"。
+                //   dpr 也要算进来：1 逻辑像素在 125% 屏上是 1.25 设备像素，
+                //   线宽得取 1/dpr 才是实心的一根。
+                const dpr = host.dpr > 0 ? host.dpr : 1
+                function snapDev(v) {
+                    return (Math.round(v * dpr) + 0.5) / dpr
+                }
                 // PS 的蚂蚁线 = 白底 + 黑虚线：白段在黑底照片上可见，黑段
                 // 在白底照片上可见。**先**铺白实线，再叠黑虚线（顺序反了
                 // 就只剩黑虚线，浅色照片上整圈看不见）。
-                ctx.lineWidth = 1
-                ctx.setLineDash([])
                 ctx.strokeStyle = "#ffffff"
+                ctx.lineWidth = 1 / dpr
                 ctx.beginPath()
                 for (var i = 0; i < rings.length; i++) {
                     const ring = rings[i]
                     if (!ring || ring.length < 2)
                         continue
-                    ctx.moveTo(ring[0][0] * s + ox, ring[0][1] * s + oy)
+                    ctx.moveTo(snapDev(ring[0][0] * s + ox),
+                               snapDev(ring[0][1] * s + oy))
                     for (var j = 1; j < ring.length; j++)
-                        ctx.lineTo(ring[j][0] * s + ox, ring[j][1] * s + oy)
+                        ctx.lineTo(snapDev(ring[j][0] * s + ox),
+                                   snapDev(ring[j][1] * s + oy))
                     // 轮廓点是「左上 → 顺时针」一圈，最后一点到起点那一段
                     // 得自己闭合 —— 少了它，矩形左边整条蚂蚁线不见。
                     ctx.closePath()
@@ -166,6 +183,7 @@ Item {
         rw: selectionViz.liveSelBox.width
         rh: selectionViz.liveSelBox.height
         dashColor: "#ffffff"
+        dpr: host.dpr > 0 ? host.dpr : 1
     }
 
     // 选区手柄：8 个蓝点 + 四边可拖。moveEnabled 关掉 —— 拖内部移动由
@@ -345,6 +363,7 @@ Item {
         rw: host.selLayerBox !== null ? host.selLayerBox.w * host.toDispScale() : 0
         rh: host.selLayerBox !== null ? host.selLayerBox.h * host.toDispScale() : 0
         dashColor: "#5b9dff99"
+        dpr: host.dpr > 0 ? host.dpr : 1
         animated: false
     }
 
