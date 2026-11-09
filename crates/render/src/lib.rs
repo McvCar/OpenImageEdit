@@ -68,24 +68,118 @@ pub fn display_size(source: Size, viewport: Size, zoom: Zoom) -> Size {
 /// into neighbours — erased holes grew a dark rim on all four sides. When the
 /// bitmap carries any transparency we resample premultiplied instead; fully
 /// opaque bitmaps (the common photo case) skip the extra passes entirely.
+///
+/// ★降采样用自带的 [`downscale_box`]，**不用** `imageops::thumbnail`：后者
+///   会把每个输出像素的源块算成 `[ceil(left*ratio), ceil(right*ratio))`，
+///   既丢掉左端的分数部分（整幅图右/下平移最多 1 个源像素），又因为 f32
+///   累加在整数边界上 `ceil` 吃掉一个多余源像素。对不透明照片看不出来，
+///   但「剪掉一块再贴回原位」时，洞的边缘会向相邻预览像素渗 1/3~1/2 的
+///   alpha，透出棋盘格 —— 就是用户报的那条「粘回去边缘有空隙」的浅色缝。
 pub fn resize_to(image: &RgbaImage, target: Size) -> RgbaImage {
     if image.width() == target.width && image.height() == target.height {
         return image.clone();
     }
+    let downscale = target.width < image.width() || target.height < image.height();
     if has_transparent_pixel(image) {
         let pma = premultiply(image);
-        let scaled = if target.width < image.width() || target.height < image.height() {
-            image::imageops::thumbnail(&pma, target.width, target.height)
+        let scaled = if downscale {
+            downscale_box(&pma, target.width, target.height)
         } else {
             image::imageops::resize(&pma, target.width, target.height, FilterType::Triangle)
         };
         return unpremultiply(&scaled);
     }
-    if target.width < image.width() || target.height < image.height() {
-        image::imageops::thumbnail(image, target.width, target.height)
+    if downscale {
+        downscale_box(image, target.width, target.height)
     } else {
         image::imageops::resize(image, target.width, target.height, FilterType::Triangle)
     }
+}
+
+/// 每个输出像素覆盖哪些源像素、各占多少（权重单位 1/256，每行合计 256）。
+///
+/// 两端带分数权重，所以输出像素的边缘与源图的边缘严格对齐 —— 这一点是
+/// 「洞的边缘不能渗到相邻像素」的前提。
+fn axis_weights(src: u32, dst: u32) -> Vec<Vec<(u32, u32)>> {
+    let ratio = src as f64 / dst as f64;
+    let last = src.saturating_sub(1) as i64;
+    let mut out = Vec::with_capacity(dst as usize);
+    for i in 0..dst {
+        let a = i as f64 * ratio;
+        let b = (i as f64 + 1.0) * ratio;
+        let mut w: Vec<(u32, u32)> = Vec::with_capacity(4);
+        let mut covers: Vec<(u32, f64)> = Vec::with_capacity(4);
+        let mut x = a.floor() as i64;
+        let mut total = 0.0f64;
+        while (x as f64) < b {
+            let cov = (b.min((x + 1) as f64) - a.max(x as f64)).max(0.0);
+            if cov > 0.0 {
+                covers.push((x.clamp(0, last) as u32, cov));
+                total += cov;
+            }
+            x += 1;
+        }
+        if covers.is_empty() {
+            out.push(vec![(i.min(src - 1), 256)]);
+            continue;
+        }
+        let scale = 256.0 / total;
+        let mut sum = 0u32;
+        for &(ix, cov) in &covers {
+            let weight = (cov * scale).round() as u32;
+            sum += weight;
+            w.push((ix, weight));
+        }
+        // 浮点四舍五入的余差补到权重最大的一项上，保证每行合计正好 256。
+        if sum != 256 {
+            if let Some(idx) = (0..w.len()).max_by_key(|&k| w[k].1) {
+                w[idx].1 = (w[idx].1 as i64 + 256 - sum as i64).max(1) as u32;
+            }
+        }
+        out.push(w);
+    }
+    out
+}
+
+/// 精确面积平均（box）降采样。
+///
+/// 竖直方向先把一趟源行按权重累加到一行缓冲，再做水平加权，所以每个源
+/// 像素只读一次、且按行顺序读（缓存友好）。权重合计 256×256，据此回到
+/// 0..255。行为等价于「每个输出像素是其源区间的面积平均」。
+fn downscale_box(image: &RgbaImage, nw: u32, nh: u32) -> RgbaImage {
+    let (w, h) = image.dimensions();
+    if nw == 0 || nh == 0 {
+        return RgbaImage::new(nw, nh);
+    }
+    let xw = axis_weights(w, nw);
+    let yw = axis_weights(h, nh);
+    let raw = image.as_raw();
+    let stride = w as usize * 4;
+    let mut acc = vec![0u32; stride];
+    let mut buf = vec![0u8; nw as usize * nh as usize * 4];
+    for (oy, yws) in yw.iter().enumerate() {
+        acc.fill(0);
+        for &(sy, wy) in yws {
+            let row = &raw[sy as usize * stride..][..stride];
+            for (a, s) in acc.iter_mut().zip(row.iter()) {
+                *a += *s as u32 * wy;
+            }
+        }
+        let orow = &mut buf[oy * nw as usize * 4..][..nw as usize * 4];
+        for (ox, xws) in xw.iter().enumerate() {
+            let mut sum = [0u32; 4];
+            for &(sx, wx) in xws {
+                let base = sx as usize * 4;
+                for c in 0..4 {
+                    sum[c] += acc[base + c] * wx;
+                }
+            }
+            for c in 0..4 {
+                orow[ox * 4 + c] = ((sum[c] + 32768) / 65536).min(255) as u8;
+            }
+        }
+    }
+    RgbaImage::from_raw(nw, nh, buf).expect("downscale_box buffer size")
 }
 
 /// True when at least one pixel is not fully opaque (cheapest possible scan;
@@ -285,9 +379,9 @@ impl PreviewComposer {
         let aligned = r.offset.0 == -doc.view.x && r.offset.1 == -doc.view.y;
         if !aligned {
             let mut out = RgbaImage::new(target.width, target.height);
-            let src = self.scaled_layer(0, &r.image, sx, sy);
-            let ox = (r.offset.0 as f64 * sx).round() as i32;
-            let oy = (r.offset.1 as f64 * sy).round() as i32;
+            let (ox, oy, nw, nh) =
+                Self::preview_dst(r.offset, (r.image.width(), r.image.height()), sx, sy);
+            let src = self.scaled_layer(0, &r.image, nw, nh);
             Self::blend_layer(&mut out, target, &src, ox, oy, bg.opacity);
             return out;
         }
@@ -364,9 +458,9 @@ impl PreviewComposer {
                     }
                 }
                 LayerContent::Raster(r) => {
-                    let src = self.scaled_layer(li, &r.image, sx, sy);
-                    let ox = (r.offset.0 as f64 * sx).round() as i32;
-                    let oy = (r.offset.1 as f64 * sy).round() as i32;
+                    let (ox, oy, nw, nh) =
+                        Self::preview_dst(r.offset, (r.image.width(), r.image.height()), sx, sy);
+                    let src = self.scaled_layer(li, &r.image, nw, nh);
                     match adjust {
                         Some((AdjustTarget::Layer(index), params)) if index == li => {
                             let mut adjusted = (*src).clone();
@@ -380,10 +474,33 @@ impl PreviewComposer {
         }
     }
 
+    /// 位图在预览里的目标矩形 `(x, y, w, h)`（整数预览像素）。
+    ///
+    /// ★两端各自取整：起点 `floor`、终点 `ceil`；**不能**用「起点四舍五入 +
+    ///   宽高四舍五入」。后者会让图层比真实落点少覆盖不到 1 个预览像素，而
+    ///   背景上被挖走的那块洞是按面积比降采样的（洞边缘自带分数 alpha），
+    ///   差出来的那半行就透出棋盘格 —— 在 13% 这类缩小档下正好是一条浅色
+    ///   「缝」，看起来像「剪切出来的内容粘回去没贴严」（用户报的就是这个）。
+    ///
+    /// 实测：120×80 的粘贴层放在 (100,100)，缩到 13% 时真实占位是
+    /// x 13.0..28.6 / y 13.0..23.4；旧算法给出 16×10 @ (13,13)，只盖到
+    /// 23 行，第 23 行留下 alpha=0.62 的缺口。改成向外取整后是 16×11，
+    /// 洞被完全盖住。两个相邻图层宁可重叠 <1 像素，也不该留缝。
+    ///
+    /// 1:1 与整数倍缩放下两端本来就落在整数上，行为完全不变。
+    fn preview_dst(offset: (i32, i32), size: (u32, u32), sx: f64, sy: f64) -> (i32, i32, u32, u32) {
+        const EPS: f64 = 1e-6;
+        let x0 = (offset.0 as f64 * sx + EPS).floor();
+        let y0 = (offset.1 as f64 * sy + EPS).floor();
+        let x1 = ((offset.0 as f64 + size.0 as f64) * sx - EPS).ceil();
+        let y1 = ((offset.1 as f64 + size.1 as f64) * sy - EPS).ceil();
+        let w = (x1 - x0).round().max(1.0) as u32;
+        let h = (y1 - y0).round().max(1.0) as u32;
+        (x0 as i32, y0 as i32, w, h)
+    }
+
     /// Cached preview-scaled copy of a layer bitmap, stored in slot `li`.
-    fn scaled_layer(&mut self, li: usize, img: &RgbaImage, sx: f64, sy: f64) -> Arc<RgbaImage> {
-        let nw = ((img.width() as f64 * sx).round() as u32).max(1);
-        let nh = ((img.height() as f64 * sy).round() as u32).max(1);
+    fn scaled_layer(&mut self, li: usize, img: &RgbaImage, nw: u32, nh: u32) -> Arc<RgbaImage> {
         let slot = self.layers.get(li).cloned().flatten();
         if let Some(cached) = Self::cached_hit(&slot, nw, nh) {
             return cached;
@@ -836,13 +953,75 @@ mod tests {
         );
     }
 
+    /// 剪切→粘贴回原位 (13% 缩放下「边缘一条浅色缝」的回归)。
+    ///
+    /// 背景挖掉 (100,100)–(220,180)，再放一张**完全盖住这个洞**的图层。
+    /// 合成结果必须处处不透明：洞的分数 alpha 只要露出哪怕一行，透出来的
+    /// 就是棋盘格，宏观看上去就是粘贴内容「没贴严」。
+    ///
+    /// 这条同时钉住 `preview_dst` 的取整策略：120×80 的图层在 0.13 倍下
+    /// 真实占位是 y 13.0..23.4，按「尺寸四舍五入」只盖 10 行（到 23 行
+    /// 就漏了 0.4 行 alpha），向外取整才盖满 11 行。
+    #[test]
+    fn pasted_layer_seals_erased_hole_at_fractional_zoom() {
+        let mut doc = Document::from_image(solid(600, 400, [70, 120, 200, 255]));
+        for y in 100..180 {
+            for x in 100..220 {
+                doc.base_image_mut().put_pixel(x, y, image::Rgba([0, 0, 0, 0]));
+            }
+        }
+        let mut pasted = Layer::new("pasted", solid(120, 80, [70, 120, 200, 255]));
+        pasted.set_offset((100, 100));
+        doc.add_layer(pasted).unwrap();
+
+        let target = display_size(doc.canvas, Size::new(1100, 700), Zoom::Factor(0.13));
+        assert_eq!(target, Size::new(78, 52));
+        let out = PreviewComposer::new().composite(&doc, target);
+        let semi: Vec<(u32, u32, u8)> = out
+            .enumerate_pixels()
+            .filter(|(_, _, p)| p.0[3] != 255)
+            .map(|(x, y, p)| (x, y, p.0[3]))
+            .collect();
+        assert!(
+            semi.is_empty(),
+            "预览出现半透明像素（会透出棋盘格 = 那条「缝」）：{:?}",
+            &semi[..semi.len().min(8)]
+        );
+    }
+
+    #[test]
+    /// 降采样的输出像素必须与源图严格对齐：洞从 x=100 开始、缩到 0.37 倍
+    /// 时真实边界在 37.0，所以输出第 36 列必须**全不透明**。旧实现用
+    /// `imageops::thumbnail`，它在整数边界上多吃一个源像素，给出 alpha=170，
+    /// 于是洞的边缘向相邻像素渗出 2/3 的半透明 —— 透出棋盘格就是那条缝。
+    #[test]
+    fn downscale_keeps_edge_on_exact_pixel() {
+        let make = |w: u32| {
+            let mut img = solid(w, 4, [255, 255, 255, 255]);
+            for y in 0..4 {
+                for x in 100..w {
+                    img.put_pixel(x, y, image::Rgba([0, 0, 0, 0]));
+                }
+            }
+            img
+        };
+        // 600 -> 222（0.37 倍）：边界 37.0
+        let out = resize_to(&make(600), Size::new(222, 2));
+        assert_eq!(out.get_pixel(36, 1).0[3], 255, "洞左边一列必须全不透明");
+        assert_eq!(out.get_pixel(37, 1).0[3], 0, "洞内部必须全透明");
+        // 600 -> 450（0.75 倍）：边界 75.0
+        let out = resize_to(&make(600), Size::new(450, 3));
+        assert_eq!(out.get_pixel(74, 1).0[3], 255, "洞左边一列必须全不透明");
+        assert_eq!(out.get_pixel(75, 1).0[3], 0, "洞内部必须全透明");
+    }
+
     #[test]
     fn fully_opaque_image_skips_premultiply_roundtrip() {
         // Opaque bitmaps must produce byte-identical results to the plain
-        // box filter (no rounding drift from premultiply/unpremultiply).
+        // area filter (no rounding drift from premultiply/unpremultiply).
         let img = solid(64, 48, [30, 144, 255, 255]);
         let a = resize_to(&img, Size::new(16, 12));
-        let b = image::imageops::thumbnail(&img, 16, 12);
+        let b = downscale_box(&img, 16, 12);
         assert_eq!(a.as_raw(), b.as_raw());
     }
 
