@@ -26,9 +26,6 @@ Rectangle {
     anchors.top: toolbar.bottom
     anchors.left: parent.left
     anchors.right: parent.right
-    // 图层面板占着右侧一列，且面板 z 比这里低：横条必须让位，不然会把
-    // 面板头部（说明行 + 按钮条）整块盖掉。
-    anchors.rightMargin: host.panelVisible ? host.layerPanelWidth : 0
     height: host.toolbarHeight
     color: "#25272b"
     z: 59

@@ -17,9 +17,13 @@ Item {
     required property var toolbar
     required property var statusBar
     anchors.top: toolbar.bottom
+    // 二级工具栏（标记栏）是全宽横条、层级也比面板高：它一出现，面板就整体
+    // 下移一行，两者上下排开互不重叠。以前是让工具栏在右侧缩进，窗口一窄
+    // 按钮行就没地方放、被裁掉半行。
+    anchors.topMargin: host.markBarVisible ? host.toolbarHeight : 0
     anchors.right: parent.right
     anchors.bottom: statusBar.top
-    // 宽度单一来源在 host（MarkBar 要让位同一个值）。
+    // 宽度单一来源在 host。
     width: host.layerPanelWidth
     visible: host.panelVisible
     z: 50
