@@ -19,7 +19,8 @@ Item {
     anchors.top: toolbar.bottom
     anchors.right: parent.right
     anchors.bottom: statusBar.top
-    width: 264
+    // 宽度单一来源在 host（MarkBar 要让位同一个值）。
+    width: host.layerPanelWidth
     visible: host.panelVisible
     z: 50
     clip: true

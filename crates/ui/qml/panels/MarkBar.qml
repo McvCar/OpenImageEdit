@@ -26,9 +26,14 @@ Rectangle {
     anchors.top: toolbar.bottom
     anchors.left: parent.left
     anchors.right: parent.right
+    // 图层面板占着右侧一列，且面板 z 比这里低：横条必须让位，不然会把
+    // 面板头部（说明行 + 按钮条）整块盖掉。
+    anchors.rightMargin: host.panelVisible ? host.layerPanelWidth : 0
     height: host.toolbarHeight
     color: "#25272b"
     z: 59
+    // 窗口被压到极窄时按钮行会撑出条带右端；裁掉总比压在图层面板上好。
+    clip: true
 
     // 窄窗口：一行的按钮放不下时，从右端成组收起（尺子 / 拾色器 / 它们
     // 前面的那条分隔线）。这三个命令在「⋯ → 图层与标记」里都有，不会

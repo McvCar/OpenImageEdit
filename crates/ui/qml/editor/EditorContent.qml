@@ -29,6 +29,9 @@ Item {
     property bool imageFrameSeen: false
     readonly property int toolbarHeight: 40
     readonly property int statusHeight: 26
+    // 右侧图层面板占的竖直列宽。二级工具栏（MarkBar）要按它让位，否则
+    // MarkBar 是全宽横条、z 又比面板高，会把面板头部整块盖住。
+    readonly property int layerPanelWidth: 264
 
     // ---- 打开图片后把窗口贴合到图片大小 --------------------------------
     // automationRun：任何 -- 开关（--selftest / --script / 各种 --probe-*）
