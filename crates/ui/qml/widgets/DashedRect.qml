@@ -29,7 +29,12 @@ Canvas {
         var ctx = getContext("2d")
         ctx.clearRect(0, 0, width, height)
         ctx.strokeStyle = String(dashColor)
-        ctx.lineWidth = 1.5
+        // ★线宽必须是 1、并且描边落在**像素中心**（整数 + 0.5）。
+        //   以前是 lineWidth 1.5 画在 rx+0.75 —— 描边正好骑在像素边界上，
+        //   Qt 会把它摊成两条 50% 半透明的线：在 100% 缩放下只是有点发虚，
+        //   在 64%/75% 这类非整数缩放下就变成一条"浅色细缝"，看起来像
+        //   粘贴回去的图层没贴严（用户报的"边缘有空隙"就是这个）。
+        ctx.lineWidth = 1
         ctx.setLineDash([5, 4])
         ctx.lineDashOffset = dashPhase
         if (quad !== null && quad.length >= 8) {
@@ -43,7 +48,13 @@ Canvas {
         }
         if (rw < 1 || rh < 1)
             return
-        ctx.strokeRect(rx + 0.75, ry + 0.75, rw - 1.5, rh - 1.5)
+        var x = Math.round(rx) + 0.5
+        var y = Math.round(ry) + 0.5
+        var w = Math.round(rw) - 1
+        var h = Math.round(rh) - 1
+        if (w < 0 || h < 0)
+            return
+        ctx.strokeRect(x, y, w, h)
     }
     Timer {
         interval: 90
