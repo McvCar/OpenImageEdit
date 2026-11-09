@@ -280,15 +280,6 @@ impl qobject::Bridge {
         match result {
             Ok(index) => {
                 self.as_mut().set_selected_layer(index as i32);
-                // ★粘贴成功后取消选区。
-                //   剪切按 PS 习惯保留选区（蚂蚁线停在原处，标出"这块被挖走了"），
-                //   但粘回来时那条轮廓正好压在补回内容的四边上：蚂蚁线的白段
-                //   在深色/蓝色内容上就是一条浅色虚线，黑段几乎看不见 —— 用户
-                //   看到的就是"剪出来的画面粘回原位，边缘有一圈空隙"。
-                //   实测预览位图（QML 覆盖层以下）在原样粘回时逐像素 0 差异，
-                //   所以这圈"缝"纯粹是轮廓线画出来的。粘完就没有"标记挖走区域"
-                //   的意义了，取消选区；粘贴出的图层本身已经是选中态。
-                self.as_mut().sel_clear();
                 {
                     let mut guard = self.session.borrow_mut();
                     if let Some(s) = guard.as_mut() {

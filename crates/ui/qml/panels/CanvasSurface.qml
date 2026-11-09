@@ -1338,7 +1338,6 @@ Item {
         rw: box ? box[2] : 0
         rh: box ? box[3] : 0
         dashColor: "#378add"
-        dpr: host.dpr > 0 ? host.dpr : 1
 
         property var box: host.selectedMarkBox()
         onBoxChanged: if (visible) requestPaint()
