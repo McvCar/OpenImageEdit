@@ -888,7 +888,7 @@ mod tests {
     fn preview_includes_visible_layers() {
         let mut doc = Document::from_image(solid(40, 40, [10, 20, 30, 255]));
         let mut layer = Layer::new("dot", solid(10, 10, [255, 255, 255, 255]));
-        layer.offset = (0, 0);
+        layer.set_offset((0, 0));
         doc.add_layer(layer).unwrap();
         let preview = composite_for_preview(&doc, Size::new(40, 40));
         assert_eq!(preview.get_pixel(2, 2).0, [255, 255, 255, 255]);
@@ -899,7 +899,7 @@ mod tests {
     fn composer_cache_follows_live_drag_and_epoch_invalidation() {
         let mut doc = Document::from_image(solid(40, 40, [10, 20, 30, 255]));
         let mut layer = Layer::new("dot", solid(10, 10, [255, 0, 0, 255]));
-        layer.offset = (0, 0);
+        layer.set_offset((0, 0));
         doc.add_layer(layer).unwrap();
         let target = Size::new(40, 40);
 
@@ -910,14 +910,14 @@ mod tests {
         // Live drag tick: offset changes WITHOUT an epoch bump (history-free
         // mutation) — the cached scaled bitmap must still land at the new
         // offset.
-        doc.layers[0].offset = (20, 20);
+        doc.layers[1].set_offset((20, 20));
         let second = composer.composite(&doc, target);
         assert_eq!(second.get_pixel(22, 22).0, [255, 0, 0, 255]);
         assert_eq!(second.get_pixel(2, 2).0, [10, 20, 30, 255]);
 
         // Committed edit bumps the epoch: cache is rebuilt and reflects the
         // new content.
-        doc.set_layer_opacity(0, 0.5).unwrap();
+        doc.set_layer_opacity(1, 0.5).unwrap();
         let third = composer.composite(&doc, target);
         let px = third.get_pixel(22, 22).0;
         // 0.5 alpha red over the base color: 255*0.5+10*0.5=132.5→133,
@@ -930,10 +930,10 @@ mod tests {
     #[test]
     fn live_scale_preview_stretches_snapshot_without_touching_doc() {        let mut doc = Document::from_image(solid(40, 40, [10, 20, 30, 255]));
         let mut layer = Layer::new("dot", solid(10, 10, [255, 0, 0, 255]));
-        layer.offset = (10, 10);
+        layer.set_offset((10, 10));
         doc.add_layer(layer).unwrap();
         let target = Size::new(40, 40);
-        let snapshot = doc.layers[0].image.clone();
+        let snapshot = doc.layers[1].img().clone();
 
         let mut composer = PreviewComposer::new();
         // Warm the caches with a normal composite, then request a live
@@ -943,7 +943,7 @@ mod tests {
         let live = composer.composite_live_scale(
             &doc,
             target,
-            0,
+            1,
             &snapshot,
             Size::new(20, 20),
             (0, 0),
@@ -956,8 +956,8 @@ mod tests {
         assert_eq!(live.get_pixel(30, 30).0, [10, 20, 30, 255]);
 
         // The document itself is never modified during the gesture.
-        assert_eq!(doc.layers[0].image.dimensions(), (10, 10));
-        assert_eq!(doc.layers[0].offset, (10, 10));
+        assert_eq!(doc.layers[1].img().dimensions(), (10, 10));
+        assert_eq!(doc.layers[1].offset(), (10, 10));
         assert_eq!(doc.edit_epoch, epoch_before);
 
         // Cancelling (back to a plain composite) restores the committed
@@ -982,14 +982,14 @@ mod tests {
             &Adjust::identity(),
         );
         assert_eq!(plain.as_raw(), neutral.as_raw());
-        assert_eq!(doc.base.get_pixel(5, 5).0, [90, 120, 200, 255]);
+        assert_eq!(doc.base_image().get_pixel(5, 5).0, [90, 120, 200, 255]);
     }
 
     #[test]
     fn adjust_preview_scopes_to_base_or_layer() {
         let mut doc = Document::from_image(solid(40, 30, [100, 100, 100, 255]));
         let mut layer = Layer::new("dot", solid(10, 10, [150, 150, 150, 255]));
-        layer.offset = (0, 0);
+        layer.set_offset((0, 0));
         doc.add_layer(layer).unwrap();
         let target = Size::new(40, 30);
         let mut composer = PreviewComposer::new();
@@ -1004,9 +1004,10 @@ mod tests {
         assert!(base_adjusted.get_pixel(30, 20).0[0] > 100);
         assert_eq!(base_adjusted.get_pixel(2, 2).0, [150, 150, 150, 255]);
 
-        // Layer scope: only the layer's rect changes.
+        // Layer scope: only the layer's rect changes. `layers[0]` is the
+        // background, so the user layer lives at index 1.
         let layer_adjusted =
-            composer.composite_with_adjust(&doc, target, AdjustTarget::Layer(0), &brighter);
+            composer.composite_with_adjust(&doc, target, AdjustTarget::Layer(1), &brighter);
         assert!(layer_adjusted.get_pixel(2, 2).0[0] > 150);
         assert_eq!(layer_adjusted.get_pixel(30, 20).0, [100, 100, 100, 255]);
     }

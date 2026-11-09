@@ -23,15 +23,9 @@ impl qobject::Bridge {
     }
 
     pub fn select_layer(mut self: Pin<&mut Self>, index: i32) {
-        if index < 0 {
-            // Negative index = deselect (Esc / clicking empty canvas).
-            self.as_mut().set_selected_layer(-1);
-            return;
-        }
-        if self.selected_guard(index).is_none() {
-            return;
-        }
-        self.as_mut().set_selected_layer(index);
+        // 单选 = 多选集合被替换成这一层（`select_layer_ex` 里统一处理，
+        // 顺带把 `layerSelectionIds` 一起发布出去，面板高亮不会残留）。
+        self.as_mut().select_layer_ex(index, 0);
     }
 
     pub fn toggle_selected_visible(mut self: Pin<&mut Self>) {

@@ -13,6 +13,7 @@ mod geometry;
 mod gesture;
 mod mark;
 mod layer;
+mod layer_ops;
 pub mod layer_transform;
 pub mod snap;
 mod transform;
@@ -33,6 +34,7 @@ pub use selection::{
 };
 pub use mark::{MarkKind, Mark};
 pub use layer::{Layer, LayerContent, LayerId, RasterLayer};
+pub use layer_ops::{AlignEdge, DistributeAxis};
 pub use layer_transform::{
     probe_lines as transform_probe_lines, Affine2, BoundsSolve, Field, LayerTransform, PanelValues,
     RectF, ReferencePoint, TransformParams, TRANSFORM_SERIAL_VERSION,
@@ -51,6 +53,8 @@ pub(crate) use document::DocumentSnapshot;
 
 // Cross-module private helpers (kept `pub(crate)` + re-exported so each
 // sibling module's `use super::*` can call them without naming the path).
+pub(crate) use layer_ops::blend_image_at;
+pub(crate) use document::blend_over;
 pub(crate) use mark::norm_rect;
 pub(crate) use transform::transform_document;
 pub(crate) use op::History;

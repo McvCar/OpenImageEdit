@@ -54,6 +54,25 @@ pub struct Layer {
     pub content: LayerContent,
 }
 
+/// 等比缩到 `max` 见方并居中，其余透明。
+fn fit_thumbnail(src: &RgbaImage, max: u32) -> RgbaImage {
+    let mut out = RgbaImage::new(max, max);
+    let (w, h) = src.dimensions();
+    if w == 0 || h == 0 {
+        return out;
+    }
+    let scale = (max as f32 / w.max(h) as f32).min(1.0);
+    let tw = ((w as f32 * scale).round() as u32).max(1).min(max);
+    let th = ((h as f32 * scale).round() as u32).max(1).min(max);
+    let small = image::imageops::thumbnail(src, tw, th);
+    let ox = (max - tw) / 2;
+    let oy = (max - th) / 2;
+    for (x, y, px) in small.enumerate_pixels() {
+        out.put_pixel(x + ox, y + oy, *px);
+    }
+    out
+}
+
 impl Layer {
     pub fn new(name: impl Into<String>, image: RgbaImage) -> Self {
         Self {
@@ -77,6 +96,54 @@ impl Layer {
             locked: true,
             background: true,
             ..Self::new("背景", image)
+        }
+    }
+
+    /// 复制一份内容相同、但 `id` 与名字全新的图层（不进文档，只构造）。
+    pub fn duplicated(&self) -> Self {
+        Self {
+            id: next_layer_id(),
+            name: format!("{} 副本", self.name),
+            ..self.clone()
+        }
+    }
+
+    /// 把图层摊平成「画布平面」：图像 + 它在画布里的左上角（不烘焙不透明度）。
+    ///
+    /// 位图直接取显示缓存（已含变换结果）；标记按自己的画布矩形画成位图。
+    /// 合并图层、生成缩略图都走这里，省得两处各写一份「标记怎么变位图」。
+    pub fn plane(&self) -> (RgbaImage, (i32, i32)) {
+        match &self.content {
+            LayerContent::Raster(r) => (r.image.clone(), r.offset),
+            LayerContent::Mark(m) => {
+                let rect = m.canvas_rect();
+                // 描边有一半在 rect 外面，四周留出 描边宽/2 + 2 的余量。
+                let pad = (m.stroke.max(1) / 2 + 2) as i32;
+                let ox = rect.x - pad;
+                let oy = rect.y - pad;
+                let w = (rect.width as i32 + pad * 2).max(1) as u32;
+                let h = (rect.height as i32 + pad * 2).max(1) as u32;
+                let mut img = RgbaImage::new(w, h);
+                m.translated(-ox as f32, -oy as f32).draw(&mut img);
+                (img, (ox, oy))
+            }
+        }
+    }
+
+    /// 面板缩略图：内容等比缩到 `max` 见方内并居中，其余透明。
+    ///
+    /// 用 `imageops::thumbnail`（整数重采样）而不是 Lanczos：40px 的小图
+    /// 看不出差别，但快一个数量级 —— 面板每次重建会连着要好几张。
+    pub fn thumbnail(&self, max: u32) -> RgbaImage {
+        let max = max.max(1);
+        // 位图直接引用原图（不克隆整层 —— 大图层克隆一次就是几十 MB）；
+        // 标记才临时画一张小的。
+        match &self.content {
+            LayerContent::Raster(r) => fit_thumbnail(&r.image, max),
+            LayerContent::Mark(_) => {
+                let (img, _) = self.plane();
+                fit_thumbnail(&img, max)
+            }
         }
     }
 

@@ -107,11 +107,19 @@ pub enum EditOp {
     },
     /// 图层整体旋转（任意角度）：位图尺寸与左上角偏移都会变，直接存旋转
     /// 前后的整层状态，撤销/重做都是整体替换。
-    RotateLayer {
+    /// 整层替换：位图 + 偏移 + 变换参数（旋转手柄落定、合并图层、栅格化
+    /// 标记都走这条）。before/after 各存一份，撤销/重做都是整体替换。
+    ReplaceLayer {
         index: usize,
         before: Layer,
         after: Layer,
     },
+    /// 一串原子编辑当成**一条**历史：对齐 / 分布 / 批量显隐这类「一条命令
+    /// 改多层」的操作走这里，Ctrl+Z 一次全部退回。
+    ///
+    /// apply 顺序执行，revert 逆序回滚；中途任何一步失败，已应用的部分先
+    /// 回滚再报错，不留半截状态。
+    Batch(Vec<EditOp>),
     /// Replace the whole selection (new marquee / invert / clear / move /
     /// resize). Selection is document state in PS and here too, so Ctrl+Z
     /// walks it back together with the pixel edits in one unified history.
@@ -394,12 +402,24 @@ impl EditOp {
                 apply_region(doc, *target, *rect, after);
                 Ok(())
             }
-            EditOp::RotateLayer { index, after, .. } => {
+            EditOp::ReplaceLayer { index, after, .. } => {
                 let layer = doc
                     .layers
                     .get_mut(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
                 *layer = after.clone();
+                Ok(())
+            }
+            EditOp::Batch(ops) => {
+                for (done, op) in ops.iter().enumerate() {
+                    if let Err(e) = op.apply(doc) {
+                        // 回滚已经生效的那几步，避免「批量命令一半成功」。
+                        for prev in ops[..done].iter().rev() {
+                            let _ = prev.revert(doc);
+                        }
+                        return Err(e);
+                    }
+                }
                 Ok(())
             }
             EditOp::SetSelection { to, .. } => {
@@ -606,12 +626,20 @@ impl EditOp {
                 apply_region(doc, *target, *rect, before);
                 Ok(())
             }
-            EditOp::RotateLayer { index, before, .. } => {
+            EditOp::ReplaceLayer { index, before, .. } => {
                 let layer = doc
                     .layers
                     .get_mut(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
                 *layer = before.clone();
+                Ok(())
+            }
+            EditOp::Batch(ops) => {
+                // 逆序回滚：后面的子步可能依赖前面的结果（先插层后改层），
+                // 反着退才回到起点。
+                for op in ops.iter().rev() {
+                    op.revert(doc)?;
+                }
                 Ok(())
             }
             EditOp::SetSelection { from, .. } => {

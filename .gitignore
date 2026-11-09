@@ -31,3 +31,8 @@ probe_v_key.log
 probe_ratio_snap.png
 probe_ratio_snap.log
 test_core.log
+probe_layer_panel.png
+probe_layer_panel_window.png
+probe_layer_panel.log
+probe_layer_ops.png
+probe_layer_ops.log

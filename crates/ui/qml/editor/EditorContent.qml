@@ -467,10 +467,13 @@ Item {
     // identity/flags, so rebind it only when those actually change.
     // Canvas outlines etc. keep using layerList (live bounds).
     readonly property string layerPanelSig: {
-        let s = ""
+        // 前缀是像素版本：值一变（任何可撤销编辑 / 撤销重做），面板重建一次，
+        // 缩略图跟着重取。拖动帧不 bump 它，所以拖动期间列表不动。
+        let s = bridge.layerEpoch + "|"
         for (var i = 0; i < layerList.length; i++) {
             const l = layerList[i]
-            s += l.i + ":" + l.n + ":" + l.v + ":" + l.l + ":" + Math.round(l.o) + ";"
+            s += l.i + ":" + l.id + ":" + l.n + ":" + l.v + ":" + l.l + ":"
+                 + Math.round(l.o) + ";"
         }
         return s
     }
@@ -2499,8 +2502,9 @@ function stepMarkFontSize(dir) {
 }
 
 function findSelLayer() {
+    // 背景层已经是普通图层（layers[0]），选中它同样要有轮廓 / 数值 / 不透明度。
     for (var i = 0; i < layerList.length; i++)
-        if (!layerList[i].base && layerList[i].i === bridge.selected_layer)
+        if (layerList[i].i === bridge.selected_layer)
             return layerList[i]
     return null
 }

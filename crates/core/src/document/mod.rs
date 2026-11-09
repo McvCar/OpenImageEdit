@@ -905,7 +905,7 @@ impl Document {
         if before == after {
             return Ok(());
         }
-        self.execute(EditOp::RotateLayer {
+        self.execute(EditOp::ReplaceLayer {
             index,
             before,
             after,
@@ -947,7 +947,7 @@ impl Document {
         if after == before {
             return Ok(());
         }
-        self.execute(EditOp::RotateLayer {
+        self.execute(EditOp::ReplaceLayer {
             index,
             before,
             after,
@@ -1122,7 +1122,7 @@ impl Document {
 }
 
 /// 把 `src` 按 `opacity` 叠到 `out` 上（与旧 `composite_pixel` 逐像素一致）。
-fn blend_over(out: &mut [u8; 4], src: [u8; 4], opacity: f32) {
+pub(crate) fn blend_over(out: &mut [u8; 4], src: [u8; 4], opacity: f32) {
     let a = (src[3] as f32 / 255.0) * opacity;
     if a <= 0.0 {
         return;
@@ -1136,26 +1136,6 @@ fn blend_over(out: &mut [u8; 4], src: [u8; 4], opacity: f32) {
 
 /// 把一个位图图层按 offset 混合进整幅画布。
 fn blend_raster_into(out: &mut RgbaImage, r: &RasterLayer, opacity: f32) {
-    let (ox, oy) = r.offset;
-    let x0 = ox.max(0);
-    let y0 = oy.max(0);
-    let x1 = (ox + r.image.width() as i32).min(out.width() as i32);
-    let y1 = (oy + r.image.height() as i32).min(out.height() as i32);
-    if x1 <= x0 || y1 <= y0 {
-        return;
-    }
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let src = r
-                .image
-                .get_pixel((x - ox) as u32, (y - oy) as u32)
-                .0;
-            if src[3] == 0 {
-                continue;
-            }
-            let px = out.get_pixel_mut(x as u32, y as u32);
-            blend_over(&mut px.0, src, opacity);
-        }
-    }
+    blend_image_at(out, &r.image, r.offset.0, r.offset.1, opacity);
 }
 

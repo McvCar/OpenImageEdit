@@ -988,12 +988,17 @@ impl Session {
                 ),
             });
             let kind = if layer.is_mark() { "mark" } else { "raster" };
+            // 标记行要用种类图标；接口给的是 MarkKind 的数字（与 marks_json 一致）。
+            let mk = match &layer.content {
+                editcore::LayerContent::Mark(m) => format!(",\"mk\":{}", m.kind as i32),
+                _ => String::new(),
+            };
             let extra = if layer.background {
                 format!(
                     ",\"base\":true,\"bg\":true,\"bd\":{base_deleted}"
                 )
             } else {
-                String::new()
+                mk
             };
             parts.push(format!(
                 "{{\"i\":{i},\"id\":{},\"n\":\"{name}\",\"v\":{},\"o\":{},\"l\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"a\":{:.3},\"sw\":{},\"sh\":{},\"k\":\"{kind}\"{extra}}}",

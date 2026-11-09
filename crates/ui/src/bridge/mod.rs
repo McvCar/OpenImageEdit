@@ -111,6 +111,13 @@ pub mod qobject {
         #[qproperty(i32, layer_count)]
         #[qproperty(i32, selected_layer)]
         #[qproperty(QString, layers_json)]
+        /// 多选：选中图层的稳定 id 列表（JSON 数组），面板据此高亮。
+        #[qproperty(QString, layer_selection_ids, cxx_name = "layerSelectionIds")]
+        /// 多选：选中图层数量（面板标题 / 批量操作条用）。
+        #[qproperty(i32, selected_layer_count, cxx_name = "selectedLayerCount")]
+        /// 文档像素版本（`Document::edit_epoch`）。面板把它混进列表签名，
+        /// 像素一改就重建列表 → 缩略图跟着刷新。
+        #[qproperty(i32, layer_epoch, cxx_name = "layerEpoch")]
         #[qproperty(i32, selected_mark)]
         #[qproperty(QString, marks_json)]
         #[qproperty(bool, dirty)]
@@ -609,6 +616,48 @@ pub mod qobject {
         #[qinvokable]
         fn select_layer(self: Pin<&mut Self>, index: i32);
 
+        /// 多选：mode 0 = 单选替换，1 = Ctrl 切换，2 = Shift 连选。
+        #[qinvokable]
+        fn select_layer_ex(self: Pin<&mut Self>, index: i32, mode: i32);
+
+        // ---- 图层命令（P1，只做按钮 / 菜单入口，不绑快捷键）----
+
+        #[qinvokable]
+        fn new_layer(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn duplicate_selected_layer(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn merge_selected_down(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn merge_visible_layers(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn flatten_layers(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        fn rasterize_selected_mark(self: Pin<&mut Self>);
+
+        /// edge: left / hcenter / right / top / vcenter / bottom
+        #[qinvokable]
+        fn align_selected_layers(self: Pin<&mut Self>, edge: &QString);
+
+        /// axis: h / v
+        #[qinvokable]
+        fn distribute_selected_layers(self: Pin<&mut Self>, axis: &QString);
+
+        #[qinvokable]
+        fn set_selected_layers_visible(self: Pin<&mut Self>, visible: bool);
+
+        #[qinvokable]
+        fn delete_selected_layers(self: Pin<&mut Self>);
+
+        /// 图层缩略图 URL（面板每行一张；按需生成 + 缓存）。
+        #[qinvokable]
+        fn layer_thumb_url(self: Pin<&mut Self>, index: i32) -> QString;
+
         #[qinvokable]
         fn toggle_selected_visible(self: Pin<&mut Self>);
 
@@ -1056,6 +1105,15 @@ pub struct BridgeRust {
     layer_count: i32,
     selected_layer: i32,
     layers_json: QString,
+    /// 多选：选中图层的稳定 id（顺序 = 点击顺序，最后一个是主选中层）。
+    /// 下标会随重排 / 删除变化，所以缓存必须用 id。
+    selection_ids: RefCell<Vec<u32>>,
+    /// 上面那份 id 的 JSON 形式（QML 直接读）。
+    layer_selection_ids: QString,
+    selected_layer_count: i32,
+    layer_epoch: i32,
+    /// 缩略图缓存：(会话 id, 图层 id) → (epoch, file:// URL, 临时文件路径)。
+    thumb_cache: RefCell<std::collections::HashMap<(u32, u32), (u64, String, PathBuf)>>,
     /// Selected markup annotation (-1 = none); survives refreshes.
     selected_mark: i32,
     /// JSON list of marks for the QML overlay: bounds, kind, style.
@@ -1192,6 +1250,11 @@ impl Default for BridgeRust {
             layer_count: 0,
             selected_layer: -1,
             layers_json: QString::default(),
+            selection_ids: RefCell::new(Vec::new()),
+            layer_selection_ids: QString::from("[]"),
+            selected_layer_count: 0,
+            layer_epoch: 0,
+            thumb_cache: RefCell::new(std::collections::HashMap::new()),
             selected_mark: -1,
             marks_json: QString::default(),
             dirty: false,
@@ -1425,6 +1488,8 @@ impl qobject::Bridge {
         };
         self.as_mut()
             .set_layers_json(QString::from(json.as_str()));
+        // 图层增删 / 重排之后多选集合可能指向已经不存在的 id，顺手校准。
+        self.as_mut().sync_layer_selection();
     }
 
     // ---- 移动图层拖拽实时预览 ----
@@ -1737,6 +1802,15 @@ impl qobject::Bridge {
                 self.as_mut().set_can_undo(can_undo);
                 self.as_mut().set_can_redo(can_redo);
                 self.as_mut().set_layer_count(layer_count);
+                // 面板列表签名里混了这个值：像素一改（含撤销）就重建列表，
+                // 缩略图随之刷新；拖动帧不改 epoch，所以拖动期间列表不动。
+                let epoch = self
+                    .session
+                    .borrow()
+                    .as_ref()
+                    .map(|s| s.doc.edit_epoch as i32)
+                    .unwrap_or(0);
+                self.as_mut().set_layer_epoch(epoch);
                 self.as_mut().set_dirty(dirty);
                 // Publish JSON properties only when they actually changed:
                 // QML re-parses them (and rebuilds the list panels) on every

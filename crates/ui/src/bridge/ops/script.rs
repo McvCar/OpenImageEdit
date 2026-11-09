@@ -255,7 +255,9 @@ impl qobject::Bridge {
                         .strip_prefix("select-layer:")
                         .and_then(|v| v.trim().parse::<i32>().ok())
                     {
-                        self.as_mut().set_selected_layer(ix);
+                        // 走 `select_layer_ex(…, 0)`：单选替换要同时把多选
+                        // 集合收敛掉，否则随后的批量命令会作用在旧集合上。
+                        self.as_mut().select_layer_ex(ix, 0);
                         self.as_mut().refresh_layers_only();
                     }
                 }
@@ -1178,6 +1180,47 @@ impl qobject::Bridge {
                             );
                         }
                     }
+                }
+                // ---- 图层命令（P1）---
+                // 每个 op 都走 QML 按钮点下去的同一条桥方法，所以这里能跑通
+                // 就说明面板上的按钮也能跑通。
+                "layer-new" => self.as_mut().new_layer(),
+                "layer-dup" => self.as_mut().duplicate_selected_layer(),
+                "layer-merge-down" => self.as_mut().merge_selected_down(),
+                "merge-visible" => self.as_mut().merge_visible_layers(),
+                "flatten" => self.as_mut().flatten_layers(),
+                "rasterize" => self.as_mut().rasterize_selected_mark(),
+                "layers-delete" => self.as_mut().delete_selected_layers(),
+                // `multi-select:1,2,3` —— 直接摆一组下标当多选集合。
+                other if other.starts_with("multi-select:") => {
+                    let idx: Vec<i32> = other
+                        .trim_start_matches("multi-select:")
+                        .split(',')
+                        .filter_map(|p| p.trim().parse().ok())
+                        .collect();
+                    if let Some(&primary) = idx.last() {
+                        self.as_mut().select_layer(primary);
+                        for &i in &idx[..idx.len() - 1] {
+                            self.as_mut().select_layer_ex(i, 1);
+                        }
+                    }
+                }
+                // `align:left|hcenter|right|top|vcenter|bottom`
+                other if other.starts_with("align:") => {
+                    let edge = other.trim_start_matches("align:").trim().to_string();
+                    self.as_mut()
+                        .align_selected_layers(&QString::from(edge.as_str()));
+                }
+                // `distribute:h|v`
+                other if other.starts_with("distribute:") => {
+                    let axis = other.trim_start_matches("distribute:").trim().to_string();
+                    self.as_mut()
+                        .distribute_selected_layers(&QString::from(axis.as_str()));
+                }
+                // `layers-visible:0|1`
+                other if other.starts_with("layers-visible:") => {
+                    let on = other.trim_start_matches("layers-visible:").trim() != "0";
+                    self.as_mut().set_selected_layers_visible(on);
                 }
                 // `layers-dump` —— 把 `layers_json()` 原样打出来（面板看到
                 // 的就是这一份）。图层重构后验 z 序 / 背景行 / 多选缓存都

@@ -12,6 +12,7 @@ pub(super) mod document;
 pub(super) mod view;
 pub(super) mod canvas;
 pub(super) mod layers;
+pub(super) mod layer_cmds;
 pub(super) mod adjust;
 pub(super) mod picker;
 pub(super) mod clipboard;
