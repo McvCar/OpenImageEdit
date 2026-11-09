@@ -616,7 +616,8 @@ pub mod qobject {
         #[qinvokable]
         fn select_layer(self: Pin<&mut Self>, index: i32);
 
-        /// 多选：mode 0 = 单选替换，1 = Ctrl 切换，2 = Shift 连选。
+        /// 多选：mode 0 = 单选替换，1 = Ctrl 切换，2 = Shift 连选，
+        /// 3 = 并进集合并设为主选中层（画布 Ctrl+点，只加不减）。
         #[qinvokable]
         fn select_layer_ex(self: Pin<&mut Self>, index: i32, mode: i32);
 
@@ -630,6 +631,12 @@ pub mod qobject {
 
         #[qinvokable]
         fn merge_selected_down(self: Pin<&mut Self>);
+
+        /// 合并**选中的多个**图层（≥2 层、背景层不参与）。
+        /// ★漏声明这条，面板 ⤓ 与右键菜单就会静默失效（QML 里 TypeError，
+        ///   而脚本 op 直接调 Rust，探针照样 PASS）——所以必须有。
+        #[qinvokable]
+        fn merge_selected_layers(self: Pin<&mut Self>);
 
         #[qinvokable]
         fn merge_visible_layers(self: Pin<&mut Self>);

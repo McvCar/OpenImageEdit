@@ -223,10 +223,12 @@ impl Document {
             x1 = x1.max(b.x + b.width as i32);
             y1 = y1.max(b.y + b.height as i32);
         }
-        if x1 <= x0 || y1 <= y0 {
-            return Err(EditError::BaseRequired);
-        }
-        let mut merged = RgbaImage::new((x1 - x0) as u32, (y1 - y0) as u32);
+        // ★并集可能退化：两层都是空的（新建的空图层 0×0，或整体在画布外）
+        //   时 x1==x0 / y1==y0。这里不能报错 —— 「合并不了」是用户最没法
+        //   自救的反馈。按 1×1 透明块落定：层数照减，内容为空，可撤销。
+        let w = (x1 - x0).max(1) as u32;
+        let h = (y1 - y0).max(1) as u32;
+        let mut merged = RgbaImage::new(w, h);
         // 由低到高叠：`draw_layer_into` 会把每层自己的不透明度烘焙进去。
         for &i in &targets {
             draw_layer_into(&mut merged, (x0, y0), &self.layers[i]);
@@ -627,6 +629,24 @@ mod tests {
         assert!(doc.merge_layers(&[0, 1]).is_err());
         assert!(doc.merge_layers(&[]).is_err());
         assert_eq!(doc.layers.len(), 2);
+    }
+
+    #[test]
+    fn merge_layers_tolerates_empty_layers() {
+        // 两层都是空的（新建的空图层就是 0×0）：并集退化，但「合并不了」
+        // 是用户最没法自救的反馈，必须照样减层、照样可撤销。
+        let mut doc = Document::from_image(blank(16, 16));
+        doc.add_layer(Layer::new("empty-a", image::RgbaImage::new(0, 0)))
+            .unwrap();
+        doc.add_layer(Layer::new("empty-b", image::RgbaImage::new(0, 0)))
+            .unwrap();
+        assert_eq!(doc.layers.len(), 3);
+        let at = doc.merge_layers(&[1, 2]).unwrap();
+        assert_eq!(at, 1);
+        assert_eq!(doc.layers.len(), 2);
+        assert!(doc.layers[1].is_raster());
+        doc.undo().unwrap();
+        assert_eq!(doc.layers.len(), 3);
     }
 
     #[test]

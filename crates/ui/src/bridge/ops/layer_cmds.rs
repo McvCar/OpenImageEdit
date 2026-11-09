@@ -294,16 +294,22 @@ impl qobject::Bridge {
     /// 与「向下合并」的区别：这里只认**选中的那些**，不碰相邻层；结果落在
     /// 最高选中层的 z 位，名字 / 锁定沿用最高层。
     pub fn merge_selected_layers(mut self: Pin<&mut Self>) {
-        let targets: Vec<usize> = self
-            .as_mut()
-            .selection_indices()
-            .into_iter()
-            .filter(|&i| i > 0)
-            .collect();
+        let selected = self.as_mut().selection_indices();
+        let targets: Vec<usize> = selected.iter().copied().filter(|&i| i > 0).collect();
         if targets.len() < 2 {
-            self.as_mut().set_status(QString::from(
-                "选中两个以上的图层才能合并（背景层不参与，Ctrl 点击可多选）",
-            ));
+            // ★要说清楚「为什么」：手上明明高亮着 2 行，点下去却没反应，最常见
+            //   的原因就是其中一行是背景（多选集合里允许有它，但合并不吃它）。
+            let message = if selected.len() > targets.len() {
+                format!(
+                    "背景层不参与合并：已选 {} 个图层，其中可合并的只有 {} 个，再选一个图层",
+                    selected.len(),
+                    targets.len()
+                )
+            } else {
+                "合并需要选中两个以上的图层：Ctrl+点击图层行（画布上的图层也可以）多选"
+                    .to_string()
+            };
+            self.as_mut().set_status(QString::from(message.as_str()));
             return;
         }
         let viewport = *self.viewport.borrow();

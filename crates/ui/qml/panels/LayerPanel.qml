@@ -60,6 +60,10 @@ Item {
         property bool usable: true
         property bool danger: false
         signal activated()
+        // 不可用时被点了一下。★默认的写法是给 MouseArea 挂 `enabled: usable`，
+        // 结果按钮变灰之后连 hover 都没了：没有说明文字、点下去也毫无反馈，
+        // 用户只能得出「这功能用不了」。所以 MouseArea 常开，由这里兜底解释。
+        signal blocked()
         width: 26
         height: 24
         radius: 4
@@ -129,7 +133,6 @@ Item {
         MouseArea {
             id: btnMa
             anchors.fill: parent
-            enabled: btn.usable
             hoverEnabled: true
             onContainsMouseChanged: {
                 if (containsMouse)
@@ -138,7 +141,16 @@ Item {
                     layerPanel.hintText = ""
             }
             cursorShape: btn.usable ? Qt.PointingHandCursor : Qt.ArrowCursor
-            onClicked: btn.activated()
+            onClicked: {
+                if (btn.usable) {
+                    btn.activated()
+                } else {
+                    // 灰按钮也要能问出「为什么」：把 tip 亮在提示行里，
+                    // 再让具体按钮补一句人话（如「先 Ctrl 选中两层」）。
+                    layerPanel.hintText = btn.tip
+                    btn.blocked()
+                }
+            }
         }
     }
 
@@ -216,6 +228,8 @@ Item {
                     glyph: "⤓"
                     tip: "合并选中的图层（Ctrl 点击多选，背景层不参与）"
                     usable: layerPanel.multiCount >= 2
+                    onBlocked: layerPanel.hintText =
+                               "合并要先选中两个以上图层：Ctrl+点击图层行（画布上的图层也可以），背景不参与"
                     onActivated: bridge.merge_selected_layers()
                 }
                 PanelButton {
