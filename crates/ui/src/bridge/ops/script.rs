@@ -246,6 +246,18 @@ impl qobject::Bridge {
                     }
                 }
                 "save" => self.as_mut().save_edited(),
+                // `save-as:<path>` — automation for the Save-As dialog route
+                // (used by probe_psd_roundtrip.py to verify that a plain image
+                // can be exported as a fresh layered PSD).
+                other if other.starts_with("save-as:") => {
+                    let raw = other.strip_prefix("save-as:").unwrap_or("").trim();
+                    if raw.is_empty() {
+                        println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}");
+                    } else {
+                        let url = QUrl::from(file_url(Path::new(raw)).as_str());
+                        self.as_mut().save_as(&url);
+                    }
+                }
                 "reset-crop" => self.as_mut().reset_crop(),
                 "toggle-visible-selected" => self.as_mut().toggle_selected_visible(),
                 // `select-layer:0` — 选中某个图层（探针：验证"选中图层后翻转

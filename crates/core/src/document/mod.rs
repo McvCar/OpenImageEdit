@@ -122,6 +122,105 @@ impl Document {
 
 
 
+/// One PSD layer ready to be assembled into a `Document`. Kept in `core` so
+/// the decode crate can hand layers over without a circular dependency.
+#[derive(Debug, Clone)]
+pub struct PsdLayerSeed {
+    pub name: String,
+    pub offset: (i32, i32),
+    pub image: RgbaImage,
+    pub visible: bool,
+    pub opacity: f32,
+}
+
+#[cfg(test)]
+mod psd_assembly_tests {
+    use super::*;
+    use image::Rgba;
+
+    fn seed(
+        name: &str,
+        offset: (i32, i32),
+        color: [u8; 4],
+        size: (u32, u32),
+        visible: bool,
+        opacity: f32,
+    ) -> PsdLayerSeed {
+        PsdLayerSeed {
+            name: name.into(),
+            offset,
+            image: RgbaImage::from_pixel(size.0, size.1, Rgba(color)),
+            visible,
+            opacity,
+        }
+    }
+
+    #[test]
+    fn zero_index_is_transparent_background_and_order_is_preserved() {
+        let doc = Document::from_psd_layers(
+            (8, 6),
+            vec![
+                seed("bottom", (0, 0), [10, 20, 30, 255], (8, 6), true, 1.0),
+                seed("top", (2, 1), [200, 100, 50, 128], (3, 2), false, 0.5),
+            ],
+        );
+        assert_eq!(doc.layers.len(), 3, "背景 + 两个 PSD 层");
+        assert!(doc.layers[0].background);
+        assert!(doc.layers[0].locked);
+        assert_eq!(
+            doc.layers[0].image().unwrap().get_pixel(0, 0),
+            &Rgba([0, 0, 0, 0])
+        );
+        assert_eq!(doc.canvas, Size::new(8, 6));
+        assert_eq!(doc.view, Rect::new(0, 0, 8, 6));
+        assert_eq!(doc.layers[1].name, "bottom");
+        assert_eq!(doc.layers[1].offset(), (0, 0));
+        assert_eq!(doc.layers[2].name, "top");
+        assert_eq!(doc.layers[2].offset(), (2, 1));
+        assert!(!doc.layers[2].visible);
+        assert_eq!(doc.layers[2].opacity, 0.5);
+        assert!(doc.layers[2].is_raster());
+        assert_eq!(doc.edit_epoch, 0);
+        assert!(doc.selection.is_none());
+    }
+
+    #[test]
+    fn flatten_matches_visible_layers() {
+        let doc = Document::from_psd_layers(
+            (4, 4),
+            vec![seed("opaque", (0, 0), [200, 10, 30, 255], (4, 4), true, 1.0)],
+        );
+        assert_eq!(doc.flatten().get_pixel(1, 1), &Rgba([200, 10, 30, 255]));
+    }
+
+    #[test]
+    fn hidden_layer_does_not_appear_in_flatten() {
+        let doc = Document::from_psd_layers(
+            (4, 4),
+            vec![seed("hidden", (0, 0), [200, 10, 30, 255], (4, 4), false, 1.0)],
+        );
+        assert_eq!(doc.flatten().get_pixel(1, 1).0[3], 0);
+    }
+
+    #[test]
+    fn negative_offsets_are_kept_as_is() {
+        let doc = Document::from_psd_layers(
+            (4, 4),
+            vec![seed("neg", (-3, -2), [1, 2, 3, 255], (5, 5), true, 1.0)],
+        );
+        assert_eq!(doc.layers[1].offset(), (-3, -2));
+        assert_eq!(doc.layers[1].bounds().x, -3);
+    }
+
+    #[test]
+    fn empty_seed_list_still_has_a_background() {
+        let doc = Document::from_psd_layers((3, 2), vec![]);
+        assert_eq!(doc.layers.len(), 1);
+        assert!(doc.layers[0].background);
+        assert_eq!(doc.canvas, Size::new(3, 2));
+    }
+}
+
 impl Document {
     pub fn from_image(image: RgbaImage) -> Self {
         let canvas = Size::new(image.width(), image.height());
@@ -130,6 +229,39 @@ impl Document {
             canvas,
             view: Rect::new(0, 0, canvas.width, canvas.height),
             layers: vec![Layer::background(image)],
+            selection: None,
+            edit_epoch: 0,
+            next_layer_seq: 0,
+            history: History::new(256),
+        }
+    }
+
+    /// Assemble an editable document from PSD layers.
+    ///
+    /// `layers[0]` is ALWAYS a transparent full-canvas background (the
+    /// invariant the whole edit/history/panel system relies on); every PSD
+    /// layer becomes an ordinary raster layer above it, bottom -> top.
+    /// A PSD file is therefore opened with `1 + N` rows in the layer panel.
+    pub fn from_psd_layers(canvas: (u32, u32), seeds: Vec<PsdLayerSeed>) -> Self {
+        let size = Size::new(canvas.0.max(1), canvas.1.max(1));
+        let mut layers = Vec::with_capacity(seeds.len() + 1);
+        layers.push(Layer::background(RgbaImage::new(size.width, size.height)));
+        for seed in seeds {
+            let mut layer = Layer::new(seed.name, seed.image);
+            layer.visible = seed.visible;
+            layer.opacity = seed.opacity.clamp(0.0, 1.0);
+            layer.locked = false;
+            layer.background = false;
+            if let Some(raster) = layer.raster_mut() {
+                raster.offset = seed.offset;
+            }
+            layers.push(layer);
+        }
+        Self {
+            source: None,
+            canvas: size,
+            view: Rect::new(0, 0, size.width, size.height),
+            layers,
             selection: None,
             edit_epoch: 0,
             next_layer_seq: 0,

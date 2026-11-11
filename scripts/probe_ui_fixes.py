@@ -74,7 +74,10 @@ def main():
     out = run([script, "--probe-select-all"])
     before = grab(out, "selall-before")
     after = grab(out, "selall-after")
-    check("全选前有选中图层", bool(before) and before.get("selLayer") == "0", str(before))
+    # A25 起 `layers[0]` 恒为背景，抠图结果落在索引 1，所以这里只要求
+    # 「有图层被选中」，不再硬编码 0（那是统一模型之前的单层文档）。
+    check("全选前有选中图层",
+          bool(before) and before.get("selLayer") not in (None, "-1"), str(before))
     check("全选后取消图层选中",
           bool(after) and after.get("selLayer") == "-1", str(after))
     check("全选后选区存在", bool(after) and after.get("selExists") == "true", str(after))
@@ -83,7 +86,8 @@ def main():
     out = run([script, "--probe-select-all-off"])
     after = grab(out, "selall-after")
     check("移动工具关时保留图层选中",
-          bool(after) and after.get("selLayer") == "0" and after.get("moveMode") == "false",
+          bool(after) and after.get("selLayer") not in (None, "-1")
+          and after.get("moveMode") == "false",
           str(after))
 
     # ---- 2. 污点工具开→关，选区工具回来 ----
@@ -106,7 +110,8 @@ def main():
     b = grab(out, "emptyclick-before")
     a = grab(out, "emptyclick-after")
     check("移动工具开：点空白前有图层+选区",
-          bool(b) and b.get("selLayer") == "0" and b.get("selExists") == "true", str(b))
+          bool(b) and b.get("selLayer") not in (None, "-1")
+          and b.get("selExists") == "true", str(b))
     check("移动工具开：点空白取消图层选中",
           bool(a) and a.get("selLayer") == "-1", str(a))
 
@@ -116,7 +121,10 @@ def main():
     check("移动工具关：随手点是区不选图层",
           bool(b) and b.get("pick") == "null", str(b))
     check("移动工具关：点空白保留图层选中",
-          bool(a) and a.get("selLayer") == "0" and a.get("moveMode") == "false", str(a))
+          bool(a) and a.get("selLayer") not in (None, "-1")
+          and a.get("selLayer") == b.get("selLayer")
+          and a.get("moveMode") == "false",
+          str(a))
     check("移动工具关：选区照旧被清掉",
           bool(a) and a.get("selExists") == "false", str(a))
 

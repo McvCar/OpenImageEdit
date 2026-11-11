@@ -789,8 +789,21 @@ Item {
         id: decodePollTimer
         interval: 50
         repeat: true
-        running: bridge.loading && !root.quitting
-        onTriggered: bridge.poll_decode()
+        // PSD stage 2 and the background save encoder both reuse this very
+        // timer: no extra timer, no extra polling loop. psdLayersPending /
+        // saving keep it alive until the worker result is drained.
+        running: (bridge.loading || bridge.psdLayersPending || bridge.saving
+                  || bridge.thumbsPending) && !root.quitting
+        onTriggered: {
+            if (bridge.loading)
+                bridge.poll_decode()
+            if (bridge.psdLayersPending)
+                bridge.poll_psd_layers()
+            if (bridge.saving)
+                bridge.poll_save()
+            if (bridge.thumbsPending)
+                bridge.poll_thumbs()
+        }
     }
 
     function raiseWindow() {
@@ -833,14 +846,15 @@ FileDialog {
     id: saveDialog
     title: "另存为"
     fileMode: FileDialog.SaveFile
-    defaultSuffix: "png"
-    nameFilters: ["PNG (*.png)", "JPEG (*.jpg)", "WebP (*.webp)", "TIFF (*.tiff)", "BMP (*.bmp)", "TGA (*.tga)", "QOI (*.qoi)", "ICO (*.ico)"]
+    // A PSD source keeps its layered format by default; other sources stay PNG.
+    defaultSuffix: String(bridge.fileName || "").toLowerCase().endsWith(".psd") ? "psd" : "png"
+    nameFilters: ["Photoshop (*.psd)", "PNG (*.png)", "JPEG (*.jpg)", "WebP (*.webp)", "TIFF (*.tiff)", "BMP (*.bmp)", "TGA (*.tga)", "QOI (*.qoi)", "ICO (*.ico)"]
     onAccepted: bridge.save_as(selectedFile)
 }
 
 Shortcut { sequences: [StandardKey.Open]; onActivated: openDialog.open() }
 Shortcut { sequences: [StandardKey.New]; onActivated: root.requestNewWindow() }
-Shortcut { sequences: [StandardKey.SaveAs]; onActivated: saveDialog.open() }
+Shortcut { sequences: [StandardKey.SaveAs]; enabled: !bridge.editingLocked && !bridge.saving; onActivated: saveDialog.open() }
 Shortcut { sequence: "F11"; onActivated: root.fullscreen = !root.fullscreen }
 Shortcut { sequence: "Escape"; onActivated: onEscape() }
 // Browse images in the loaded file's folder (guard: no active gesture).
@@ -851,19 +865,19 @@ Shortcut { sequence: "Right"; enabled: canNavigate(); onActivated: navigateRel(1
 // 回车：模态确认框 = 默认动作（保存并打开/切换/关闭）；否则裁剪/粘贴。
 // 数值框正在编辑时禁用：回车属于输入框（提交数值），不能顺手把图裁了。
 Shortcut { sequences: ["Return", "Enter"]
-           enabled: !root.selFieldEditing
+           enabled: !bridge.editingLocked && !root.selFieldEditing
                     && (confirmOverlay.visible || root.pasteFloating
                     || root.selExists || view.canvasSurface.selPolyActive)
            onActivated: onEnter() }
 
-Shortcut { sequence: "Left";  enabled: bridge.selected_layer >= 0; onActivated: nudgeLayer(-1, 0) }
-Shortcut { sequence: "Right"; enabled: bridge.selected_layer >= 0; onActivated: nudgeLayer(1, 0) }
-Shortcut { sequence: "Up";    enabled: bridge.selected_layer >= 0; onActivated: nudgeLayer(0, -1) }
-Shortcut { sequence: "Down";  enabled: bridge.selected_layer >= 0; onActivated: nudgeLayer(0, 1) }
-Shortcut { sequence: "Shift+Left";  enabled: bridge.selected_layer >= 0; onActivated: nudgeLayer(-10, 0) }
-Shortcut { sequence: "Shift+Right"; enabled: bridge.selected_layer >= 0; onActivated: nudgeLayer(10, 0) }
-Shortcut { sequence: "Shift+Up";    enabled: bridge.selected_layer >= 0; onActivated: nudgeLayer(0, -10) }
-Shortcut { sequence: "Shift+Down";  enabled: bridge.selected_layer >= 0; onActivated: nudgeLayer(0, 10) }
+Shortcut { sequence: "Left";  enabled: !bridge.editingLocked && bridge.selected_layer >= 0; onActivated: nudgeLayer(-1, 0) }
+Shortcut { sequence: "Right"; enabled: !bridge.editingLocked && bridge.selected_layer >= 0; onActivated: nudgeLayer(1, 0) }
+Shortcut { sequence: "Up";    enabled: !bridge.editingLocked && bridge.selected_layer >= 0; onActivated: nudgeLayer(0, -1) }
+Shortcut { sequence: "Down";  enabled: !bridge.editingLocked && bridge.selected_layer >= 0; onActivated: nudgeLayer(0, 1) }
+Shortcut { sequence: "Shift+Left";  enabled: !bridge.editingLocked && bridge.selected_layer >= 0; onActivated: nudgeLayer(-10, 0) }
+Shortcut { sequence: "Shift+Right"; enabled: !bridge.editingLocked && bridge.selected_layer >= 0; onActivated: nudgeLayer(10, 0) }
+Shortcut { sequence: "Shift+Up";    enabled: !bridge.editingLocked && bridge.selected_layer >= 0; onActivated: nudgeLayer(0, -10) }
+Shortcut { sequence: "Shift+Down";  enabled: !bridge.editingLocked && bridge.selected_layer >= 0; onActivated: nudgeLayer(0, 10) }
 
 Shortcut { sequences: [StandardKey.ZoomIn, "Ctrl+="]; onActivated: view.queueZoom(1.25) }
 Shortcut { sequences: [StandardKey.ZoomOut]; onActivated: view.queueZoom(1 / 1.25) }
@@ -879,26 +893,29 @@ Shortcut { sequence: "Ctrl+Down";  enabled: root.selExists && root.toolKeysReady
            onActivated: bridge.sel_translate(0, 1) }
 Shortcut { sequences: ["Ctrl+0", "Ctrl+1"]; onActivated: bridge.zoom_actual() }
 Shortcut { sequences: ["Ctrl+9"]; onActivated: bridge.zoom_fit() }
-Shortcut { sequences: [StandardKey.Undo]; onActivated: bridge.undo() }
+// ★ 编辑锁：以下全部是写文档 / 写文件的动作，阶段 2 未完成前一律禁用。
+// 查看类（缩放、平移、打开文件、关闭）不在这里，保持可用。
+Shortcut { sequences: [StandardKey.Undo]; enabled: !bridge.editingLocked; onActivated: bridge.undo() }
 // Redo: explicit keys — StandardKey.Redo maps inconsistently across
 // platforms/layouts, plain strings fire reliably (Ctrl+Y and ⇧Ctrl+Z).
-Shortcut { sequences: ["Ctrl+Shift+Z", "Ctrl+Y"]; onActivated: bridge.redo() }
-Shortcut { sequences: [StandardKey.Save]; onActivated: saveOrSaveAs() }
-Shortcut { sequences: [StandardKey.Copy]; onActivated: doCopy() }
-Shortcut { sequences: [StandardKey.Cut]; onActivated: doCut() }
-Shortcut { sequences: [StandardKey.Paste]; onActivated: doPaste() }
-Shortcut { sequence: "Ctrl+K"; enabled: root.selExists; onActivated: applyCrop() }
+Shortcut { sequences: ["Ctrl+Shift+Z", "Ctrl+Y"]; enabled: !bridge.editingLocked; onActivated: bridge.redo() }
+Shortcut { sequences: [StandardKey.Save]; enabled: !bridge.editingLocked && !bridge.saving; onActivated: saveOrSaveAs() }
+Shortcut { sequences: [StandardKey.Copy]; enabled: !bridge.editingLocked; onActivated: doCopy() }
+Shortcut { sequences: [StandardKey.Cut]; enabled: !bridge.editingLocked; onActivated: doCut() }
+Shortcut { sequences: [StandardKey.Paste]; enabled: !bridge.editingLocked; onActivated: doPaste() }
+Shortcut { sequence: "Ctrl+K"; enabled: !bridge.editingLocked && root.selExists; onActivated: applyCrop() }
 // 调整颜色面板（macOS 预览的调色入口）。
-Shortcut { sequence: "Ctrl+E"; enabled: bridge.image_width > 0
+Shortcut { sequence: "Ctrl+E"; enabled: !bridge.editingLocked && bridge.image_width > 0
            onActivated: root.toggleAdjustPanel() }
-Shortcut { sequence: "Ctrl+L"; onActivated: bridge.rotate_ccw() }
-Shortcut { sequence: "Ctrl+Shift+R"; onActivated: bridge.rotate_cw() }
+Shortcut { sequence: "Ctrl+L"; enabled: !bridge.editingLocked; onActivated: bridge.rotate_ccw() }
+Shortcut { sequence: "Ctrl+Shift+R"; enabled: !bridge.editingLocked; onActivated: bridge.rotate_cw() }
 // Delete/Backspace 在文本输入（文本标记就地编辑 / 字号输入 / 图层
 // 重命名）获得焦点时必须禁用：QML Shortcut 先于焦点项拦截按键，
 // 不禁用会吞掉输入框的退格键，还会误删选中的标记/图层。
 Shortcut { id: deleteShortcut
            sequences: ["Delete", "Backspace"]
-           enabled: !view.canvasSurface.textPopup.visible
+           enabled: !bridge.editingLocked
+                    && !view.canvasSurface.textPopup.visible
                     && !(fontPopover.visible && fontPopover.sizeInput.activeFocus)
                     && !root.selFieldEditing
                     && root.renamingIndex < 0
@@ -911,7 +928,7 @@ Shortcut { id: deleteShortcut
                     })())
            onActivated: onDeleteKey() }
 Shortcut { sequence: "Ctrl+A"
-           enabled: bridge.image_width > 0 && root.renamingIndex < 0
+           enabled: !bridge.editingLocked && bridge.image_width > 0 && root.renamingIndex < 0
                     && !root.selFieldEditing
            onActivated: selectAllCanvas() }
 // ---- 选区（PS 快捷键）----
@@ -971,9 +988,9 @@ Shortcut { sequence: "]"; enabled: root.toolKeysReady && root.canUseToolKeys()
                else
                    root.setQuickRadius(root.quickRadius + 4)
            } }
-Shortcut { sequence: "Ctrl+D"; enabled: root.selExists
+Shortcut { sequence: "Ctrl+D"; enabled: !bridge.editingLocked && root.selExists
            onActivated: bridge.sel_clear() }
-Shortcut { sequence: "Ctrl+Shift+I"; enabled: bridge.image_width > 0
+Shortcut { sequence: "Ctrl+Shift+I"; enabled: !bridge.editingLocked && bridge.image_width > 0
            onActivated: bridge.sel_invert() }
 // Q: 快速蒙版（要看羽化软边在哪就按它）。
 Shortcut { sequence: "Q"; enabled: bridge.image_width > 0 && root.toolKeysReady && root.canUseToolKeys()
@@ -981,7 +998,7 @@ Shortcut { sequence: "Q"; enabled: bridge.image_width > 0 && root.toolKeysReady 
 // ⌘W / ⌘Q: close window / quit, both through the dirty-confirm guard.
 Shortcut { sequence: "Ctrl+W"; onActivated: requestQuit() }
 Shortcut { sequence: "Ctrl+Q"; onActivated: requestQuit() }
-Shortcut { sequence: "Ctrl+R"; onActivated: bridge.rotate_cw() }
+Shortcut { sequence: "Ctrl+R"; enabled: !bridge.editingLocked; onActivated: bridge.rotate_cw() }
 
 // ---- Custom title bar: title + icon toolbar + overflow "…" menu + ----
 // ---- window buttons. The windows are frameless; this bar doubles as ----
@@ -1572,6 +1589,10 @@ function cancelLayerScale() {
 // 单字母快捷键（M/L/Q）只有在没有任何文本输入获得焦点时才生效，否则会
 // 把用户正在输入的字符吞成工具切换。
 function canUseToolKeys() {
+    // ★PSD 阶段 2 编辑锁：加载未完成时整组工具键都不放行（用户 2026-11-12
+    // 定稿）。只判 bridge 属性，不引任何后置 id，避免创建期 TypeError 把
+    // enabled 绑定丢掉、解锁后仍永久 false。
+    const locked = (typeof bridge !== "undefined" && bridge && bridge.editingLocked)
     // 每项都判空：任何一个 id 尚未实例化时抛 TypeError，整组快捷键的
     // enabled 绑定就会被 QML 丢弃并永久停在 false（V/M/L 全按不动）。
     const tp = (typeof view !== "undefined" && view && view.canvasSurface
@@ -1579,7 +1600,8 @@ function canUseToolKeys() {
                ? view.canvasSurface.textPopup : null
     const si = (typeof fontPopover !== "undefined" && fontPopover
                 && fontPopover.sizeInput) ? fontPopover.sizeInput : null
-    return !(tp !== null && tp.visible)
+    return !locked
+        && !(tp !== null && tp.visible)
         && root.renamingIndex < 0
         // 菜单被别处直接藏起来时 selFieldEditing 可能卡在 true；只有菜单
         // 确实开着才认它，否则「开过一次右键菜单 → 快捷键全废」。
@@ -1870,7 +1892,7 @@ function onEscape() {
     if (layerPanel.contextVisible) { layerPanel.closeContext(); return }
     if (root.renamingIndex >= 0) { root.renamingIndex = -1; return }
     if (confirmOverlay.visible) { confirmCancel(); return }
-    if (psdHintOverlay.visible) { psdHintOverlay.visible = false; return }
+    if (psdHintOverlay.visible) { psdHintOverlay.dismiss(); return }
     if (resizeOverlay.visible) { resizeOverlay.visible = false; return }
     if (settingsOverlay.visible) { settingsOverlay.visible = false; return }
     if (root.scaleW > 0) { cancelLayerScale(); return }
@@ -2562,6 +2584,14 @@ PsdHintOverlay {
     host: root
 }
 
+// Rust publishes a one-shot PSD notice (degraded layers / skipped stage 2 /
+// downsampled read-only). This is a pure info overlay — it never blocks save.
+property string psdNoticeText: bridge.psdNotice
+onPsdNoticeTextChanged: {
+    if (psdNoticeText.length > 0)
+        psdHintOverlay.showNotice(psdNoticeText, "PSD 分层说明")
+}
+
 SettingsOverlay {
     id: settingsOverlay
     bridge: bridge
@@ -2629,6 +2659,9 @@ function navigateRel(dir) {
 }
 
 function requestClose(close) {
+    // 窗口关闭也必须解锁（C2-c）：任何残留的锁都不该活过本次会话。
+    if (bridge.editingLocked)
+        bridge.skip_psd_layers()
     if (root.quitting)
         return
     if (bridge.dirty && !root.forceClose) {
@@ -2667,21 +2700,21 @@ function confirmProceed() {
 // no source file (pasted image, new window) has nothing to overwrite, so
 // fall back to the Save-As dialog.
 //
-// PSD documents are preview-only (layers were merged at open and there
-// is no PSD encoder): block the direct save with an explanatory dialog
-// that routes to Save-As instead.
-function sourceIsPsd() {
-    return String(bridge.fileName || "").toLowerCase().endsWith(".psd")
-}
-
+// PSD is a first-class save format now: no UI-level interception remains.
+// Rust `Session::save_target` is the single gate (composite-only / downsampled
+// read-only), and encoding runs on a worker thread.
 function saveOrSaveAs() {
-    if (bridge.fileName.length > 0) {
-        if (sourceIsPsd()) {
-            psdHintOverlay.visible = true
-            return
-        }
+    // 阶段 2 未完成时保存入口整体禁用（连同菜单与 Ctrl+S）。
+    if (bridge.editingLocked) {
+        bridge.psd_locked_hint()
+        return
+    }
+    // 后台编码期间不允许叠加第二次保存。
+    if (bridge.saving)
+        return
+    if (bridge.fileName.length > 0)
         bridge.save_edited()
-    } else
+    else
         saveDialog.open()
 }
 
@@ -2689,6 +2722,10 @@ function saveOrSaveAs() {
 // edited image, then continue whatever the user originally asked for
 // (open another file / navigate / close the window).
 function confirmSaveProceed() {
+    if (bridge.editingLocked) {
+        bridge.psd_locked_hint()
+        return
+    }
     const mode = root.confirmMode
     // No source file: saving needs a destination first; let the user
     // pick one instead of discarding the edits silently.
@@ -2698,14 +2735,8 @@ function confirmSaveProceed() {
         saveDialog.open()
         return
     }
-    // PSD source: direct save is blocked, so the "save and proceed"
-    // action degrades to Save-As (the dialog drives the continuation).
-    if (sourceIsPsd()) {
-        confirmOverlay.visible = false
-        root.confirmMode = ""
-        psdHintOverlay.visible = true
-        return
-    }
+    // PSD sources are saved in place just like any other document; the
+    // Rust gate reports an actionable hint if write-back is unsafe.
     bridge.save_edited()
     confirmOverlay.visible = false
     root.confirmMode = ""

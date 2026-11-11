@@ -32,6 +32,8 @@ Item {
     readonly property int rowHeight: 44
     readonly property int rowSpacing: 3
     readonly property int multiCount: bridge.selectedLayerCount
+    // PSD 阶段 2：图层后台加载完成前，面板所有命令一律灰掉并给进度提示。
+    readonly property bool editLocked: bridge.editingLocked
     // 按钮 hover 时的说明文字（面板里没有原生 tooltip，用一个固定行显示，
     // 免得浮层跑出面板边界）。
     property string hintText: ""
@@ -59,6 +61,8 @@ Item {
         property string tip: ""
         property bool usable: true
         property bool danger: false
+        // 编辑锁是全局的，按钮自身的 usable 只管「本命令当前是否可用」。
+        readonly property bool effectiveUsable: usable && !layerPanel.editLocked
         signal activated()
         // 不可用时被点了一下。★默认的写法是给 MouseArea 挂 `enabled: usable`，
         // 结果按钮变灰之后连 hover 都没了：没有说明文字、点下去也毫无反馈，
@@ -67,18 +71,18 @@ Item {
         width: 26
         height: 24
         radius: 4
-        color: !usable ? "transparent"
+        color: !effectiveUsable ? "transparent"
              : (btnMa.containsMouse ? (btn.danger ? "#5d2c30" : "#414852")
                                     : "#2c3137")
-        border.width: usable ? 1 : 0
+        border.width: effectiveUsable ? 1 : 0
         border.color: btn.danger ? "#4d3033" : "#3a4048"
-        opacity: usable ? 1.0 : 0.35
+        opacity: effectiveUsable ? 1.0 : 0.35
 
         Text {
             anchors.centerIn: parent
             visible: btn.icon === ""
             text: btn.glyph
-            color: btnMa.containsMouse && btn.usable
+            color: btnMa.containsMouse && btn.effectiveUsable
                    ? (btn.danger ? "#ff9b9b" : "#ffffff") : "#c6ccd3"
             font.pixelSize: 13
             font.family: "Segoe UI Symbol"
@@ -90,7 +94,7 @@ Item {
             height: 16
             visible: btn.icon !== ""
             property string kind: btn.icon
-            property color tint: btnMa.containsMouse && btn.usable
+            property color tint: btnMa.containsMouse && btn.effectiveUsable
                                  ? (btn.danger ? "#ff9b9b" : "#ffffff") : "#c6ccd3"
             onKindChanged: requestPaint()
             onTintChanged: requestPaint()
@@ -140,9 +144,12 @@ Item {
                 else if (layerPanel.hintText === btn.tip)
                     layerPanel.hintText = ""
             }
-            cursorShape: btn.usable ? Qt.PointingHandCursor : Qt.ArrowCursor
+            cursorShape: btn.effectiveUsable ? Qt.PointingHandCursor : Qt.ArrowCursor
             onClicked: {
-                if (btn.usable) {
+                if (layerPanel.editLocked) {
+                    layerPanel.hintText = "图层仍在后台加载，可点「跳过图层加载」"
+                    bridge.psd_locked_hint()
+                } else if (btn.effectiveUsable) {
                     btn.activated()
                 } else {
                     // 灰按钮也要能问出「为什么」：把 tip 亮在提示行里，
@@ -196,6 +203,47 @@ Item {
                           : "暂无图层"
                     color: "#7b828a"
                     font.pixelSize: 11
+                }
+            }
+
+            // ---- PSD 阶段 2：逐层进度 + 「跳过图层加载」逃生口 ----
+            // 用户定稿：阶段 2 期间禁用全部编辑工具，所以必须能看见进度、
+            // 并且随时能一键解锁，避免大文件把人锁死（C2-a / C2-b）。
+            Rectangle {
+                width: parent.width
+                height: 42
+                visible: layerPanel.editLocked
+                color: "#26313d"
+                border.color: "#46617c"
+                border.width: 1
+                radius: 5
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 8
+                    anchors.right: parent.right
+                    anchors.rightMargin: 8
+                    anchors.top: parent.top
+                    anchors.topMargin: 4
+                    text: bridge.psdProgress.length > 0
+                          ? bridge.psdProgress : "正在加载图层…"
+                    color: "#dce6f0"
+                    font.pixelSize: 10
+                    elide: Text.ElideRight
+                }
+                Text {
+                    anchors.right: parent.right
+                    anchors.rightMargin: 8
+                    anchors.bottom: parent.bottom
+                    anchors.bottomMargin: 4
+                    text: "跳过图层加载，以合并预览继续编辑 ›"
+                    color: "#8ec5ff"
+                    font.pixelSize: 10
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: bridge.skip_psd_layers()
+                    }
                 }
             }
 
@@ -364,9 +412,12 @@ Item {
                     readonly property bool isMark: row !== null && row.k === "mark"
                     readonly property bool renaming: host.renamingIndex !== -1
                         && row !== null && host.renamingIndex === row.i
-                    // 缩略图：把 layerEpoch 读一遍当依赖，像素一改就重新取。
+                    // 缩略图：layerEpoch = 像素变化，thumbEpoch = 后台分批
+                    // 写入完成（C6）。两者都读一遍当依赖，避免 100 层首次
+                    // 展开时 UI 线程同步缩图。
                     readonly property string thumbUrl: {
                         const epoch = bridge.layerEpoch
+                        const batch = bridge.thumbEpoch
                         return row ? bridge.layer_thumb_url(row.i) : ""
                     }
 
@@ -910,6 +961,12 @@ Item {
 
     // 打开右键图层菜单（layerPanel 坐标），夹在面板内不溢出。
     function openLayerContext(index, locked, panelPos) {
+        // 编辑锁期间不打开任何带输入框的浮层（焦点会静默废掉 Delete /
+        // 工具键，见既有坑），也不给右键命令任何入口。
+        if (layerPanel.editLocked) {
+            bridge.psd_locked_hint()
+            return
+        }
         layerContext.targetIndex = index
         layerContext.targetLocked = locked
         layerContext.targetIsMark = false

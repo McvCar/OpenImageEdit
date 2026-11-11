@@ -311,6 +311,14 @@ Item {
         }
 
         onPressed: (mouse) => {
+            // ★PSD 阶段 2 编辑锁：只放行中键平移与滚轮缩放（onWheel 是独立
+            // 处理器，不受这里影响），落笔 / 拾取 / 右键菜单一律忽略。
+            // 不能把整个 MouseArea 设成 enabled:false，那样连导航都被吞。
+            if (bridge.editingLocked && mouse.button !== Qt.MiddleButton) {
+                bridge.psd_locked_hint()
+                mouse.accepted = true
+                return
+            }
             // 按下画布 = 离开所有浮层输入框：字号框握着 activeFocus 会把
             // Delete / 工具键整组禁掉（详见 host.dropPopoverFocus 注释）。
             host.dropPopoverFocus()
@@ -1038,6 +1046,12 @@ Item {
         }
 
         onPressed: (mouse) => {
+            // ★PSD 阶段 2 编辑锁：标记 / 变换手柄同样不许起手势。
+            if (bridge.editingLocked && mouse.button !== Qt.MiddleButton) {
+                bridge.psd_locked_hint()
+                mouse.accepted = true
+                return
+            }
             // 正在就地编辑文本：点击别处先提交编辑。
             if (textPopup.visible) {
                 textPopup.close(true)

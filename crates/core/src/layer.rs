@@ -55,7 +55,10 @@ pub struct Layer {
 }
 
 /// 等比缩到 `max` 见方并居中，其余透明。
-fn fit_thumbnail(src: &RgbaImage, max: u32) -> RgbaImage {
+///
+/// 公开给 UI 的 PSD stage-2 后台线程：图层位图还在 worker 手上时就把 40px
+/// 缩略图算好，UI 线程首次展开 100 层只做缓存命中（C6，单次 ≤16ms）。
+pub fn thumbnail_image(src: &RgbaImage, max: u32) -> RgbaImage {
     let mut out = RgbaImage::new(max, max);
     let (w, h) = src.dimensions();
     if w == 0 || h == 0 {
@@ -139,10 +142,10 @@ impl Layer {
         // 位图直接引用原图（不克隆整层 —— 大图层克隆一次就是几十 MB）；
         // 标记才临时画一张小的。
         match &self.content {
-            LayerContent::Raster(r) => fit_thumbnail(&r.image, max),
+            LayerContent::Raster(r) => thumbnail_image(&r.image, max),
             LayerContent::Mark(_) => {
                 let (img, _) = self.plane();
-                fit_thumbnail(&img, max)
+                thumbnail_image(&img, max)
             }
         }
     }

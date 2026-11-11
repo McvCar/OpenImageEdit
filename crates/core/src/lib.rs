@@ -33,7 +33,7 @@ pub use selection::{
     QuickSelectOptions, SelOps, SelShape, SelectionMask, SelectionState, WandOptions,
 };
 pub use mark::{MarkKind, Mark};
-pub use layer::{Layer, LayerContent, LayerId, RasterLayer};
+pub use layer::{thumbnail_image, Layer, LayerContent, LayerId, RasterLayer};
 pub use layer_ops::{AlignEdge, DistributeAxis};
 pub use layer_transform::{
     probe_lines as transform_probe_lines, Affine2, BoundsSolve, Field, LayerTransform, PanelValues,
@@ -48,7 +48,7 @@ pub use retouch::{
     heal_clone, patch_fill, spot_heal, stroke_mask, BrushSpec, StrokeMask,
 };
 pub use op::{EditError, EditOp};
-pub use document::Document;
+pub use document::{Document, PsdLayerSeed};
 pub(crate) use document::DocumentSnapshot;
 
 // Cross-module private helpers (kept `pub(crate)` + re-exported so each

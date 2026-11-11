@@ -47,6 +47,12 @@ pub(in crate::bridge) struct Session {
     /// document. The status bar keeps a persistent hint (refreshes rebuild
     /// the status text, so a one-shot message would be wiped instantly).
     pub(in crate::bridge) downsampled_from: Option<(u32, u32)>,
+    /// True only when the document was assembled from real PSD layer seeds.
+    /// A composite-only PSD (stage 2 failed / skipped / flat / downsampled)
+    /// must NOT be written back as PSD — that would destroy the original
+    /// layer stack (§8). Plain image documents leave this false but can still
+    /// be "Saved As" a new PSD (a fresh layered file from their flat pixels).
+    pub(in crate::bridge) psd_layered: bool,
     /// Decoder hint shown in the status bar (e.g. PSD flattened preview).
     pub(in crate::bridge) note: Option<String>,
     /// Screen device-pixel-ratio (OS scaling, e.g. 1.25 at 125%). Kept on the
@@ -307,10 +313,145 @@ pub(in crate::bridge) struct AdjustLive {
     pub(in crate::bridge) params: Adjust,
 }
 
+/// Stage-2 (PSD layer parsing) progress / result messages. The worker sends
+/// one `Progress` per layer so the UI can show "已加载 k/N 层" while the
+/// editing lock is held (C2-a).
+pub(in crate::bridge) enum PsdLayerMsg {
+    Progress { done: usize, total: usize },
+    Done {
+        result: Result<decode::PsdLayerSet, String>,
+        elapsed_ms: u64,
+        /// 40px thumbnails already rendered by the worker, in the same
+        /// bottom-to-top order as `PsdLayerSet::layers` (C6). Each is only
+        /// 6.4 KB, and dropping a discarded job leaves no temp files behind.
+        thumbs: Vec<RgbaImage>,
+    },
+}
+
+/// C6: the stage-2 worker owns every full-resolution layer bitmap, so it
+/// renders the panel thumbnails there. The UI thread never calls
+/// `imageops::thumbnail` on a 12MP layer while the window is being laid out.
+fn psd_thumb_images(set: &decode::PsdLayerSet) -> Vec<RgbaImage> {
+    set.layers
+        .iter()
+        .map(|layer| editcore::thumbnail_image(&layer.image, 40))
+        .collect()
+}
+
 /// Message from the background decode worker (see `BridgeRust::decode_job`).
+/// `layer_job` is `Some` only for interactive PSD opens; the stage-2 thread is
+/// already running when this message is sent, so the first frame never waits
+/// for it (C2).
 pub(in crate::bridge) struct DecodeMsg {
     pub(in crate::bridge) path: PathBuf,
     pub(in crate::bridge) result: Result<(Decoded, i32), String>,
+    pub(in crate::bridge) layer_job: Option<mpsc::Receiver<PsdLayerMsg>>,
+}
+
+/// Start the stage-2 PSD layer parse on its own thread. Returns `None` for
+/// non-PSD files (or any file that should stay composite-only). Dropping the
+/// receiver discards a superseded job's result without touching Qt state.
+pub(in crate::bridge) fn spawn_psd_layer_job(
+    path: &Path,
+    opts: decode::DecodeOptions,
+) -> Option<mpsc::Receiver<PsdLayerMsg>> {
+    if !is_psd_path(path) {
+        return None;
+    }
+    let (tx, rx) = mpsc::channel::<PsdLayerMsg>();
+    let owned = path.to_path_buf();
+    std::thread::spawn(move || {
+        let t0 = Instant::now();
+        // Automation-only hooks. They are inert unless the matching env vars
+        // are set, and let probes exercise slow / failed stage-2 paths
+        // without shipping a multi-hundred-MB PSD.
+        //
+        // The delay is injected PER LAYER, i.e. while the UI is already
+        // polling, not at thread start: stage-2 is launched by prewarm before
+        // the first frame lands, so a start-of-thread sleep would be spent
+        // before the editing lock is even raised and would not exercise the
+        // lock at all.
+        let per_layer_ms = std::env::var("IMAGEEDIT_PSD_STAGE2_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let nap = std::time::Duration::from_millis(per_layer_ms);
+        let force_fail = std::env::var("IMAGEEDIT_PSD_STAGE2_FAIL").is_ok();
+        let result = if force_fail {
+            Err("模拟分层解析失败（自动化测试钩子）".into())
+        } else {
+            (|| -> Result<decode::PsdLayerSet, String> {
+                let bytes = std::fs::read(&owned).map_err(|e| e.to_string())?;
+                decode::decode_psd_layers_with_progress(&bytes, opts, |done, total| {
+                    let _ = tx.send(PsdLayerMsg::Progress { done, total });
+                    if !nap.is_zero() {
+                        std::thread::sleep(nap);
+                    }
+                })
+                .map_err(|e| e.to_string())
+            })()
+        };
+        let thumbs = match &result {
+            Ok(set) => psd_thumb_images(set),
+            Err(_) => Vec::new(),
+        };
+        let _ = tx.send(PsdLayerMsg::Done {
+            result,
+            elapsed_ms: t0.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            thumbs,
+        });
+    });
+    Some(rx)
+}
+
+/// Result of one background encode job. Encoding (which can take 1~2 s for a
+/// large layered PSD) never runs on the UI thread (C5); only the atomic
+/// rename and the dirty/source update happen there.
+pub(in crate::bridge) struct SaveMsg {
+    pub(in crate::bridge) bytes: Result<Vec<u8>, String>,
+    pub(in crate::bridge) encode_ms: u64,
+    pub(in crate::bridge) is_psd: bool,
+}
+
+/// Everything the UI thread needs to finish a save once the worker is done.
+/// `epoch` is the document's `edit_epoch` at snapshot time: if the user kept
+/// editing while the encode ran, the completion must NOT clear `dirty`.
+pub(in crate::bridge) struct SaveJob {
+    pub(in crate::bridge) path: PathBuf,
+    pub(in crate::bridge) format: SaveFormat,
+    pub(in crate::bridge) epoch: u64,
+    pub(in crate::bridge) session_id: u32,
+    pub(in crate::bridge) update_source: bool,
+    pub(in crate::bridge) rx: mpsc::Receiver<SaveMsg>,
+}
+
+/// Encode a cloned Document snapshot on a worker thread. `catch_unwind`
+/// keeps a malformed layer from taking down the app (panic=unwind is a
+/// release hard constraint). Dropping the receiver cancels the job.
+pub(in crate::bridge) fn spawn_save_job(
+    doc: &Document,
+    format: SaveFormat,
+    quality: u8,
+) -> mpsc::Receiver<SaveMsg> {
+    let snapshot = doc.clone();
+    let (tx, rx) = mpsc::channel::<SaveMsg>();
+    std::thread::spawn(move || {
+        let t0 = Instant::now();
+        let bytes: Result<Vec<u8>, String> =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                encode_document(&snapshot, format, quality)
+            })) {
+                Ok(Ok(v)) => Ok(v),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("编码时发生内部错误，已取消保存（原文件未被修改）".into()),
+            };
+        let _ = tx.send(SaveMsg {
+            bytes,
+            encode_ms: t0.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            is_psd: matches!(format, SaveFormat::Psd),
+        });
+    });
+    rx
 }
 
 /// Longest-edge cap applied when the user enables downsampling-first open.
@@ -570,8 +711,38 @@ impl Session {
         save_quality: u8,
         dpr: f64,
     ) -> (Self, i32) {
+        Self::from_decoded_with_layers(path, decoded, viewport, save_quality, dpr, None)
+    }
+
+    /// Same as `from_decoded`, but installs the real PSD layer stack when the
+    /// stage-2 parse is already available (synchronous/automation path).
+    pub(in crate::bridge) fn from_decoded_with_layers(
+        path: &Path,
+        decoded: Decoded,
+        viewport: Size,
+        save_quality: u8,
+        dpr: f64,
+        layers: Option<decode::PsdLayerSet>,
+    ) -> (Self, i32) {
         let t0 = Instant::now();
-        let doc = Document::from_image(decoded.image);
+        let layered = matches!(&layers, Some(set) if !set.layers.is_empty());
+        let (doc, note) = match layers {
+            Some(set) if !set.layers.is_empty() => {
+                let mut text = format!("PSD 分层已就绪：{} 个可编辑图层", set.layer_count());
+                if !set.degraded.is_empty() {
+                    text.push_str(&format!(
+                        "（已降级 {} 项：{}）",
+                        set.degraded.len(),
+                        set.degraded.join("、")
+                    ));
+                }
+                (
+                    Document::from_psd_layers(set.canvas, set.into_seeds()),
+                    Some(text),
+                )
+            }
+            _ => (Document::from_image(decoded.image), decoded.note.clone()),
+        };
         let dpr = if dpr.is_finite() && dpr > 0.0 { dpr } else { 1.0 };
         let zoom = fit_zoom(doc.canvas, viewport, dpr);
         let ms = t0.elapsed().as_millis().min(i32::MAX as u128) as i32;
@@ -598,7 +769,8 @@ impl Session {
                 last_render: None,
                 adjust: None,
                 downsampled_from: decoded.downsampled_from,
-                note: decoded.note,
+                psd_layered: layered,
+                note,
                 dpr,
                 quick_mask: false,
                 sel_rev: 0,
@@ -642,7 +814,25 @@ impl Session {
         let t0 = Instant::now();
         let decoded = decode_path(path, opts).map_err(|e| e.to_string())?;
         let decode_ms = t0.elapsed().as_millis().min(i32::MAX as u128) as i32;
-        let (session, _) = Self::from_decoded(path, decoded, viewport, save_quality, dpr);
+        // Automation (--script / --selftest / probes) must see the FINAL
+        // layered document inline. It never goes through the editing lock.
+        // IMAGEEDIT_PSD_SYNC_COMPOSITE is a probe-only hook that keeps the
+        // composite placeholder, so the write-back guard can be exercised
+        // without an asynchronous stage-2 run.
+        let force_composite = std::env::var("IMAGEEDIT_PSD_SYNC_COMPOSITE").is_ok();
+        let layers = if is_psd_path(path)
+            && decoded.downsampled_from.is_none()
+            && !force_composite
+        {
+            std::fs::read(path)
+                .ok()
+                .and_then(|bytes| decode::decode_psd_layers(&bytes, opts).ok())
+                .filter(|set| !set.layers.is_empty())
+        } else {
+            None
+        };
+        let (session, _) =
+            Self::from_decoded_with_layers(path, decoded, viewport, save_quality, dpr, layers);
         Ok((session, decode_ms))
     }
 
@@ -917,50 +1107,45 @@ impl Session {
         AdjustTarget::Base
     }
 
-    pub(in crate::bridge) fn default_save_path(&self) -> (PathBuf, Format) {
+    /// Default "Save a copy" target. A PSD source now defaults to `.psd` —
+    /// the encoder exists, so `<stem>-edited.png` is no longer necessary.
+    pub(in crate::bridge) fn default_save_path(&self) -> (PathBuf, SaveFormat) {
         match &self.source {
             Some(src) => {
                 let stem = src
                     .file_stem()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "image".to_string());
-                // A PSD source can't be re-encoded (no PSD writer); default
-                // the target to PNG instead of a corrupt "<stem>-edited.psd".
                 let format = save_format_for_source(src);
                 (
-                    src.with_file_name(format!("{stem}-edited.{}", extension_for(format))),
+                    src.with_file_name(format!(
+                        "{stem}-edited.{}",
+                        extension_for_save(format)
+                    )),
                     format,
                 )
             }
             None => (
                 std::env::temp_dir().join("imageedit-edited.png"),
-                Format::Png,
+                SaveFormat::Image(Format::Png),
             ),
         }
     }
 
-    /// Ctrl+S semantics: overwrite the file the document was loaded from,
-    /// keeping its original format. Without a source (e.g. a pasted image)
-    /// there is nothing to overwrite — QML routes those to the Save-As
-    /// dialog instead.
+    /// Validate a save target and return its EXPLICIT format. This is the
+    /// single gate behind both Ctrl+S and Save-As: `.psd` can never fall
+    /// through to `unwrap_or(Png)` and write image bytes into a PSD file.
     ///
-    /// PSD is preview-only (the decoder flattens layers and image 0.25 has
-    /// no PSD encoder): saving back would `unwrap_or(Png)` into PNG bytes
-    /// written to the .psd path. Block it with an actionable hint.
-    pub(in crate::bridge) fn save(&self) -> Result<PathBuf, String> {
-        let src = self.source.clone().ok_or_else(|| "没有可保存的文件".to_string())?;
-        if is_psd_path(&src) {
-            return Err(PSD_SAVE_HINT.to_string());
-        }
-        let format = save_format_for_source(&src);
-        self.write_to(&src, format)?;
-        Ok(src)
-    }
-
-    pub(in crate::bridge) fn write_to(&self, path: &Path, format: Format) -> Result<(), String> {
-        let bytes = encode(&self.doc.flatten(), format, self.save_quality)
-            .map_err(|e| e.to_string())?;
-        std::fs::write(path, bytes).map_err(|e| e.to_string())
+    /// §8 / C8: a composite-only PSD (layers skipped / failed / flat /
+    /// downsampled) or any downsampled source overwrite is rejected with an
+    /// actionable hint; exporting to a DIFFERENT path stays allowed.
+    pub(in crate::bridge) fn save_target(&self, target: &Path) -> Result<SaveFormat, String> {
+        validate_save_target(
+            target,
+            self.source.as_deref(),
+            self.downsampled_from.is_some(),
+            self.psd_layered,
+        )
     }
 
     /// 面板用的图层列表（显示顺序 = 顶 → 底）。

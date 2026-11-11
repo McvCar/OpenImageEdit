@@ -485,6 +485,13 @@ impl qobject::Bridge {
                 return QString::from(url.as_str());
             }
         }
+        // C6: while the stage-2 pre-rendered batch is being written, never
+        // fall through to a synchronous full-resolution downscale here —
+        // QML rebinds every row on thumbEpoch, which would turn the batched
+        // work straight back into one 100-layer UI stall.
+        if *self.thumbs_pending() {
+            return QString::default();
+        }
         let thumb = {
             let guard = self.session.borrow();
             let Some(session) = guard.as_ref() else {

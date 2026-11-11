@@ -91,22 +91,23 @@ pub(in crate::bridge) fn file_url(path: &Path) -> String {
     out
 }
 
-pub(in crate::bridge) fn extension_for(format: Format) -> &'static str {
+/// File extension for a save target. `SaveFormat` is explicit: image 0.25's
+/// extension map returns `None` for `.psd`, and blindly falling back to PNG
+/// once wrote PNG bytes into a `.psd` file.
+pub(in crate::bridge) fn extension_for_save(format: SaveFormat) -> &'static str {
     match format {
-        Format::Jpeg => "jpg",
-        Format::Png => "png",
-        Format::WebP => "webp",
-        Format::Bmp => "bmp",
-        Format::Tiff => "tiff",
-        Format::Gif => "gif",
-        _ => "png",
+        SaveFormat::Psd => "psd",
+        SaveFormat::Image(Format::Jpeg) => "jpg",
+        SaveFormat::Image(Format::Png) => "png",
+        SaveFormat::Image(Format::WebP) => "webp",
+        SaveFormat::Image(Format::Bmp) => "bmp",
+        SaveFormat::Image(Format::Tiff) => "tiff",
+        SaveFormat::Image(Format::Gif) => "gif",
+        SaveFormat::Image(_) => "png",
     }
 }
 
-/// True when the path points at a Photoshop document. PSD is preview-only
-/// (the decoder flattens layers) and image 0.25 has no PSD encoder — its
-/// extension map returns None for `.psd`, so every `unwrap_or(Format::Png)`
-/// save path would silently write PNG bytes into the .psd file.
+/// True when the path points at a Photoshop document.
 pub(in crate::bridge) fn is_psd_path(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -114,18 +115,87 @@ pub(in crate::bridge) fn is_psd_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-pub(in crate::bridge) const PSD_SAVE_HINT: &str = "PSD 是预览专用格式（打开时图层已合并），不能直接保存原文件，请用「另存为」导出 PNG / JPEG 等格式";
+/// C8: a downsampled (>8192px) document must never overwrite its source —
+/// that would silently discard the original resolution.
+pub(in crate::bridge) const DOWNSAMPLED_HINT: &str = "此文件以降采样预览打开，写回会丢失分辨率；请关闭「大图优先降采样」后重新打开，或另存为其它文件";
 
-/// Encode format for saving a document loaded from `path`. PSD sources fall
-/// back to PNG: image 0.25 has no PSD encoder and its extension map returns
-/// None for `.psd`, so the historical `unwrap_or(Format::Png)` here is what
-/// silently wrote PNG bytes into .psd files.
-pub(in crate::bridge) fn save_format_for_source(path: &Path) -> Format {
+/// A PSD opened as a composite (stage 2 failed / skipped / flat file) has no
+/// layer stack. Writing it back as PSD would destroy the original layers.
+pub(in crate::bridge) const PSD_COMPOSITE_HINT: &str = "此 PSD 以合并预览打开（图层未加载或已跳过），直接写回会丢失原图层；请重新打开并等待图层加载完成，或另存为 PNG / JPEG 等格式";
+
+/// Explicit format for ANY save target (source path or Save-As hand-typed
+/// path). Never `unwrap_or(Png)` on a `.psd` — that was the historical bug.
+pub(in crate::bridge) fn save_format_for_target(path: &Path) -> SaveFormat {
     if is_psd_path(path) {
-        Format::Png
+        SaveFormat::Psd
     } else {
-        format_from_path(path).unwrap_or(Format::Png)
+        SaveFormat::Image(format_from_path(path).unwrap_or(Format::Png))
     }
+}
+
+/// Save format for Ctrl+S (the document's own source path).
+pub(in crate::bridge) fn save_format_for_source(path: &Path) -> SaveFormat {
+    save_format_for_target(path)
+}
+
+/// Pure validation of a save target (unit-testable without a full Session).
+/// `Session::save_target` is a thin wrapper over this.
+pub(in crate::bridge) fn validate_save_target(
+    target: &Path,
+    source: Option<&Path>,
+    downsampled: bool,
+    psd_layered: bool,
+) -> Result<SaveFormat, String> {
+    let format = save_format_for_target(target);
+    let overwriting_source = source == Some(target);
+    // C8: overwriting a downsampled source silently discards resolution.
+    if downsampled && overwriting_source {
+        return Err(DOWNSAMPLED_HINT.to_string());
+    }
+    if matches!(format, SaveFormat::Psd) {
+        if downsampled {
+            return Err(DOWNSAMPLED_HINT.to_string());
+        }
+        // A PSD opened as a composite has no layer stack to write back.
+        if source.map(is_psd_path).unwrap_or(false) && !psd_layered {
+            return Err(PSD_COMPOSITE_HINT.to_string());
+        }
+    }
+    Ok(format)
+}
+
+/// Atomic write: `<target>.imageedit-<pid>.tmp` → flush+sync → rename over
+/// the target. A failure at any point leaves the original file untouched.
+/// On Windows `std::fs::rename` uses MOVEFILE_REPLACE_EXISTING, so overwriting
+/// an existing document works without a remove-then-write gap.
+pub(in crate::bridge) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| format!("无法创建目录：{e}"))?;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let tmp = path.with_extension(format!(
+        "{ext}.imageedit-{}.tmp",
+        std::process::id()
+    ));
+    let write = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("保存失败（原文件未被修改）：{e}"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -142,12 +212,94 @@ mod psd_save_guard_tests {
     }
 
     #[test]
-    fn psd_source_save_format_falls_back_to_png() {
+    fn save_formats_are_explicit_for_every_target() {
         // The corruption bug: .psd + unwrap_or(Png) wrote PNG bytes into the
-        // .psd file. Explicit fallback + no .psd target anywhere.
-        assert_eq!(save_format_for_source(Path::new("D:/art/ui.psd")), Format::Png);
-        assert_eq!(save_format_for_source(Path::new("D:/art/ui.PNG")), Format::Png);
-        assert_eq!(save_format_for_source(Path::new("D:/art/a.jpg")), Format::Jpeg);
-        assert_eq!(save_format_for_source(Path::new("D:/art/unknown.xyz")), Format::Png);
+        // .psd file. Now .psd maps to SaveFormat::Psd, never to an image format.
+        assert_eq!(save_format_for_source(Path::new("D:/art/ui.psd")), SaveFormat::Psd);
+        assert_eq!(save_format_for_target(Path::new("D:/art/hand.PSD")), SaveFormat::Psd);
+        assert_eq!(
+            save_format_for_source(Path::new("D:/art/ui.PNG")),
+            SaveFormat::Image(Format::Png)
+        );
+        assert_eq!(
+            save_format_for_source(Path::new("D:/art/a.jpg")),
+            SaveFormat::Image(Format::Jpeg)
+        );
+        assert_eq!(
+            save_format_for_target(Path::new("D:/art/unknown.xyz")),
+            SaveFormat::Image(Format::Png)
+        );
+        assert_eq!(extension_for_save(SaveFormat::Psd), "psd");
+        assert_eq!(extension_for_save(SaveFormat::Image(Format::Jpeg)), "jpg");
+    }
+
+    #[test]
+    fn writeback_guards_cover_composite_and_downsampled_cases() {
+        let src = Path::new("D:/art/ui.psd");
+        let png = Path::new("D:/art/ui.png");
+        // Fully layered PSD: Ctrl+S and Save-As PSD both allowed.
+        assert_eq!(validate_save_target(src, Some(src), false, true), Ok(SaveFormat::Psd));
+        assert_eq!(
+            validate_save_target(Path::new("D:/art/copy.psd"), Some(src), false, true),
+            Ok(SaveFormat::Psd)
+        );
+        // Composite-only PSD source: writing back as PSD is forbidden, but
+        // exporting to PNG (including a different path) stays available.
+        assert_eq!(
+            validate_save_target(src, Some(src), false, false),
+            Err(PSD_COMPOSITE_HINT.to_string())
+        );
+        assert_eq!(
+            validate_save_target(Path::new("D:/art/out.png"), Some(src), false, false),
+            Ok(SaveFormat::Image(Format::Png))
+        );
+        // A plain image may be Saved As a NEW PSD (one flat layer).
+        assert_eq!(
+            validate_save_target(Path::new("D:/art/new.psd"), Some(png), false, false),
+            Ok(SaveFormat::Psd)
+        );
+        // C8: downsampled source overwrite (any format) + any PSD write.
+        assert_eq!(
+            validate_save_target(src, Some(src), true, true),
+            Err(DOWNSAMPLED_HINT.to_string())
+        );
+        assert_eq!(
+            validate_save_target(Path::new("D:/art/copy.psd"), Some(src), true, true),
+            Err(DOWNSAMPLED_HINT.to_string())
+        );
+        assert_eq!(
+            validate_save_target(Path::new("D:/art/export.png"), Some(src), true, true),
+            Ok(SaveFormat::Image(Format::Png))
+        );
+        // Historical bug guard: a hand-typed .psd must never become PNG bytes.
+        assert_eq!(
+            validate_save_target(Path::new("D:/art/hand.PSD"), None, false, false),
+            Ok(SaveFormat::Psd)
+        );
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file_and_keeps_it_on_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "imageedit-atomic-{}",
+            std::process::id()
+        ));
+        let path = dir.join("doc.psd");
+        let _ = std::fs::remove_file(&path);
+        atomic_write(&path, b"first").expect("create");
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        atomic_write(&path, b"second").expect("overwrite");
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        // A second overwrite must not leave .tmp files behind.
+        assert_eq!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().to_string_lossy().contains(".imageedit-"))
+                .count(),
+            0
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

@@ -483,6 +483,65 @@ C 档要扩 `Layer` 模型加 `blend_mode / parent / mask` / 文本，会波及�
 
 ---
 
+## 13. 实施状态（M0 ~ M6 已全部落地，2026-11-12）
+
+按本文件的里程碑顺序**串行**推进，每个模块自测通过后才进入下一个。
+
+| 里程碑 | 状态 | 落地位置 |
+| --- | --- | --- |
+| **M0** 基准基建 | ✅ | `scripts/make_psd_fixture.py`（6 份样本）、`crates/decode/examples/dec_bench.rs --json --psd-layers`、`scripts/probe_psd_perf.py --baseline/--collect`、`tmp/psd-baseline.json` |
+| **M1** 分层解析 | ✅ | `crates/decode/src/psd_layers.rs`（`decode_psd_layers` / `_with_progress`、按层矩形展开通道、PackBits、段边界预校验、逐层进度） |
+| **M2** 文档装配 | ✅ | `core::document::Document::from_psd_layers` + `PsdLayerSeed`（0 号位透明背景、层属性映射） |
+| **M3** 两阶段接线 + 编辑锁 | ✅ | `bridge/session.rs`（`spawn_psd_layer_job`、`from_decoded_with_layers`）、`bridge/ops/document.rs`（`poll_psd_layers` / `install_psd_layers` / `finish_psd_layers`）、QML 四处 gate |
+| **M4** PSD 编码器 | ✅ | `crates/decode/src/psd_write.rs`（`encode_psd` / `encode_document`，8bit RGB / RAW / planar / Layer & Mask / 合成图 / `luni`） |
+| **M5** 写回与 UI 改造 | ✅ | `bridge/paths.rs`（`SaveFormat`、原子写、写回守卫）、`Session::save_target`、`save_edited` / `save_as`、QML 解拦截 + `PSD (*.psd)` 过滤器 |
+| **M6** 性能收口 | ✅ | 缩略图后台预渲染 + 分批落盘、`psd-notice`、`probe_psd_roundtrip.py`、`crosscheck_psd.py`（第三方 psd-tools 双向对照）、本文档与手测清单 §A26 |
+
+### C1 ~ C8 逐条验收
+
+| 条款 | 结果 | 证据 |
+| --- | --- | --- |
+| **C1** `decode_psd_bytes` 签名/行为不变 | ✅ | `git diff crates/decode/src/lib.rs` 中该函数与 `validate_psd_sections`、`encode` **零改动**；分层解析是独立模块 |
+| **C2** 两阶段、首帧不等阶段 2 | ✅ | 实测 `psd-stage1-ms` = 1ms（small-layers，基线漂移 ≤3%）；阶段 2 在独立线程，`prewarm` 不等它 |
+| **C3** 按图层矩形分配位图 | ✅ | 5 层 260×400 样本 `psd-layer-bytes` = 676400，而非 5×416000；完全在画布外的层跳过 |
+| **C4** `flatten_layers_rgba()` 只做兜底 | ✅ | 仅在 `has_composite == false` 时走兜底；正常路径直接解 layer records |
+| **C5** 编码/解码在后台 + `catch_unwind` | ✅ | `psd_layers.rs:89`、`psd_write.rs:534`、`session.rs:441`（后台编码线程）三处保留 `catch_unwind` |
+| **C6** 缩略图懒生成 / 分批 | ✅ | 阶段 2 线程预渲染 40px；UI 线程每 50ms ≤6 行落盘；100 层实测 `layer-thumb-first-ms` = 0ms、`layer-thumb-batch-ms` 最大 11ms（门槛 16） |
+| **C7** 层数 / 内存上限提示 | ✅ | `install_psd_layers`：`count > 32 \|\| bytes > 256MB` 时状态栏追加「图层较多（N 层 / M MB），实时预览重建可能变慢」 |
+| **C8** >8192 降采样只读 | ✅ | `DOWNSAMPLE_EDGE = 8192` 未改；`save_target` 对 `downsampled_from.is_some()` + 目标是源文件时用 `DOWNSAMPLED_HINT` 拒绝；`probe_psd_roundtrip.py` 覆盖 |
+
+### C2-a ~ C2-d 编辑锁生命周期
+
+`scripts/probe_psd_layers.py --only all` 覆盖 5 条路径，全部 PASS：
+
+| 路径 | 触发方式 | 断言 |
+| --- | --- | --- |
+| 同步自动化（`--script`） | 直接打开 | 0 个 `editing-locked`，一次性装配 5 层 |
+| 正常交互 | prewarm stage 2 | `editing-locked → psd-stage2-ms → psd-layer-count=5 → psd-install-ms → editing-unlocked(done)` |
+| 解析失败 | `IMAGEEDIT_PSD_STAGE2_FAIL=1` | 仍解锁（`reason=done`），保持合并预览 |
+| 用户跳过 | 逐层延迟 + `AUTO_SKIP` | 进度出现后解锁（`reason=skipped`），不装配分层 |
+| 慢加载 | 逐层延迟 400ms+ | 锁真实保持，进度逐层递增，仍在 3s 内完成 |
+
+另有切文件（`finish_psd_layers("new-load")` / `"sync-load"`）、通道断开（`"channel-closed"`）、关窗口（`skip_psd_layers()`）三条 finally 式收尾。
+
+### 与计划的偏差（已修正的真实缺陷）
+
+1. **可见位语义写反**：vendor 解析器把 flags bit 1 当「置位=可见」，Adobe 规范是「置位=隐藏」。不是本档新增的 bug，但会同时毁掉读与写（真实 PSD 全判隐藏、写出的 PSD 在 Photoshop 里全隐藏）。已在 `vendor/psd/.../mod.rs` 与编码器同步修正，并加回归单测 + 20 份真实样本核对。
+2. **透明占位背景被写进 PSD**：`layers[0]` 是为统一模型造的全画布透明层，写回时会变成真实图层，导致每保存一次多一层。现已在编码器中跳过。
+3. **阶段 2 延迟钩子位置**：自动化钩子原本 sleep 在 stage 2 线程开头，大部分落在首帧之前，导致「锁时长」测不出来；改为逐层延迟后锁时长可测。
+
+### 五读侧交叉验证
+
+| 读侧 | 结果 |
+| --- | --- |
+| 自解码（`decode_psd_layers`） | `probe_psd_roundtrip.py`：写回后重开，层数/层名/显隐/opacity/offset 全一致，连续保存层数不增长 |
+| 独立第三方实现（psd-tools 1.26.1） | `crosscheck_psd.py --only written`：层表逐项一致 + 合成图 4412 色；`--only vendor`：30 份第三方 fixture 双向对照 0 失败 |
+| 资源管理器缩略图（`crates/thumbnail`） | `decode_psd_bytes` 零改动（C1），缩略图路径不受分层解析影响 |
+| Photoshop | 本机未安装，**待用户手测**（§A26-15 / A26-18） |
+| Krita / GIMP | 本机未安装，**待手测**（第三方实现对照已覆盖同一语义风险） |
+
+---
+
 ## 附录 A：PSD 写入最小子集
 
 只写 **8bit / RGB（`mode=3`）/ 无压缩或 RLE（`compression=0|1`）**，大端字节序。

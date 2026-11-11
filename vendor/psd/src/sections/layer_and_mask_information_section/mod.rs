@@ -394,14 +394,17 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
     let clipping_base = cursor.read_u8();
     let clipping_base = clipping_base == 0;
 
-    // We do not currently parse all flags, only visible
+    // We do not currently parse all flags, only visible.
     // Flags:
     //  - bit 0 = transparency protected;
-    //  - bit 1 = visible;
+    //  - bit 1 = hidden (Adobe's "visible" flag is INVERTED: set means the
+    //    layer is hidden). Photoshop writes 0 / 8 / 24 for visible layers and
+    //    never sets bit 1 unless the layer is hidden.
     //  - bit 2 = obsolete;
     //  - bit 3 = 1 for Photoshop 5.0 and later, tells if bit 4 has useful information;
     //  - bit 4 = pixel data irrelevant to appearance of document
-    let visible = cursor.read_u8() & (1 << 1) != 0; // here we get second bit - visible
+    let flags = cursor.read_u8();
+    let visible = flags & (1 << 1) == 0;
 
     // We do not currently parse the filler, skip it
     cursor.read_1();

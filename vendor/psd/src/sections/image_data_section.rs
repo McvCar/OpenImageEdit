@@ -219,8 +219,12 @@ impl ImageDataSection {
     }
 }
 
+/// Bytes of a single planar channel, either raw or PackBits (with the
+/// per-scanline length table already stripped by the layer reader).
 #[derive(Debug, Clone)]
 pub enum ChannelBytes {
+    /// Uncompressed planar bytes, one byte per pixel of the rectangle.
     RawData(Vec<u8>),
+    /// PackBits-compressed planar bytes (scanline length table removed).
     RleCompressed(Vec<u8>),
 }

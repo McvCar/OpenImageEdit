@@ -230,6 +230,14 @@ impl PsdLayer {
         }
     }
 
+    /// Read-only access to this layer's planar channels.
+    ///
+    /// B-plan layered editing expands them into the LAYER rectangle instead of
+    /// calling `rgba()`, which allocates a full-canvas RGBA buffer per layer.
+    pub fn channel_bytes(&self) -> &LayerChannels {
+        &self.channels
+    }
+
     /// Get the compression level for one of this layer's channels
     pub fn compression(
         &self,

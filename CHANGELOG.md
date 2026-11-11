@@ -4,6 +4,64 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.2] - 2026-11-12
+
+`.psd` 从「只能看的合并图」变成**可编辑的分层文档**：打开还原图层，
+编辑后 `Ctrl+S` 写回，图层仍在。
+
+### 新增
+
+- **PSD 分层可编辑（B 档）**：打开 `.psd` 会先把各图层解析成真正的可编辑
+  图层（层名、显隐、不透明度、位置全部保留），背景占据 0 号位，之后可以用
+  图层面板的全部功能（新建/复制/合并/对齐/多选/变换）继续编辑。
+- **写回 PSD**：`Ctrl+S` 覆盖原 `.psd`、另存为对话框新增 `PSD (*.psd)`
+  过滤器。写的是 8 位 RGB、RAW 压缩的多层 PSD，带合成图与中文层名（`luni`），
+  第三方软件可直接打开。
+- **两阶段渐进加载**：首帧仍然只等合成图（阶段 1），图层在后台线程解析
+  （阶段 2），窗口不会为了等图层而白屏。
+- **加载期编辑锁**：图层后台加载期间禁用全部编辑工具（画笔、选区、裁剪、
+  移动、快捷键、保存……），只放行查看、缩放、平移、打开、浏览菜单与关闭。
+  图层面板头部有逐层进度与「跳过图层加载，以合并预览继续编辑」逃生口。
+- **降级提示**：混合模式、图层组、图层蒙版等 B 档暂不支持的结构会按合并
+  预览处理，并在状态栏列出降级项数量，不静默丢内容。
+- **性能埋点与门槛脚本**：新增 `psd-stage1-ms` / `psd-stage2-ms` /
+  `psd-layer-count` / `psd-layer-bytes` / `psd-install-ms` / `psd-encode-ms` /
+  `layer-thumb-first-ms` / `editing-locked|unlocked` 结构化事件，配合
+  `scripts/probe_psd_perf.py` 做硬门槛断言。
+
+### 变更
+
+- 保存链统一走 `SaveFormat`（`Image(Format)` / `Psd`），`Ctrl+S` 与非 PSD
+  另存为行为不变；编码与写盘移到后台线程，写入采用「临时文件 + rename」
+  原子替换，保存失败不会留下半个文件。
+- 图层面板缩略图改为由阶段 2 线程预渲染 40px 位图，UI 线程每 50ms 只落盘
+  最多 6 行，100 层首次展开的界面占用从 52ms 降到 0ms。
+- `PsdHintOverlay` 由「PSD 不能保存」的拦截浮层改为纯说明浮层。
+
+### 修复
+
+- **PSD 图层可见性判断反了**：vendored 解析器把 flags bit 1 当作「置位=可见」，
+  而 Adobe 规范是「置位=隐藏」。此前打开任何真实 PSD 都会把所有层判成隐藏、
+  装出空文档；写回的 PSD 在 Photoshop 里也会全部变成隐藏层。现已按规范解析
+  与写入，并用 20 份真实样本 + 回归单测锁定。
+- 写回时把「合成用的透明占位背景」当成真实图层写进 PSD，导致每保存/重开
+  一次就多一层；现在占位背景不落盘，连续保存层数稳定。
+- 合并预览状态（图层加载失败或用户跳过）覆盖原 `.psd` 被拒绝，避免用一层
+  合成图毁掉原文件；降采样打开的大图同样禁止写回。
+
+### 工程
+
+- 新增 `scripts/make_psd_fixture.py`（6 份 PSD 样本，含 100 层与 >8192 超限）、
+  `scripts/probe_psd_layers.py`（编辑锁生命周期 5 条路径）、
+  `scripts/probe_psd_roundtrip.py`（写回/重开/层数稳定/拒绝写回/另存为）、
+  `scripts/probe_psd_perf.py`（基线与硬门槛）、
+  `crates/decode/examples/dec_bench.rs --psd-layers`（阶段计时）。
+- vendored `psd` 只做最小改动：导出 `ChannelBytes` / `LayerChannels` /
+  `BlendMode` / `PsdLayer`，新增只读访问器 `PsdLayer::channel_bytes()`，
+  并修正可见位语义；`decode_psd_bytes` 的签名与行为保持不变（缩略图 DLL 复用）。
+- 新增 QML 桥自检覆盖：154 个调用 / 0 个漏声明；`cargo test --workspace`
+  314 项全绿。
+
 ## [0.1.1] - 2026-11-10
 
 图层系统重构、非破坏性变换与吸附的完整落地版本。

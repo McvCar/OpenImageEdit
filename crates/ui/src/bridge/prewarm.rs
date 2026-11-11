@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use decode::decode_path;
 
-use super::session::{DecodeMsg, DOWNSAMPLE_EDGE};
+use super::session::{spawn_psd_layer_job, DecodeMsg, DOWNSAMPLE_EDGE};
 use super::{AppConfig, DecodeOptions};
 
 /// 至多一个（一个进程只预热"本窗口要打开的那一张"）。
@@ -40,6 +40,10 @@ pub(in crate::bridge) fn spawn(path: &Path) {
     let owned = path.to_path_buf();
     let thread_path = owned.clone();
     let (tx, rx) = mpsc::channel::<DecodeMsg>();
+    // PSD: stage 2 parses the real layers in parallel with stage 1's
+    // composite decode. Starting it here keeps the first frame off its
+    // critical path (C2) while the result is ready by the time QML polls.
+    let layer_job = spawn_psd_layer_job(&thread_path, opts);
     std::thread::spawn(move || {
         let t0 = Instant::now();
         let result = decode_path(&thread_path, opts).map_err(|e| e.to_string());
@@ -47,6 +51,7 @@ pub(in crate::bridge) fn spawn(path: &Path) {
         let _ = tx.send(DecodeMsg {
             path: thread_path,
             result: result.map(|d| (d, ms)),
+            layer_job,
         });
     });
     println!(

@@ -51,6 +51,37 @@ Rectangle {
     // 负责展开）。写成函数而不是 property，是为了每次打开都重新求值
     // ok（can_undo / selExists 这些），否则菜单状态会冻在启动那一刻。
     function menuTree() {
+        // ★PSD 阶段 2 编辑锁：只留查看 / 缩放 / 打开 / 关闭，并给一个
+        // 明确的逃生口。菜单每次打开都重建，解锁后立刻恢复完整菜单（C2-d）。
+        if (bridge.editingLocked) {
+            return [
+                { l: "文件", sub: [
+                    { l: "打开图片… (Ctrl+O)", ok: true,
+                      run: function () { openDialog.open() } },
+                    { l: "新窗口 (Ctrl+N)", ok: true,
+                      run: function () { host.requestNewWindow() } },
+                    { l: "", sep: true },
+                    { l: "关闭窗口 (Ctrl+W)", ok: true,
+                      run: function () { host.requestQuit() } }
+                ] },
+                { l: "视图", sub: [
+                    { l: "放大 (Ctrl++)", ok: true,
+                      run: function () { view.queueZoom(1.25) } },
+                    { l: "缩小 (Ctrl+-)", ok: true,
+                      run: function () { view.queueZoom(1 / 1.25) } },
+                    { l: "适应窗口 (Ctrl+9)", ok: bridge.image_width > 0,
+                      run: function () { bridge.zoom_fit() } },
+                    { l: "100% 实际大小 (Ctrl+0)", ok: bridge.image_width > 0,
+                      run: function () { bridge.zoom_actual() } }
+                ] },
+                { l: "图层加载中", sub: [
+                    { l: "编辑工具暂不可用（可查看 / 缩放 / 平移）", ok: false,
+                      run: function () {} },
+                    { l: "跳过图层加载，以合并预览继续编辑", ok: true,
+                      run: function () { bridge.skip_psd_layers() } }
+                ] }
+            ]
+        }
         return [
             { l: "文件", sub: [
                 { l: "打开图片… (Ctrl+O)", ok: true,
@@ -58,9 +89,9 @@ Rectangle {
                 { l: "新窗口 (Ctrl+N)", ok: true,
                   run: function () { host.requestNewWindow() } },
                 { l: "", sep: true },
-                { l: "保存 (Ctrl+S)", ok: bridge.image_width > 0,
+                { l: "保存 (Ctrl+S)", ok: bridge.image_width > 0 && !bridge.saving,
                   run: function () { host.saveOrSaveAs() } },
-                { l: "另存为… (Ctrl+Shift+S)", ok: true,
+                { l: "另存为… (Ctrl+Shift+S)", ok: !bridge.saving,
                   run: function () { saveDialog.open() } },
                 { l: "", sep: true },
                 { l: "关闭窗口 (Ctrl+W)", ok: true,

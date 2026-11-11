@@ -6,6 +6,24 @@ use image::{ImageFormat, ImageReader, RgbaImage};
 
 pub use image::ImageFormat as Format;
 
+mod psd_layers;
+pub use psd_layers::{
+    decode_psd_layers, decode_psd_layers_with_progress, PsdLayerData, PsdLayerSet,
+};
+
+mod psd_write;
+pub use psd_write::{encode_document, encode_psd};
+
+/// Format used when writing a document. `image::ImageFormat` has no PSD
+/// variant, so PSD needs its own arm; this is an explicit type (never an
+/// `unwrap_or(Format::Png)` fallback) to avoid writing PNG bytes into a
+/// `.psd` file (a historical bug).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveFormat {
+    Image(Format),
+    Psd,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
     #[error("unsupported format")]

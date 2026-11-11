@@ -7,7 +7,10 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use cxx_qt_lib::{QString, QUrl};
-use decode::{decode_path, encode, format_from_path, DecodeOptions, Decoded, Format};
+use decode::{
+    decode_path, encode, encode_document, format_from_path, DecodeOptions, Decoded, Format,
+    SaveFormat,
+};
 use editcore::{
     adjust_json, Adjust, AdjustTarget, BoundsSolve, Document, Field, Histogram, Layer,
     LayerTransform, Mark, MarkKind, PickedColor, QuickSelectOptions, Rect, ReferencePoint, SelOps,
@@ -140,6 +143,26 @@ pub mod qobject {
         /// True while an image is being decoded off the UI thread; the QML
         /// poll timer calls `poll_decode()` until it flips back to false.
         #[qproperty(bool, loading)]
+        /// PSD stage-2 lock: ALL editing tools are disabled until the layer
+        /// stack is installed (or the user skips / the parse fails). Viewing,
+        /// zoom, pan and opening files stay available.
+        #[qproperty(bool, editing_locked, cxx_name = "editingLocked")]
+        /// True while a stage-2 layer job is still being polled; keeps the
+        /// existing 50 ms decode timer alive after `loading` turns false.
+        #[qproperty(bool, psd_layers_pending, cxx_name = "psdLayersPending")]
+        /// Status text for the layer panel / status bar ("已加载 k/N 层…").
+        #[qproperty(QString, psd_progress, cxx_name = "psdProgress")]
+        /// One-shot PSD notice for the info overlay (degraded layers /
+        /// composite-only / downsampled read-only). Never blocks saving.
+        #[qproperty(QString, psd_notice, cxx_name = "psdNotice")]
+        /// True while a save is being encoded on the worker thread; keeps the
+        /// existing 50 ms timer alive and gates the save entry points.
+        #[qproperty(bool, saving)]
+        /// C6: panel thumbnails are enqueued by the stage-2 worker and written
+        /// in batches of <=6 rows per 50 ms tick (single UI occupancy <=16ms).
+        #[qproperty(bool, thumbs_pending, cxx_name = "thumbsPending")]
+        /// Bumped after every thumbnail batch so QML re-queries the URLs.
+        #[qproperty(i32, thumb_epoch, cxx_name = "thumbEpoch")]
         /// Downsampling-first open for very large images (longest edge
         /// capped at 8192 px). `false` keeps the original resolution.
         #[qproperty(bool, large_downsample, cxx_name = "largeDownsample")]
@@ -265,6 +288,33 @@ pub mod qobject {
         /// the UI thread (no-op while the decode thread is still running).
         #[qinvokable]
         fn poll_decode(self: Pin<&mut Self>);
+
+        /// Drain PSD stage-2 progress / result messages on the UI thread.
+        /// Called by the same 50 ms timer as `poll_decode`.
+        #[qinvokable]
+        fn poll_psd_layers(self: Pin<&mut Self>);
+
+        /// Escape hatch: drop the stage-2 job and edit the composite preview
+        /// immediately (C2-b). Big/slow files must never lock the user out.
+        #[qinvokable]
+        fn skip_psd_layers(self: Pin<&mut Self>);
+
+        /// One-shot status hint when a locked-UI edit is attempted.
+        #[qinvokable]
+        fn psd_locked_hint(self: Pin<&mut Self>);
+
+        /// Drain the background save job: encoding runs off the UI thread
+        /// (C5), only the atomic rename happens here.
+        #[qinvokable]
+        fn poll_save(self: Pin<&mut Self>);
+
+        /// Write at most 6 pre-rendered layer thumbnails per 50 ms tick (C6).
+        #[qinvokable]
+        fn poll_thumbs(self: Pin<&mut Self>);
+
+        /// Dismiss the PSD info overlay (degraded / loading / read-only).
+        #[qinvokable]
+        fn clear_psd_notice(self: Pin<&mut Self>);
 
         /// Toggle downsampling-first open for very large images.
         #[qinvokable]
@@ -1165,6 +1215,26 @@ pub struct BridgeRust {
     /// option drops the old receiver, so a superseded job's result is simply
     /// discarded (the thread itself cannot touch any Qt state).
     decode_job: RefCell<Option<mpsc::Receiver<DecodeMsg>>>,
+    /// ---- PSD stage-2 (layered editing) ----
+    /// All editing tools are disabled while this is true. Always cleared by
+    /// `finish_psd_layers` (success / failure / skip / switch / handoff).
+    editing_locked: bool,
+    /// Keeps the poll timer running after `loading` becomes false.
+    psd_layers_pending: bool,
+    /// "已加载 k/N 层…" text shown in the layer panel and status bar.
+    psd_progress: QString,
+    /// Receiver for the stage-2 thread. Dropping it discards a superseded job.
+    psd_job: RefCell<Option<mpsc::Receiver<PsdLayerMsg>>>,
+    /// One-shot PSD notice (degraded / composite-only / downsampled read-only).
+    psd_notice: QString,
+    /// In-flight background encode. The worker owns a Document snapshot; the
+    /// UI thread only performs the atomic rename and the dirty/source update.
+    saving: bool,
+    save_job: RefCell<Option<SaveJob>>,
+    /// C6: (session id, layer id, doc epoch, already-downscaled 40px bitmap).
+    thumbs_pending: bool,
+    thumb_epoch: i32,
+    thumb_queue: RefCell<std::collections::VecDeque<(u32, u32, u64, RgbaImage)>>,
     /// "拾色器" panel: open flag + the last pick ("" before the first one).
     picker_open: bool,
     picker_color: QString,
@@ -1289,6 +1359,16 @@ impl Default for BridgeRust {
             loading: false,
             large_downsample: cfg.max_dimension != 0,
             decode_job: RefCell::new(None),
+            editing_locked: false,
+            psd_layers_pending: false,
+            psd_progress: QString::default(),
+            psd_job: RefCell::new(None),
+            psd_notice: QString::default(),
+            saving: false,
+            save_job: RefCell::new(None),
+            thumbs_pending: false,
+            thumb_epoch: 0,
+            thumb_queue: RefCell::new(std::collections::VecDeque::new()),
             picker_open: false,
             picker_color: QString::default(),
             picker_history: QString::from("[]"),
@@ -1531,6 +1611,13 @@ impl qobject::Bridge {
             Err(err) => {
                 let text = format!("save-error: {err}");
                 self.as_mut().set_status(QString::from(text.as_str()));
+                // Structured event for the round-trip / write-back probes:
+                // a rejected save must never look like a silent success.
+                let safe = err.replace('\\', "/").replace('"', "'");
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"save-error\",\"detail\":\"{}\"}}",
+                    safe
+                );
             }
         }
     }
@@ -1544,6 +1631,12 @@ impl qobject::Bridge {
     /// immediately, so even a huge image never freezes the UI. The current
     /// document stays visible until the decode lands (or fails).
     fn load_path(mut self: Pin<&mut Self>, path: &Path) {
+        // finally-style cleanup: opening another file must never leave the
+        // previous stage-2 lock, an in-flight save, or a stale PSD notice.
+        self.as_mut().finish_psd_layers("new-load");
+        self.as_mut().cancel_save("new-load");
+        self.as_mut().cancel_thumbs("new-load");
+        self.as_mut().clear_psd_notice();
         println!(
             "{{\"phase\":\"ui\",\"event\":\"load\",\"file\":\"{}\"}}",
             path.to_string_lossy().replace('\\', "/")
@@ -1561,6 +1654,9 @@ impl qobject::Bridge {
         let (tx, rx) = mpsc::channel::<DecodeMsg>();
         let thread_path = path.to_path_buf();
         let opts = self.decode_opts();
+        // Stage 2 parses PSD layers in parallel; stage 1 keeps the existing
+        // composite-only path so the first frame is unchanged (C1/C2).
+        let layer_job = spawn_psd_layer_job(&thread_path, opts);
         std::thread::spawn(move || {
             let t0 = Instant::now();
             let result = decode_path(&thread_path, opts).map_err(|e| e.to_string());
@@ -1568,6 +1664,7 @@ impl qobject::Bridge {
             let _ = tx.send(DecodeMsg {
                 path: thread_path,
                 result: result.map(|d| (d, ms)),
+                layer_job,
             });
         });
         // Dropping the previous receiver (if any) discards its result.
@@ -1583,6 +1680,12 @@ impl qobject::Bridge {
     /// Synchronous load for automation (the script ops that follow `start()`
     /// assume the document already exists).
     fn load_path_sync(mut self: Pin<&mut Self>, path: &Path) {
+        // Synchronous automation path is NEVER locked; make sure a leftover
+        // interactive lock / save / notice cannot leak into --script probes.
+        self.as_mut().finish_psd_layers("sync-load");
+        self.as_mut().cancel_save("sync-load");
+        self.as_mut().cancel_thumbs("sync-load");
+        self.as_mut().clear_psd_notice();
         println!(
             "{{\"phase\":\"ui\",\"event\":\"load\",\"file\":\"{}\"}}",
             path.to_string_lossy().replace('\\', "/")

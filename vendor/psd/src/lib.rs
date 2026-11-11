@@ -20,13 +20,14 @@ use sections::layer_and_mask_information_section::layer::PsdLayerError;
 use crate::psd_channel::IntoRgba;
 pub use crate::psd_channel::{PsdChannelCompression, PsdChannelKind};
 pub use crate::sections::file_header_section::{ColorMode, PsdDepth};
-use crate::sections::image_data_section::ChannelBytes;
+pub use crate::sections::image_data_section::ChannelBytes;
 use crate::sections::image_data_section::ImageDataSection;
 pub use crate::sections::image_resources_section::ImageResource;
 use crate::sections::image_resources_section::ImageResourcesSection;
 pub use crate::sections::image_resources_section::{DescriptorField, UnitFloatStructure};
-pub use crate::sections::layer_and_mask_information_section::layer::PsdGroup;
-pub use crate::sections::layer_and_mask_information_section::layer::PsdLayer;
+pub use crate::sections::layer_and_mask_information_section::layer::{
+    BlendMode, LayerChannels, PsdGroup, PsdLayer,
+};
 use crate::sections::layer_and_mask_information_section::LayerAndMaskInformationSection;
 use crate::sections::MajorSections;
 
