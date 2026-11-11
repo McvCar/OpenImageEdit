@@ -4,11 +4,17 @@ param(
     [switch]$SkipVerify,
     [switch]$SkipInstaller,
     [switch]$NoBump,
-    [string]$Version
+    [string]$Version,
+    [int]$WatchIntervalSec = 60,
+    [int]$StallMinutes = 5
 )
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'env.ps1')
+# Build heartbeat / stall detector (1-minute checks by default). See the
+# header of build_watch.ps1 for why the plain `& cargo | Out-String` form is
+# not usable on this machine.
+. (Join-Path $PSScriptRoot 'build_watch.ps1')
 
 # NOTE: keep this file ASCII-only. powershell.exe (5.1) reads .ps1 as ANSI,
 # so UTF-8 Chinese comments corrupt the parser.
@@ -17,6 +23,11 @@ $ErrorActionPreference = 'Stop'
 # fails closed. In a non-interactive (background/CI) run that looks like the
 # script "hangs forever": no error, no exit. So packaging deletes files through
 # the .NET API instead.
+#
+# The same "looks hung" problem applies to compilation: cl.exe sometimes idles
+# at 0% CPU forever and cargo's output used to be buffered until exit. Every
+# cargo build below now goes through Invoke-GuardedCargo (build_watch.ps1),
+# which prints a heartbeat every 60s and kills a persistently idle build.
 function Remove-PathForce([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return }
     $item = Get-Item -LiteralPath $Path -Force
@@ -86,21 +97,20 @@ $benchDir = Join-Path $repoRoot 'bench-data'
 $sample = Join-Path $benchDir 'small-1600x1200.jpg'
 
 if (-not $SkipBuild) {
-    $oldEA = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    $buildOut = & cargo build --release --workspace --exclude imageedit-ui 2>&1 | Out-String
-    $buildExit = $LASTEXITCODE
-    if ($buildExit -eq 0) {
-        # End-user binary: drop the console feature so main.rs compiles as
-        # windows_subsystem = "windows" (no console window for users).
-        # imageedit-ui is excluded from the loop above on purpose: the console
-        # variant is never packaged, and building it just to throw it away adds
-        # a whole second ui compile + link to every package run.
-        $buildOut += & cargo build --release -p imageedit-ui --no-default-features 2>&1 | Out-String
-        $buildExit = $LASTEXITCODE
-    }
-    $ErrorActionPreference = $oldEA
-    if ($buildExit -ne 0) { throw "cargo build failed`n$buildOut" }
+    $r = Invoke-GuardedCargo -Label 'workspace' `
+        -CargoArgs @('build', '--release', '--workspace', '--exclude', 'imageedit-ui') `
+        -IntervalSec $WatchIntervalSec -StallMinutes $StallMinutes
+    if ($r.ExitCode -ne 0) { throw "cargo build failed`n$($r.Tail)" }
+
+    # End-user binary: drop the console feature so main.rs compiles as
+    # windows_subsystem = "windows" (no console window for users).
+    # imageedit-ui is excluded from the loop above on purpose: the console
+    # variant is never packaged, and building it just to throw it away adds
+    # a whole second ui compile + link to every package run.
+    $r = Invoke-GuardedCargo -Label 'ui' `
+        -CargoArgs @('build', '--release', '-p', 'imageedit-ui', '--no-default-features') `
+        -IntervalSec $WatchIntervalSec -StallMinutes $StallMinutes
+    if ($r.ExitCode -ne 0) { throw "cargo build failed`n$($r.Tail)" }
 }
 
 Write-Host '==> deploy' -ForegroundColor Cyan
@@ -116,18 +126,17 @@ Copy-Item (Join-Path $repoRoot 'target\release\imageedit.exe') $distDir
 # dedicated `thumb` profile: same optimizations as release but panic=unwind
 # so the provider's catch_unwind can stop PSD parse panics from taking down
 # explorer.exe (the workspace release profile uses panic=abort).
-# PS 5.1 turns cargo's stderr progress lines into ErrorRecords; under
-# $ErrorActionPreference='Stop' the first one aborts the script.
-$oldEA = $ErrorActionPreference
-$ErrorActionPreference = 'Continue'
+# The .cmd wrapper redirects cargo's stderr to a file, so the PS 5.1
+# ErrorRecord problem with native stderr no longer applies here.
 # Static CRT: the DLL must load on machines without the VC++ redistributable
 # (Explorer silently drops the handler when LoadLibrary fails). Pure Rust,
 # no C++ objects, so /MT is conflict-free here.
 $env:RUSTFLAGS = '-C target-feature=+crt-static'
-$thumbOut = & cargo build -p imageedit-thumbnail --profile thumb 2>&1 | Out-String
+$thumb = Invoke-GuardedCargo -Label 'thumbnail' `
+    -CargoArgs @('build', '-p', 'imageedit-thumbnail', '--profile', 'thumb') `
+    -IntervalSec $WatchIntervalSec -StallMinutes $StallMinutes
 [Environment]::SetEnvironmentVariable('RUSTFLAGS', $null, 'Process')
-$ErrorActionPreference = $oldEA
-if ($LASTEXITCODE -ne 0) { throw "thumbnail DLL build failed`n$thumbOut" }
+if ($thumb.ExitCode -ne 0) { throw "thumbnail DLL build failed`n$($thumb.Tail)" }
 Copy-Item (Join-Path $repoRoot 'target\thumb\imageedit_thumb.dll') $distDir
 
 # App-local VC++ runtime: imageedit.exe (cxx-qt) and the Qt6 DLLs import
@@ -196,7 +205,7 @@ Write-Host '==> windeployqt done' -ForegroundColor Cyan
 # only needs QtQuick + QtQuick.Templates + QtQuick.Layouts, so the whole
 # QtQuick.Controls stack (and its style DLLs) can go.
 #
-# Image formats: ALL Qt image-format plugins are dead weight here — decoding
+# Image formats: ALL Qt image-format plugins are dead weight here - decoding
 # runs through the Rust `image` crate and the QML preview only ever loads BMP
 # data URLs, which QtGui handles with its BUILT-IN handler (no plugin). Same
 # story for the network stack: Qt6Qml hard-links Qt6Network.dll (must stay)

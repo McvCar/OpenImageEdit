@@ -1,6 +1,6 @@
 # PSD 分层可编辑（B 方案）实施方案
 
-状态：**待确认 · 设计稿，尚未写任何实现代码** ｜ 2026-11-12
+状态：**设计已定稿（用户 2026-11-12 拍板「图层后台加载期间禁用全部编辑工具」），尚未写任何实现代码** ｜ 2026-11-12
 影响范围：`decode` / `core` / `ui-bridge` / `QML` / 新增 `encode`；`thumbnail` **不改**
 前置：统一图层模型已全量落地（`0.1.1`，commit `aaf1f23`），291 项测试全绿
 关联：三档评估 A（拼合写回）/ **B（分层可编辑）** / C（结构保真）；本文档只展开 B
@@ -24,6 +24,8 @@
 > 但**写侧没有现成实现**——`image 0.25` 无 PSD 编码器，该 crate 的序列化作者明确未做。
 
 **性能结论（详细见 §6）**：进程启动和窗口出现 **0 额外开销**（解析代码是被动调用的纯函数，首图解码本来就在 `main()` 里丢到后台线程）；非 PSD 文件零影响；唯一受影响的是「打开 PSD」，靠**两阶段渐进加载**把「画面出现」时间也保持不变，代价只是「图层可编辑」晚几秒就绪。这不靠运气，是靠 §6 的 8 条硬约束 + 可测门槛保证的。
+
+**★ 用户定稿的交互约束**：阶段 2（图层后台加载）**完成前，不允许使用任何编辑工具**——不是「允许编辑再事后守卫」，而是从入口禁用。查看 / 缩放 / 平移 / 打开文件仍然可用；加载完成、失败或用户主动「跳过图层加载」时立即解锁。详见 §3.1 与 §6.2.1。
 
 **工作量**：12~17 人天（原估 10~15，性能专项 +2），全职约 2.5~3.5 周。
 
@@ -101,14 +103,15 @@ flowchart LR
 flowchart TD
   A[main: prewarm::spawn] --> B[阶段1 后台线程]
   B --> C["decode_path → 合成图 (与现在完全一致)"]
-  C --> D[poll_decode → 首帧画面 + 1 个背景层]
+  C --> D["poll_decode → 首帧画面 + editingLocked=true"]
+  D --> L["全部编辑工具禁用 · 只可查看/缩放/平移 · 显示加载进度"]
   B --> E[阶段2 后台线程: decode_psd_layers]
   E --> F[PsdLayerSet: N 层位图 + 属性 + 降级清单]
   F --> G[poll_psd_layers 50ms 轮询]
-  G --> H{edit_epoch 未变?}
-  H -->|是| I[install_psd_layers: 替换 doc.layers]
-  H -->|否| J[放弃分层, 保留合并预览 + 提示重开]
-  I --> K[图层面板出现 N 层 · 可编辑 · Ctrl+S 可写回]
+  G --> H["install_psd_layers: 替换 doc.layers + 清历史"]
+  H --> K["editingLocked=false · 面板出现 N 层 · 可编辑 · Ctrl+S 可写回"]
+  G -.失败 / 跳过.-> M["保持合并预览 + 立即解锁"]
+  L -.用户点「跳过图层加载」.-> M
 ```
 
 **为什么首帧不直接等分层解完**：`PsdLayer::rgba()` 按画布尺寸分配，10 层 4000×3000 朴素实现是 480MB + 120M 次像素循环；同步等待会让「打开 PSD」明显变慢甚至内存吃紧。渐进方案让画面出现时间**与现状完全一致**（PSD 通常自带合成图）。
@@ -129,16 +132,59 @@ pub(in crate::bridge) struct DecodeMsg {
 - **`Session::open()`（自动化 / `--script` / 探针的同步路径）必须 `recv()` 等到层解析完**，保证脚本拿到的文档是分层的，否则所有既有探针的图层断言失效；
 - 单实例转交、打开第二张图时，未完成的 `layer_job` 要丢弃（drop receiver 即可）。
 
-### 3.1 并发守卫（必须做）
+### 3.1 编辑锁：加载完成前禁用全部编辑工具（★ 用户定稿）
 
-分层结果回来时用户可能已经画了一笔 / 拖过图层：
+**用户明确要求：阶段 2 未完成时不允许使用任何编辑工具。** 所以 B 档**不采用**
+「先允许编辑、回来时靠 `edit_epoch / dirty` 放弃分层」的竞态守卫方案——那会让用户
+白做几笔再被提示重开。改为**在入口禁用编辑**，竞态从根上不存在；epoch 检查只保留为
+防御性兜底（脚本 op / 外部命令仍可能绕过 UI 写文档）。
 
-- 记录首帧落地时的 `doc.edit_epoch` 和 `dirty`；
-- 回来时若 `epoch` 变了或 `dirty == true` → **不替换文档**，保留合并预览，状态栏提示「图层加载期间文档已被修改，本次保持合并预览；重新打开可编辑图层」；
-- 正常路径下替换文档要**重置历史栈**（加载不是一次编辑，不该能 Ctrl+Z 撤回到 1 层状态），并保留 `zoom / fit / viewport`，避免窗口跳一下。
+#### 3.1.1 状态与生命周期
 
-> 备选方案是「加载完成前禁用绘制与图层命令」，但会明显限制用户，B 档不采用；
-> 若实测发现竞态频繁，可在 C 档把装配改成一条 `EditOp::Batch`，让编辑与分层共存。
+新增桥属性 `editingLocked`（`qproperty bool`，写进 `bridge/mod.rs` 的 cxx 声明块）。
+
+| 时机 | `editingLocked` | 说明 |
+|---|---|---|
+| 首帧落地，且 `SourceFormat::Psd` + 开启分层 | **true** | 立刻上锁，与首帧同一次 `poll_decode` 发布 |
+| 阶段 2 成功 `install_psd_layers` | **false** | 装配 + 清历史 + 刷新面板后解锁 |
+| 阶段 2 失败 / 解析降级 / 无合成图兜底失败 | **false** | 保持合并预览，**必须解锁**，否则用户什么都干不了 |
+| 超限只读（>8192，C8）/ 用户点「跳过图层加载」 | **false** | 保持合并预览，按普通文档编辑（写回 PSD 仍禁） |
+| 打开另一张图 / 单实例转交 / 窗口关闭 | **false** | 丢弃未完成的 `layer_job` 时同步解锁，防永久锁死 |
+| 同步路径（`--script=` / `--selftest` / 探针） | **恒 false** | `Session::open()` 会 `recv()` 等到层解析完成才返回，探针拿到的文档已是分层的，不应被锁影响 |
+
+#### 3.1.2 禁止什么、放行什么
+
+- **禁止**：全部绘制 / 选区 / 变换 / 修复 / 调色工具；图层面板所有命令按钮与右键菜单项
+  （新建、复制、合并选中、删除、上下移、显隐、锁定、不透明度、对齐分布、栅格化）；
+  工具快捷键、Delete、Ctrl+Z/Y、Ctrl+C/X/V；Ctrl+S 写回 PSD；数值面板 / 浮层输入框。
+- **放行**（不属于「编辑工具」）：查看、滚轮缩放、平移、窗口缩放、打开文件 / 另开窗口、
+  浏览菜单、关闭程序。文件菜单里「打开」不锁，「保存 / 另存为」在锁期间置灰。
+- 锁期间状态栏与图层面板显示「正在加载 N 个图层…（完成前编辑工具暂不可用）」，
+  并给一个**逃生按钮**「跳过图层加载，以合并预览继续编辑」——避免大文件把用户锁太久。
+
+#### 3.1.3 QML 落点与已知坑
+
+| 落点 | 做法 |
+|---|---|
+| `qml/editor/EditorContent.qml` | 所有编辑类 `Shortcut` 的 `enabled` 叠加 `&& !bridge.editingLocked`；工具按钮 `enabled` 同理 |
+| `qml/panels/CanvasSurface.qml` | **不要**把 MouseArea 整个 `enabled: false`（会连滚轮缩放 / 平移一起吞掉）。在 `onPressed` / 变换手柄按下分支里判断：导航事件放行，落笔 / 拾取 / 拖柄直接忽略并给一次性状态栏提示 |
+| `qml/panels/LayerPanel.qml` | 每个 `PanelButton` 的 `usable` 叠 `!editingLocked`；`MenuRow.active` 同理；标题行显示加载进度 |
+| 右键 / 浮层 | 锁期间不开任何带 `TextInput` 的浮层（焦点会静默废掉 Delete / 工具键，见既有坑）；已有 `dropPopoverFocus()` 复用 |
+
+★ 三条必须记住的既有坑：
+1. `Shortcut.enabled` 引用**同文件后面才实例化**的 id → 创建期 TypeError → 绑定丢失、
+   `enabled` 永久 false。`editingLocked` 只依赖 bridge 属性，但仍沿用已有的 `toolKeysReady`
+   短路，别引后置 id。
+2. qproperty 的 QML 名规则：带 `cxx_name=` 用驼峰，不带的按 snake_case；写错是
+   `undefined` 静默失效。新增属性必须进 cxx 块，改完跑 `scripts/check_bridge_api.py`。
+3. 新增 QML 文件必须加进 `crates/ui/build.rs` 的 `.qml_files([...])`。
+
+#### 3.1.4 装配落地（成功路径）
+
+替换 `doc.layers` 后：**重置历史栈**（加载不是一次编辑，不该能 Ctrl+Z 撤回到 1 层状态）、
+保留 `zoom / fit / viewport` 避免窗口跳动、刷新图层面板与缩略图、发布降级说明、
+最后置 `editingLocked = false`。落地前仍做一次 `edit_epoch / dirty` 断言：若被脚本改过，
+放弃分层、保留合并预览、解锁并提示重新打开（防御路径，不是主路径）。
 
 ---
 
@@ -228,8 +274,9 @@ pub fn encode_psd(doc: &Document, quality: u8) -> Result<Vec<u8>, DecodeError>;
 | M1d | `validate_psd_sections` | 现在只校验到 image data 段长度；分层解析要深入 layer record / channel 长度，补齐「每条记录的 channel data 长度、extra length、RLE 行表」越界预校验，全部包 `catch_unwind` | 损坏样本返回 `DecodeError`，不 panic |
 | M2 | `crates/core/src/document/mod.rs` | `Document::from_psd_layers()`；不扩 `Layer` 结构 | core 单测：层序、offset、opacity、0 号位不变量 |
 | M3a | `bridge/session.rs::DecodeMsg` | 加 `layer_job` 字段 | — |
-| M3b | `bridge/prewarm.rs` + `bridge/ops/document.rs` | 阶段 2 线程启动 / `poll_psd_layers` / `install_psd_layers` / epoch 守卫 / 历史栈重置 | 探针跑同步与异步两条路径 |
-| M3c | `bridge/paths.rs`、`session.rs::{default_save_path, save, write_to}`、`ops/document.rs::save_as` | 解除 5 处拦截，切 `SaveFormat`，PSD 走原子写 | 「保存后图层还在」往返测试 |
+| M3b | `bridge/prewarm.rs` + `bridge/ops/document.rs` | 阶段 2 线程启动 / `poll_psd_layers` / `install_psd_layers` / **`editingLocked` 上下锁与全部解锁路径** / 历史栈重置 | 探针跑同步与异步两条路径；锁的生命周期用例全过 |
+| M3c | `bridge/mod.rs` + `qml/editor/EditorContent.qml` / `CanvasSurface.qml` / `LayerPanel.qml` | 新增 `editingLocked` qproperty；编辑类 Shortcut / 按钮 / 画布落笔 / 右键菜单全部 gate；状态栏进度 + 「跳过图层加载」逃生按钮 | 手测：锁期间任何编辑都无响应，查看缩放平移正常 |
+| M3d | `bridge/paths.rs`、`session.rs::{default_save_path, save, write_to}`、`ops/document.rs::save_as` | 解除 5 处拦截，切 `SaveFormat`，PSD 走原子写；保存入口在锁期间置灰 | 「保存后图层还在」往返测试 |
 | M4 | `crates/decode/src/psd_write.rs`（新） | PSD 编码器（附录 A） | Photoshop / Krita / GIMP / 自解码交叉验证 |
 | M5a | `qml/editor/EditorContent.qml` | 删 `sourceIsPsd` 分支与 `confirmSaveProceed` 里的 PSD 特判；另存为过滤器加 `Photoshop (*.psd)`；PSD 源默认后缀 `psd` | 手测 Ctrl+S / 另存为 |
 | M5b | `qml/panels/PsdHintOverlay.qml` | 复用改造成「降级说明 / 图层加载中 / 超限只读」提示，**不再拦保存** | 手测 |
@@ -251,7 +298,7 @@ pub fn encode_psd(doc: &Document, quality: u8) -> Result<Vec<u8>, DecodeError>;
 |---|---|---|
 | 进程启动 / 窗口出现 / 打开 PNG·JPEG | **零** | PSD 编码器是被调用的纯函数，无全局初始化；首图解码本就在 `main()` → `prewarm::spawn` 后台线程，与 Qt/QML 建窗重叠；非 PSD 连分支都不多走一次 |
 | 打开 PSD → **画面出现** | 目标也是**零** | 阶段 1 完全沿用现有合成图路径，不等阶段 2 |
-| 打开 PSD → **图层可编辑** | 唯一新增延迟 | 阶段 2 后台解 N 层；用户看到「正在加载图层」但可立即查看/缩放 |
+| 打开 PSD → **图层可编辑** | 唯一新增延迟 | 阶段 2 后台解 N 层；期间**全部编辑工具禁用**（用户定稿），只可查看/缩放/平移，并显示加载进度与「跳过」按钮 |
 
 ### 6.2 八条硬约束（写进实现，逐条验收）
 
@@ -265,6 +312,22 @@ pub fn encode_psd(doc: &Document, quality: u8) -> Result<Vec<u8>, DecodeError>;
 | **C6** | 缩略图改**按需懒生成 / 分批** | `bridge/ops/layer_cmds.rs::layer_thumb_url(i)` 现在在 **UI 线程同步**给每行生成 40px PNG；100 层会因 QML 逐行调用卡一下。改成只对可见行生成、一次 ≤8 行，生成完 `layerEpoch` 通知刷新（缓存 key `(sid,lid)` 沿用） |
 | **C7** | 层数上限与预览提示 | `PreviewComposer` 按 `edit_epoch` 缓存缩放位图，但 `composite_for_preview` 仍是每层一次缩放，重建耗时随层数线性增长。层数 >32 或层位图总量 >256MB 时状态栏提示，并考虑暂停实时预览重建（沿用 `gpu_live` 回退策略） |
 | **C8** | `DOWNSAMPLE_EDGE = 8192` 保持；超限 PSD **只做合并预览 + 禁止写回** | 降采样打开 10000px 文件后 Ctrl+S 会把 8192px 写回原文件 = 静默丢分辨率。B 档不做层坐标按比例缩放（易出 ±1px 累积误差），直接降级并明示 |
+
+### 6.2.1 编辑锁把「加载时长」变成了硬指标 ★
+
+原本允许用户在阶段 2 期间先编辑，所以那几秒只是「图层晚点可用」；用户定稿改为
+**加载期间禁用全部编辑工具**后，这段时间变成用户**完全不能动手**的窗口，性能要求的
+性质就变了——它不再只是体验优化，而是不能把人锁死：
+
+| 追加约束 | 内容 |
+|---|---|
+| **C2-a** | 锁定时长 = 阶段 2 时长，12MP / 10 层 **≤3s**（与 §6.4 同一门槛）；超过 3s 必须实时显示「已加载 k/N 层」，不能只有一句静态文字 |
+| **C2-b** | 必须提供「跳过图层加载，以合并预览继续编辑」按钮，点击立即丢弃 `layer_job`、解锁；这是大文件 / 慢磁盘的逃生口 |
+| **C2-c** | **任何失败路径都必须解锁**：解析错误、`catch_unwind` 捕获、无合成图兜底失败、超限只读、切换文件、单实例转交、窗口关闭。把解锁放在 `finally` 式的收尾里，不要只写在成功分支 |
+| **C2-d** | 解锁后立刻刷新一次面板与快捷键 enabled 状态；QML 绑定若因属性遮蔽 / 后置 id 失效，锁会变成永久的（见 §3.1.3 的坑） |
+
+> 因此 §6.5 的 `psd-stage2-ms` 与「锁定时长」要作为**同一个指标**采样并进
+> `probe_psd_perf.py` 的硬断言，而不只是打印出来看看。
 
 ### 6.3 内存预算（示例：4000×3000 / 12MP，10 层各占 10% 面积）
 
@@ -282,7 +345,7 @@ pub fn encode_psd(doc: &Document, quality: u8) -> Result<Vec<u8>, DecodeError>;
 |---|---|---|
 | 冷启动 `window-visible` / `qml-completed`（PSD 与非 PSD） | 与基线偏差 **≤3%** | 现有 `prewarm` / `window-visible` 事件埋点对比 |
 | 首帧画面出现（260×400 样本） | 现状 ~2ms，目标 **≤3ms** | `dec_bench --psd-layers` 的阶段 1 耗时 |
-| 分层就绪（4000×3000 / 10 层，release） | **≤3s**，且不阻塞 UI | `psd-stage2-ms` 事件 + 主线程帧率探针 |
+| 分层就绪 / **编辑锁持续时长**（4000×3000 / 10 层，release） | **≤3s**，且不阻塞 UI；>3s 必须逐层报进度、可「跳过」解锁 | `psd-stage2-ms` + `editingLocked` 上下锁事件 + 主线程帧率探针 |
 | 层缩略图首次展开（100 层） | 单次 UI 线程占用 **≤16ms** | `probe_psd_perf.py` 采样 |
 | PSD 编码写回（12MP / 10 层） | **≤2s**，期间窗口可拖动 | `psd-encode-ms` + 主线程响应探针 |
 | 缩略图 DLL 单次 `decode_psd_bytes` | 与基线**完全一致** | 复用 `crates/thumbnail` 现有单测 + 计时断言 |
@@ -339,7 +402,7 @@ pub fn encode_psd(doc: &Document, quality: u8) -> Result<Vec<u8>, DecodeError>;
 | 另存为 `.psd` | 过滤器加 `Photoshop (*.psd)`；写完后 `session.source = 新路径`（与现有行为一致） |
 | 另存为其它格式 | 维持现状：`doc.flatten()` → `encode()` |
 | 降采样打开的 PSD（>8192） | **拒绝写回**，提示「此文件以降采样预览打开，写回会丢失分辨率；请关闭『大图优先降采样』后重新打开」 |
-| 阶段 2 未完成时保存 | 允许，但只能保存「合并预览」为 PNG 等；写 PSD 置灰并提示「图层尚未就绪」 |
+| 阶段 2 未完成时保存 | **全部保存入口置灰**（编辑锁期间不允许任何写文件动作）；用户可先点「跳过图层加载」解锁，之后按合并预览另存为 PNG；写 PSD 仍禁 |
 | 原子写 | 写 `<target>.tmp` → `flush` → `rename` 覆盖；失败保留原文件，绝不半途截断 |
 
 `encode_psd` 的输入是 `&Document` 而非 `RgbaImage`：逐层输出层记录与通道，同时额外输出一份 `doc.flatten()` 作为合成图（Image Data 段），这样**没勾「最大化兼容」的阅读器也能显示**。
@@ -357,7 +420,7 @@ pub fn encode_psd(doc: &Document, quality: u8) -> Result<Vec<u8>, DecodeError>;
 | 5 | vendored `psd` 解析器到处是 unchecked slice | M1d 扩展 `validate_psd_sections`；所有阶段 2 调用点 `catch_unwind`；损坏 fixture 单测 |
 | 6 | 写出的 PSD 第三方读不开 | 交叉验证列为**独立里程碑**（M6），不压缩；Photoshop / Krita / GIMP / 自解码 / Explorer 缩略图五个读侧 |
 | 7 | 中文层名写回变乱码 | Pascal 名走 ASCII 占位 + `8BIMluni` additional layer info（UTF-16BE）；用 `green-chinese-layer-name-1x1.psd` 往返验证 |
-| 8 | 阶段 2 回来时用户已编辑 → 覆盖用户工作 | epoch / dirty 守卫（§3.1），失败路径只提示不替换 |
+| 8 | 编辑锁把用户卡住（加载慢 / 失败 / 忘了解锁 / QML 绑定失效导致永久锁） | §3.1 的生命周期表 + §6.2.1 的 C2-a~d：逐层进度、「跳过」按钮、所有失败路径 finally 式解锁、同步路径恒不锁；A26 手测逐项验 |
 | 9 | 层数多导致面板 / 预览卡顿 | C6 / C7 + 门槛测试 |
 | 10 | 新增桥方法漏 `#[qinvokable]` 声明（历史踩过：探针全绿但按钮是死的） | 改完跑 `scripts/check_bridge_api.py`；新增 QML 文件加进 `build.rs` |
 
@@ -371,6 +434,7 @@ pub fn encode_psd(doc: &Document, quality: u8) -> Result<Vec<u8>, DecodeError>;
 - `decode::psd_write`：写→自读往返，**逐像素**比对合成图；每层位图与属性往返一致（这是 B 档最核心的一条）。
 - `core::from_psd_layers`：0 号位恒背景、层序、offset 不变量、与 `flatten()` 一致性。
 - `paths.rs`：把现有「PSD 回落 PNG」两个断言改成「PSD → `SaveFormat::Psd`」，保留未知扩展名兜底断言。
+- `bridge`：`editingLocked` 生命周期单测——首帧上锁、成功/失败/跳过/切换文件四条路径都解锁、同步 `--script=` 路径恒不锁（防探针全废）。
 - `thumbnail`：现有单测全绿 + 一次「解一次只出合成图」的耗时/调用次数断言。
 
 ### 10.2 交叉验证（M6，不可用自解码代替）
@@ -391,7 +455,7 @@ pub fn encode_psd(doc: &Document, quality: u8) -> Result<Vec<u8>, DecodeError>;
 
 ### 10.4 手动清单
 
-`docs/大版本重构-手动测试清单.md` 新增 **§A26 PSD 分层专项**：打开多层 / 层名中文 / 隐藏层 / 不透明度 / 负偏移 / 越界层 / 混合模式降级提示 / 无合成图 / 超限只读 / Ctrl+S 一次撤销链 / 另存为 PSD 再用 PS 打开 / 100 层面板流畅度 / 阶段 2 期间先画一笔（竞态守卫）/ 缩略图刷新 / 窗口缩放不跳。
+`docs/大版本重构-手动测试清单.md` 新增 **§A26 PSD 分层专项**：打开多层 / 层名中文 / 隐藏层 / 不透明度 / 负偏移 / 越界层 / 混合模式降级提示 / 无合成图 / 超限只读 / Ctrl+S 一次撤销链 / 另存为 PSD 再用 PS 打开 / 100 层面板流畅度 / **编辑锁专项**（锁期间画一笔 / 拖图层 / 按 Delete / Ctrl+Z / Ctrl+S 全部无响应；滚轮缩放与平移仍可用；进度与「跳过」可解锁；解析失败与切换文件后自动解锁）/ 缩略图刷新 / 窗口缩放不跳。
 
 ---
 
@@ -402,11 +466,11 @@ pub fn encode_psd(doc: &Document, quality: u8) -> Result<Vec<u8>, DecodeError>;
 | **M0** | 造大尺寸多层 fixture、扩展 `dec_bench --psd-layers`、埋点、**存基线数据** | 1.0 |
 | **M1** | vendor 访问器 + `psd_layers.rs` 分层解析 + 段校验扩展 + fixture 单测 | 2.5 |
 | **M2** | `Document::from_psd_layers` + core 单测 | 1.5 |
-| **M3** | 两阶段接线（`DecodeMsg` / prewarm / `poll_psd_layers` / epoch 守卫）+ 同步路径 | 2.0 |
+| **M3** | 两阶段接线（`DecodeMsg` / prewarm / `poll_psd_layers` / **`editingLocked` 编辑锁与全部 QML gate**）+ 同步路径 | 2.5 |
 | **M4** | `psd_write.rs` 编码器（文件头 / layer&mask / RLE 通道 / 合成图 / `luni`）+ 往返单测 | 3.5 |
 | **M5** | 解除 5 处拦截、`SaveFormat`、原子写、QML 对话框与提示改造 | 1.5 |
 | **M6** | **性能收口**（C1~C8 逐条测、门槛回归）、五读侧交叉验证、文档与打包 | 2.5 |
-| 合计 | | **14.5** （区间 12~17） |
+| 合计 | | **15.0** （区间 12~17；编辑锁比原估多 0.5d） |
 
 建议发版节奏：M1+M2 → M3+M4 → M5+M6 三次提交，每次都保持 `cargo test --workspace` 全绿；
 M6 完成后走 `.\scripts\package.ps1`（版本号自动 patch+1，旧安装包保留）。
