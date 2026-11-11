@@ -224,10 +224,14 @@ impl LayerAndMaskInformationSection {
 
         let mut result = vec![];
         for layer_record in layer_records {
+            // `height()` is `bottom - top + 1`; a corrupt record can make it
+            // negative, and `as usize` would turn that into a huge scanline
+            // count (then `2 * scanlines` overflows and panics).
+            let scanlines = layer_record.height().max(0) as usize;
             let channels = read_layer_channels(
                 cursor,
                 &layer_record.channel_data_lengths,
-                layer_record.height() as usize,
+                scanlines,
             )?;
 
             result.push((layer_record, channels));

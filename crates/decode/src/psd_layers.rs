@@ -81,7 +81,7 @@ where
 {
     let (width, height, channels) = check_header(bytes, options)?;
     crate::validate_psd_sections(bytes, width, height, channels)?;
-    validate_psd_layer_records(bytes)?;
+    let file_notes = validate_psd_layer_records(bytes)?;
 
     // The vendored parser still has unchecked slices. Everything it touches
     // (including our own channel expansion) stays inside catch_unwind (C5).
@@ -92,7 +92,12 @@ where
         build_layers(&psd, (width, height), &mut progress)
     }));
     match built {
-        Ok(Ok(set)) => Ok(set),
+        Ok(Ok(mut set)) => {
+            // File-level notes go first: they explain why a layer may be empty.
+            set.degraded.splice(0..0, file_notes);
+            dedup(&mut set.degraded);
+            Ok(set)
+        }
         Ok(Err(msg)) => Err(DecodeError::Psd(msg)),
         Err(_) => Err(DecodeError::Psd(
             "无法解析此 PSD 的图层数据（文件数据异常）".into(),
@@ -319,7 +324,9 @@ fn unpack_packbits(data: &[u8], expected: usize) -> Vec<u8> {
 /// Pre-validate the layer&mask section down to per-record / per-channel
 /// lengths (M1d). `catch_unwind` stays as the last line of defence, but a
 /// corrupt file should produce a normal `DecodeError` instead of a panic.
-fn validate_psd_layer_records(bytes: &[u8]) -> Result<(), DecodeError> {
+///
+/// Returns non-fatal degradation notes; `Ok(vec![])` means "clean".
+fn validate_psd_layer_records(bytes: &[u8]) -> Result<Vec<String>, DecodeError> {
     let err = || DecodeError::Psd("图层记录区段被截断，文件已损坏".into());
     let u32at = |o: usize| -> Option<u32> {
         let s = bytes.get(o..o + 4)?;
@@ -344,11 +351,11 @@ fn validate_psd_layer_records(bytes: &[u8]) -> Result<(), DecodeError> {
     // A flat PSD has an empty Layer & Mask section (length 0); there is
     // nothing to pre-validate and the parser will report zero layers.
     if section_len == 0 {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let info_len = u32at(section_start).ok_or_else(err)? as usize;
     if info_len == 0 {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let info_start = section_start + 4;
     // Some encoders write a Layer Info length that does not cover the channel
@@ -364,7 +371,9 @@ fn validate_psd_layer_records(bytes: &[u8]) -> Result<(), DecodeError> {
         return Err(DecodeError::Psd("图层数量异常".into()));
     }
     let mut p = info_start + 2;
-    let mut records: Vec<(usize, Vec<u32>)> = Vec::with_capacity(count);
+    // (layer height, user-mask height, real-mask height, (channel id, length))
+    let mut records: Vec<(usize, Option<usize>, Option<usize>, Vec<(i16, u32)>)> =
+        Vec::with_capacity(count);
     for _ in 0..count {
         let top = u32at(p).ok_or_else(err)? as i32;
         let bottom = u32at(p + 8).ok_or_else(err)? as i32;
@@ -376,11 +385,12 @@ fn validate_psd_layer_records(bytes: &[u8]) -> Result<(), DecodeError> {
         }
         let mut lengths = Vec::with_capacity(nch);
         for _ in 0..nch {
+            let cid = u16at(p).ok_or_else(err)? as i16;
             let l = u32at(p + 2).ok_or_else(err)?;
             if l < 2 {
                 return Err(DecodeError::Psd("图层通道长度异常".into()));
             }
-            lengths.push(l);
+            lengths.push((cid, l));
             p += 6;
         }
         p += 12; // '8BIM' + blend key + opacity/clipping/flags/filler
@@ -392,7 +402,25 @@ fn validate_psd_layer_records(bytes: &[u8]) -> Result<(), DecodeError> {
         }
         // Extra data: mask length, blending ranges length, Pascal name,
         // then a chain of 8BIM/8B64 additional-layer-info blocks.
+        //
+        // Layer mask data carries its OWN rectangle, and its channel (`-2`) is
+        // compressed against that rectangle — not against the layer rectangle.
+        // Reading the mask rect here is what makes mask channels validate
+        // correctly. Layout: top/left/bottom/right (4x i32), default colour,
+        // flags, 2 pad bytes; a real user mask (channel `-3`) follows at +18.
         let mask_len = u32at(p).ok_or_else(err)? as usize;
+        let mut mask_rows = None;
+        let mut real_mask_rows = None;
+        if mask_len >= 20 {
+            let m_top = u32at(p + 4).ok_or_else(err)? as i32;
+            let m_bottom = u32at(p + 12).ok_or_else(err)? as i32;
+            mask_rows = Some((m_bottom as i64 - m_top as i64 + 1).clamp(0, 65_535) as usize);
+        }
+        if mask_len >= 38 {
+            let r_top = u32at(p + 22).ok_or_else(err)? as i32;
+            let r_bottom = u32at(p + 30).ok_or_else(err)? as i32;
+            real_mask_rows = Some((r_bottom as i64 - r_top as i64 + 1).clamp(0, 65_535) as usize);
+        }
         p = p.checked_add(4 + mask_len).ok_or_else(err)?;
         let ranges_len = u32at(p).ok_or_else(err)? as usize;
         p = p.checked_add(4 + ranges_len).ok_or_else(err)?;
@@ -414,11 +442,12 @@ fn validate_psd_layer_records(bytes: &[u8]) -> Result<(), DecodeError> {
         if p > info_end {
             return Err(err());
         }
-        let scanlines = (bottom as i64 - top as i64 + 1).max(1).min(65_535) as usize;
-        records.push((scanlines, lengths));
+        let scanlines = (bottom as i64 - top as i64 + 1).max(0).min(65_535) as usize;
+        records.push((scanlines, mask_rows, real_mask_rows, lengths));
     }
-    for (scanlines, lengths) in records {
-        for l in lengths {
+    let mut short_channels = 0usize;
+    for (scanlines, mask_rows, real_mask_rows, lengths) in records {
+        for (cid, l) in lengths {
             let l = l as usize;
             let end = p.checked_add(l).ok_or_else(err)?;
             if end > info_end {
@@ -426,15 +455,25 @@ fn validate_psd_layer_records(bytes: &[u8]) -> Result<(), DecodeError> {
             }
             let compression = u16at(p).ok_or_else(err)?;
             if compression == 1 {
-                // Vendor skips 2*scanlines bytes of row-length table. A channel
-                // shorter than that is degraded to an empty (transparent) layer
-                // by the vendored reader, so reject it here with a clear error.
-                // The row counts themselves are NOT validated against the
-                // remaining bytes: real files (e.g. out-of-bounds layers) can
-                // carry a truncated RLE stream, and both the vendor reader and
-                // our own PackBits unpacker are bounds-safe in that case.
-                if l.saturating_sub(2) < scanlines * 2 {
-                    return Err(DecodeError::Psd("RLE 行长度表被截断".into()));
+                // Vendor skips 2 rows-of-table bytes. Mask channels (`-2` /
+                // `-3`) hold their OWN rectangle in the mask block, so their
+                // scanline count is not the layer height; using the layer
+                // height there flagged perfectly good Photoshop files.
+                let rows = match cid {
+                    -2 => mask_rows.unwrap_or(scanlines),
+                    -3 => real_mask_rows.or(mask_rows).unwrap_or(scanlines),
+                    _ => scanlines,
+                };
+                // A short row table is NOT fatal: the vendored reader drops
+                // that single channel (the layer shows as transparent) and both
+                // it and our PackBits unpacker are bounds-safe. Real files do
+                // hit this (empty layers, unusual encoders), and refusing the
+                // whole document loses every other layer as well — degrade and
+                // report instead.
+                // The row counts themselves are also not validated against the
+                // remaining bytes for the same reason.
+                if l.saturating_sub(2) < rows * 2 && cid >= -1 {
+                    short_channels += 1;
                 }
             } else if compression > 1 {
                 return Err(DecodeError::Psd(format!(
@@ -444,7 +483,13 @@ fn validate_psd_layer_records(bytes: &[u8]) -> Result<(), DecodeError> {
             p = end;
         }
     }
-    Ok(())
+    let mut notes = Vec::new();
+    if short_channels > 0 {
+        notes.push(format!(
+            "{short_channels} 个图层通道数据不完整，已按空层处理"
+        ));
+    }
+    Ok(notes)
 }
 
 #[cfg(test)]
@@ -825,5 +870,135 @@ mod tests {
         assert_eq!(doc.layers[2].offset(), (2, 1));
         assert!(!doc.layers[2].visible);
         assert!((doc.layers[2].opacity - 128.0 / 255.0).abs() < 1e-6);
+    }
+
+    /// One RLE channel: `rows` scanlines of `width` pixels. `truncate` keeps
+    /// only that many bytes of the body, which is how a broken row-length
+    /// table looks on disk.
+    fn packbits_channel(rows: u32, width: u32, value: u8, truncate: Option<usize>) -> Vec<u8> {
+        let mut body = Vec::new();
+        for _ in 0..rows {
+            push_u16(&mut body, 2);
+        }
+        for _ in 0..rows {
+            body.push((1i16 - width as i16) as i8 as u8);
+            body.push(value);
+        }
+        if let Some(n) = truncate {
+            body.truncate(n);
+        }
+        let mut out = Vec::new();
+        push_u16(&mut out, 1); // RLE
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// A one-layer PSD with an optional user-mask channel. Photoshop stores the
+    /// mask rectangle separately from the layer rectangle, so the mask channel
+    /// legitimately has fewer scanlines than the layer — that combination used
+    /// to reject the whole file ("RLE 行长度表被截断").
+    fn make_psd_with_mask(side: u32, mask_side: Option<u32>, truncate_red: bool) -> Vec<u8> {
+        let red = if truncate_red { Some(2) } else { None };
+        let mut chans: Vec<(i16, Vec<u8>)> = vec![
+            (-1, packbits_channel(side, side, 255, None)),
+            (0, packbits_channel(side, side, 200, red)),
+            (1, packbits_channel(side, side, 100, None)),
+            (2, packbits_channel(side, side, 50, None)),
+        ];
+        let mask_len = match mask_side {
+            Some(m) => {
+                chans.push((-2, packbits_channel(m, m, 128, None)));
+                20usize
+            }
+            None => 0,
+        };
+
+        let mut rec = Vec::new();
+        push_i32(&mut rec, 0);
+        push_i32(&mut rec, 0);
+        push_i32(&mut rec, side as i32);
+        push_i32(&mut rec, side as i32);
+        push_u16(&mut rec, chans.len() as u16);
+        for (id, data) in &chans {
+            push_i16(&mut rec, *id);
+            push_u32(&mut rec, data.len() as u32);
+        }
+        rec.extend_from_slice(b"8BIMnorm");
+        rec.push(255);
+        rec.push(0);
+        rec.push(8); // bit 3 = Photoshop 5+, bit 1 clear = visible
+        rec.push(0);
+        let mut extra = Vec::new();
+        push_u32(&mut extra, mask_len as u32);
+        if let Some(m) = mask_side {
+            push_i32(&mut extra, 0);
+            push_i32(&mut extra, 0);
+            push_i32(&mut extra, m as i32);
+            push_i32(&mut extra, m as i32);
+            extra.push(0); // default colour
+            extra.push(0); // flags
+            extra.extend_from_slice(&[0, 0]);
+        }
+        push_u32(&mut extra, 0);
+        extra.push(5);
+        extra.extend_from_slice(b"masks");
+        pad4(&mut extra);
+        push_u32(&mut rec, extra.len() as u32);
+        rec.extend_from_slice(&extra);
+
+        let mut channels = Vec::new();
+        for (_, data) in &chans {
+            channels.extend_from_slice(data);
+        }
+        let mut info = Vec::new();
+        push_u32(&mut info, (2 + rec.len() + channels.len()) as u32);
+        push_i16(&mut info, 1);
+        info.extend_from_slice(&rec);
+        info.extend_from_slice(&channels);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"8BPS");
+        push_u16(&mut out, 1);
+        out.extend_from_slice(&[0; 6]);
+        push_u16(&mut out, 4);
+        push_u32(&mut out, side);
+        push_u32(&mut out, side);
+        push_u16(&mut out, 8);
+        push_u16(&mut out, 3);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, (info.len() + 4) as u32);
+        out.extend_from_slice(&info);
+        push_u32(&mut out, 0);
+        push_u16(&mut out, 0);
+        for c in 0..4u8 {
+            out.extend(std::iter::repeat(c * 40 + 17).take((side * side) as usize));
+        }
+        out
+    }
+
+    #[test]
+    fn mask_channel_with_its_own_rect_is_accepted() {
+        let bytes = make_psd_with_mask(8, Some(2), false);
+        let set = decode_psd_layers(&bytes, DecodeOptions::default()).expect("mask channel parses");
+        assert_eq!(set.layer_count(), 1);
+        // A 2x2 mask on an 8x8 layer must not be reported as corruption.
+        assert!(
+            !set.degraded.iter().any(|n| n.contains("不完整")),
+            "unexpected degrade notes: {:?}",
+            set.degraded
+        );
+    }
+
+    #[test]
+    fn truncated_channel_degrades_instead_of_failing_the_file() {
+        let bytes = make_psd_with_mask(8, None, true);
+        let set = decode_psd_layers(&bytes, DecodeOptions::default()).expect("其他图层仍可加载");
+        assert_eq!(set.layer_count(), 1);
+        assert!(
+            set.degraded.iter().any(|n| n.contains("通道数据不完整")),
+            "expected a degrade note, got {:?}",
+            set.degraded
+        );
     }
 }

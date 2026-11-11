@@ -238,7 +238,7 @@ Flickable {
         // 当前正在显示的那一帧的 URL。
         property string shownUrl: ""
         // false = previewA 在前台（显示 shownUrl），true = previewB 在前台。
-        property bool frontIsB: bool
+        property bool frontIsB: false
         // 「上一帧还在解码」的起始时刻（见 previewBusy / pulse）。
         property double pendingSince: 0
         // 还没派给后台 Image 的最新一帧。
