@@ -1,4 +1,10 @@
-//! Baking of Photoshop layer styles (`lfx2`) into a layer bitmap.
+//! Baking of Photoshop layer styles (`lfx2` / `lmfx` / `lfxs`) into a layer
+//! bitmap.
+//!
+//! Photoshop CS6+ stores *several effects of the same kind* under `xxxMulti`
+//! descriptor lists. The vendored parser flattens those into one entry per
+//! stack (see `psd::effects::parse_layer_effects`), so this renderer only ever
+//! sees one stroke / shadow / overlay per kind per layer.
 //!
 //! Photoshop keeps styles as parameters, not pixels: a button's drop shadow,
 //! its gradient fill and its 1 px stroke never appear in the layer's channel
@@ -34,6 +40,35 @@ pub struct Baked {
     pub notes: Vec<String>,
 }
 
+/// Diagnostic ablation: `IMAGEEDIT_FX_SKIP=stroke,gradient` removes whole
+/// effect kinds so a bad renderer can be isolated by measuring the composite.
+fn skip_kind(kind: EffectKind) -> bool {
+    static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = SKIP.get_or_init(|| {
+        std::env::var("IMAGEEDIT_FX_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    if list.is_empty() {
+        return false;
+    }
+    let name = match kind {
+        EffectKind::DropShadow => "dropshadow",
+        EffectKind::InnerShadow => "innershadow",
+        EffectKind::OuterGlow => "outerglow",
+        EffectKind::InnerGlow => "innerglow",
+        EffectKind::Stroke => "stroke",
+        EffectKind::ColorOverlay => "color",
+        EffectKind::GradientOverlay => "gradient",
+        EffectKind::PatternOverlay => "pattern",
+        EffectKind::BevelEmboss => "bevel",
+    };
+    list.iter().any(|s| s == name || s == "all")
+}
+
 /// Bake every enabled style into `image`.
 ///
 /// Returns `None` when there is nothing to do, so callers can keep the
@@ -41,7 +76,10 @@ pub struct Baked {
 /// corner; effects that paint outside the layer (shadow, outside stroke) grow
 /// the bitmap and push the offset accordingly.
 pub fn bake(image: &RgbaImage, offset: (i32, i32), effects: &[LayerEffect]) -> Option<Baked> {
-    let active: Vec<&LayerEffect> = effects.iter().filter(|e| e.enabled).collect();
+    let active: Vec<&LayerEffect> = effects
+        .iter()
+        .filter(|e| e.enabled && !skip_kind(e.kind))
+        .collect();
     if active.is_empty() {
         return None;
     }

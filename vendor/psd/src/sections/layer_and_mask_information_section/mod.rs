@@ -543,7 +543,13 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
                     .get_ref()
                     .get(start..start.checked_add(len).unwrap_or(usize::MAX))
                     .unwrap_or(&[]);
-                layer_effects = crate::effects::parse_layer_effects(block);
+                // A record may carry more than one effects block (e.g. an old
+                // `lmfx` plus a newer `lfxs`). Merge instead of letting the
+                // last one silently win; a malformed block must not erase a
+                // good one either.
+                if let Some(fx) = crate::effects::parse_layer_effects(block) {
+                    layer_effects.get_or_insert_with(Vec::new).extend(fx);
+                }
                 let end = start.saturating_add(len).min(cursor.get_ref().len());
                 cursor.seek(end as u64);
             }

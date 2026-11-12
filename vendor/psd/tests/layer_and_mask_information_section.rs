@@ -54,17 +54,22 @@ fn layer_with_clipping() {
     let psd = Psd::from_bytes(psd).unwrap();
 
     assert_eq!(psd.layers().len(), 3);
+    // PSD spec: the record byte is 0 for a base layer and 1 for a layer that
+    // is clipped to the base. The old assertions were inverted (they described
+    // the pre-fix bug where `clipping_base` was assigned straight into
+    // `clipping_mask`). Verified against psd-tools on this very fixture:
+    //   Clipping base = 0, First/Second clipped layer = 1.
     assert_eq!(
         psd.layer_by_name("Clipping base")
             .unwrap()
             .is_clipping_mask(),
-        true
+        false
     );
     assert_eq!(
         psd.layer_by_name("First clipped layer")
             .unwrap()
             .is_clipping_mask(),
-        false
+        true
     );
 }
 

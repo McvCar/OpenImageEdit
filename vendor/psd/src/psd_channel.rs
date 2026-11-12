@@ -367,6 +367,9 @@ mod tests {
             psd_height: 1,
             blend_mode: BlendMode::Normal,
             group_id: None,
+            brightness_contrast: None,
+            hue_saturation: None,
+            layer_effects: None,
         };
 
         let layer = PsdLayer {
