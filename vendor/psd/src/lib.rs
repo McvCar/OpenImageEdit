@@ -26,7 +26,7 @@ pub use crate::sections::image_resources_section::ImageResource;
 use crate::sections::image_resources_section::ImageResourcesSection;
 pub use crate::sections::image_resources_section::{DescriptorField, UnitFloatStructure};
 pub use crate::sections::layer_and_mask_information_section::layer::{
-    BlendMode, LayerChannels, PsdGroup, PsdLayer,
+    BlendMode, BrightnessContrast, HueSaturation, LayerChannels, PsdGroup, PsdLayer,
 };
 use crate::sections::layer_and_mask_information_section::LayerAndMaskInformationSection;
 use crate::sections::MajorSections;
@@ -37,6 +37,11 @@ mod blend;
 mod psd_channel;
 mod render;
 mod sections;
+
+pub mod descriptor;
+pub mod effects;
+
+pub use effects::{EffectKind, Gradient, GradientKind, LayerEffect, StrokeFill, StrokePosition};
 
 /// An list of errors returned when processing PSD file.
 ///

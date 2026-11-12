@@ -75,18 +75,21 @@ struct PreparedLayer {
     name: String,
     opacity: u8,
     visible: bool,
+    blend: editcore::BlendMode,
     planes: [Vec<u8>; 4],
 }
 
-/// Build the PSD layer records. PSD stores records top-to-bottom in the file;
-/// the vendored `Psd::layers()` reverses them back to bottom-to-top, which is
-/// exactly `doc.layers` order — so we iterate `doc.layers` in reverse.
+/// Build the PSD layer records. A PSD file stores layer records bottom-to-top,
+/// which is exactly `doc.layers` order, so they are written in order. (The
+/// vendored parser reverses the records as it reads them, and
+/// `psd_layers::build_layers` reverses that back — reversing here as well would
+/// flip the stack on every save/reopen round-trip.)
 fn prepare_layers(doc: &Document) -> Result<Vec<PreparedLayer>, crate::DecodeError> {
     let cw = doc.canvas.width as i64;
     let ch = doc.canvas.height as i64;
     let mut out = Vec::new();
 
-    for (idx, layer) in doc.layers.iter().enumerate().rev() {
+    for (idx, layer) in doc.layers.iter().enumerate() {
         let (plane, (ox, oy)) = layer.plane();
         let pw = plane.width() as i64;
         let ph = plane.height() as i64;
@@ -141,6 +144,7 @@ fn prepare_layers(doc: &Document) -> Result<Vec<PreparedLayer>, crate::DecodeErr
             name: layer.name.clone(),
             opacity: (layer.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
             visible: layer.visible,
+            blend: layer.blend,
             planes,
         });
     }
@@ -149,6 +153,35 @@ fn prepare_layers(doc: &Document) -> Result<Vec<PreparedLayer>, crate::DecodeErr
         return Err(crate::DecodeError::Psd("图层数超过 PSD 上限 (32767)".into()));
     }
     Ok(out)
+}
+
+/// PSD's four-character key for a blend mode.
+///
+/// The mapping is the inverse of `psd_layers::map_blend_mode`; anything the
+/// reader had to fall back to Normal already carries a degradation note, so
+/// silently writing `norm` for it is consistent with what the user was told.
+fn blend_key(mode: editcore::BlendMode) -> &'static [u8; 4] {
+    use editcore::BlendMode as M;
+    match mode {
+        M::Normal => b"norm",
+        M::Multiply => b"mul ",
+        M::Screen => b"scrn",
+        M::Overlay => b"over",
+        M::Darken => b"dark",
+        M::Lighten => b"lite",
+        M::ColorDodge => b"div ",
+        M::ColorBurn => b"idiv",
+        M::LinearDodge => b"lddg",
+        M::LinearBurn => b"lbrn",
+        M::SoftLight => b"sLit",
+        M::HardLight => b"hLit",
+        M::Difference => b"diff",
+        M::Exclusion => b"smud",
+        M::Hue => b"hue ",
+        M::Saturation => b"sat ",
+        M::Color => b"colr",
+        M::Luminosity => b"lum ",
+    }
 }
 
 /// Write one Layer Record (geometry + channel declarations + blend mode +
@@ -174,7 +207,7 @@ fn write_layer_record(out: &mut Vec<u8>, l: &PreparedLayer) -> Result<(), crate:
         push_u32(out, channel_len);
     }
     push_bytes(out, b"8BIM");
-    push_bytes(out, b"norm");
+    push_bytes(out, blend_key(l.blend));
     push_u8(out, l.opacity); // 0 = transparent, 255 = opaque
     push_u8(out, 0);         // clipping: base
     // Adobe's layer flags bit 1 is INVERTED: SET means HIDDEN. Photoshop
@@ -446,7 +479,7 @@ mod tests {
             .iter()
             .map(|&o| bytes[o])
             .collect();
-        // File order is top-to-bottom: 显示 (visible), 隐藏 (hidden), 背景 (visible).
+        // File order is bottom-to-top: 背景 (visible), 隐藏 (hidden), 显示 (visible).
         assert_eq!(flags.len(), 3);
         assert_eq!(flags[0] & 2, 0, "visible layer must NOT set bit 1");
         assert_eq!(flags[1] & 2, 2, "hidden layer MUST set bit 1");
@@ -493,6 +526,7 @@ mod tests {
             image: solid(2, 2, [30, 60, 90, 255]),
             visible: true,
             opacity: 1.0,
+            blend: editcore::BlendMode::Normal,
         };
         let doc = Document::from_psd_layers((4, 4), vec![seed("上层"), seed("下层")]);
         assert_eq!(doc.layers.len(), 3, "background + 2 seeds");

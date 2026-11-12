@@ -40,6 +40,50 @@ pub struct LayerProperties {
     pub(crate) blend_mode: BlendMode,
     /// If layer is nested, contains parent group ID, otherwise `None`
     pub(crate) group_id: Option<u32>,
+    /// Brightness/contrast adjustment settings (`brit` block), when present.
+    pub(crate) brightness_contrast: Option<BrightnessContrast>,
+    /// Hue/saturation adjustment settings (`hue2` block), when present.
+    pub(crate) hue_saturation: Option<HueSaturation>,
+    /// Layer styles (`lfx2` block), when present. Disabled styles are kept:
+    /// the decoder filters on `enabled`.
+    pub(crate) layer_effects: Option<Vec<crate::effects::LayerEffect>>,
+}
+
+/// Brightness/contrast adjustment layer settings (`brit`).
+///
+/// Both values are the Photoshop legacy 16-bit sliders, -100..=100 where 0
+/// means "leave the pixels alone". Files whose adjustment is neutral still
+/// carry the block, so an all-zero pair is common and must stay a no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BrightnessContrast {
+    /// Brightness slider, -100..=100.
+    pub brightness: i16,
+    /// Contrast slider, -100..=100.
+    pub contrast: i16,
+}
+
+/// Hue/saturation adjustment layer settings (`hue2`).
+///
+/// `hue` is a degree offset (-180..=180) and the two others are the -100..=100
+/// Photoshop sliders. `colorize` mirrors the "着色" checkbox; when it is set the
+/// layer first turns the backdrop monochrome and then applies `colorize_*`
+/// instead of the `master` triple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HueSaturation {
+    /// Master hue shift in degrees, -180..=180.
+    pub hue: i16,
+    /// Master saturation slider, -100..=100.
+    pub saturation: i16,
+    /// Master lightness slider, -100..=100.
+    pub lightness: i16,
+    /// "着色" (colorize) checkbox.
+    pub colorize: bool,
+    /// Colorize hue in degrees, -180..=180.
+    pub colorize_hue: i16,
+    /// Colorize saturation, -100..=100.
+    pub colorize_saturation: i16,
+    /// Colorize lightness, -100..=100.
+    pub colorize_lightness: i16,
 }
 
 impl LayerProperties {
@@ -68,7 +112,25 @@ impl LayerProperties {
             psd_width,
             psd_height,
             group_id,
+            brightness_contrast: layer_record.brightness_contrast,
+            hue_saturation: layer_record.hue_saturation,
+            layer_effects: layer_record.layer_effects.clone(),
         }
+    }
+
+    /// Brightness/contrast settings, when this layer is such an adjustment.
+    pub fn brightness_contrast(&self) -> Option<BrightnessContrast> {
+        self.brightness_contrast
+    }
+
+    /// Hue/saturation settings, when this layer is such an adjustment.
+    pub fn hue_saturation(&self) -> Option<HueSaturation> {
+        self.hue_saturation
+    }
+
+    /// Layer styles (`lfx2`), in file order, including disabled ones.
+    pub fn layer_effects(&self) -> Option<&[crate::effects::LayerEffect]> {
+        self.layer_effects.as_deref()
     }
 
     /// Get the name of the layer
@@ -304,7 +366,7 @@ impl GroupDivider {
 }
 
 /// Describes how to blend a layer with the layer below it
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub enum BlendMode {
     PassThrough = 0,
@@ -407,6 +469,12 @@ pub struct LayerRecord {
     pub(super) blend_mode: BlendMode,
     /// Group divider tag
     pub(super) divider_type: Option<GroupDivider>,
+    /// Brightness/contrast adjustment settings ("brit"), when present
+    pub(super) brightness_contrast: Option<BrightnessContrast>,
+    /// Hue/saturation adjustment settings ("hue2"), when present
+    pub(super) hue_saturation: Option<HueSaturation>,
+    /// Layer styles ("lfx2"), when present
+    pub(super) layer_effects: Option<Vec<crate::effects::LayerEffect>>,
 }
 
 impl LayerRecord {

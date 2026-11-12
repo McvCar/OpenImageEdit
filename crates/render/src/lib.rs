@@ -382,7 +382,7 @@ impl PreviewComposer {
             let (ox, oy, nw, nh) =
                 Self::preview_dst(r.offset, (r.image.width(), r.image.height()), sx, sy);
             let src = self.scaled_layer(0, &r.image, nw, nh);
-            Self::blend_layer(&mut out, target, &src, ox, oy, bg.opacity);
+            Self::blend_layer(&mut out, target, &src, ox, oy, bg.opacity, bg.blend);
             return out;
         }
         let nw = ((doc.view.width as f64 * sx).round() as u32).max(1);
@@ -410,7 +410,7 @@ impl PreviewComposer {
             return img;
         }
         let mut out = RgbaImage::new(img.width(), img.height());
-        Self::blend_layer(&mut out, target, &img, 0, 0, bg.opacity);
+        Self::blend_layer(&mut out, target, &img, 0, 0, bg.opacity, bg.blend);
         out
     }
 
@@ -465,9 +465,25 @@ impl PreviewComposer {
                         Some((AdjustTarget::Layer(index), params)) if index == li => {
                             let mut adjusted = (*src).clone();
                             params.apply_in_place(&mut adjusted);
-                            Self::blend_layer(out, target, &adjusted, ox, oy, layer.opacity);
+                            Self::blend_layer(
+                                out,
+                                target,
+                                &adjusted,
+                                ox,
+                                oy,
+                                layer.opacity,
+                                layer.blend,
+                            );
                         }
-                        _ => Self::blend_layer(out, target, &src, ox, oy, layer.opacity),
+                        _ => Self::blend_layer(
+                            out,
+                            target,
+                            &src,
+                            ox,
+                            oy,
+                            layer.opacity,
+                            layer.blend,
+                        ),
                     }
                 }
             }
@@ -523,6 +539,7 @@ impl PreviewComposer {
         ox: i32,
         oy: i32,
         opacity: f32,
+        mode: editcore::BlendMode,
     ) {
         let nw = src.width() as i32;
         let nh = src.height() as i32;
@@ -534,6 +551,7 @@ impl PreviewComposer {
         let src_stride = nw as usize * 4;
         let src_buf: &[u8] = src.as_raw();
         let out_stride = target.width as usize * 4;
+        let normal = mode.is_normal();
         for ty in 0..target.height {
             let ly = ty as i64 - oy as i64;
             if ly < 0 || ly >= nh as i64 {
@@ -545,24 +563,49 @@ impl PreviewComposer {
             for tx in x0..x1 {
                 let lx = tx as i64 - ox as i64;
                 let so = lx as usize * 4;
-                let sa = srow[so + 3] as f32 / 255.0 * opacity;
-                if sa <= 0.0 {
-                    continue;
-                }
                 let oo = tx as usize * 4;
-                let inv = 1.0 - sa;
-                for c in 0..3 {
-                    orow[oo + c] =
-                        (srow[so + c] as f32 * sa + orow[oo + c] as f32 * inv).round() as u8;
+                if normal {
+                    let sa = srow[so + 3] as f32 / 255.0 * opacity;
+                    if sa <= 0.0 {
+                        continue;
+                    }
+                    let inv = 1.0 - sa;
+                    for c in 0..3 {
+                        orow[oo + c] =
+                            (srow[so + c] as f32 * sa + orow[oo + c] as f32 * inv).round() as u8;
+                    }
+                    orow[oo + 3] = ((sa + orow[oo + 3] as f32 / 255.0 * inv) * 255.0).round() as u8;
+                } else {
+                    let mut dst = [
+                        orow[oo],
+                        orow[oo + 1],
+                        orow[oo + 2],
+                        orow[oo + 3],
+                    ];
+                    let px = [
+                        srow[so],
+                        srow[so + 1],
+                        srow[so + 2],
+                        srow[so + 3],
+                    ];
+                    editcore::blend_pixel(&mut dst, px, opacity, mode);
+                    orow[oo..oo + 4].copy_from_slice(&dst);
                 }
-                orow[oo + 3] = ((sa + orow[oo + 3] as f32 / 255.0 * inv) * 255.0).round() as u8;
             }
         }
     }
 
-    fn blend_layer(out: &mut RgbaImage, target: Size, src: &RgbaImage, ox: i32, oy: i32, opacity: f32) {
+    fn blend_layer(
+        out: &mut RgbaImage,
+        target: Size,
+        src: &RgbaImage,
+        ox: i32,
+        oy: i32,
+        opacity: f32,
+        mode: editcore::BlendMode,
+    ) {
         let mut raw = std::mem::take(out).into_raw();
-        Self::blend(&mut raw, target, src, ox, oy, opacity);
+        Self::blend(&mut raw, target, src, ox, oy, opacity, mode);
         *out = RgbaImage::from_raw(target.width, target.height, raw)
             .expect("preview buffer size preserved");
     }
@@ -662,6 +705,13 @@ impl PreviewComposer {
             .get(layer_index)
             .map(|l| if l.visible { l.opacity } else { 0.0 })
             .unwrap_or(0.0);
+        // The dragged layer keeps its own blend mode, otherwise a `Multiply`
+        // layer would flash to Normal for the duration of the gesture.
+        let drag_blend = doc
+            .layers
+            .get(layer_index)
+            .map(|l| l.blend)
+            .unwrap_or_default();
         let mut out = self.base_buffer(doc, target, sx, sy);
         if let Some((AdjustTarget::Base, params)) = adjust {
             params.apply_in_place(&mut out);
@@ -711,7 +761,7 @@ impl PreviewComposer {
                 }
                 _ => (*src).clone(),
             };
-            Self::blend_layer(&mut out, target, &stretched, ox, oy, drag_opacity);
+            Self::blend_layer(&mut out, target, &stretched, ox, oy, drag_opacity, drag_blend);
         }
         out
     }
@@ -744,6 +794,13 @@ impl PreviewComposer {
             .get(layer_index)
             .map(|l| if l.visible { l.opacity } else { 0.0 })
             .unwrap_or(0.0);
+        // The dragged layer keeps its own blend mode, otherwise a `Multiply`
+        // layer would flash to Normal for the duration of the gesture.
+        let drag_blend = doc
+            .layers
+            .get(layer_index)
+            .map(|l| l.blend)
+            .unwrap_or_default();
         let mut out = self.base_buffer(doc, target, sx, sy);
         if let Some((AdjustTarget::Base, params)) = adjust {
             params.apply_in_place(&mut out);
@@ -812,7 +869,7 @@ impl PreviewComposer {
                 }
                 _ => active,
             };
-            Self::blend_layer(&mut out, target, &stretched, 0, 0, drag_opacity);
+            Self::blend_layer(&mut out, target, &stretched, 0, 0, drag_opacity, drag_blend);
         }
         out
     }
@@ -837,6 +894,13 @@ impl PreviewComposer {
             .get(layer_index)
             .map(|l| if l.visible { l.opacity } else { 0.0 })
             .unwrap_or(0.0);
+        // The dragged layer keeps its own blend mode, otherwise a `Multiply`
+        // layer would flash to Normal for the duration of the gesture.
+        let drag_blend = doc
+            .layers
+            .get(layer_index)
+            .map(|l| l.blend)
+            .unwrap_or_default();
         let mut out = self.base_buffer(doc, target, sx, sy);
         if let Some((AdjustTarget::Base, params)) = adjust {
             params.apply_in_place(&mut out);
@@ -897,7 +961,7 @@ impl PreviewComposer {
                 }
                 _ => rotated,
             };
-            Self::blend_layer(&mut out, target, &src, ox, oy, drag_opacity);
+            Self::blend_layer(&mut out, target, &src, ox, oy, drag_opacity, drag_blend);
         }
         out
     }

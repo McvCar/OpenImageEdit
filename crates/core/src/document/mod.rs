@@ -1,5 +1,6 @@
 // crates/core/src/document/mod.rs
 use super::*;
+use crate::layer_ops::blend_image_at_mode;
 
 #[derive(Debug, Clone)]
 pub struct Document {
@@ -131,6 +132,8 @@ pub struct PsdLayerSeed {
     pub image: RgbaImage,
     pub visible: bool,
     pub opacity: f32,
+    /// Blend mode carried by the PSD layer record.
+    pub blend: BlendMode,
 }
 
 #[cfg(test)]
@@ -152,6 +155,7 @@ mod psd_assembly_tests {
             image: RgbaImage::from_pixel(size.0, size.1, Rgba(color)),
             visible,
             opacity,
+            blend: BlendMode::Normal,
         }
     }
 
@@ -250,6 +254,7 @@ impl Document {
             let mut layer = Layer::new(seed.name, seed.image);
             layer.visible = seed.visible;
             layer.opacity = seed.opacity.clamp(0.0, 1.0);
+            layer.blend = seed.blend;
             layer.locked = false;
             layer.background = false;
             if let Some(raster) = layer.raster_mut() {
@@ -1113,7 +1118,7 @@ impl Document {
                 continue;
             }
             let src = r.image.get_pixel(lx as u32, ly as u32).0;
-            blend_over(&mut out, src, layer.opacity);
+            blend_over_with(&mut out, src, layer.opacity, layer.blend);
         }
         image::Rgba(out)
     }
@@ -1220,7 +1225,9 @@ impl Document {
                 continue;
             }
             match &layer.content {
-                LayerContent::Raster(r) => blend_raster_into(&mut out, r, layer.opacity),
+                LayerContent::Raster(r) => {
+                    blend_raster_into(&mut out, r, layer.opacity, layer.blend)
+                }
                 LayerContent::Mark(m) => {
                     if layer.opacity >= 0.999 {
                         m.draw(&mut out);
@@ -1253,21 +1260,23 @@ impl Document {
     }
 }
 
-/// 把 `src` 按 `opacity` 叠到 `out` 上（与旧 `composite_pixel` 逐像素一致）。
+/// 把 `src` 按 `opacity` 叠到 `out` 上（正常模式，与旧 `composite_pixel` 逐像素一致）。
 pub(crate) fn blend_over(out: &mut [u8; 4], src: [u8; 4], opacity: f32) {
-    let a = (src[3] as f32 / 255.0) * opacity;
-    if a <= 0.0 {
-        return;
-    }
-    let inv = 1.0 - a;
-    for c in 0..3 {
-        out[c] = (src[c] as f32 * a + out[c] as f32 * inv).round() as u8;
-    }
-    out[3] = ((a + out[3] as f32 / 255.0 * inv) * 255.0).round() as u8;
+    blend_over_with(out, src, opacity, BlendMode::Normal);
+}
+
+/// 带混合模式的版本：PSD 打开时带回的 `Multiply` / `Color` 等都走这里。
+pub(crate) fn blend_over_with(
+    out: &mut [u8; 4],
+    src: [u8; 4],
+    opacity: f32,
+    mode: BlendMode,
+) {
+    crate::blend::blend_pixel(out, src, opacity, mode);
 }
 
 /// 把一个位图图层按 offset 混合进整幅画布。
-fn blend_raster_into(out: &mut RgbaImage, r: &RasterLayer, opacity: f32) {
-    blend_image_at(out, &r.image, r.offset.0, r.offset.1, opacity);
+fn blend_raster_into(out: &mut RgbaImage, r: &RasterLayer, opacity: f32, mode: BlendMode) {
+    blend_image_at_mode(out, &r.image, r.offset.0, r.offset.1, opacity, mode);
 }
 

@@ -12,6 +12,7 @@
 
 use image::RgbaImage;
 use psd::{ChannelBytes, PsdChannelKind};
+use std::collections::HashMap;
 
 use crate::{DecodeError, DecodeOptions};
 
@@ -24,6 +25,12 @@ pub struct PsdLayerData {
     pub image: RgbaImage,
     pub visible: bool,
     pub opacity: f32,
+    /// Blend mode of the layer record (already mapped onto what `core` renders).
+    pub blend: editcore::BlendMode,
+    /// The layer sits inside a group Photoshop's author used for annotations
+    /// ("标注", "备注", ...). Those carry measurements and colour codes, not
+    /// artwork, so the UI can hide them on request.
+    pub annotation: bool,
     /// Per-layer "something was simplified" notes.
     pub degraded: Vec<String>,
 }
@@ -39,6 +46,18 @@ pub struct PsdLayerSet {
     pub has_composite: bool,
     /// Total bytes held by the layer bitmaps, for the memory budget probes.
     pub bytes: usize,
+}
+
+impl PsdLayerSet {
+    /// Indices (into `layers`, bottom -> top) of the annotation layers.
+    pub fn annotation_indices(&self) -> Vec<usize> {
+        self.layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.annotation)
+            .map(|(i, _)| i)
+            .collect()
+    }
 }
 
 impl PsdLayerSet {
@@ -58,6 +77,7 @@ impl PsdLayerSet {
                 image: l.image,
                 visible: l.visible,
                 opacity: l.opacity,
+                blend: l.blend,
             })
             .collect()
     }
@@ -156,6 +176,64 @@ fn check_header(bytes: &[u8], options: DecodeOptions) -> Result<(u32, u32, u16),
     Ok((width, height, channels))
 }
 
+/// Multiply a layer's own state by every ancestor group's, returning
+/// `(visible, opacity)`.
+///
+/// Flattening the group tree loses the folder records, and a folder is where
+/// Photoshop puts the "this whole variant is hidden" flag. Walking the chain
+/// (`group_id -> parent group id`) keeps that information on the children.
+/// The depth guard is there because a corrupt file could describe a cycle.
+fn inherited_group_state(
+    groups: &HashMap<u32, psd::PsdGroup>,
+    parent: Option<u32>,
+) -> (bool, f32) {
+    let mut visible = true;
+    let mut opacity = 1.0f32;
+    let mut next = parent;
+    for _ in 0..64 {
+        let Some(group) = next.and_then(|id| groups.get(&id)) else {
+            break;
+        };
+        visible &= group.visible();
+        opacity *= group.opacity() as f32 / 255.0;
+        next = group.parent_id();
+    }
+    (visible, opacity)
+}
+
+/// Group names designers use for annotation / spec layers.
+///
+/// These folders hold measurements, colour codes and font specs — data for the
+/// implementer, not part of the screen. They are matched on the *group* name so
+/// a real text layer called "字号28，描边2xp" (very common in Chinese UI files,
+/// the name records the styling) is never mistaken for a note.
+const ANNOTATION_GROUP_KEYWORDS: &[&str] = &["标注", "备注", "注释", "批注", "说明", "切图"];
+
+fn is_annotation_name(name: &str) -> bool {
+    let name = name.trim();
+    ANNOTATION_GROUP_KEYWORDS
+        .iter()
+        .any(|kw| name.contains(kw))
+}
+
+/// Whether any ancestor group of a layer is an annotation folder.
+fn ancestor_is_annotation_group(
+    groups: &HashMap<u32, psd::PsdGroup>,
+    parent: Option<u32>,
+) -> bool {
+    let mut next = parent;
+    for _ in 0..64 {
+        let Some(group) = next.and_then(|id| groups.get(&id)) else {
+            break;
+        };
+        if is_annotation_name(group.name()) {
+            return true;
+        }
+        next = group.parent_id();
+    }
+    false
+}
+
 fn build_layers<F: FnMut(usize, usize)>(
     psd: &psd::Psd,
     canvas: (u32, u32),
@@ -166,10 +244,23 @@ fn build_layers<F: FnMut(usize, usize)>(
     let total = source.len();
     progress(0, total);
     let mut layers = Vec::with_capacity(total);
+    // Whether each already-pushed layer is a clipping mask — needed to scope an
+    // adjustment layer onto the chain it clips to.
+    let mut clips: Vec<bool> = Vec::with_capacity(total);
     let mut degraded: Vec<String> = Vec::new();
     let mut total_bytes = 0usize;
+    let mut baked_adjustments = 0usize;
+    let mut styled_layers = 0usize;
+    let groups = psd.groups();
+    let mut inherited_hidden = false;
 
-    for (idx, layer) in source.iter().enumerate() {
+    // Bottom -> top: the vendor hands records back top -> bottom (it reverses
+    // them on read), and `PsdLayerSet::layers` is documented as bottom -> top.
+    // Iterating in the target order here means an adjustment layer can be baked
+    // into the layers it actually sits above, which is only knowable in this
+    // direction.
+    for (step, idx) in (0..total).rev().enumerate() {
+        let layer = &source[idx];
         let left = layer.layer_left();
         let top = layer.layer_top();
         let right = layer.layer_right();
@@ -178,13 +269,41 @@ fn build_layers<F: FnMut(usize, usize)>(
         let raw_h = (bottom as i64 - top as i64 + 1).max(1);
         let mut notes: Vec<String> = Vec::new();
 
-        // ---- degradation contract (§7) ---------------------------------
-        match layer.blend_mode() {
-            psd::BlendMode::Normal | psd::BlendMode::PassThrough => {}
-            other => notes.push(format!("混合模式 {other:?} 已按 Normal 处理")),
+        // ---- adjustment layers -----------------------------------------
+        // Brightness/contrast and hue/saturation are not pixels: Photoshop
+        // applies them to everything below (or, when clipped, to the layer the
+        // chain clips to). We have no live adjustment layer concept, so bake
+        // the effect into those layers and keep the document pixel-exact.
+        let bc = layer.brightness_contrast();
+        let hs = layer.hue_saturation();
+        if bc.is_some() || hs.is_some() {
+            if layer.visible() && layer.opacity() > 0 {
+                let clipped = layer.is_clipping_mask();
+                let start = adjustment_scope(&clips, clipped, layers.len());
+                apply_adjustment(&mut layers[start..], bc, hs);
+                baked_adjustments += 1;
+            }
+            progress(step + 1, total);
+            continue;
         }
+
+        // ---- degradation contract (§7) ---------------------------------
+        let blend = map_blend_mode(layer.blend_mode());
+        if blend.is_none() {
+            notes.push(format!("混合模式 {:?} 不支持，已按正常处理", layer.blend_mode()));
+        }
+        let blend = blend.unwrap_or_default();
         if layer.parent_id().is_some() {
             notes.push("组结构已展平".into());
+        }
+        // A group's own visibility and opacity live on the folder record, not on
+        // its children: Photoshop keeps the children's flags untouched and hides
+        // them through the group. Flattening drops that, so a hidden group (an
+        // alternate screen state, a popup variant) would pop into the canvas.
+        // Fold every ancestor group's flag into the child.
+        let (ancestor_visible, ancestor_opacity) = inherited_group_state(groups, layer.parent_id());
+        if !ancestor_visible && layer.visible() {
+            inherited_hidden = true;
         }
         if layer.is_clipping_mask() {
             notes.push("裁剪蒙版未保留".into());
@@ -201,7 +320,7 @@ fn build_layers<F: FnMut(usize, usize)>(
         if x1 <= x0 || y1 <= y0 {
             notes.push("层完全在画布外，已跳过".into());
             degraded.extend(notes.iter().cloned());
-            progress(idx + 1, total);
+            progress(step + 1, total);
             continue;
         }
         let src_x = (x0 - left) as u32;
@@ -216,59 +335,98 @@ fn build_layers<F: FnMut(usize, usize)>(
         if crop_w == 0 || crop_h == 0 {
             notes.push("层位图数据不足，已跳过".into());
             degraded.extend(notes.iter().cloned());
-            progress(idx + 1, total);
+            progress(step + 1, total);
             continue;
         }
 
-        // Only the visible part of the layer needs to be expanded. For a
-        // negative-offset layer the source image is cropped from its top-left.
-        let need_w = src_x + crop_w;
-        let need_h = src_y + crop_h;
-        let pixels = need_w as u64 * need_h as u64;
-        if pixels > 300_000_000 {
+        // Expand the channel planes at their **own** rectangle size, then crop
+        // the canvas-visible part out of it.
+        //
+        // ★ Reading them at the cropped size instead used to shear the layer:
+        //   a plane is `raw_w` bytes per row, so decoding it as `crop_w` bytes
+        //   per row shifts every row further right. A shape layer that pokes a
+        //   few pixels outside the canvas (a decorative border) turned into a
+        //   parallelogram of diagonal red lines.
+        let raw_pixels = raw_w as u64 * raw_h as u64;
+        if raw_pixels > 300_000_000 {
             notes.push("层尺寸过大，已按空层处理".into());
             degraded.extend(notes.iter().cloned());
-            progress(idx + 1, total);
+            progress(step + 1, total);
             continue;
         }
-        let pixels = pixels as usize;
+        let raw_pixels = raw_pixels as usize;
 
         let chans = layer.channel_bytes();
-        let red = channel_plane(chans, PsdChannelKind::Red, pixels);
-        let green = channel_plane(chans, PsdChannelKind::Green, pixels);
-        let blue = channel_plane(chans, PsdChannelKind::Blue, pixels);
-        let alpha = channel_plane(chans, PsdChannelKind::TransparencyMask, pixels);
+        let red = channel_plane(chans, PsdChannelKind::Red, raw_pixels);
+        let green = channel_plane(chans, PsdChannelKind::Green, raw_pixels);
+        let blue = channel_plane(chans, PsdChannelKind::Blue, raw_pixels);
+        let alpha = channel_plane(chans, PsdChannelKind::TransparencyMask, raw_pixels);
         let Some(red) = red else {
             return Err(format!("PSD 图层「{}」缺少颜色通道", layer.name()));
         };
         // Grayscale PSDs store a single channel; mirror generate_rgba().
         let green = green.unwrap_or_else(|| red.clone());
         let blue = blue.unwrap_or_else(|| red.clone());
-        let mut rgba = vec![0u8; pixels * 4];
-        for i in 0..pixels {
+        let mut rgba = vec![0u8; raw_pixels * 4];
+        for i in 0..raw_pixels {
             rgba[i * 4] = red[i];
             rgba[i * 4 + 1] = green[i];
             rgba[i * 4 + 2] = blue[i];
             rgba[i * 4 + 3] = alpha.as_ref().map(|a| a[i]).unwrap_or(255);
         }
-        let full = RgbaImage::from_raw(need_w, need_h, rgba)
+        let full = RgbaImage::from_raw(raw_w as u32, raw_h as u32, rgba)
             .ok_or_else(|| "层位图尺寸异常".to_string())?;
         let image = image::imageops::crop_imm(&full, src_x, src_y, crop_w, crop_h).to_image();
+        let mut image = image;
+        let mut layer_offset = (x0, y0);
+
+        // ---- layer styles (lfx2) ---------------------------------------
+        // Photoshop stores shadow / stroke / overlay as parameters; without
+        // baking them the layer looks flat (a title loses its gradient fill,
+        // a button loses its outline). `bake` renders them into the bitmap and
+        // reports any style it could not draw.
+        if let Some(effects) = layer.layer_effects() {
+            if let Some(baked) = crate::psd_effects::bake(&image, layer_offset, effects) {
+                image = baked.image;
+                layer_offset = baked.offset;
+                notes.extend(baked.notes);
+                styled_layers += 1;
+            }
+        }
+
         total_bytes += (image.width() as usize) * (image.height() as usize) * 4;
 
         degraded.extend(notes.iter().cloned());
         layers.push(PsdLayerData {
+            annotation: ancestor_is_annotation_group(groups, layer.parent_id()),
             name: layer.name().to_string(),
-            offset: (x0, y0),
+            offset: layer_offset,
             image,
-            visible: layer.visible(),
-            opacity: layer.opacity() as f32 / 255.0,
+            visible: layer.visible() && ancestor_visible,
+            opacity: (layer.opacity() as f32 / 255.0) * ancestor_opacity,
+            blend,
             degraded: notes,
         });
-        progress(idx + 1, total);
+        clips.push(layer.is_clipping_mask());
+        progress(step + 1, total);
     }
 
     dedup(&mut degraded);
+    if inherited_hidden {
+        // Say it out loud: the panel will show a layer whose own eye says
+        // "visible" but which the canvas correctly hides.
+        degraded.push("组已隐藏，其子层已跟随隐藏".into());
+    }
+    if baked_adjustments > 0 {
+        degraded.push(format!(
+            "{baked_adjustments} 个调整图层已烘焙进下方图层"
+        ));
+    }
+    if styled_layers > 0 {
+        degraded.push(format!(
+            "{styled_layers} 个图层的样式（阴影/描边/渐变叠加等）已烘焙进图层像素"
+        ));
+    }
     Ok(PsdLayerSet {
         layers,
         canvas,
@@ -283,6 +441,191 @@ fn build_layers<F: FnMut(usize, usize)>(
 fn dedup(v: &mut Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     v.retain(|s| seen.insert(s.clone()));
+}
+
+/// Blend mode for anything outside a layer record (layer styles).
+pub(crate) fn blend_of(mode: psd::BlendMode) -> editcore::BlendMode {
+    map_blend_mode(mode).unwrap_or_default()
+}
+
+/// Map the parser's blend mode onto the subset `core` can render.
+///
+/// `None` means "not implemented": the caller falls back to Normal and records a
+/// degradation note, so a file never silently changes appearance without saying
+/// so. A pass-through folder record is Normal for the layer itself.
+fn map_blend_mode(mode: psd::BlendMode) -> Option<editcore::BlendMode> {
+    use editcore::BlendMode as M;
+    Some(match mode {
+        psd::BlendMode::PassThrough | psd::BlendMode::Normal => M::Normal,
+        psd::BlendMode::Multiply => M::Multiply,
+        psd::BlendMode::Screen => M::Screen,
+        psd::BlendMode::Overlay => M::Overlay,
+        psd::BlendMode::Darken => M::Darken,
+        psd::BlendMode::Lighten => M::Lighten,
+        psd::BlendMode::ColorDodge => M::ColorDodge,
+        psd::BlendMode::ColorBurn => M::ColorBurn,
+        psd::BlendMode::LinearDodge => M::LinearDodge,
+        psd::BlendMode::LinearBurn => M::LinearBurn,
+        psd::BlendMode::SoftLight => M::SoftLight,
+        psd::BlendMode::HardLight => M::HardLight,
+        psd::BlendMode::Difference => M::Difference,
+        psd::BlendMode::Exclusion => M::Exclusion,
+        psd::BlendMode::Hue => M::Hue,
+        psd::BlendMode::Saturation => M::Saturation,
+        psd::BlendMode::Color => M::Color,
+        psd::BlendMode::Luminosity => M::Luminosity,
+        _ => return None,
+    })
+}
+
+/// Which already-pushed layers an adjustment layer applies to.
+///
+/// A clipped adjustment (Photoshop's "剪贴蒙版", the usual way a designer
+/// recolours one button graphic) only touches the chain it clips to: the run of
+/// trailing clipping layers plus the base layer under them. An unclipped one
+/// affects everything below it — we approximate the group scope by taking every
+/// layer already emitted.
+fn adjustment_scope(clips: &[bool], clipped: bool, len: usize) -> usize {
+    if !clipped {
+        return 0;
+    }
+    let mut start = len;
+    while start > 0 && clips[start - 1] {
+        start -= 1;
+    }
+    // Include the base layer the chain clips to.
+    start.saturating_sub(1)
+}
+
+/// Bake one adjustment layer's effect into the pixels of `targets`.
+///
+/// Adjustment layers have no bitmap of their own, so the only way to show what
+/// Photoshop shows is to apply the operation to the layers below — exactly what
+/// "拼合图层" would do. Alpha is never touched: an adjustment changes colour,
+/// not coverage.
+fn apply_adjustment(
+    targets: &mut [PsdLayerData],
+    bc: Option<psd::BrightnessContrast>,
+    hs: Option<psd::HueSaturation>,
+) {
+    for layer in targets.iter_mut() {
+        if !layer.visible || layer.opacity <= 0.0 {
+            continue;
+        }
+        for px in layer.image.pixels_mut() {
+            if px.0[3] == 0 {
+                continue;
+            }
+            let mut rgb = [px.0[0], px.0[1], px.0[2]];
+            if let Some(hs) = hs {
+                rgb = hue_saturation(rgb, hs);
+            }
+            if let Some(bc) = bc {
+                rgb = brightness_contrast(rgb, bc);
+            }
+            px.0[0] = rgb[0];
+            px.0[1] = rgb[1];
+            px.0[2] = rgb[2];
+        }
+    }
+}
+
+/// Photoshop's brightness/contrast sliders (legacy range -100..=100).
+fn brightness_contrast(rgb: [u8; 3], bc: psd::BrightnessContrast) -> [u8; 3] {
+    if bc.brightness == 0 && bc.contrast == 0 {
+        return rgb;
+    }
+    let bright = bc.brightness as f32 / 100.0;
+    let contrast = 1.0 + bc.contrast as f32 / 100.0;
+    let mut out = rgb;
+    for c in 0..3 {
+        let v = rgb[c] as f32 / 255.0;
+        let v = (v - 0.5) * contrast + 0.5 + bright;
+        out[c] = (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
+/// Photoshop's hue/saturation adjustment in HSL space.
+fn hue_saturation(rgb: [u8; 3], hs: psd::HueSaturation) -> [u8; 3] {
+    let (mut h, mut s, mut l) = rgb_to_hsl(rgb);
+    if hs.colorize {
+        // "着色": flatten the colour to a single hue first, then apply.
+        s = 0.0;
+        l = l * 0.5;
+        h = 0.0;
+        h = (h + hs.colorize_hue as f32 / 360.0).rem_euclid(1.0);
+        s = apply_slider(s, hs.colorize_saturation as f32);
+        l = apply_slider(l, hs.colorize_lightness as f32);
+    } else {
+        h = (h + hs.hue as f32 / 360.0).rem_euclid(1.0);
+        s = apply_slider(s, hs.saturation as f32);
+        l = apply_slider(l, hs.lightness as f32);
+    }
+    hsl_to_rgb(h, s, l)
+}
+
+/// Photoshop's -100..=100 sliders move a 0..1 value towards the corresponding
+/// end of its range instead of scaling it linearly (so +100 really is "max").
+fn apply_slider(v: f32, slider: f32) -> f32 {
+    let t = (slider / 100.0).clamp(-1.0, 1.0);
+    if t >= 0.0 {
+        v + (1.0 - v) * t
+    } else {
+        v * (1.0 + t)
+    }
+}
+
+fn rgb_to_hsl(rgb: [u8; 3]) -> (f32, f32, f32) {
+    let r = rgb[0] as f32 / 255.0;
+    let g = rgb[1] as f32 / 255.0;
+    let b = rgb[2] as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) * 0.5;
+    if (max - min).abs() < f32::EPSILON {
+        return (0.0, 0.0, l);
+    }
+    let d = max - min;
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
+    let h = if max == r {
+        ((g - b) / d + if g < b { 6.0 } else { 0.0 }) / 6.0
+    } else if max == g {
+        ((b - r) / d + 2.0) / 6.0
+    } else {
+        ((r - g) / d + 4.0) / 6.0
+    };
+    (h, s, l)
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [u8; 3] {
+    if s <= 0.0 {
+        let v = (l * 255.0).round().clamp(0.0, 255.0) as u8;
+        return [v, v, v];
+    }
+    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let p = 2.0 * l - q;
+    let f = |t: f32| -> f32 {
+        let t = t.rem_euclid(1.0);
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 0.5 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+    [
+        (f(h + 1.0 / 3.0) * 255.0).round().clamp(0.0, 255.0) as u8,
+        (f(h) * 255.0).round().clamp(0.0, 255.0) as u8,
+        (f(h - 1.0 / 3.0) * 255.0).round().clamp(0.0, 255.0) as u8,
+    ]
 }
 
 /// Expand one planar channel to exactly `pixels` bytes. RLE data from the
@@ -535,10 +878,12 @@ mod tests {
         }
     }
 
+    /// `layers` is given in file order, i.e. bottom -> top: that is how a PSD
+    /// stores its records, and what `decode_psd_layers` must hand back.
     fn make_psd(w: u32, h: u32, layers: &[TestLayer]) -> Vec<u8> {
         let mut records = Vec::new();
         let mut channels = Vec::new();
-        for layer in layers.iter().rev() {
+        for layer in layers.iter() {
             let n = (layer.w * layer.h) as usize;
             let planes: Vec<Vec<u8>> = (0..4)
                 .map(|c| (0..n).map(|i| layer.rgba[i * 4 + c]).collect::<Vec<u8>>())
@@ -1040,6 +1385,132 @@ mod tests {
         let t = std::time::Instant::now();
         let _ = decode_psd_layers(&bytes, DecodeOptions::default()).expect("layers");
         println!("full #2   {:>8.1} ms  (warm)", ms(t));
+    }
+
+    /// Per-layer transparency census for real user files (ignored by default).
+    ///
+    /// A canvas that comes out blank while the panel lists hundreds of layers
+    /// almost always means the layers decoded to fully transparent bitmaps
+    /// (vector / text / smart-object layers carry no channel data of their
+    /// own). This prints the numbers instead of guessing.
+    ///
+    /// ```text
+    /// set IMAGEEDIT_INSPECT_PSD=<file.psd>
+    /// cargo test -p imageedit-decode inspect_real_psd -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn inspect_real_psd() {
+        let Ok(path) = std::env::var("IMAGEEDIT_INSPECT_PSD") else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read");
+        let set = decode_psd_layers(&bytes, DecodeOptions::default()).expect("layers");
+        println!(
+            "canvas {:?}  layers {}  composite {}",
+            set.canvas,
+            set.layer_count(),
+            set.has_composite
+        );
+        if let Ok(psd) = psd::Psd::from_bytes(&bytes) {
+            let groups = psd.groups();
+            let mut in_group = 0usize;
+            let mut hidden_inherited = 0usize;
+            for l in psd.layers() {
+                if let Some(gid) = l.parent_id() {
+                    in_group += 1;
+                    let (vis, op) = inherited_group_state(groups, Some(gid));
+                    if !vis || op < 0.999 {
+                        hidden_inherited += 1;
+                    }
+                }
+            }
+            println!(
+                "groups {}  layers_in_group {}  inherited_hidden_or_faded {}",
+                groups.len(),
+                in_group,
+                hidden_inherited
+            );
+        }
+        let mut empty = 0usize;
+        let mut visible_empty = 0usize;
+        let mut rows: Vec<(u64, String, (u32, u32), (i32, i32), bool, f32)> = Vec::new();
+        for l in &set.layers {
+            let nz = l.image.pixels().filter(|p| p[3] > 8).count() as u64;
+            if nz == 0 {
+                empty += 1;
+                if l.visible {
+                    visible_empty += 1;
+                }
+            }
+            rows.push((nz, l.name.clone(), l.image.dimensions(), l.offset, l.visible, l.opacity));
+        }
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        println!("全透明层 {empty} / {}（其中可见 {visible_empty}）", set.layers.len());
+        for r in rows.iter().take(12) {
+            println!(
+                "  {:>9} px  {}  {:?} off={:?} vis={} op={:.2}",
+                r.0, r.1, r.2, r.3, r.4, r.5
+            );
+        }
+        println!("degraded: {:?}", set.degraded);
+        println!(
+            "前5: {:?}",
+            set.layers.iter().take(5).map(|l| l.name.clone()).collect::<Vec<_>>()
+        );
+        println!(
+            "后5: {:?}",
+            set.layers.iter().rev().take(5).map(|l| l.name.clone()).collect::<Vec<_>>()
+        );
+
+        // Colour census for the biggest layers: all-white RGBA would composite
+        // to a blank canvas even though the alpha mask is perfectly fine.
+        for r in rows.iter().take(4) {
+            if let Some(l) = set.layers.iter().find(|l| l.name == r.1 && l.image.dimensions() == r.2) {
+                let mut min = [255u8; 4];
+                let mut max = [0u8; 4];
+                let mut sum = [0u64; 4];
+                let n = l.image.pixels().count() as u64;
+                for p in l.image.pixels() {
+                    for c in 0..4 {
+                        min[c] = min[c].min(p[c]);
+                        max[c] = max[c].max(p[c]);
+                        sum[c] += p[c] as u64;
+                    }
+                }
+                let mean: Vec<u64> = (0..4).map(|c| sum[c] / n.max(1)).collect();
+                let center = l.image.get_pixel(l.image.width() / 2, l.image.height() / 2);
+                println!(
+                    "  [{}] {:?} min={:?} max={:?} mean={:?} center={:?}",
+                    l.name, l.image.dimensions(), min, max, mean, center
+                );
+            }
+        }
+
+        // TEMP diagnostic: dump one layer by name so its pixels can be compared
+        // with the reference renderer.
+        if let Ok(want) = std::env::var("IMAGEEDIT_DUMP_LAYER") {
+            for l in &set.layers {
+                if l.name == want {
+                    let name = format!("C:/_APP_CODE/our_{}.png", want.replace(' ', "_"));
+                    l.image.save(&name).expect("dump layer");
+                    println!("dump -> {name} {:?} offset {:?}", l.image.dimensions(), l.offset);
+                }
+            }
+        }
+
+        // Composite through the **real** pipeline (core flatten, blend modes
+        // included) so this file is directly comparable with the composite
+        // Photoshop baked into the PSD. A hand-rolled source-over loop here used
+        // to hide every blend-mode problem.
+        let doc = editcore::Document::from_psd_layers(set.canvas, set.clone().into_seeds());
+        let out = doc.flatten();
+        let path = std::path::Path::new(&path)
+            .file_stem()
+            .map(|s| std::path::PathBuf::from(format!("C:/_APP_CODE/composite-{}.png", s.to_string_lossy())))
+            .unwrap_or_else(|| std::path::PathBuf::from("C:/_APP_CODE/composite-check.png"));
+        out.save(&path).expect("save composite");
+        println!("composite -> {}", path.display());
     }
 
     fn ms(t: std::time::Instant) -> f64 {

@@ -56,6 +56,18 @@ pub(crate) fn blend_image_at(
     dy: i32,
     opacity: f32,
 ) {
+    blend_image_at_mode(out, src, dx, dy, opacity, BlendMode::Normal);
+}
+
+/// 同上，但显式指定混合模式（PSD 带入的图层用）。
+pub(crate) fn blend_image_at_mode(
+    out: &mut RgbaImage,
+    src: &RgbaImage,
+    dx: i32,
+    dy: i32,
+    opacity: f32,
+    mode: BlendMode,
+) {
     if opacity <= 0.0 {
         return;
     }
@@ -73,7 +85,7 @@ pub(crate) fn blend_image_at(
                 continue;
             }
             let px = out.get_pixel_mut(x as u32, y as u32);
-            blend_over(&mut px.0, s, opacity);
+            blend_over_with(&mut px.0, s, opacity, mode);
         }
     }
 }
@@ -81,12 +93,13 @@ pub(crate) fn blend_image_at(
 /// 把一个图层按**画布坐标**叠到以 `origin` 为原点的图像上。
 fn draw_layer_into(out: &mut RgbaImage, origin: (i32, i32), layer: &Layer) {
     match &layer.content {
-        LayerContent::Raster(r) => blend_image_at(
+        LayerContent::Raster(r) => blend_image_at_mode(
             out,
             &r.image,
             r.offset.0 - origin.0,
             r.offset.1 - origin.1,
             layer.opacity,
+            layer.blend,
         ),
         LayerContent::Mark(m) => {
             // 标记直接用画布坐标绘制：先画到同尺寸临时图再按不透明度混合，

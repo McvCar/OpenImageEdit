@@ -51,6 +51,8 @@ pub struct Layer {
     /// 仅 `layers[0]` 可为 true：文档背景层。仍可隐藏 / 解锁 / 移动，
     /// 「删除」= 清空像素（见 `EditOp::ClearBackground`）。
     pub background: bool,
+    /// 与下方已合成内容混合的方式（PSD 打开时带入，默认正常）。
+    pub blend: BlendMode,
     pub content: LayerContent,
 }
 
@@ -85,6 +87,7 @@ impl Layer {
             locked: false,
             opacity: 1.0,
             background: false,
+            blend: BlendMode::Normal,
             content: LayerContent::Raster(RasterLayer {
                 image,
                 offset: (0, 0),
@@ -159,6 +162,7 @@ impl Layer {
             locked: false,
             opacity: 1.0,
             background: false,
+            blend: BlendMode::Normal,
             content: LayerContent::Mark(mark),
         }
     }

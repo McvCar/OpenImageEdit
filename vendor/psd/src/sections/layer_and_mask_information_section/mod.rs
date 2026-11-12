@@ -6,7 +6,8 @@ use crate::psd_channel::PsdChannelKind;
 use crate::sections::image_data_section::ChannelBytes;
 use crate::sections::layer_and_mask_information_section::groups::Groups;
 use crate::sections::layer_and_mask_information_section::layer::{
-    BlendMode, GroupDivider, LayerChannels, LayerRecord, PsdGroup, PsdLayer, PsdLayerError,
+    BlendMode, BrightnessContrast, GroupDivider, HueSaturation, LayerChannels, LayerRecord,
+    PsdGroup, PsdLayer, PsdLayerError,
 };
 use crate::sections::layer_and_mask_information_section::layers::Layers;
 use crate::sections::PsdCursor;
@@ -21,6 +22,20 @@ const SIGNATURE_EIGHT_B64: [u8; 4] = [56, 66, 54, 52];
 const KEY_UNICODE_LAYER_NAME: &[u8; 4] = b"luni";
 /// Key of `Section divider setting (Photoshop 6.0)`, "lsct"
 const KEY_SECTION_DIVIDER_SETTING: &[u8; 4] = b"lsct";
+/// Key of `Brightness/contrast adjustment layer`, "brit"
+const KEY_BRIGHTNESS_CONTRAST: &[u8; 4] = b"brit";
+/// Key of `Hue/saturation (photoshop 6.0)`, "hue2"
+const KEY_HUE_SATURATION: &[u8; 4] = b"hue2";
+/// Key of `Object-based effects layer info`, "lfx2" — layer styles.
+///
+/// Photoshop picks the key by where the layer lives: `lfx2` at the root,
+/// `lmfx` / `lfxs` for layers inside groups. All three carry the same
+/// DescriptorBlock2 payload, and a file that mixes them (a UI file with most
+/// art in folders) would lose the styles of everything in a group if only
+/// `lfx2` were read.
+const KEY_LAYER_EFFECTS: &[u8; 4] = b"lfx2";
+const KEY_LAYER_EFFECTS_V0: &[u8; 4] = b"lmfx";
+const KEY_LAYER_EFFECTS_V1: &[u8; 4] = b"lfxs";
 
 pub mod groups;
 pub mod layer;
@@ -66,6 +81,12 @@ struct Frame {
     name: String,
     group_id: u32,
     parent_group_id: u32,
+    /// The folder record itself. `visible` / `opacity` / `blend_mode` for a
+    /// group live on the record that OPENS the folder; the record that closes
+    /// it (the bounding section) carries only a marker. Reading the group's
+    /// state off the closing record makes every group look visible/opaque,
+    /// which is how a hidden group's children ended up painted on the canvas.
+    folder: Option<LayerRecord>,
 }
 
 impl LayerAndMaskInformationSection {
@@ -136,6 +157,7 @@ impl LayerAndMaskInformationSection {
             name: String::from("root"),
             group_id: 0,
             parent_group_id: 0,
+            folder: None,
         }];
 
         // Viewed group counter
@@ -153,9 +175,10 @@ impl LayerAndMaskInformationSection {
 
                     let frame = Frame {
                         start_idx: layers.len(),
-                        name: layer_record.name,
+                        name: layer_record.name.clone(),
                         group_id: already_viewed,
                         parent_group_id: current_group_id,
+                        folder: Some(layer_record.clone()),
                     };
 
                     stack.push(frame);
@@ -170,11 +193,13 @@ impl LayerAndMaskInformationSection {
                         end: layers.len(),
                     };
 
+                    // Prefer the folder record for the group's own state.
+                    let group_record = frame.folder.as_ref().unwrap_or(&layer_record);
                     groups.push(PsdGroup::new(
                         frame.name,
                         frame.group_id,
                         range,
-                        &layer_record,
+                        group_record,
                         psd_size.0,
                         psd_size.1,
                         if frame.parent_group_id > 0 {
@@ -440,6 +465,12 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
     cursor.read(padding as u32);
 
     let mut divider_type = None;
+    // Adjustment-layer payloads, kept as parsed structs so the decoder can
+    // bake them (we do not render live adjustment layers).
+    let mut brightness_contrast = None;
+    let mut hue_saturation = None;
+    // Layer styles, kept so the decoder can bake the visible ones.
+    let mut layer_effects: Option<Vec<crate::effects::LayerEffect>> = None;
     // There can be multiple additional layer information sections so we'll loop
     // until we stop seeing them.
     while cursor.peek_4() == SIGNATURE_EIGHT_BIM || cursor.peek_4() == SIGNATURE_EIGHT_B64 {
@@ -469,6 +500,54 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
                 }
             }
 
+            // Brightness/contrast ("brit"): 2×i16 sliders + mean + lab flag.
+            KEY_BRIGHTNESS_CONTRAST => {
+                let pos = cursor.position();
+                let mut bc = BrightnessContrast::default();
+                if additional_layer_info_len >= 4 {
+                    bc.brightness = cursor.read_i16();
+                    bc.contrast = cursor.read_i16();
+                }
+                brightness_contrast = Some(bc);
+                cursor.seek(pos + additional_layer_info_len as u64);
+            }
+
+            // Hue/saturation ("hue2"): version u16, colorize flag u8 + pad,
+            // colorize HSL (3×i16), master HSL (3×i16), then 6 range records
+            // we do not need.
+            KEY_HUE_SATURATION => {
+                let pos = cursor.position();
+                let mut hs = HueSaturation::default();
+                if additional_layer_info_len >= 16 {
+                    let _version = cursor.read_u16();
+                    hs.colorize = cursor.read_u8() != 0;
+                    cursor.read_1();
+                    hs.colorize_hue = cursor.read_i16();
+                    hs.colorize_saturation = cursor.read_i16();
+                    hs.colorize_lightness = cursor.read_i16();
+                    hs.hue = cursor.read_i16();
+                    hs.saturation = cursor.read_i16();
+                    hs.lightness = cursor.read_i16();
+                }
+                hue_saturation = Some(hs);
+                cursor.seek(pos + additional_layer_info_len as u64);
+            }
+
+            // Layer styles ("lfx2"): a DescriptorBlock2. Parsing is fully
+            // bounds-checked and yields `None` on a malformed block, so a
+            // broken style never costs the layer itself.
+            KEY_LAYER_EFFECTS | KEY_LAYER_EFFECTS_V0 | KEY_LAYER_EFFECTS_V1 => {
+                let start = cursor.position() as usize;
+                let len = additional_layer_info_len as usize;
+                let block = cursor
+                    .get_ref()
+                    .get(start..start.checked_add(len).unwrap_or(usize::MAX))
+                    .unwrap_or(&[]);
+                layer_effects = crate::effects::parse_layer_effects(block);
+                let end = start.saturating_add(len).min(cursor.get_ref().len());
+                cursor.seek(end as u64);
+            }
+
             // TODO: Skipping other keys until we implement parsing for them
             _ => {
                 cursor.read(additional_layer_info_len);
@@ -488,5 +567,8 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
         clipping_base,
         blend_mode,
         divider_type,
+        brightness_contrast,
+        hue_saturation,
+        layer_effects,
     })
 }

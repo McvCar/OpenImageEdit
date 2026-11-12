@@ -2,9 +2,11 @@ use image::RgbaImage;
 
 mod adjust;
 pub mod alpha_fit;
+mod blend;
 mod color;
 pub mod font;
 pub use adjust::{adjust_json, Adjust, AdjustTarget, Histogram, BINS};
+pub use blend::{blend_pixel, BlendMode};
 pub use color::{cmyk_of, hsl_of, PickedColor};
 pub use font::{measure_text, FONTS};
 
@@ -54,7 +56,7 @@ pub(crate) use document::DocumentSnapshot;
 // Cross-module private helpers (kept `pub(crate)` + re-exported so each
 // sibling module's `use super::*` can call them without naming the path).
 pub(crate) use layer_ops::blend_image_at;
-pub(crate) use document::blend_over;
+pub(crate) use document::{blend_over, blend_over_with};
 pub(crate) use mark::norm_rect;
 pub(crate) use transform::transform_document;
 pub(crate) use op::History;
