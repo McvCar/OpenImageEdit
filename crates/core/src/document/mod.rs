@@ -14,6 +14,10 @@ pub struct Document {
     /// 背景层 `background == true`、默认锁定；矢量标记作为 `LayerContent::Mark`
     /// 与位图图层同栈、同排序、同可见性 / 锁定 / 不透明度。
     pub layers: Vec<Layer>,
+    /// 图层分组元数据（平行字段，不进 `layers`）。
+    /// 组只是组织标签：成员由 `Layer::group` 反查，z 序与合成完全不变，
+    /// 因此普通图片（只有 1 层背景）和 PSD 分层态都能随时编组。
+    pub groups: Vec<LayerGroup>,
     /// Active selection (PS-style alpha coverage map, canvas coordinates).
     /// Lives here instead of on the UI session so Ctrl+Z walks it back in the
     /// same history as pixel edits. `None` = nothing selected.
@@ -38,6 +42,9 @@ pub struct DocumentSnapshot {
     pub canvas: Size,
     pub view: Rect,
     pub layers: Vec<Layer>,
+    /// 快照类 op（缩放 / 裁剪 / 清背景）会整份还原 layers，分组元数据必须
+    /// 一起带上，否则 Ctrl+Z 会把分组悄悄抹掉。
+    pub groups: Vec<LayerGroup>,
 }
 
 impl Document {
@@ -46,6 +53,7 @@ impl Document {
             canvas: self.canvas,
             view: self.view,
             layers: self.layers.clone(),
+            groups: self.groups.clone(),
         }
     }
 
@@ -54,6 +62,7 @@ impl Document {
         self.canvas = snapshot.canvas;
         self.view = snapshot.view;
         self.layers = snapshot.layers;
+        self.groups = snapshot.groups;
     }
 
     // ---- 背景层访问（`layers[0]`，恒存在）----------------------------
@@ -233,6 +242,7 @@ impl Document {
             canvas,
             view: Rect::new(0, 0, canvas.width, canvas.height),
             layers: vec![Layer::background(image)],
+            groups: Vec::new(),
             selection: None,
             edit_epoch: 0,
             next_layer_seq: 0,
@@ -267,6 +277,7 @@ impl Document {
             canvas: size,
             view: Rect::new(0, 0, size.width, size.height),
             layers,
+            groups: Vec::new(),
             selection: None,
             edit_epoch: 0,
             next_layer_seq: 0,
@@ -275,9 +286,15 @@ impl Document {
     }
 
     pub fn execute(&mut self, op: EditOp) -> Result<(), EditError> {
+        // 纯分组元数据不改变任何像素：不 bump edit_epoch，预览缓存 / 原生
+        // 合成校准就不会因为「只是把几层收进一个组」而失效切回重建画面。
+        // 面板刷新由 UI 侧的 groupViewEpoch 负责。
+        let metadata_only = op.is_metadata_only();
         op.apply(self)?;
         self.history.push(op);
-        self.edit_epoch = self.edit_epoch.wrapping_add(1);
+        if !metadata_only {
+            self.edit_epoch = self.edit_epoch.wrapping_add(1);
+        }
         Ok(())
     }
 
@@ -711,17 +728,23 @@ impl Document {
 
     pub fn undo(&mut self) -> Result<(), EditError> {
         let op = self.history.undo.pop().ok_or(EditError::NothingToUndo)?;
+        let metadata_only = op.is_metadata_only();
         op.revert(self)?;
         self.history.redo.push(op);
-        self.edit_epoch = self.edit_epoch.wrapping_add(1);
+        if !metadata_only {
+            self.edit_epoch = self.edit_epoch.wrapping_add(1);
+        }
         Ok(())
     }
 
     pub fn redo(&mut self) -> Result<(), EditError> {
         let op = self.history.redo.pop().ok_or(EditError::NothingToRedo)?;
+        let metadata_only = op.is_metadata_only();
         op.apply(self)?;
         self.history.undo.push(op);
-        self.edit_epoch = self.edit_epoch.wrapping_add(1);
+        if !metadata_only {
+            self.edit_epoch = self.edit_epoch.wrapping_add(1);
+        }
         Ok(())
     }
 

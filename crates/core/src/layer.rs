@@ -15,6 +15,46 @@ fn next_layer_id() -> LayerId {
     NEXT_LAYER_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// 稳定分组 id。**组不是图层**：它只存在于 `Document::groups` 这份平行
+/// 元数据里，绝不进 `doc.layers`。合成、预览缓存、PSD 写出都只遍历
+/// `layers`，所以加分组不需要碰任何一条渲染路径。
+pub type GroupId = u32;
+
+static NEXT_GROUP_ID: AtomicU32 = AtomicU32::new(1);
+
+pub fn next_group_id() -> GroupId {
+    NEXT_GROUP_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// 图层分组元数据。成员关系不单独存表，而是由每个 `Layer::group` 反查，
+/// 这样删层 / 撤销 / 替换整层时归属自动跟着走，不会出现成员表与图层栈
+/// 不一致的两份真值。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayerGroup {
+    pub id: GroupId,
+    pub name: String,
+    /// 面板折叠状态：纯视图状态，不进撤销历史。
+    pub collapsed: bool,
+    /// 组的眼睛状态。真正的显隐靠批量写成员的 `visible`（合成只认成员），
+    /// 这个字段只是面板图标与「显示整组」的目标值。
+    pub visible: bool,
+    /// 隐藏整组之前记下各成员自己的显隐，重新显示时按 id 还原 ——
+    /// 否则组里原本手动隐藏的层会被「显示整组」一起点亮。
+    pub hidden_snapshot: Vec<(LayerId, bool)>,
+}
+
+impl LayerGroup {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            id: next_group_id(),
+            name: name.into(),
+            collapsed: false,
+            visible: true,
+            hidden_snapshot: Vec::new(),
+        }
+    }
+}
+
 /// 位图内容：像素 + 画布相对偏移 + 非破坏性变换参数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RasterLayer {
@@ -53,6 +93,9 @@ pub struct Layer {
     pub background: bool,
     /// 与下方已合成内容混合的方式（PSD 打开时带入，默认正常）。
     pub blend: BlendMode,
+    /// 所属分组（`None` = 不属于任何组）。组只影响面板组织与批量显隐，
+    /// 不改变 z 序、不参与合成。`duplicated()` 会继承它。
+    pub group: Option<GroupId>,
     pub content: LayerContent,
 }
 
@@ -88,6 +131,7 @@ impl Layer {
             opacity: 1.0,
             background: false,
             blend: BlendMode::Normal,
+            group: None,
             content: LayerContent::Raster(RasterLayer {
                 image,
                 offset: (0, 0),
@@ -163,6 +207,7 @@ impl Layer {
             opacity: 1.0,
             background: false,
             blend: BlendMode::Normal,
+            group: None,
             content: LayerContent::Mark(mark),
         }
     }

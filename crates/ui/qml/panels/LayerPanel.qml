@@ -32,11 +32,21 @@ Item {
     readonly property int rowHeight: 44
     readonly property int rowSpacing: 3
     readonly property int multiCount: bridge.selectedLayerCount
+    readonly property bool hasGroups: {
+        try {
+            return JSON.parse(bridge.groups_json).length > 0
+        } catch (e) {
+            return false
+        }
+    }
     // PSD 阶段 2：图层后台加载完成前，面板所有命令一律灰掉并给进度提示。
     readonly property bool editLocked: bridge.editingLocked
     // 按钮 hover 时的说明文字（面板里没有原生 tooltip，用一个固定行显示，
     // 免得浮层跑出面板边界）。
     property string hintText: ""
+    // 组标题行的内联重命名（-1 = 没有）。折叠态也能改名，所以按组 id
+    // 而不是显示行下标来记。
+    property int renamingGroupId: -1
     // 选中的 id 集合：面板高亮用它，而不是下标（重排后下标会变）。
     readonly property var selIds: {
         try {
@@ -46,7 +56,19 @@ Item {
         }
     }
     function isSelectedRow(row) {
-        return row !== null && row !== undefined && selIds.indexOf(row.id) >= 0
+        if (row === null || row === undefined)
+            return false
+        // 组标题行：整组成员都被选中时高亮（点组标题 = 选中整组）。
+        if (row.k === "group") {
+            const mids = row.mids || []
+            if (mids.length === 0)
+                return false
+            for (var i = 0; i < mids.length; i++)
+                if (selIds.indexOf(mids[i]) < 0)
+                    return false
+            return true
+        }
+        return selIds.indexOf(row.id) >= 0
     }
 
     // ---- 小按钮（面板里到处是这种 26×24 的方形图标键）----
@@ -130,6 +152,18 @@ Item {
                     bar(2, 2, 5, 14); bar(6.5, 2, 9.5, 14); bar(11, 2, 14, 14)
                 } else if (k === "spread-v") {
                     bar(2, 2, 14, 5); bar(2, 6.5, 14, 9.5); bar(2, 11, 14, 14)
+                } else if (k === "group" || k === "ungroup") {
+                    // 文件夹轮廓；ungroup 再压一道斜杠表示「拆开」。
+                    ctx.beginPath()
+                    ctx.moveTo(1.5, 4); ctx.lineTo(6, 4); ctx.lineTo(7.5, 6)
+                    ctx.lineTo(14.5, 6); ctx.lineTo(14.5, 13)
+                    ctx.lineTo(1.5, 13); ctx.closePath(); ctx.stroke()
+                    if (k === "group") {
+                        railH(9.6)
+                    } else {
+                        ctx.beginPath()
+                        ctx.moveTo(4, 1.5); ctx.lineTo(12, 14.5); ctx.stroke()
+                    }
                 }
             }
         }
@@ -281,6 +315,28 @@ Item {
                     onActivated: bridge.merge_selected_layers()
                 }
                 PanelButton {
+                    id: btnGroup
+                    anchors.left: btnMerge.right
+                    anchors.leftMargin: 4
+                    icon: "group"
+                    tip: "编组（Ctrl+G）：把选中的两个以上图层收进一组，不改变 z 序"
+                    usable: layerPanel.multiCount >= 2
+                    onBlocked: layerPanel.hintText =
+                               "编组要先选中两个以上图层：Ctrl+点击图层行，背景不参与"
+                    onActivated: bridge.group_selected_layers()
+                }
+                PanelButton {
+                    id: btnUngroup
+                    anchors.left: btnGroup.right
+                    anchors.leftMargin: 4
+                    icon: "ungroup"
+                    tip: "解散分组（Ctrl+Shift+G）：图层本身保留"
+                    usable: layerPanel.hasGroups
+                    onBlocked: layerPanel.hintText =
+                               "还没有分组：先选中两个以上图层点「编组」"
+                    onActivated: bridge.ungroup_selected_layers()
+                }
+                PanelButton {
                     anchors.right: parent.right
                     glyph: "✕"
                     tip: "删除选中图层"
@@ -405,17 +461,28 @@ Item {
                     required property int index
 
                     readonly property var row: modelData
+                    readonly property bool isGroup: row !== null
+                        && row !== undefined && row.k === "group"
                     readonly property bool isBase: row !== null && row.base === true
                     readonly property bool locked: row !== null && row.l === true
                     readonly property bool vis: row !== null && row.v === true
                     readonly property bool sel: layerPanel.isSelectedRow(row)
                     readonly property bool isMark: row !== null && row.k === "mark"
-                    readonly property bool renaming: host.renamingIndex !== -1
-                        && row !== null && host.renamingIndex === row.i
+                    readonly property bool renaming: row !== null
+                        && (layerRow.isGroup
+                            ? layerPanel.renamingGroupId === row.gid
+                            : (host.renamingIndex !== -1
+                               && host.renamingIndex === row.i))
+                    // 组内成员缩进一点，组标题行贴左边。
+                    readonly property int indent: row && !layerRow.isGroup
+                        && row.g > 0 ? 14 : 0
                     // 缩略图：layerEpoch = 像素变化，thumbEpoch = 后台分批
                     // 写入完成（C6）。两者都读一遍当依赖，避免 100 层首次
-                    // 展开时 UI 线程同步缩图。
+                    // 展开时 UI 线程同步缩图。组标题行没有位图，别去问
+                    // layer_thumb_url(-1)。
                     readonly property string thumbUrl: {
+                        if (layerRow.isGroup)
+                            return ""
                         const epoch = bridge.layerEpoch
                         const batch = bridge.thumbEpoch
                         return row ? bridge.layer_thumb_url(row.i) : ""
@@ -444,10 +511,11 @@ Item {
                     // ---- 缩略图 ----
                     Item {
                         id: thumbBox
-                        x: 9
+                        x: 9 + layerRow.indent
                         anchors.verticalCenter: parent.verticalCenter
                         width: 34
                         height: 34
+                        visible: !layerRow.isGroup
                         clip: true
                         opacity: layerRow.vis ? 1.0 : 0.4
 
@@ -483,14 +551,60 @@ Item {
                         // 角标一压边就被切；而且缩略图本身已经画出了形状。
                     }
 
+                    // ---- 组标题行的折叠箭头 ----
+                    // z 要高于行本体 MouseArea：它在左侧，而 rowMa 覆盖整行
+                    // （只让出右侧的眼睛/锁），不抬高会被整行点击吃掉。
+                    Item {
+                        id: groupArrow
+                        z: 3
+                        x: 9
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: 34
+                        height: 34
+                        visible: layerRow.isGroup
+
+                        Canvas {
+                            anchors.fill: parent
+                            property bool collapsed: layerRow.row
+                                ? layerRow.row.c === true : false
+                            onCollapsedChanged: requestPaint()
+                            Component.onCompleted: requestPaint()
+                            onPaint: {
+                                var ctx = getContext("2d")
+                                ctx.clearRect(0, 0, width, height)
+                                ctx.fillStyle = "#8ec7ff"
+                                ctx.beginPath()
+                                if (collapsed) {
+                                    ctx.moveTo(13, 11)
+                                    ctx.lineTo(22, 17)
+                                    ctx.lineTo(13, 23)
+                                } else {
+                                    ctx.moveTo(10, 13)
+                                    ctx.lineTo(24, 13)
+                                    ctx.lineTo(17, 23)
+                                }
+                                ctx.closePath()
+                                ctx.fill()
+                            }
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: if (layerRow.row)
+                                bridge.set_group_collapsed(layerRow.row.gid,
+                                                           !layerRow.row.c)
+                        }
+                    }
+
                     // ---- 名称 + 副信息 ----
                     //
                     // Column 里只放两行文本：重命名的 TextInput 放在 Column
                     // **外面**。放在里面时它的隐式高度会把两行文字顶上去、
                     // 副标题被行底边切掉半截（TextInput 即使空着也占一行）。
                     Column {
-                        x: 50
-                        width: parent.width - 50 - 54
+                        x: 50 + layerRow.indent
+                        width: parent.width - 50 - 54 - layerRow.indent
                         anchors.verticalCenter: parent.verticalCenter
                         spacing: 2
 
@@ -499,9 +613,10 @@ Item {
                             height: 16
                             verticalAlignment: Text.AlignVCenter
                             text: layerRow.row ? layerRow.row.n : ""
-                            color: layerRow.sel ? "#ffffff" : "#d3d8de"
+                            color: layerRow.isGroup ? "#a8cbef"
+                                 : (layerRow.sel ? "#ffffff" : "#d3d8de")
                             font.pixelSize: 12
-                            font.bold: layerRow.sel
+                            font.bold: layerRow.sel || layerRow.isGroup
                             elide: Text.ElideRight
                             visible: !layerRow.renaming
                         }
@@ -515,6 +630,9 @@ Item {
                                 if (!layerRow.row)
                                     return ""
                                 const r = layerRow.row
+                                if (layerRow.isGroup)
+                                    return r.cnt + " 个图层 · "
+                                           + (r.c ? "已折叠" : "已展开")
                                 if (layerRow.isBase && r.bd === true)
                                     return "背景 · 已清空"
                                 const pos = layerRow.isMark ? "标记" : (r.w + "×" + r.h)
@@ -531,9 +649,9 @@ Item {
 
                     TextInput {
                         id: renameInput
-                        x: 50
+                        x: 50 + layerRow.indent
                         y: 6
-                        width: parent.width - 50 - 54
+                        width: parent.width - 50 - 54 - layerRow.indent
                         height: 20
                         visible: layerRow.renaming
                         text: layerRow.row ? layerRow.row.n : ""
@@ -542,12 +660,19 @@ Item {
                         selectByMouse: true
                         focus: visible
                         onAccepted: {
-                            if (text.trim().length > 0)
-                                bridge.rename_selected_layer(text)
+                            if (text.trim().length > 0) {
+                                if (layerRow.isGroup)
+                                    bridge.rename_group(layerRow.row.gid, text)
+                                else
+                                    bridge.rename_selected_layer(text)
+                            }
                             host.renamingIndex = -1
+                            layerPanel.renamingGroupId = -1
                         }
-                        onActiveFocusChanged: if (!activeFocus && visible)
+                        onActiveFocusChanged: if (!activeFocus && visible) {
                             host.renamingIndex = -1
+                            layerPanel.renamingGroupId = -1
+                        }
                     }
 
                     // ---- 眼睛 ----
@@ -600,7 +725,10 @@ Item {
                                        && layerRow.row.bd === true)
                             cursorShape: Qt.PointingHandCursor
                             onClicked: if (layerRow.row) {
-                                if (layerRow.isBase)
+                                if (layerRow.isGroup)
+                                    bridge.set_group_visible(layerRow.row.gid,
+                                                             !layerRow.row.v)
+                                else if (layerRow.isBase)
                                     bridge.toggle_base_visible()
                                 else
                                     bridge.set_layer_visible_at(layerRow.row.i,
@@ -649,7 +777,10 @@ Item {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
                             onClicked: if (layerRow.row) {
-                                if (layerRow.isBase)
+                                if (layerRow.isGroup)
+                                    bridge.set_group_locked(layerRow.row.gid,
+                                                            !layerRow.locked)
+                                else if (layerRow.isBase)
                                     bridge.set_base_locked(!layerRow.locked)
                                 else
                                     bridge.set_layer_locked(layerRow.row.i,
@@ -674,11 +805,17 @@ Item {
                         onPressed: (mouse) => {
                             if (mouse.button === Qt.RightButton) {
                                 const pt = layerRow.mapToItem(layerPanel, mouse.x, mouse.y)
-                                if (!layerPanel.isSelectedRow(layerRow.row)
-                                    && layerRow.row && !layerRow.locked)
-                                    bridge.select_layer(layerRow.row.i)
-                                openLayerContext(layerRow.row ? layerRow.row.i : -1,
-                                                 layerRow.locked, pt)
+                                if (layerRow.isGroup) {
+                                    openLayerContext(-1, false, pt,
+                                                     layerRow.row.gid)
+                                } else {
+                                    if (!layerPanel.isSelectedRow(layerRow.row)
+                                        && layerRow.row && !layerRow.locked)
+                                        bridge.select_layer(layerRow.row.i)
+                                    openLayerContext(layerRow.row
+                                                     ? layerRow.row.i : -1,
+                                                     layerRow.locked, pt, 0)
+                                }
                                 return
                             }
                             pressY = mouse.y
@@ -686,7 +823,8 @@ Item {
                         }
 
                         onPositionChanged: (mouse) => {
-                            if (!pressed || layerRow.locked || layerRow.isBase)
+                            if (!pressed || layerRow.locked || layerRow.isBase
+                                || layerRow.isGroup)
                                 return
                             if (!reordering && Math.abs(mouse.y - pressY) > 6) {
                                 reordering = true
@@ -710,25 +848,34 @@ Item {
                             if (mouse.button === Qt.RightButton)
                                 return
                             if (reordering && toPos >= 0 && toPos !== fromPos) {
-                                // 显示位置 p ↔ 文档下标 len-1-p
-                                const len = host.layerPanelList.length
-                                bridge.reorder_layer(len - 1 - fromPos,
-                                                     len - 1 - toPos)
+                                // 显示行里混了组标题行，不能再用
+                                // len-1-pos 反推文档下标（会算到错的层）。
+                                // 起止行各自带真实 i，直接拿来排序。
+                                const target = host.layerPanelList[toPos]
+                                const from = layerRow.row ? layerRow.row.i : -1
+                                const to = target && target.i >= 0
+                                           ? target.i : from
+                                if (from > 0 && to > 0 && to !== from)
+                                    bridge.reorder_layer(from, to)
                             } else if (!reordering && layerRow.row && !layerRow.isBase
-                                       && !layerRow.locked) {
-                                // Ctrl = 切换，Shift = 连选，普通点击 = 单选。
-                                // 事件自带的 modifiers 在「先松鼠标再松 Ctrl」时
-                                // 偶尔拿不到 Ctrl（释放事件里键盘状态已经是新的），
-                                // 所以再问一次实时键状态（bit0 Shift / bit1 Ctrl）。
-                                const bits = bridge.modifier_bits()
-                                const ctrl = (mouse.modifiers & Qt.ControlModifier) !== 0
-                                             || (bits & 2) !== 0
-                                const shift = (mouse.modifiers & Qt.ShiftModifier) !== 0
-                                              || (bits & 1) !== 0
-                                if (!ctrl && !shift)
-                                    bridge.sel_clear()
-                                bridge.select_layer_ex(layerRow.row.i,
-                                                       ctrl ? 1 : (shift ? 2 : 0))
+                                       && (!layerRow.locked || layerRow.isGroup)) {
+                                if (layerRow.isGroup) {
+                                    bridge.select_group(layerRow.row.gid)
+                                } else {
+                                    // Ctrl = 切换，Shift = 连选，普通点击 = 单选。
+                                    // 事件自带的 modifiers 在「先松鼠标再松 Ctrl」时
+                                    // 偶尔拿不到 Ctrl（释放事件里键盘状态已经是新的），
+                                    // 所以再问一次实时键状态（bit0 Shift / bit1 Ctrl）。
+                                    const bits = bridge.modifier_bits()
+                                    const ctrl = (mouse.modifiers & Qt.ControlModifier) !== 0
+                                                 || (bits & 2) !== 0
+                                    const shift = (mouse.modifiers & Qt.ShiftModifier) !== 0
+                                                  || (bits & 1) !== 0
+                                    if (!ctrl && !shift)
+                                        bridge.sel_clear()
+                                    bridge.select_layer_ex(layerRow.row.i,
+                                                           ctrl ? 1 : (shift ? 2 : 0))
+                                }
                             }
                             reordering = false
                             toPos = -1
@@ -736,7 +883,10 @@ Item {
                         }
 
                         onDoubleClicked: if (layerRow.row && !layerRow.isBase) {
-                            host.renamingIndex = layerRow.row.i
+                            if (layerRow.isGroup)
+                                layerPanel.renamingGroupId = layerRow.row.gid
+                            else
+                                host.renamingIndex = layerRow.row.i
                             renameInput.focus = true
                             renameInput.selectAll()
                         }
@@ -884,6 +1034,8 @@ Item {
         property int targetIndex: -1
         property bool targetLocked: false
         property bool targetIsMark: false
+        // 右键点在组标题行上时 > 0；此时图层类命令全部不适用。
+        property int targetGroupId: 0
 
         Column {
             id: ctxCol
@@ -905,6 +1057,39 @@ Item {
                 onActivated: {
                     layerContext.visible = false
                     bridge.duplicate_selected_layer()
+                }
+            }
+            MenuRow {
+                label: "编组 (Ctrl+G)"
+                active: layerPanel.multiCount >= 2
+                onActivated: {
+                    layerContext.visible = false
+                    bridge.group_selected_layers()
+                }
+            }
+            MenuRow {
+                label: "解散分组 (Ctrl+Shift+G)"
+                active: layerContext.targetGroupId > 0 || layerPanel.hasGroups
+                onActivated: {
+                    layerContext.visible = false
+                    if (layerContext.targetGroupId > 0)
+                        bridge.ungroup_group(layerContext.targetGroupId)
+                    else
+                        bridge.ungroup_selected_layers()
+                }
+            }
+            MenuRow {
+                label: "折叠 / 展开分组"
+                active: layerContext.targetGroupId > 0
+                onActivated: {
+                    layerContext.visible = false
+                    const list = host.layerPanelList
+                    for (var k = 0; k < list.length; k++)
+                        if (list[k].k === "group"
+                            && list[k].gid === layerContext.targetGroupId) {
+                            bridge.set_group_collapsed(list[k].gid, !list[k].c)
+                            break
+                        }
                 }
             }
             MenuRow {
@@ -960,7 +1145,7 @@ Item {
     }
 
     // 打开右键图层菜单（layerPanel 坐标），夹在面板内不溢出。
-    function openLayerContext(index, locked, panelPos) {
+    function openLayerContext(index, locked, panelPos, groupId) {
         // 编辑锁期间不打开任何带输入框的浮层（焦点会静默废掉 Delete /
         // 工具键，见既有坑），也不给右键命令任何入口。
         if (layerPanel.editLocked) {
@@ -970,6 +1155,7 @@ Item {
         layerContext.targetIndex = index
         layerContext.targetLocked = locked
         layerContext.targetIsMark = false
+        layerContext.targetGroupId = groupId || 0
         if (index >= 0) {
             const list = host.layerPanelList
             for (var i = 0; i < list.length; i++) {

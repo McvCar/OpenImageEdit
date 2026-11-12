@@ -42,7 +42,10 @@ impl qobject::Bridge {
     }
 
     /// 把一组下标写回多选状态（内部统一走稳定 id），并发布给 QML。
-    fn set_selection_indices(mut self: Pin<&mut Self>, indices: &[usize]) {
+    pub(in crate::bridge) fn set_selection_indices(
+        mut self: Pin<&mut Self>,
+        indices: &[usize],
+    ) {
         let ids: Vec<u32> = {
             let guard = self.session.borrow();
             match guard.as_ref() {

@@ -751,6 +751,7 @@ pub(in crate::bridge) enum Refresh {
         save_url: String,
         layer_count: i32,
         layers_json: String,
+        groups_json: String,
         marks_json: String,
         dirty: bool,
         adjust_open: bool,
@@ -1372,7 +1373,7 @@ impl Session {
                 mk
             };
             parts.push(format!(
-                "{{\"i\":{i},\"id\":{},\"n\":\"{name}\",\"v\":{},\"o\":{},\"l\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"a\":{:.3},\"sw\":{},\"sh\":{},\"k\":\"{kind}\"{extra}}}",
+                "{{\"i\":{i},\"id\":{},\"n\":\"{name}\",\"v\":{},\"o\":{},\"l\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"a\":{:.3},\"sw\":{},\"sh\":{},\"k\":\"{kind}\",\"g\":{}{extra}}}",
                 layer.id,
                 layer.visible,
                 (layer.opacity * 100.0).round() as i32,
@@ -1383,7 +1384,47 @@ impl Session {
                 bounds.height,
                 angle,
                 sw,
-                sh
+                sh,
+                layer.group.unwrap_or(0)
+            ));
+        }
+        format!("[{}]", parts.join(","))
+    }
+
+    /// 面板用的分组列表。组不是图层，QML 把它和 `layers_json` 合成显示行
+    /// （组标题行插在最高成员之前，折叠时隐藏成员行）。
+    ///
+    /// `mids` 是成员稳定 id（显示顺序 = 顶 → 底），`c` 折叠、`v` 组眼睛、
+    /// `l` 整组是否已锁、`cnt` 成员数。一次遍历 `layers` 收集所有组的成员，
+    /// 避免每帧 O(组数 × 层数)。
+    pub(in crate::bridge) fn groups_json(&self) -> String {
+        if self.doc.groups.is_empty() {
+            return "[]".to_string();
+        }
+        let mut members: std::collections::HashMap<u32, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut locked: std::collections::HashMap<u32, bool> =
+            std::collections::HashMap::new();
+        for layer in self.doc.layers.iter().rev() {
+            if let Some(gid) = layer.group {
+                members.entry(gid).or_default().push(layer.id.to_string());
+                let all_locked = locked.entry(gid).or_insert(true);
+                *all_locked &= layer.locked;
+            }
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for group in &self.doc.groups {
+            let name = group.name.replace('\\', "\\\\").replace('"', "\\\"");
+            let ids = members.get(&group.id).cloned().unwrap_or_default();
+            let cnt = ids.len();
+            let all_locked = *locked.get(&group.id).unwrap_or(&false);
+            parts.push(format!(
+                "{{\"id\":{},\"n\":\"{name}\",\"c\":{},\"v\":{},\"l\":{},\"cnt\":{cnt},\"mids\":[{}]}}",
+                group.id,
+                group.collapsed,
+                group.visible,
+                all_locked,
+                ids.join(",")
             ));
         }
         format!("[{}]", parts.join(","))
@@ -1615,6 +1656,7 @@ impl Session {
                     save_url: file_url(&self.default_save_path().0),
                     layer_count: self.doc.layers.len() as i32,
                     layers_json: self.layers_json(),
+                    groups_json: self.groups_json(),
                     marks_json: self.marks_json(),
                     dirty: self.dirty,
                     adjust_open: adjust.is_some(),

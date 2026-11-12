@@ -93,6 +93,8 @@ Rectangle {
                   run: function () { host.saveOrSaveAs() } },
                 { l: "另存为… (Ctrl+Shift+S)", ok: !bridge.saving,
                   run: function () { saveDialog.open() } },
+                { l: "另存为 PSD…（保留图层）", ok: bridge.image_width > 0 && !bridge.saving,
+                  run: function () { host.openSaveAsPsd() } },
                 { l: "", sep: true },
                 { l: "关闭窗口 (Ctrl+W)", ok: true,
                   run: function () { host.requestQuit() } }
@@ -145,6 +147,13 @@ Rectangle {
             { l: "图层与标记", sub: [
                 { l: "图层面板", ok: true,
                   run: function () { host.panelVisible = !host.panelVisible } },
+                // 分组是纯组织功能：普通编辑模式（随手新建的图层）和
+                // PSD 分层态都能用，不依赖文件里有没有组结构。
+                { l: "编组 (Ctrl+G)",
+                  ok: !bridge.editingLocked && bridge.selectedLayerCount >= 2,
+                  run: function () { bridge.group_selected_layers() } },
+                { l: "解散分组 (Ctrl+Shift+G)", ok: !bridge.editingLocked,
+                  run: function () { bridge.ungroup_selected_layers() } },
                 { l: "标记工具栏", ok: true,
                   run: function () { markBarBtn.clicked() } },
                 { l: "调整颜色… (Ctrl+E)", ok: bridge.image_width > 0,

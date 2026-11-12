@@ -1273,6 +1273,64 @@ impl qobject::Bridge {
                          \"primary\":{primary},\"count\":{count}}}"
                     );
                 }
+                // ---- 图层分组（普通编辑模式与 PSD 分层态共用）----
+                "layer-group" => {
+                    let ok = self.as_mut().group_selected_layers();
+                    println!("{{\"phase\":\"ui\",\"event\":\"script-group\",\"ok\":{ok}}}");
+                }
+                "layer-ungroup" => {
+                    let ok = self.as_mut().ungroup_selected_layers();
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"script-ungroup\",\"ok\":{ok}}}"
+                    );
+                }
+                // `group-collapse:1,0|1`
+                other if other.starts_with("group-collapse:") => {
+                    let body = other.trim_start_matches("group-collapse:");
+                    let mut it = body.split(',');
+                    let id: i32 = it.next().and_then(|p| p.trim().parse().ok()).unwrap_or(0);
+                    let on = it.next().map(|p| p.trim() != "0").unwrap_or(false);
+                    self.as_mut().set_group_collapsed(id, on);
+                }
+                // `group-visible:1,0|1`
+                other if other.starts_with("group-visible:") => {
+                    let body = other.trim_start_matches("group-visible:");
+                    let mut it = body.split(',');
+                    let id: i32 = it.next().and_then(|p| p.trim().parse().ok()).unwrap_or(0);
+                    let on = it.next().map(|p| p.trim() != "0").unwrap_or(false);
+                    self.as_mut().set_group_visible(id, on);
+                }
+                // `group-select:1`
+                other if other.starts_with("group-select:") => {
+                    let id: i32 = other
+                        .trim_start_matches("group-select:")
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
+                    self.as_mut().select_group(id);
+                }
+                // `group-rename:1:新名字`
+                other if other.starts_with("group-rename:") => {
+                    let body = other.trim_start_matches("group-rename:");
+                    if let Some((id, name)) = body.split_once(':') {
+                        let id: i32 = id.trim().parse().unwrap_or(0);
+                        self.as_mut()
+                            .rename_group(id, &QString::from(name.trim()));
+                    }
+                }
+                // `groups-dump` —— 分组元数据（id / 折叠 / 成员 id）。
+                "groups-dump" => {
+                    let json = {
+                        let guard = self.session.borrow();
+                        guard
+                            .as_ref()
+                            .map(|s| s.groups_json())
+                            .unwrap_or_else(|| "[]".to_string())
+                    };
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"groups-dump\",\"groups\":{json}}}"
+                    );
+                }
                 // `layer-dump:index:path` —— 把图层位图原样存成 PNG。
                 // 诊断「拖动帧里图层那一块是空的」时，先确认图层位图本身有
                 // 没有内容（别把「合成没画」当成「位图透明」）。

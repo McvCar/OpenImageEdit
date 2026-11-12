@@ -475,7 +475,9 @@ Item {
     readonly property string layerPanelSig: {
         // 前缀是像素版本：值一变（任何可撤销编辑 / 撤销重做），面板重建一次，
         // 缩略图跟着重取。拖动帧不 bump 它，所以拖动期间列表不动。
-        let s = bridge.layerEpoch + "|"
+        // groups_json 也进签名：编组 / 解组 / 重命名 / 折叠都不改像素版本，
+        // 但面板的显示行必须重建，否则组标题行不会出现。
+        let s = bridge.layerEpoch + "|" + bridge.groups_json + "|"
         for (var i = 0; i < layerList.length; i++) {
             const l = layerList[i]
             s += l.i + ":" + l.id + ":" + l.n + ":" + l.v + ":" + l.l + ":"
@@ -483,8 +485,11 @@ Item {
         }
         return s
     }
-    property var layerPanelList: layerList
-    onLayerPanelSigChanged: layerPanelList = layerList
+    // 分组元数据（组不是图层，单独一份）。画布点选 / 选层框等仍只读
+    // layerList（纯图层行），不会被组标题行污染。
+    readonly property var groupList: Layers.parseLayers(bridge.groups_json)
+    property var layerPanelList: buildLayerPanelRows()
+    onLayerPanelSigChanged: layerPanelList = buildLayerPanelRows()
     readonly property var selLayer: findSelLayer()
     readonly property var selLayerBox: findLayerBox()
     // ---- 旋转后的图层框 ----
@@ -849,10 +854,24 @@ FileDialog {
     id: saveDialog
     title: "另存为"
     fileMode: FileDialog.SaveFile
-    // A PSD source keeps its layered format by default; other sources stay PNG.
-    defaultSuffix: String(bridge.fileName || "").toLowerCase().endsWith(".psd") ? "psd" : "png"
+    // 不写死 defaultSuffix：老写法固定 "png"，选了「Photoshop (*.psd)」
+    // 再输入不带扩展名的文件名，Qt 仍会补成 .png —— 用户以为存了 PSD，
+    // 实际写出去的是 PNG。后缀改为按当前选中的文件类型推导。
+    defaultSuffix: ""
     nameFilters: ["Photoshop (*.psd)", "PNG (*.png)", "JPEG (*.jpg)", "WebP (*.webp)", "TIFF (*.tiff)", "BMP (*.bmp)", "TGA (*.tga)", "QOI (*.qoi)", "ICO (*.ico)"]
-    onAccepted: bridge.save_as(selectedFile)
+    onAccepted: bridge.save_as(root.saveTargetUrl(selectedFile))
+}
+
+// 「另存为 PSD…」：普通图片（或任何非 PSD 文档）也能把当前图层栈写成
+// 一份 PSD。过滤器锁死 Photoshop、后缀固定 .psd，不依赖原生对话框的
+// 默认后缀行为；分组是编辑器元数据，写进 PSD 会展开成平级图层。
+FileDialog {
+    id: psdSaveDialog
+    title: "另存为 PSD"
+    fileMode: FileDialog.SaveFile
+    defaultSuffix: "psd"
+    nameFilters: ["Photoshop (*.psd)"]
+    onAccepted: bridge.save_as(root.withPsdSuffix(selectedFile))
 }
 
 Shortcut { sequences: [StandardKey.Open]; onActivated: openDialog.open() }
@@ -907,6 +926,13 @@ Shortcut { sequences: [StandardKey.Copy]; enabled: !bridge.editingLocked; onActi
 Shortcut { sequences: [StandardKey.Cut]; enabled: !bridge.editingLocked; onActivated: doCut() }
 Shortcut { sequences: [StandardKey.Paste]; enabled: !bridge.editingLocked; onActivated: doPaste() }
 Shortcut { sequence: "Ctrl+K"; enabled: !bridge.editingLocked && root.selExists; onActivated: applyCrop() }
+// 图层分组：普通编辑模式（随手新建的图层）与 PSD 分层态通用。
+// 用 toolKeysReady 短路创建期求值，canUseToolKeys 保证重命名输入框
+// 有焦点时不会误触发（和 V/M/L 那批工具键同一个闸门）。
+Shortcut { sequence: "Ctrl+G"; enabled: !bridge.editingLocked && root.toolKeysReady
+           && root.canUseToolKeys(); onActivated: bridge.group_selected_layers() }
+Shortcut { sequence: "Ctrl+Shift+G"; enabled: !bridge.editingLocked && root.toolKeysReady
+           && root.canUseToolKeys(); onActivated: bridge.ungroup_selected_layers() }
 // 调整颜色面板（macOS 预览的调色入口）。
 Shortcut { sequence: "Ctrl+E"; enabled: !bridge.editingLocked && bridge.image_width > 0
            onActivated: root.toggleAdjustPanel() }
@@ -2533,6 +2559,47 @@ function stepMarkFontSize(dir) {
     applyTextFont()
 }
 
+// 面板显示行 = 图层行 + 组标题行。
+// 组不是图层：这里只在「该组最高的成员」之前插一行标题，折叠时把成员行
+// 隐藏掉。真实 z 序完全不变 —— 编组不该改变画面，所以绝不重排 layerList。
+// layerList 保持纯图层行，画布点选 / 选层框 / 缩略图都不受组行影响。
+function buildLayerPanelRows() {
+    const groups = groupList
+    const byId = ({})
+    for (var g = 0; g < groups.length; g++)
+        byId[groups[g].id] = groups[g]
+    const rows = []
+    const emitted = ({})
+    function groupRow(grp, empty) {
+        return {
+            i: -1, id: -grp.id, gid: grp.id, k: "group",
+            n: empty ? grp.n + "（空）" : grp.n,
+            v: grp.v, l: grp.l, o: 100,
+            c: grp.c, cnt: empty ? 0 : grp.cnt, mids: grp.mids || [],
+            x: 0, y: 0, w: 0, h: 0, g: 0, base: false
+        }
+    }
+    for (var i = 0; i < layerList.length; i++) {
+        const l = layerList[i]
+        const gid = l.g || 0
+        if (gid > 0 && byId[gid]) {
+            const grp = byId[gid]
+            if (!emitted[gid]) {
+                emitted[gid] = true
+                rows.push(groupRow(grp, false))
+            }
+            if (grp.c)
+                continue
+        }
+        rows.push(l)
+    }
+    // 成员被删光的空组仍要留一行，否则用户没有入口把它解散。
+    for (var k = 0; k < groups.length; k++)
+        if (!emitted[groups[k].id])
+            rows.push(groupRow(groups[k], true))
+    return rows
+}
+
 function findSelLayer() {
     // 背景层已经是普通图层（layers[0]），选中它同样要有轮廓 / 数值 / 不透明度。
     for (var i = 0; i < layerList.length; i++)
@@ -2701,6 +2768,80 @@ function confirmProceed() {
             w.close()
     }
     root.confirmMode = ""
+}
+
+// ---- 另存为：后缀按「文件类型」推导 ------------------------------------
+// 原生对话框在部分平台不补后缀，另一些平台只认 defaultSuffix（老代码写死
+// png，于是选了 Photoshop 也存成 .png）。这里统一按选中过滤器收尾。
+function suffixForFilter(name) {
+    const f = String(name || "")
+    if (f.indexOf("Photoshop") >= 0) return "psd"
+    if (f.indexOf("JPEG") >= 0) return "jpg"
+    if (f.indexOf("WebP") >= 0) return "webp"
+    if (f.indexOf("TIFF") >= 0) return "tiff"
+    if (f.indexOf("BMP") >= 0) return "bmp"
+    if (f.indexOf("TGA") >= 0) return "tga"
+    if (f.indexOf("QOI") >= 0) return "qoi"
+    if (f.indexOf("ICO") >= 0) return "ico"
+    return "png"
+}
+
+// `selectedNameFilter` 只在对话框打开期间有效，缺属性时静默退化为 png。
+function currentSaveFilter() {
+    try {
+        return String(saveDialog.selectedNameFilter || "")
+    } catch (e) {
+        return ""
+    }
+}
+
+function saveTargetUrl(url) {
+    const s = String(url || "")
+    if (s.length === 0)
+        return s
+    const slash = s.lastIndexOf("/")
+    const name = slash >= 0 ? s.slice(slash + 1) : s
+    // 已经有了扩展名（用户手打的 .psd / 原生对话框补的）就原样用。
+    if (name.indexOf(".") > 0)
+        return s
+    return s + "." + suffixForFilter(currentSaveFilter())
+}
+
+function withPsdSuffix(url) {
+    const s = String(url || "")
+    if (s.length === 0)
+        return s
+    return s.toLowerCase().endsWith(".psd") ? s : s + ".psd"
+}
+
+// 「另存为 PSD」默认落在源文件同目录、同名 .psd（没有源文件就留空）。
+function psdSaveUrl() {
+    const p = String(bridge.sourcePath || "").replace(/\\/g, "/")
+    if (p.length === 0)
+        return ""
+    const slash = p.lastIndexOf("/")
+    const dir = slash >= 0 ? p.slice(0, slash + 1) : ""
+    let base = slash >= 0 ? p.slice(slash + 1) : p
+    const dot = base.lastIndexOf(".")
+    if (dot > 0)
+        base = base.slice(0, dot)
+    if (base.length === 0)
+        base = "untitled"
+    return encodeURI("file:///" + dir + base + ".psd")
+}
+
+// 普通图片也能走这条：把当前图层栈写成一个 PSD（背景 = 图层 1）。
+function openSaveAsPsd() {
+    if (bridge.editingLocked) {
+        bridge.psd_locked_hint()
+        return
+    }
+    if (bridge.saving)
+        return
+    const u = psdSaveUrl()
+    if (u.length > 0)
+        psdSaveDialog.currentFile = u
+    psdSaveDialog.open()
 }
 
 // Ctrl+S: overwrite the file the image was loaded from. A document with

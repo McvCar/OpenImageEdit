@@ -16,6 +16,7 @@ mod gesture;
 mod mark;
 mod layer;
 mod layer_ops;
+mod group_ops;
 pub mod layer_transform;
 pub mod snap;
 mod transform;
@@ -35,7 +36,10 @@ pub use selection::{
     QuickSelectOptions, SelOps, SelShape, SelectionMask, SelectionState, WandOptions,
 };
 pub use mark::{MarkKind, Mark};
-pub use layer::{thumbnail_image, Layer, LayerContent, LayerId, RasterLayer};
+pub use layer::{
+    next_group_id, thumbnail_image, GroupId, Layer, LayerContent, LayerGroup, LayerId,
+    RasterLayer,
+};
 pub use layer_ops::{AlignEdge, DistributeAxis};
 pub use layer_transform::{
     probe_lines as transform_probe_lines, Affine2, BoundsSolve, Field, LayerTransform, PanelValues,

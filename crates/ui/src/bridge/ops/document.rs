@@ -325,7 +325,40 @@ impl qobject::Bridge {
             self.as_mut().set_dirty(false);
         }
         self.as_mut().update_file_info();
-        self.as_mut().report_save(Ok(job.path));
+        // PSD 写出的「层数 / 分组数」要如实报出来：分组只是本编辑器的元
+        // 数据，PSD 里会被展开成平级图层 —— 不提示的话，用户会以为是丢了。
+        let psd_report = if matches!(job.format, SaveFormat::Psd) {
+            let (layers, groups) = self
+                .session
+                .borrow()
+                .as_ref()
+                .map(|s| (s.doc.layers.len(), s.doc.groups.len()))
+                .unwrap_or((0, 0));
+            println!(
+                "{{\"phase\":\"ui\",\"event\":\"psd-saved\",\"path\":\"{}\",\"layers\":{},\"groups\":{}}}",
+                job.path.display().to_string().replace('\\', "/"),
+                layers,
+                groups
+            );
+            Some((layers, groups))
+        } else {
+            None
+        };
+        self.as_mut().report_save(Ok(job.path.clone()));
+        if let Some((layers, groups)) = psd_report {
+            let text = if groups > 0 {
+                format!(
+                    "已保存 PSD：{}（{layers} 个图层；{groups} 个分组已展开，不写入 PSD）",
+                    job.path.display()
+                )
+            } else {
+                format!(
+                    "已保存 PSD：{}（{layers} 个图层）",
+                    job.path.display()
+                )
+            };
+            self.as_mut().set_status(QString::from(text.as_str()));
+        }
     }
 
     /// Drop queued thumbnails when the document is replaced (C2-c style

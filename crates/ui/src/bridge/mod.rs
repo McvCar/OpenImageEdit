@@ -123,6 +123,10 @@ pub mod qobject {
         #[qproperty(i32, layer_count)]
         #[qproperty(i32, selected_layer)]
         #[qproperty(QString, layers_json)]
+        /// 图层分组元数据（JSON 数组）。组不是图层、不进 `layers_json`：
+        /// 面板把这份列表和图层行合成「组标题行 + 缩进成员行」。
+        /// 折叠状态也在里面，所以视图状态变化会触发面板重建但不动像素。
+        #[qproperty(QString, groups_json)]
         /// 多选：选中图层的稳定 id 列表（JSON 数组），面板据此高亮。
         #[qproperty(QString, layer_selection_ids, cxx_name = "layerSelectionIds")]
         /// 多选：选中图层数量（面板标题 / 批量操作条用）。
@@ -748,6 +752,40 @@ pub mod qobject {
         #[qinvokable]
         fn delete_selected_layers(self: Pin<&mut Self>);
 
+        // ---- 图层分组（普通编辑模式与 PSD 分层态走同一套）----
+        // 组只是组织标签：不重排 layers、不改像素，所以保真 / 校准态下
+        // 编组也不会把画面切回重建预览。
+
+        /// 把当前多选（≥2 个普通层）收进一个新组，返回是否成功。
+        #[qinvokable]
+        fn group_selected_layers(self: Pin<&mut Self>) -> bool;
+
+        /// 解散当前选中层所属的所有分组（图层本身保留）。
+        #[qinvokable]
+        fn ungroup_selected_layers(self: Pin<&mut Self>) -> bool;
+
+        /// 解散指定分组（组行上的「解散」入口）。
+        #[qinvokable]
+        fn ungroup_group(self: Pin<&mut Self>, group_id: i32) -> bool;
+
+        /// 点组标题行：选中整组，主选中层为组内最上层。
+        #[qinvokable]
+        fn select_group(self: Pin<&mut Self>, group_id: i32);
+
+        /// 折叠 / 展开（纯视图状态，不进撤销栈）。
+        #[qinvokable]
+        fn set_group_collapsed(self: Pin<&mut Self>, group_id: i32, collapsed: bool);
+
+        #[qinvokable]
+        fn rename_group(self: Pin<&mut Self>, group_id: i32, name: &QString);
+
+        /// 整组显隐：批量写成员 visible，会重建预览。
+        #[qinvokable]
+        fn set_group_visible(self: Pin<&mut Self>, group_id: i32, visible: bool);
+
+        #[qinvokable]
+        fn set_group_locked(self: Pin<&mut Self>, group_id: i32, locked: bool);
+
         /// 图层缩略图 URL（面板每行一张；按需生成 + 缓存）。
         #[qinvokable]
         fn layer_thumb_url(self: Pin<&mut Self>, index: i32) -> QString;
@@ -1224,6 +1262,8 @@ pub struct BridgeRust {
     layer_count: i32,
     selected_layer: i32,
     layers_json: QString,
+    /// 分组元数据（组标题行 / 折叠状态 / 成员 id），面板重组显示行用。
+    groups_json: QString,
     /// 多选：选中图层的稳定 id（顺序 = 点击顺序，最后一个是主选中层）。
     /// 下标会随重排 / 删除变化，所以缓存必须用 id。
     selection_ids: RefCell<Vec<u32>>,
@@ -1404,6 +1444,7 @@ impl Default for BridgeRust {
             layer_count: 0,
             selected_layer: -1,
             layers_json: QString::default(),
+            groups_json: QString::from("[]"),
             selection_ids: RefCell::new(Vec::new()),
             layer_selection_ids: QString::from("[]"),
             selected_layer_count: 0,
@@ -1653,16 +1694,41 @@ impl qobject::Bridge {
     /// Eye toggle on the base row: hide/show the background (undoable).
     /// Re-publish `layers_json` (lock toggles change panel state only).
     fn refresh_layers_only(mut self: Pin<&mut Self>) {
-        let json = {
-            let mut guard = self.session.borrow_mut();
-            match guard.as_mut() {
-                Some(session) => session.layers_json(),
+        let (json, groups) = {
+            let guard = self.session.borrow();
+            match guard.as_ref() {
+                Some(session) => (session.layers_json(), session.groups_json()),
                 None => return,
             }
         };
         self.as_mut()
             .set_layers_json(QString::from(json.as_str()));
+        self.as_mut().publish_groups(groups);
         // 图层增删 / 重排之后多选集合可能指向已经不存在的 id，顺手校准。
+        self.as_mut().sync_layer_selection();
+    }
+
+    /// 只在内容变化时发布分组 JSON：QML 会重新解析并重建面板显示行，
+    /// 拖动帧里内容不变就不发信号。
+    fn publish_groups(mut self: Pin<&mut Self>, json: String) {
+        if self.groups_json().to_string() != json {
+            self.as_mut()
+                .set_groups_json(QString::from(json.as_str()));
+        }
+    }
+
+    /// 分组命令专用刷新：只重发面板数据，**不重建预览**。
+    /// 编组 / 解组 / 重命名 / 折叠都不改像素，走这里就不会把原生合成
+    /// 校准误判成「文档被编辑过」而切回按层重建的画面。
+    fn refresh_groups_only(mut self: Pin<&mut Self>) {
+        let json = {
+            let guard = self.session.borrow();
+            guard
+                .as_ref()
+                .map(|s| s.groups_json())
+                .unwrap_or_else(|| "[]".to_string())
+        };
+        self.as_mut().publish_groups(json);
         self.as_mut().sync_layer_selection();
     }
 
@@ -1964,6 +2030,7 @@ impl qobject::Bridge {
                 save_url,
                 layer_count,
                 layers_json,
+                groups_json,
                 marks_json,
                 dirty,
                 adjust_open,
@@ -2064,6 +2131,7 @@ impl qobject::Bridge {
                     self.as_mut()
                         .set_layers_json(QString::from(layers_json.as_str()));
                 }
+                self.as_mut().publish_groups(groups_json);
                 // P0-4 / P0-5：随帧下发参考线与数值面板参数；内容不变时不发信号，
                 // 避免拖动帧触发 QML 重新解析 / 重绘。
                 let guides = if *self.show_guides() {

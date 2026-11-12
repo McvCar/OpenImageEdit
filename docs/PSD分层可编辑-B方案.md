@@ -880,3 +880,53 @@ python scripts/probe_calibration.py --seconds 40
 `calibration-mae`（约 6.67），用来证明「被替换掉的确实是有误差的那张」，
 而不是校准逻辑根本没生效。`IMAGEEDIT_CALIBRATION_PROBE=edit` 在装配后模拟
 一次编辑（epoch bump + dirty）以驱动失效路径。
+
+## 18. 普通图片「另存为 PSD」（2026-11-13 追加）
+
+### 18.1 背景
+
+`encode_psd` 本来就接受任意 `Document`：它把 `doc.layers` 逐层写成 PSD 图层
+记录、把 `doc.flatten()` 写成合并图。所以「PNG 存成 PSD」在编码层早就成立，
+缺的只是入口与后缀：
+
+1. 菜单里只有泛化的「另存为…」，PSD 只是对话框里的一个过滤器，不显眼。
+2. 泛化对话框把 `defaultSuffix` 写死成 `"png"`。选了 `Photoshop (*.psd)`
+   再输入不带扩展名的文件名，Qt 仍会补成 `.png` —— 用户以为存了 PSD，实际
+   写出去的是 PNG 字节。
+3. `validate_save_target` 对「源文件是合并预览态 PSD」一律拒绝 `.psd` 目标，
+   连导出到另一个文件也一并拦掉，与它自己的注释（导出到不同路径应当允许）
+   矛盾。
+
+### 18.2 改动
+
+| 位置 | 改动 |
+| --- | --- |
+| `crates/ui/qml/panels/TitleBar.qml` | 文件菜单新增「另存为 PSD…（保留图层）」，`ok` 条件为有图且不在保存中 |
+| `crates/ui/qml/editor/EditorContent.qml` | 新增 `psdSaveDialog`（过滤器固定 Photoshop、`defaultSuffix: "psd"`）与 `openSaveAsPsd()`；默认落在源文件同目录、同名 `.psd` |
+| 同上 | 泛化 `saveDialog` 的 `defaultSuffix` 改为空，`onAccepted` 走 `saveTargetUrl()` 按**当前选中的过滤器**补后缀 |
+| `crates/ui/src/bridge/paths.rs` | 合并预览态 PSD 的 `.psd` 限制收窄为**仅覆盖源文件**；导出到其它路径放行 |
+| `crates/ui/src/bridge/ops/document.rs` | 保存成功后打印 `psd-saved`（`layers` / `groups`），状态栏给出「已保存 PSD：…（N 个图层）」；有分组时补一句「M 个分组已展开，不写入 PSD」 |
+
+### 18.3 语义与边界
+
+- **写什么**：当前 `doc.layers` 的每一层（位图 / 标记都算，标记按其画布外接
+  框栅格化），合并图用 `doc.flatten()`。普通图片只有 `layers[0]`，就是 1 层。
+- **分组**：分组是本编辑器的平行元数据，PSD 图层段目前不写 `lsct` 分组标记，
+  所以成员会**展开成平级图层**。这是有意为之（否则重开时反而多出虚假层级），
+  状态栏会明说。
+- **仍然禁止**：`另存为 PSD` 覆盖一个「合并预览态」的 PSD 源文件（会烧掉原
+  图层）；降采样打开（>8192）的文档任何 PSD 写出都被拒绝。
+- **校准态**：位图导出用校准参考图（所见即所得）；PSD 导出例外，必须写图层
+  栈，不能用 1 层合并图顶替。
+
+### 18.4 验收
+
+```
+python scripts/probe_psd_roundtrip.py --only saveas
+```
+
+| 用例 | 断言 |
+| --- | --- |
+| 普通 PNG → 新 `.psd` | `saved` 事件、无 `save-error`、文件 1 层且可见位不被置为隐藏 |
+| 合并预览态 PSD → 另一个 `.psd` | 放行且写出 1 个平铺图层（覆盖源仍由 `--only composite` 验证被拒） |
+| 分组文档 → `.psd` | `psd-saved.groups >= 1`，文件层记录保持平铺 5 层 |

@@ -156,8 +156,12 @@ pub(in crate::bridge) fn validate_save_target(
         if downsampled {
             return Err(DOWNSAMPLED_HINT.to_string());
         }
-        // A PSD opened as a composite has no layer stack to write back.
-        if source.map(is_psd_path).unwrap_or(false) && !psd_layered {
+        // A composite-only PSD has no layer stack. Overwriting ITS OWN source
+        // would burn the original layers, so that stays forbidden — but
+        // exporting the current image to a DIFFERENT `.psd` is a legitimate
+        // "flatten and export" (one flat layer), and it is also how a plain
+        // PNG gets turned into a PSD. Only the overwrite is a data-loss risk.
+        if overwriting_source && source.map(is_psd_path).unwrap_or(false) && !psd_layered {
             return Err(PSD_COMPOSITE_HINT.to_string());
         }
     }
@@ -256,6 +260,18 @@ mod psd_save_guard_tests {
         // A plain image may be Saved As a NEW PSD (one flat layer).
         assert_eq!(
             validate_save_target(Path::new("D:/art/new.psd"), Some(png), false, false),
+            Ok(SaveFormat::Psd)
+        );
+        // A composite-only PSD may still be EXPORTED to another .psd: only
+        // overwriting its own source would destroy the original layers.
+        assert_eq!(
+            validate_save_target(Path::new("D:/art/flat.psd"), Some(src), false, false),
+            Ok(SaveFormat::Psd)
+        );
+        // A document without a source path (new / untitled) is not an
+        // overwrite either, so `另存为 PSD` must work from a blank document.
+        assert_eq!(
+            validate_save_target(Path::new("D:/art/untitled.psd"), None, false, false),
             Ok(SaveFormat::Psd)
         );
         // C8: downsampled source overwrite (any format) + any PSD write.

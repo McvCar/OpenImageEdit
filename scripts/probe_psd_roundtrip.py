@@ -370,6 +370,62 @@ def phase_saveas():
         problems.append("另存的图层不该被写成隐藏")
     print("  psd=%dx%d layers=%d size=%d bytes" % (
         info["width"], info["height"], len(info["layers"]), info["size"]))
+
+    # 2) 合并预览态 PSD 另存到「另一个」.psd：只允许导出，不允许覆盖源。
+    #    （覆盖源已由 composite / lossy 两段覆盖；这里验证导出没被误拦。）
+    src_psd = os.path.join(WORK_DIR, "composite-src.psd")
+    dst_psd = os.path.join(WORK_DIR, "composite-export.psd")
+    shutil.copyfile(FIXTURE, src_psd)
+    if os.path.exists(dst_psd):
+        os.remove(dst_psd)
+    lines = run_script(
+        src_psd, "save-as:" + dst_psd.replace("\\", "/"), '"event":"saved"',
+        extra_env={"IMAGEEDIT_PSD_SYNC_COMPOSITE": "1"},
+    )
+    if parse_events(lines, "save-error"):
+        problems.append("合并预览 PSD 另存到新文件被错误拒绝")
+    if not parse_events(lines, "saved"):
+        problems.append("合并预览 PSD 另存没有产生 saved 事件")
+    if not os.path.exists(dst_psd):
+        problems.append("合并预览 PSD 另存的新文件不存在")
+    else:
+        flat = parse_psd(dst_psd)
+        if len(flat["layers"]) != 1:
+            problems.append("合并预览导出应为 1 个平铺图层，实际 %d"
+                            % len(flat["layers"]))
+        print("  composite-export layers=%d" % len(flat["layers"]))
+
+    # 3) 分组文档导出 PSD：分组只是编辑器元数据，写出去必须**展开**成
+    #    平级图层，并在 psd-saved 事件里如实报出 groups>0。
+    grp_src = os.path.join(WORK_DIR, "grouped.psd")
+    grp_dst = os.path.join(WORK_DIR, "grouped-export.psd")
+    shutil.copyfile(FIXTURE, grp_src)
+    if os.path.exists(grp_dst):
+        os.remove(grp_dst)
+    lines = run_script(
+        grp_src,
+        "multi-select:2,3;layer-group;groups-dump;save-as:" + grp_dst.replace("\\", "/"),
+        '"event":"saved"',
+    )
+    if not parse_events(lines, "script-group") or \
+            not parse_events(lines, "script-group")[-1].get("ok"):
+        problems.append("分组没成功（脚本前置条件失败）")
+    saved = parse_events(lines, "psd-saved")
+    if not saved:
+        problems.append("分组文档导出缺 psd-saved 事件")
+    elif saved[-1].get("groups", 0) < 1:
+        problems.append("psd-saved 没有报出分组数（groups=%s）"
+                        % saved[-1].get("groups"))
+    if not os.path.exists(grp_dst):
+        problems.append("分组文档导出的 PSD 不存在")
+    else:
+        grouped = parse_psd(grp_dst)
+        if len(grouped["layers"]) != EXPECTED_LAYERS:
+            problems.append("分组导出后层记录 %d，应保持平铺 %d 层"
+                            % (len(grouped["layers"]), EXPECTED_LAYERS))
+        print("  grouped-export layers=%d groups=%s" % (
+            len(grouped["layers"]),
+            saved[-1].get("groups") if saved else None))
     return problems
 
 

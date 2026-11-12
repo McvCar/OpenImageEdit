@@ -19,6 +19,10 @@ pub enum EditError {
     NothingToRedo,
     #[error("the base layer needs at least one other layer")]
     BaseRequired,
+    #[error("layer group {0} not found")]
+    GroupNotFound(GroupId),
+    #[error("grouping needs at least two ordinary layers")]
+    GroupNeedsTwoLayers,
 }
 
 
@@ -50,6 +54,11 @@ pub enum EditOp {
         to: Option<LayerTransform>,
     },
     RenameLayer { index: usize, from: String, to: String },
+    /// 整份替换分组元数据（组数量很少，全量存最省事且撤销精确）。
+    /// 与 `SetLayerGroup` 一起包进 `Batch`，就是一次可撤销的编组 / 解组。
+    SetGroups { from: Vec<LayerGroup>, to: Vec<LayerGroup> },
+    /// 单层归属变更。`from`/`to` 都记下来，撤销时精确还原。
+    SetLayerGroup { index: usize, from: Option<GroupId>, to: Option<GroupId> },
     /// Non-destructive "delete selection pixels": the base pixels under the
     /// selection fade out (scaled by the mask's alpha coverage, so a feathered
     /// selection gets a soft edge) while layers stay untouched. The pre-op
@@ -133,6 +142,16 @@ pub enum EditOp {
 }
 
 impl EditOp {
+    /// 纯分组元数据操作不改像素：`Document::execute/undo/redo` 据此跳过
+    /// `edit_epoch`，避免编组 / 解组把预览缓存与原生合成校准一起废掉。
+    pub fn is_metadata_only(&self) -> bool {
+        match self {
+            EditOp::SetGroups { .. } | EditOp::SetLayerGroup { .. } => true,
+            EditOp::Batch(ops) => ops.iter().all(|op| op.is_metadata_only()),
+            _ => false,
+        }
+    }
+
     pub fn apply(&self, doc: &mut Document) -> Result<(), EditError> {
         match self {
             EditOp::TransformDocument { transform } => {
@@ -260,6 +279,18 @@ impl EditOp {
                     .get_mut(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
                 layer.name = to.clone();
+                Ok(())
+            }
+            EditOp::SetGroups { to, .. } => {
+                doc.groups = to.clone();
+                Ok(())
+            }
+            EditOp::SetLayerGroup { index, to, .. } => {
+                let layer = doc
+                    .layers
+                    .get_mut(*index)
+                    .ok_or(EditError::LayerIndex(*index))?;
+                layer.group = *to;
                 Ok(())
             }
             EditOp::EraseBasePixels { selection, .. } => {
@@ -541,6 +572,18 @@ impl EditOp {
                     .get_mut(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
                 layer.name = from.clone();
+                Ok(())
+            }
+            EditOp::SetGroups { from, .. } => {
+                doc.groups = from.clone();
+                Ok(())
+            }
+            EditOp::SetLayerGroup { index, from, .. } => {
+                let layer = doc
+                    .layers
+                    .get_mut(*index)
+                    .ok_or(EditError::LayerIndex(*index))?;
+                layer.group = *from;
                 Ok(())
             }
             EditOp::EraseBasePixels { from, .. } => {
