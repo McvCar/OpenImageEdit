@@ -460,6 +460,28 @@ impl qobject::Bridge {
                     );
                 }
                 *self.session.borrow_mut() = Some(session);
+                // 保真模式：阶段 1 解出来的就是 PSD 自带合并图。只要这次没有
+                // 顺带跑阶段 2（旧探针钩子除外），画面就保持逐像素一致，
+                // 也不启动图层解析。「进入分层编辑」由用户显式触发。
+                let psd = is_psd_path(&msg.path);
+                let fidelity = psd && layer_job.is_none() && downsampled_from.is_none();
+                self.as_mut().set_fidelity_mode(fidelity);
+                // 只有「以合并图打开」的文档才缓存了可换回的另一半；旧探针的
+                // 自动装配路径没有保真文档，不能开放切换入口。
+                self.as_mut().set_has_psd_layers(fidelity);
+                if fidelity {
+                    if let Some(session) = self.session.borrow_mut().as_mut() {
+                        session.note = Some(
+                            "保真显示：PSD 自带合并图（与 Photoshop 一致）· 视图菜单可进入分层编辑"
+                                .to_string(),
+                        );
+                    }
+                }
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"fidelity-state\",\"value\":{},\"canLayer\":{}}}",
+                    fidelity,
+                    fidelity
+                );
                 // 诊断：旧 Session 已在这一行被替换掉，读数里若没有回落，
                 // 说明有东西替旧文档继续持有那批图层像素。
                 mem::log("after-session");
@@ -502,6 +524,13 @@ impl qobject::Bridge {
                     // survive from an earlier document.
                     self.as_mut().finish_psd_layers("composite-only");
                 }
+                // 自动化钩子：让保真 ↔ 分层的切换也能在无人工点击的探针里跑。
+                // 值为 enter 时停在分层态，roundtrip 时装配完立即换回保真态。
+                if let Ok(want) = std::env::var("IMAGEEDIT_FIDELITY_PROBE") {
+                    if want == "enter" || want == "roundtrip" || want == "roundtrip2" {
+                        self.as_mut().enter_layered_editing();
+                    }
+                }
             }
             Err(err) => {
                 self.as_mut().finish_psd_layers("decode-failed");
@@ -539,6 +568,15 @@ impl qobject::Bridge {
         if !*self.psd_layers_pending() {
             return;
         }
+        if *self.fidelity_mode() {
+            // 保真模式下阶段 2 是用户主动发起的「进入分层编辑」，跳过 =
+            // 取消这次切换，画面本来就是合并图，谈不上降级或只读。
+            self.as_mut().set_status(QString::from(
+                "已取消进入分层编辑，保持保真显示（PS 合并图）",
+            ));
+            self.as_mut().finish_psd_layers("layered-cancelled");
+            return;
+        }
         self.as_mut().set_status(QString::from(
             "已跳过图层加载，以合并预览继续编辑；写回 PSD 仍不可用",
         ));
@@ -553,6 +591,161 @@ impl qobject::Bridge {
         self.as_mut().set_status(QString::from(
             "图层仍在后台加载，编辑工具暂不可用（可点「跳过图层加载」立即编辑）",
         ));
+    }
+
+    /// 保真 → 分层。已经解析过就直接把缓存的图层栈换回来（毫秒级、不重读
+    /// 文件）；第一次才按需启动阶段 2，解析期间沿用原有 editingLocked 闸门。
+    pub fn enter_layered_editing(mut self: Pin<&mut Self>) {
+        if !*self.has_psd_layers() || !*self.fidelity_mode() {
+            return;
+        }
+        let cached = self
+            .inactive_doc
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.psd_layered);
+        if cached {
+            self.as_mut().swap_display_docs();
+            self.as_mut().publish_mode_switch(false);
+            println!("{{\"phase\":\"ui\",\"event\":\"fidelity-enter\",\"mode\":\"cache\"}}");
+            return;
+        }
+        // 只有「需要重新解析」的路径才怕并发作业；缓存换回不需要等作业收尾。
+        if *self.psd_layers_pending() {
+            return;
+        }
+        let Some(path) = self
+            .session
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.source.clone())
+        else {
+            return;
+        };
+        let opts = self.decode_opts();
+        let Some(job) = spawn_psd_layer_job(&path, opts) else {
+            self.as_mut()
+                .set_status(QString::from("当前文件不是可分层的 PSD"));
+            return;
+        };
+        *self.psd_job.borrow_mut() = Some(job);
+        self.as_mut().set_psd_layers_pending(true);
+        self.as_mut().set_editing_locked(true);
+        self.as_mut().set_psd_progress(QString::from(
+            "正在加载图层…（完成前编辑工具暂不可用）",
+        ));
+        self.as_mut()
+            .set_status(QString::from("正在进入分层编辑…"));
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"editing-locked\",\"ms\":{}}}",
+            elapsed_ms()
+        );
+        println!("{{\"phase\":\"ui\",\"event\":\"fidelity-enter\",\"mode\":\"parse\"}}");
+    }
+
+    /// 分层 → 保真。分层栈（连同它的撤销记录）原样缓存，再切回来时不用重解析。
+    pub fn return_to_fidelity(mut self: Pin<&mut Self>) {
+        // 注意：装配刚完成时 finish_psd_layers("done") 还没跑，此刻
+        // psd_layers_pending 仍为 true。菜单本身已用 !psdLayersPending 把关，
+        // 这里不能再拿它当守卫，否则阶段 2 完成当帧的往返切换会被吞掉。
+        if !*self.has_psd_layers() || *self.fidelity_mode() {
+            return;
+        }
+        self.as_mut().swap_display_docs();
+        self.as_mut().publish_mode_switch(true);
+        // 探针：换回保真后再进一次分层，验证缓存路径（不重读文件、不重解析）。
+        if std::env::var("IMAGEEDIT_FIDELITY_PROBE").ok().as_deref() == Some("roundtrip2") {
+            self.as_mut().enter_layered_editing();
+        }
+    }
+
+    /// 把当前显示的那份 Document 与缓存的另一份互换。History 在 Document
+    /// 内部，所以两边的 Ctrl+Z 各自独立，切换不丢编辑、不串历史。
+    fn swap_display_docs(mut self: Pin<&mut Self>) {
+        let Some(stored) = self.inactive_doc.borrow_mut().take() else {
+            self.as_mut()
+                .set_status(QString::from("另一份显示文档不可用，请重新打开此文件"));
+            return;
+        };
+        let mut guard = self.session.borrow_mut();
+        let Some(session) = guard.as_mut() else {
+            *self.inactive_doc.borrow_mut() = Some(stored);
+            return;
+        };
+        let old = std::mem::replace(&mut session.doc, stored.doc);
+        let old_state = InactiveDoc {
+            doc: old,
+            dirty: session.dirty,
+            note: session.note.clone(),
+            psd_layered: session.psd_layered,
+            psd_lossy: session.psd_lossy,
+        };
+        *self.inactive_doc.borrow_mut() = Some(old_state);
+        session.dirty = stored.dirty;
+        session.note = stored.note.clone();
+        session.psd_layered = stored.psd_layered;
+        session.psd_lossy = stored.psd_lossy;
+        // 合成缓存 / GPU 快路径都按旧文档的 epoch 建立，换文档后必须整体
+        // 失效，否则 gpuLive 会永久盖住旧纹理（历史踩过的坑）。
+        session.composer = render::PreviewComposer::new();
+        session.last_render = None;
+        session.transform = None;
+        session.sel_flip_sign = (false, false);
+        session.adjust = None;
+        session.preview_hidden_mark = -1;
+        session.brush_live = None;
+        session.gradient_live = None;
+        session.patch_live = None;
+        session.patch_region = None;
+        session.heal_source = None;
+        session.rotate_origin = None;
+        session.fit_content = None;
+        session.quick_mask = false;
+        session.snap_statics.clear();
+        session.snap = editcore::snap::SnapResult::default();
+        session.mods = 0;
+        session.disp_scale = 1.0;
+        session.gesture = -1;
+        session.gesture_index = -1;
+        session.gesture_start = (0.0, 0.0);
+        session.gesture_rect = (0.0, 0.0, 0.0, 0.0);
+        session.fit_occ = editcore::alpha_fit::Occupancy::default();
+        session.gpu_live = false;
+        session.gpu_static_url.clear();
+        session.gpu_active_url.clear();
+        session.gpu_index = 0;
+        session.gpu_rect = (0.0, 0.0, 0.0, 0.0, 1.0);
+        session.sel_rev = session.sel_rev.wrapping_add(1);
+    }
+
+    /// 换文档之后统一发布 UI 状态（图层面板 / 缩略图 / 写回守卫 / 预览）。
+    fn publish_mode_switch(mut self: Pin<&mut Self>, to_fidelity: bool) {
+        self.as_mut().cancel_thumbs("mode-switch");
+        self.as_mut().set_thumbs_pending(false);
+        self.as_mut().clear_psd_notice();
+        let lossy = self
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.psd_lossy);
+        self.as_mut().set_psd_write_lossy(lossy);
+        self.as_mut().set_psd_lossy_ack(false);
+        let has_annotations_now = !to_fidelity && !self.annotation_ids.borrow().is_empty();
+        self.as_mut().set_has_annotations(has_annotations_now);
+        self.as_mut().set_selected_layer(-1);
+        self.as_mut().sync_layer_selection();
+        self.as_mut().set_fidelity_mode(to_fidelity);
+        self.as_mut().refresh_preview();
+        self.as_mut().set_status(QString::from(if to_fidelity {
+            "已返回保真显示：画面为 PSD 自带合并图（与 Photoshop 一致）"
+        } else {
+            "已进入分层编辑：图层面板可逐层编辑；视图菜单可随时返回保真显示"
+        }));
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"fidelity-mode\",\"value\":{},\"ms\":{}}}",
+            to_fidelity,
+            elapsed_ms()
+        );
     }
 
     /// Drain stage-2 messages on the UI thread. Called by the same 50 ms
@@ -601,6 +794,7 @@ impl qobject::Bridge {
                             self.as_mut().install_psd_layers(set, &thumbs)
                         }
                         Ok(_) => {
+                            self.as_mut().set_fidelity_mode(true);
                             self.as_mut().set_status(QString::from(
                                 "此 PSD 没有可编辑图层，已按合并预览打开",
                             ));
@@ -609,6 +803,7 @@ impl qobject::Bridge {
                             ));
                         }
                         Err(err) => {
+                            self.as_mut().set_fidelity_mode(true);
                             self.as_mut().set_status(QString::from(format!(
                                 "图层加载失败，已按合并预览打开并解锁编辑：{err}"
                             )));
@@ -622,6 +817,7 @@ impl qobject::Bridge {
                 }
                 Err(mpsc::TryRecvError::Empty) => return,
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    self.as_mut().set_fidelity_mode(true);
                     self.as_mut().set_status(QString::from(
                         "图层加载线程已结束，已按合并预览打开并解锁编辑",
                     ));
@@ -643,6 +839,8 @@ impl qobject::Bridge {
         let t0 = Instant::now();
         // Defensive assertion: `--script` / external commands can bypass the
         // QML gate, so never overwrite edits that happened while loading.
+        // 保真模式例外：合并图那份 Document 会被完整缓存起来（连同它自己的
+        // 撤销栈），用户切回来时编辑还在，所以这里允许它带着编辑被换下。
         let (epoch, dirty) = {
             let guard = self.session.borrow();
             guard
@@ -650,7 +848,7 @@ impl qobject::Bridge {
                 .map(|s| (s.doc.edit_epoch, s.dirty))
                 .unwrap_or((0, false))
         };
-        if epoch != 0 || dirty {
+        if !*self.fidelity_mode() && (epoch != 0 || dirty) {
             self.as_mut().set_status(QString::from(
                 "加载期间文档被修改，已保留合并预览；请重新打开此 PSD 以使用分层编辑",
             ));
@@ -690,21 +888,36 @@ impl qobject::Bridge {
         let heavy = count > 32 || bytes > 256 * 1024 * 1024;
         let thumb_t0 = Instant::now();
         let mut seeded = 0usize;
-        let annotation_layers_present;
+        let annotation_layers_present = !annotation_ids.is_empty();
         {
             let mut guard = self.session.borrow_mut();
             let Some(session) = guard.as_mut() else {
                 return;
             };
-            session.doc = doc;
+            if *self.fidelity_mode() {
+                // 保真模式下用户可能已经改过合并图：整份 Document 缓存起来，
+                // 「返回保真显示」时连编辑与撤销栈一起换回来，绝不静默丢弃。
+                let old = std::mem::replace(&mut session.doc, doc);
+                *self.inactive_doc.borrow_mut() = Some(InactiveDoc {
+                    doc: old,
+                    dirty: session.dirty,
+                    note: session.note.clone(),
+                    psd_layered: session.psd_layered,
+                    psd_lossy: session.psd_lossy,
+                });
+            } else {
+                session.doc = doc;
+            }
             // The real layer stack is now in memory; Ctrl+S may write it back.
             session.psd_layered = true;
             // Publish the annotation-layer bookkeeping for the view menu.
             *self.annotation_ids.borrow_mut() = annotation_ids;
-            annotation_layers_present = !annotation_flags.is_empty();
             // Cached previews were built from the 1-layer placeholder.
             session.composer = render::PreviewComposer::new();
             session.last_render = None;
+            session.gpu_live = false;
+            session.gpu_static_url.clear();
+            session.gpu_active_url.clear();
             session.dirty = false;
             // C6: the worker already downscaled every layer to 40px. Queue
             // them for batched writing (<=6 rows per 50 ms tick) instead of
@@ -735,6 +948,8 @@ impl qobject::Bridge {
         }
         self.as_mut().set_thumbs_pending(seeded > 0);
         self.as_mut().set_has_annotations(annotation_layers_present);
+        // 阶段 2 装配完成后画面换成按层重建的结果；保真那份仍在缓存里。
+        self.as_mut().set_fidelity_mode(false);
         // The stack is editable, but a write-back would bake in every loss the
         // load reported (groups, masks, blend modes, clipped pixels). QML asks
         // for confirmation once per document before overwriting the source.
@@ -787,6 +1002,17 @@ impl qobject::Bridge {
             "{{\"phase\":\"ui\",\"event\":\"psd-install-ms\",\"value\":{}}}",
             t0.elapsed().as_millis()
         );
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"fidelity-mode\",\"value\":false,\"ms\":{}}}",
+            elapsed_ms()
+        );
+        // 探针：装配完立即换回保真，用来验证双向切换、缓存与预览失效。
+        if matches!(
+            std::env::var("IMAGEEDIT_FIDELITY_PROBE").ok().as_deref(),
+            Some("roundtrip") | Some("roundtrip2")
+        ) {
+            self.as_mut().return_to_fidelity();
+        }
     }
 }
 

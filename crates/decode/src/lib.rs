@@ -503,6 +503,27 @@ pub fn encode(
 mod tests {
     use super::*;
 
+    /// 保真模式的像素证据：把阶段 1 解出来的合并图原样存盘，交给
+    /// `scripts/compare_composite.py` 与 PSD 自带合并图比。它俩读的是同一份
+    /// 数据，MAE 应为 0；分层重建路线的 6.99 才是需要继续优化的那条。
+    ///
+    /// ```text
+    /// set IMAGEEDIT_FIDELITY_PSD=<file.psd>
+    /// cargo test -p imageedit-decode dump_stage1_composite -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn dump_stage1_composite() {
+        let Ok(path) = std::env::var("IMAGEEDIT_FIDELITY_PSD") else {
+            return;
+        };
+        let decoded = decode_path(std::path::Path::new(&path), DecodeOptions::default())
+            .expect("stage-1 decode");
+        let out = std::path::Path::new("C:/_APP_CODE/stage1-composite.png");
+        decoded.image.save(out).expect("save stage-1 composite");
+        println!("stage1 -> {} {:?}", out.display(), decoded.image.dimensions());
+    }
+
     fn gradient(width: u32, height: u32) -> RgbaImage {
         RgbaImage::from_fn(width, height, |x, y| {
             image::Rgba([

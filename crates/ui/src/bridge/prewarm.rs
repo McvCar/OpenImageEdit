@@ -40,10 +40,13 @@ pub(in crate::bridge) fn spawn(path: &Path) {
     let owned = path.to_path_buf();
     let thread_path = owned.clone();
     let (tx, rx) = mpsc::channel::<DecodeMsg>();
-    // PSD: stage 2 parses the real layers in parallel with stage 1's
-    // composite decode. Starting it here keeps the first frame off its
-    // critical path (C2) while the result is ready by the time QML polls.
-    let layer_job = spawn_psd_layer_job(&thread_path, opts);
+    // 保真模式下阶段 2 不启动：阶段 1 的合并图就是最终显示内容。
+    // 只有旧探针（IMAGEEDIT_AUTO_LAYERED）才在预热时并行解析分层。
+    let layer_job = if super::auto_layered_requested() {
+        spawn_psd_layer_job(&thread_path, opts)
+    } else {
+        None
+    };
     std::thread::spawn(move || {
         let t0 = Instant::now();
         let result = decode_path(&thread_path, opts).map_err(|e| e.to_string());

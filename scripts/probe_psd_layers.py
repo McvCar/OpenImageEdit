@@ -43,6 +43,10 @@ def env(extra=None):
     e = dict(os.environ)
     e["QT_FORCE_STDERR_LOGGING"] = "1"
     e["PATH"] = "D:/Qt/6.8.3/msvc2022_64/bin;" + e.get("PATH", "")
+    # 保真模式上线后，打开 PSD 默认不再自动装配分层（§16）。这组探针专门
+    # 检查「阶段 2 后台加载期间锁编辑」的五条路径，必须用回归钩子恢复旧行为。
+    e["IMAGEEDIT_AUTO_LAYERED"] = "1"
+    e.pop("IMAGEEDIT_FIDELITY_PROBE", None)
     # Never let a hook from a previous run leak into a fresh variant.
     for key in (
         "IMAGEEDIT_PSD_STAGE2_DELAY_MS",

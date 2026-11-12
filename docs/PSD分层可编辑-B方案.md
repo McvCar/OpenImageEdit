@@ -708,3 +708,53 @@ PSD 里常有一层「标注 / 备注」文件夹放尺寸、色值、字号这�
   一次性提交成一条 `Batch` 历史，Ctrl+Z 一把恢复。
 - 注意：本机这份文件里「标注」组本身在 PSD 里就是隐藏的（组可见性已折叠进子层），
   所以开关对它是空操作；顶部那些黄字是背景栅格图的一部分，不属于任何图层。
+
+## 16. 保真模式（2026-11-13 追加，方向调整）
+
+产品定位是**代替 macOS Preview 的轻量看图 / 轻编辑工具**，不是 Photoshop 复刻。
+§14 那种「逐特性复刻 + 烘焙」的路线命中幂律长尾，继续投入不划算。PSD 文件本身
+存了**两份画面**：一张 Photoshop 保存时渲染好的合并图，和一堆图层数据。显示一致
+根本不需要任何 PS 特性 —— 直接显示合并图就是 100% 一致。
+
+### 16.1 行为
+
+| | 保真显示（默认） | 分层编辑（用户显式进入） |
+| --- | --- | --- |
+| 画面来源 | PSD 自带合并图 | 按层重建（§14 烘焙，MAE 6.99） |
+| 阶段 2 图层解析 | **完全不启动** | 点菜单时才启动，约 4 s / 694 层 |
+| 内存 / 层数 | 一张位图 / 1 层 | 617 层像素 + 缩略图 |
+| 图层面板 | 只有背景层 | 完整图层栈 |
+| Ctrl+S 覆盖 PSD | 禁止（读的是合并图） | 可用，降级项仍会先确认一次 |
+
+入口在「视图」菜单：**保真显示（PS 合并图）** / **进入分层编辑…**。
+`bridge.fidelityMode` 是当前状态，`bridge.hasPsdLayers` 决定菜单是否可用
+（降采样只读 PSD 不开放切换）。
+
+### 16.2 关键实现
+
+- `load_path` / `prewarm::spawn` 默认不再 `spawn_psd_layer_job`，`DecodeMsg.layer_job`
+  传 `None`；首帧走原有 composite-only 分支，不锁任何编辑工具。
+- `enter_layered_editing()` 从 `session.source` 取路径，按需启动阶段 2；解析期间
+  沿用 `editingLocked` 闸门，`poll_psd_layers` / `install_psd_layers` 一行不改地复用。
+- **两份 Document 互换而不是替换**：`BridgeRust::inactive_doc` 存另一模式的
+  `Document` 加 `dirty / note / psd_layered / psd_lossy`。History 在 Document 内部，
+  因此来回切换不会丢任何一边的编辑、也不会把 Ctrl+Z 串到另一半。
+  换文档时统一失效合成缓存、双缓冲与 GPU 快路径（否则会盖住旧纹理），
+  再 `sync_layer_selection()` + `refresh_preview()` 刷新面板与画面。
+- 第二次「进入分层编辑」直接换回缓存的图层栈（`mode=cache`），不重读文件。
+- 写回守卫：保真态 `session.psd_layered=false`，`save_target` 依旧拒绝覆盖源 PSD。
+- 回归钩子 `IMAGEEDIT_AUTO_LAYERED=1` 恢复「打开即装配分层」旧行为，
+  供 `probe_psd_layers.py` 的编辑锁路径使用；`--script` 同步路径本来就直出分层，
+  不参与切换。
+
+### 16.3 验收探针
+
+```
+IMAGEEDIT_FIDELITY_PROBE=enter      # 保真 → 解析 → 停在分层态
+IMAGEEDIT_FIDELITY_PROBE=roundtrip  # 装配完立刻换回保真
+IMAGEEDIT_FIDELITY_PROBE=roundtrip2 # 再进一次，走缓存路径
+```
+
+结构化事件：`fidelity-state`（打开时的初始态）、`fidelity-enter`（parse / cache）、
+`fidelity-mode`（每次切换后的值）。默认打开时日志里**不应**出现
+`psd-stage2-ms` / `editing-locked` / `psd-layer-progress`。

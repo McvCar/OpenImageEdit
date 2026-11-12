@@ -38,6 +38,13 @@ pub fn prewarm_open(path: &Path) {
     prewarm::spawn(path);
 }
 
+/// 回归钩子：旧行为是打开 PSD 就自动装配分层（阶段 2 常驻）。保真模式上线后
+/// 改为按需启动，但探针（`probe_psd_layers.py` 的编辑锁 5 条路径）仍要靠这个
+/// 环境变量复现旧路径。用户日常运行不会设置它。
+fn auto_layered_requested() -> bool {
+    std::env::var("IMAGEEDIT_AUTO_LAYERED").is_ok()
+}
+
 pub static PROCESS_START: OnceLock<Instant> = OnceLock::new();
 
 /// Session ids make preview temp filenames unique per document, which is
@@ -170,6 +177,11 @@ pub mod qobject {
         #[qproperty(bool, annotations_hidden, cxx_name = "annotationsHidden")]
         /// Whether THIS document actually has annotation layers (menu enable).
         #[qproperty(bool, has_annotations, cxx_name = "hasAnnotations")]
+        /// 保真显示：画面就是 PSD 自带的那张合并图（Photoshop 保存时的成品，
+        /// 逐像素一致），不解析、不重建图层。用户显式点「进入分层编辑」才换。
+        #[qproperty(bool, fidelity_mode, cxx_name = "fidelityMode")]
+        /// 当前文件能否切换到分层编辑（PSD、有合并图、没有降采样只读）。
+        #[qproperty(bool, has_psd_layers, cxx_name = "hasPsdLayers")]
         /// True while a save is being encoded on the worker thread; keeps the
         /// existing 50 ms timer alive and gates the save entry points.
         #[qproperty(bool, saving)]
@@ -941,6 +953,13 @@ pub mod qobject {
         /// 说明性图层）。返回切换后的状态。
         #[qinvokable]
         fn toggle_annotation_layers(self: Pin<&mut Self>) -> bool;
+        /// 进入分层编辑：按需启动 PSD 阶段 2 解析；若已经解析过则直接换回
+        /// 缓存的图层栈（两边文档各自保留编辑与撤销栈）。
+        #[qinvokable]
+        fn enter_layered_editing(self: Pin<&mut Self>);
+        /// 返回保真显示：换回 PSD 自带合并图，分层文档原样缓存。
+        #[qinvokable]
+        fn return_to_fidelity(self: Pin<&mut Self>);
         /// 数值面板写回：x/y/w/h 是变换后外接框（图像坐标），rotation 单位度。
         /// 一次调用 = 一条 SetLayerTransform 历史。
         #[qinvokable]
@@ -1167,6 +1186,16 @@ pub(in crate::bridge) struct QuickDrag {
     pub mode: i32,
 }
 
+/// 保真 / 分层两种显示模式，各持有一份完整的 Document。Document 自带撤销栈，
+/// 所以来回切换不会串历史、也不会丢任何一边已经做过的编辑。
+pub(in crate::bridge) struct InactiveDoc {
+    pub(in crate::bridge) doc: Document,
+    pub(in crate::bridge) dirty: bool,
+    pub(in crate::bridge) note: Option<String>,
+    pub(in crate::bridge) psd_layered: bool,
+    pub(in crate::bridge) psd_lossy: bool,
+}
+
 pub struct BridgeRust {
     status: QString,
     preview_url: QString,
@@ -1259,6 +1288,11 @@ pub struct BridgeRust {
     annotations_hidden: bool,
     has_annotations: bool,
     annotation_ids: RefCell<Vec<u32>>,
+    /// 保真模式的两个标志 + 暂时搁置的那份文档（保真时放分层栈，分层时放
+    /// 合并图）。打开新文件必须清空，否则会把上一个文件的图层串进来。
+    fidelity_mode: bool,
+    has_psd_layers: bool,
+    inactive_doc: RefCell<Option<InactiveDoc>>,
     /// In-flight background encode. The worker owns a Document snapshot; the
     /// UI thread only performs the atomic rename and the dirty/source update.
     saving: bool,
@@ -1401,6 +1435,9 @@ impl Default for BridgeRust {
             annotations_hidden: false,
             has_annotations: false,
             annotation_ids: RefCell::new(Vec::new()),
+            fidelity_mode: true,
+            has_psd_layers: false,
+            inactive_doc: RefCell::new(None),
             saving: false,
             save_job: RefCell::new(None),
             thumbs_pending: false,
@@ -1676,6 +1713,13 @@ impl qobject::Bridge {
         self.as_mut().clear_psd_notice();
         self.as_mut().set_psd_write_lossy(false);
         self.as_mut().set_psd_lossy_ack(false);
+        // 新文件 = 全新会话状态：上一份文件缓存的另一模式文档、标注层 id
+        // 都必须丢掉，否则切换显示模式会串到旧文件的图层。
+        *self.inactive_doc.borrow_mut() = None;
+        *self.annotation_ids.borrow_mut() = Vec::new();
+        self.as_mut().set_has_annotations(false);
+        self.as_mut().set_has_psd_layers(false);
+        self.as_mut().set_fidelity_mode(true);
         println!(
             "{{\"phase\":\"ui\",\"event\":\"load\",\"file\":\"{}\"}}",
             path.to_string_lossy().replace('\\', "/")
@@ -1695,9 +1739,14 @@ impl qobject::Bridge {
         let (tx, rx) = mpsc::channel::<DecodeMsg>();
         let thread_path = path.to_path_buf();
         let opts = self.decode_opts();
-        // Stage 2 parses PSD layers in parallel; stage 1 keeps the existing
-        // composite-only path so the first frame is unchanged (C1/C2).
-        let layer_job = spawn_psd_layer_job(&thread_path, opts);
+        // 保真模式：阶段 1 只解合并图，阶段 2 完全不启动 —— 打开快、内存省，
+        // 而且画面本来就是 Photoshop 的成品。用户点「进入分层编辑」时才解析。
+        // IMAGEEDIT_AUTO_LAYERED 是给旧探针保留的回归钩子。
+        let layer_job = if auto_layered_requested() {
+            spawn_psd_layer_job(&thread_path, opts)
+        } else {
+            None
+        };
         std::thread::spawn(move || {
             let t0 = Instant::now();
             let result = decode_path(&thread_path, opts).map_err(|e| e.to_string());
@@ -1729,6 +1778,11 @@ impl qobject::Bridge {
         self.as_mut().clear_psd_notice();
         self.as_mut().set_psd_write_lossy(false);
         self.as_mut().set_psd_lossy_ack(false);
+        // 自动化路径同步解出完整分层栈（脚本 op 假定文档已是最终态），
+        // 不参与保真 / 分层切换，属性保持关闭以免菜单误导。
+        *self.inactive_doc.borrow_mut() = None;
+        self.as_mut().set_has_psd_layers(false);
+        self.as_mut().set_fidelity_mode(false);
         println!(
             "{{\"phase\":\"ui\",\"event\":\"load\",\"file\":\"{}\"}}",
             path.to_string_lossy().replace('\\', "/")

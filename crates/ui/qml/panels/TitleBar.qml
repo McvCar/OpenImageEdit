@@ -160,6 +160,15 @@ Rectangle {
                   run: function () { host.togglePickerPanel() } }
             ] },
             { l: "视图", sub: [
+                // 保真模式：画面就是 PSD 自带的合并图，和 Photoshop 逐像素一致。
+                // 只有用户显式「进入分层编辑」才会解析图层并按层重建（有烘焙误差）。
+                { l: (bridge.fidelityMode ? "✓ " : "　 ") + "保真显示（PS 合并图）",
+                  ok: bridge.hasPsdLayers && !bridge.fidelityMode && !bridge.psdLayersPending,
+                  run: function () { bridge.return_to_fidelity() } },
+                { l: "进入分层编辑…",
+                  ok: bridge.hasPsdLayers && bridge.fidelityMode && !bridge.psdLayersPending,
+                  run: function () { bridge.enter_layered_editing() } },
+                { l: "", sep: true },
                 { l: "放大 (Ctrl++)", ok: true,
                   run: function () { view.queueZoom(1.25) } },
                 { l: "缩小 (Ctrl+-)", ok: true,
