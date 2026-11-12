@@ -769,7 +769,7 @@ PSD 里常有一层「标注 / 备注」文件夹放尺寸、色值、字号这�
 
 | | 保真显示（默认） | 分层编辑（用户显式进入） |
 | --- | --- | --- |
-| 画面来源 | PSD 自带合并图 | 按层重建（§14 烘焙，MAE 6.99） |
+| 画面来源 | PSD 自带合并图 | 默认仍是合并图（§17 校准）；首次编辑后改为按层重建（MAE 6.674） |
 | 阶段 2 图层解析 | **完全不启动** | 点菜单时才启动，约 4 s / 694 层 |
 | 内存 / 层数 | 一张位图 / 1 层 | 617 层像素 + 缩略图 |
 | 图层面板 | 只有背景层 | 完整图层栈 |
@@ -807,3 +807,76 @@ IMAGEEDIT_FIDELITY_PROBE=roundtrip2 # 再进一次，走缓存路径
 结构化事件：`fidelity-state`（打开时的初始态）、`fidelity-enter`（parse / cache）、
 `fidelity-mode`（每次切换后的值）。默认打开时日志里**不应**出现
 `psd-stage2-ms` / `editing-locked` / `psd-layer-progress`。
+
+## 17. 原生预览校准：编辑态与 PS 画面逐像素一致（2026-11-13 追加）
+
+§16 解决了「看图」的一致，但用户一进分层编辑，画面就换成 §14 的按层重建
+（MAE 6.674），仍然和 PS 不一样。要求「改到编辑模式与原生预览效果一致」时，
+**继续补特性是到不了 0 的**：矢量蒙版、文字排版引擎、图层样式之间的实时混合
+在烘焙方案里无法精确复刻，投入是无底洞。
+
+但文件里本来就存着 Photoshop 自己渲染好的成品。于是把它同时用作**分层态的
+显示基准**：
+
+| 状态 | 画布显示 | 图层面板 | 可编辑 |
+| --- | --- | --- | --- |
+| 刚进入分层编辑，文档未改动 | **PS 自带合并图（MAE 0.00）** | 完整 617 层 | 是 |
+| 任意一次编辑 / 手势之后 | 按层重建（MAE 6.674） | 完整 617 层 | 是 |
+
+校准帧和保真帧走的是**同一个 `PreviewComposer` 路径 + 同一张像素**，缩放与
+抗锯齿行为完全一致，所以是逐像素相等，不是「误差很小」。校准生效时连 617 层
+合成都省掉了，预览反而更快。
+
+### 17.1 关键实现
+
+- `Session::calibration: Option<Calibration>`，其中 `reference` 是保真态那份
+  1 层 Document（`install_psd_layers` 换出去时 clone 一份；`swap_display_docs`
+  切回分层时重新挂上），`composer` 是**独立**合成器 —— 主 composer 的缓存键是
+  `doc.edit_epoch`，两份 Document 的 epoch 都是 0，共用会串缓存。
+- `install_calibration()` 只在 `psd_layered && reference.canvas == doc.canvas`、
+  且分层栈仍是原始状态（`!dirty && (epoch == 0 || !can_undo())`）时激活。
+  已经编辑过的图层栈**不会**被静默盖回原图。
+- ★ 失效判定必须放在 `render()` 的 **GPU 快路径早退之前**。拖动期间 render 会
+  直接返回上一帧 URL，若失效判定在后面，旧的合并图会永久盖住画面 —— 和
+  历史上 `gpuLive` 盖旧纹理是同一类坑。失效时一次性清 `last_render` +
+  重建 `composer`，强制重画成按层重建的帧。
+- 失效是 **sticky** 的：任何 bump `edit_epoch` 的编辑、任何手势 / 实时面板 /
+  快速蒙版，都会永久停用校准，直到切回保真再进分层（或手动开关）。
+  这样撤销时画面不会在「原图」和「重建图」之间来回跳。
+- `gpu_begin()` 在校准生效时禁用快路径：它的「静态底图 + QML 移动活动层」是
+  按重建栈生成的，和合并图叠一起会重影。手势一开始校准已失效，这里只是兜底。
+- **所见即所得**：`begin_save()` 在校准生效且目标是位图格式时，导出
+  `reference.flatten()`（PS 合并图）而不是 `doc.flatten()`。`SaveFormat::Psd`
+  是例外 —— 写回必须保留 617 层图层栈，用 1 层合并图会毁掉原文件。
+- 菜单「视图 → PS 原合成校准」可手动关掉 / 打开。重新打开时只有分层栈仍
+  处于原始状态才会恢复。`bridge.calibratedPreview` 是当前是否生效，
+  `bridge.hasCalibration` 决定菜单可用性；状态栏常驻提示当前显示的是哪一种。
+
+### 17.2 边界（不是"支持了全部 PS 特性"）
+
+- 校准只作用于**显示**。图层栈、缩略图、历史、写回都还是真实的 617 层；
+  样式依旧是烘焙过的，改不了渐变角度。这是「显示基准」，不是实时样式栈。
+- 用户一旦动手改，画面切回重建结果（MAE 6.674）。此时用户已经主动改变了
+  画面，「与 PS 一致」不再是目标，可编辑性才是；状态栏会同步说明。
+- 撤销到干净状态**不会**自动恢复校准（`edit_epoch` 单调递增），切一次模式即可。
+- 同步 `--script` 路径直出分层、没有保真态可参照，不校准；降采样只读 PSD
+  不开放切换，同样不校准。
+
+### 17.3 验收
+
+```
+python scripts/probe_calibration.py --seconds 40
+```
+
+三条独立启动路径（靠结构化事件驱动，不点击、不 SendInput）：
+
+| 路径 | 期望事件 | 断言 |
+| --- | --- | --- |
+| `fidelity` | `fidelity-state:true` | 没有 `calibration-install` |
+| `layered` | `calibration-install active:true`、`calibration-frame`、`fidelity-mode:false` | 预览 BMP 与 `fidelity` 帧 **MAE 0.00 / max 0** |
+| `edited` | `calibration-off`、`calibration-probe-edit` | 校准 sticky 失效 |
+
+`IMAGEEDIT_CALIBRATION_MAE=1` 会额外合成一次重建帧并打印
+`calibration-mae`（约 6.67），用来证明「被替换掉的确实是有误差的那张」，
+而不是校准逻辑根本没生效。`IMAGEEDIT_CALIBRATION_PROBE=edit` 在装配后模拟
+一次编辑（epoch bump + dirty）以驱动失效路径。

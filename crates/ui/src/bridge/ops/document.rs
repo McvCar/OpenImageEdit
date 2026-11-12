@@ -196,13 +196,29 @@ impl qobject::Bridge {
                 return;
             };
             match session.save_target(&path) {
-                Ok(format) => (
-                    session.doc.clone(),
-                    session.doc.edit_epoch,
-                    session.id,
-                    session.save_quality,
-                    format,
-                ),
+                Ok(format) => {
+                    // 校准生效时位图导出必须给出「所见」的 PS 合并图，而不是
+                    // 按层重建的结果（§17）。PSD 写回例外：它要保留完整的
+                    // 图层栈，用 1 层合并图会毁掉原文件。
+                    let snapshot = if !matches!(format, SaveFormat::Psd)
+                        && session.calibration_active()
+                    {
+                        session
+                            .calibration
+                            .as_ref()
+                            .map(|c| c.reference.clone())
+                            .unwrap_or_else(|| session.doc.clone())
+                    } else {
+                        session.doc.clone()
+                    };
+                    (
+                        snapshot,
+                        session.doc.edit_epoch,
+                        session.id,
+                        session.save_quality,
+                        format,
+                    )
+                }
                 Err(err) => {
                     drop(guard);
                     self.as_mut().report_save(Err(err));
@@ -659,6 +675,38 @@ impl qobject::Bridge {
         }
     }
 
+    /// 「视图 → PS 原合成校准」开关。返回切换后校准是否生效。
+    pub fn toggle_calibrated_preview(mut self: Pin<&mut Self>) -> bool {
+        let currently_on = self
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.calibration.as_ref().is_some_and(|c| c.enabled));
+        let next = !currently_on;
+        if let Some(session) = self.session.borrow_mut().as_mut() {
+            session.set_calibration_enabled(next);
+        }
+        let active = self
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.calibration_active());
+        self.as_mut().set_calibrated_preview(active);
+        self.as_mut().refresh_preview();
+        self.as_mut().set_status(QString::from(if !next {
+            "已关闭原合成校准：当前显示按层重建的画面"
+        } else if active {
+            "已开启原合成校准：当前显示 PSD 自带合并图"
+        } else {
+            "图层栈已被修改，无法恢复校准；请切回保真显示查看原图"
+        }));
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"calibration-toggle\",\"enabled\":{},\"active\":{}}}",
+            next, active
+        );
+        active
+    }
+
     /// 把当前显示的那份 Document 与缓存的另一份互换。History 在 Document
     /// 内部，所以两边的 Ctrl+Z 各自独立，切换不丢编辑、不串历史。
     fn swap_display_docs(mut self: Pin<&mut Self>) {
@@ -672,7 +720,11 @@ impl qobject::Bridge {
             *self.inactive_doc.borrow_mut() = Some(stored);
             return;
         };
+        let to_layered = stored.psd_layered;
         let old = std::mem::replace(&mut session.doc, stored.doc);
+        // 切回分层时，刚被换出去的那份就是保真态的合并图；重新挂成显示
+        // 基准（install_calibration 会检查分层栈是否仍处于原始状态）。
+        let reference = if to_layered { Some(old.clone()) } else { None };
         let old_state = InactiveDoc {
             doc: old,
             dirty: session.dirty,
@@ -716,6 +768,10 @@ impl qobject::Bridge {
         session.gpu_index = 0;
         session.gpu_rect = (0.0, 0.0, 0.0, 0.0, 1.0);
         session.sel_rev = session.sel_rev.wrapping_add(1);
+        match reference {
+            Some(reference) => session.install_calibration(reference),
+            None => session.clear_calibration(),
+        }
     }
 
     /// 换文档之后统一发布 UI 状态（图层面板 / 缩略图 / 写回守卫 / 预览）。
@@ -739,7 +795,7 @@ impl qobject::Bridge {
         self.as_mut().set_status(QString::from(if to_fidelity {
             "已返回保真显示：画面为 PSD 自带合并图（与 Photoshop 一致）"
         } else {
-            "已进入分层编辑：图层面板可逐层编辑；视图菜单可随时返回保真显示"
+            "已进入分层编辑：显示 PS 原合成（校准），编辑图层后自动切换为重建预览"
         }));
         println!(
             "{{\"phase\":\"ui\",\"event\":\"fidelity-mode\",\"value\":{},\"ms\":{}}}",
@@ -894,10 +950,12 @@ impl qobject::Bridge {
             let Some(session) = guard.as_mut() else {
                 return;
             };
-            if *self.fidelity_mode() {
+            let reference = if *self.fidelity_mode() {
                 // 保真模式下用户可能已经改过合并图：整份 Document 缓存起来，
                 // 「返回保真显示」时连编辑与撤销栈一起换回来，绝不静默丢弃。
+                // 同时留一份作为分层态的「原生预览校准」显示基准（§17）。
                 let old = std::mem::replace(&mut session.doc, doc);
+                let reference = old.clone();
                 *self.inactive_doc.borrow_mut() = Some(InactiveDoc {
                     doc: old,
                     dirty: session.dirty,
@@ -905,9 +963,12 @@ impl qobject::Bridge {
                     psd_layered: session.psd_layered,
                     psd_lossy: session.psd_lossy,
                 });
+                Some(reference)
             } else {
+                // 同步 / --script 路径直出分层，没有保真态可参照。
                 session.doc = doc;
-            }
+                None
+            };
             // The real layer stack is now in memory; Ctrl+S may write it back.
             session.psd_layered = true;
             // Publish the annotation-layer bookkeeping for the view menu.
@@ -945,6 +1006,10 @@ impl qobject::Bridge {
                 ));
             }
             session.note = Some(note.clone());
+            match reference {
+                Some(reference) => session.install_calibration(reference),
+                None => session.clear_calibration(),
+            }
         }
         self.as_mut().set_thumbs_pending(seeded > 0);
         self.as_mut().set_has_annotations(annotation_layers_present);
@@ -965,12 +1030,7 @@ impl qobject::Bridge {
         self.as_mut().sync_layer_selection();
         self.as_mut().refresh_preview();
         self.as_mut().set_status(QString::from(format!(
-            "PSD 分层已装配 {count} 层；{}{}",
-            if degraded.is_empty() {
-                "与合成图一致".to_string()
-            } else {
-                format!("已降级 {} 项（混合模式/组/蒙版等）", degraded.len())
-            },
+            "显示 PS 原合成（校准）；编辑图层后切换为重建预览 · 已装配 {count} 层{}",
             if heavy {
                 format!("；图层较多（{count} 层 / {} MB），实时预览可能变慢", bytes / 1_048_576)
             } else {
@@ -1006,6 +1066,16 @@ impl qobject::Bridge {
             "{{\"phase\":\"ui\",\"event\":\"fidelity-mode\",\"value\":false,\"ms\":{}}}",
             elapsed_ms()
         );
+        // 探针：模拟一次真实编辑造成的两个可观察变化（epoch bump + dirty），
+        // 验证校准会 sticky 失效、画面切回按层重建。
+        if std::env::var("IMAGEEDIT_CALIBRATION_PROBE").ok().as_deref() == Some("edit") {
+            if let Some(session) = self.session.borrow_mut().as_mut() {
+                session.doc.edit_epoch = session.doc.edit_epoch.wrapping_add(1);
+                session.dirty = true;
+            }
+            self.as_mut().refresh_preview();
+            println!("{{\"phase\":\"ui\",\"event\":\"calibration-probe-edit\"}}");
+        }
         // 探针：装配完立即换回保真，用来验证双向切换、缓存与预览失效。
         if matches!(
             std::env::var("IMAGEEDIT_FIDELITY_PROBE").ok().as_deref(),

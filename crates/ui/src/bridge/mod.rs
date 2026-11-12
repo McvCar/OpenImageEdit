@@ -182,6 +182,11 @@ pub mod qobject {
         #[qproperty(bool, fidelity_mode, cxx_name = "fidelityMode")]
         /// 当前文件能否切换到分层编辑（PSD、有合并图、没有降采样只读）。
         #[qproperty(bool, has_psd_layers, cxx_name = "hasPsdLayers")]
+        /// 分层编辑态：画布当前显示的是 PSD 原合成（校准生效）。
+        /// 一旦开始编辑会置 false，切回按层重建的画面。
+        #[qproperty(bool, calibrated_preview, cxx_name = "calibratedPreview")]
+        /// 这份文档是否带「原合成校准」（视图菜单开关的可用性）。
+        #[qproperty(bool, has_calibration, cxx_name = "hasCalibration")]
         /// True while a save is being encoded on the worker thread; keeps the
         /// existing 50 ms timer alive and gates the save entry points.
         #[qproperty(bool, saving)]
@@ -960,6 +965,10 @@ pub mod qobject {
         /// 返回保真显示：换回 PSD 自带合并图，分层文档原样缓存。
         #[qinvokable]
         fn return_to_fidelity(self: Pin<&mut Self>);
+        /// 「视图 → PS 原合成校准」开关。返回切换后校准是否生效。
+        /// 关闭后显示按层重建的画面；只有分层栈仍处于原始状态才能重新打开。
+        #[qinvokable]
+        fn toggle_calibrated_preview(self: Pin<&mut Self>) -> bool;
         /// 数值面板写回：x/y/w/h 是变换后外接框（图像坐标），rotation 单位度。
         /// 一次调用 = 一条 SetLayerTransform 历史。
         #[qinvokable]
@@ -1292,6 +1301,8 @@ pub struct BridgeRust {
     /// 合并图）。打开新文件必须清空，否则会把上一个文件的图层串进来。
     fidelity_mode: bool,
     has_psd_layers: bool,
+    calibrated_preview: bool,
+    has_calibration: bool,
     inactive_doc: RefCell<Option<InactiveDoc>>,
     /// In-flight background encode. The worker owns a Document snapshot; the
     /// UI thread only performs the atomic rename and the dirty/source update.
@@ -1437,6 +1448,8 @@ impl Default for BridgeRust {
             annotation_ids: RefCell::new(Vec::new()),
             fidelity_mode: true,
             has_psd_layers: false,
+            calibrated_preview: false,
+            has_calibration: false,
             inactive_doc: RefCell::new(None),
             saving: false,
             save_job: RefCell::new(None),
@@ -1719,6 +1732,8 @@ impl qobject::Bridge {
         *self.annotation_ids.borrow_mut() = Vec::new();
         self.as_mut().set_has_annotations(false);
         self.as_mut().set_has_psd_layers(false);
+        self.as_mut().set_has_calibration(false);
+        self.as_mut().set_calibrated_preview(false);
         self.as_mut().set_fidelity_mode(true);
         println!(
             "{{\"phase\":\"ui\",\"event\":\"load\",\"file\":\"{}\"}}",
@@ -1782,6 +1797,8 @@ impl qobject::Bridge {
         // 不参与保真 / 分层切换，属性保持关闭以免菜单误导。
         *self.inactive_doc.borrow_mut() = None;
         self.as_mut().set_has_psd_layers(false);
+        self.as_mut().set_has_calibration(false);
+        self.as_mut().set_calibrated_preview(false);
         self.as_mut().set_fidelity_mode(false);
         println!(
             "{{\"phase\":\"ui\",\"event\":\"load\",\"file\":\"{}\"}}",
@@ -1968,7 +1985,25 @@ impl qobject::Bridge {
                 let phys_h = ((display.height as f64 * dpr).round() as u32).max(1);
                 let degraded =
                     !live && (preview.width < phys_w || preview.height < phys_h);
-                let mut status = if degraded {
+                // 校准状态每帧同步给菜单勾选与状态栏；只有值变化才 set，
+                // 否则 QML 的属性变更信号会反复重建菜单。提示放在 status
+                // 最前面 —— 状态栏会省略中段长文本，放末尾等于没写。
+                let (cal_on, cal_avail) = {
+                    let guard = self.session.borrow();
+                    match guard.as_ref() {
+                        Some(s) => (s.calibration_active(), s.calibration.is_some()),
+                        None => (false, false),
+                    }
+                };
+                if *self.calibrated_preview() != cal_on {
+                    self.as_mut().set_calibrated_preview(cal_on);
+                }
+                if *self.has_calibration() != cal_avail {
+                    self.as_mut().set_has_calibration(cal_avail);
+                }
+                let mut status = if cal_on {
+                    "显示 PS 原合成（校准）；编辑图层后自动切换为重建预览".to_string()
+                } else if degraded {
                     format!(
                         "{}  (预览 {}x{})",
                         if fit { "适应窗口" } else { "缩放" },

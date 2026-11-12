@@ -168,6 +168,11 @@ Rectangle {
                 { l: "进入分层编辑…",
                   ok: bridge.hasPsdLayers && bridge.fidelityMode && !bridge.psdLayersPending,
                   run: function () { bridge.enter_layered_editing() } },
+                // 分层态默认仍显示 PS 自带合并图（逐像素一致）；动手改图层时
+                // 自动切回按层重建的画面。这里留一个手动开关便于对照两种结果。
+                { l: (bridge.calibratedPreview ? "✓ " : "　 ") + "PS 原合成校准",
+                  ok: bridge.hasCalibration,
+                  run: function () { bridge.toggle_calibrated_preview() } },
                 { l: "", sep: true },
                 { l: "放大 (Ctrl++)", ok: true,
                   run: function () { view.queueZoom(1.25) } },

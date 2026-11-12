@@ -60,6 +60,8 @@ pub(in crate::bridge) struct Session {
     pub(in crate::bridge) psd_lossy: bool,
     /// Decoder hint shown in the status bar (e.g. PSD flattened preview).
     pub(in crate::bridge) note: Option<String>,
+    /// 分层编辑态的「原生预览校准」。None = 当前不是可校准的分层文档。
+    pub(in crate::bridge) calibration: Option<Calibration>,
     /// Screen device-pixel-ratio (OS scaling, e.g. 1.25 at 125%). Kept on the
     /// session so `refit`/`from_decoded` can compute a correct fit zoom even
     /// before the first `render`. Mirrors the bridge's `dpr` (synced by
@@ -705,6 +707,37 @@ pub(in crate::bridge) struct CachedRender {
     pub(in crate::bridge) special: bool,
 }
 
+/// 「原生预览校准」：分层编辑态下，文档尚未被改动时直接显示 PSD 自带的那张
+/// 合并图（Photoshop 保存时的成品，逐像素一致），而不是按 617 层重建的结果。
+///
+/// 为什么不逐特性去追平：矢量蒙版、文字排版、样式内部混合这些东西无法在
+/// 烘焙方案里精确复刻，继续堆特性只能把 MAE 往 0 逼近而永远到不了 0。
+/// 合并图本来就在文件里，直接拿它当显示基准就是精确解，而且只有 1 层，
+/// 预览合成比重建 617 层还快。
+///
+/// 一旦用户开始编辑（任何 bump `edit_epoch` 的操作、任何手势、任何实时
+/// 面板），校准**永久停用**，画面切回按层重建的结果 —— 此时用户已经主动
+/// 改变了画面，「与 PS 一致」不再是目标，可编辑性才是。sticky 语义避免
+/// 撤销时画面在「原图」和「重建图」之间来回跳。切回保真再进分层会重新
+/// 装配一次校准。
+pub(in crate::bridge) struct Calibration {
+    /// 保真态的 Document（layers[0] 就是合并图）。用它走同一个
+    /// PreviewComposer，保证缩放路径与保真显示完全相同。
+    pub(in crate::bridge) reference: Document,
+    /// 独立合成器：主 composer 的缓存键是 `doc.edit_epoch`，两份 Document
+    /// 的 epoch 都是 0，共用会串缓存。
+    pub(in crate::bridge) composer: render::PreviewComposer,
+    /// 装配时主文档的 epoch（正常为 0）。编辑会让它失配。
+    pub(in crate::bridge) epoch: u64,
+    /// 用户在「视图」菜单里手动关掉校准。
+    pub(in crate::bridge) enabled: bool,
+    /// 本次分层会话内校准是否仍然生效（sticky，失效后不再自动恢复）。
+    pub(in crate::bridge) active: bool,
+    /// 诊断：是否已经为第一帧打印过事件 / MAE。
+    pub(in crate::bridge) reported: bool,
+    pub(in crate::bridge) mae_reported: bool,
+}
+
 pub(in crate::bridge) enum Refresh {
     Ok {
         url: String,
@@ -803,6 +836,7 @@ impl Session {
                 psd_layered: layered,
                 psd_lossy: lossy,
                 note,
+                calibration: None,
                 dpr,
                 quick_mask: false,
                 sel_rev: 0,
@@ -876,6 +910,58 @@ impl Session {
         Ok((session, decode_ms))
     }
 
+    /// 装配分层栈之后，把保真态的那份 Document 挂成显示基准。
+    /// 只有「主文档仍是原始状态」时才允许激活 —— 已经编辑过的图层栈不能
+    /// 被静默盖回原图。
+    pub(in crate::bridge) fn install_calibration(&mut self, reference: Document) {
+        if !self.psd_layered || reference.canvas != self.doc.canvas {
+            self.calibration = None;
+            return;
+        }
+        let pristine = !self.dirty
+            && (self.doc.edit_epoch == 0 || !self.doc.can_undo());
+        let epoch = self.doc.edit_epoch;
+        self.calibration = Some(Calibration {
+            reference,
+            composer: render::PreviewComposer::new(),
+            epoch,
+            enabled: true,
+            active: pristine,
+            reported: false,
+            mae_reported: false,
+        });
+        // 装配前后的预览帧完全不同，必须强制重画一次。
+        self.last_render = None;
+        self.composer = render::PreviewComposer::new();
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"calibration-install\",\"active\":{},\"epoch\":{}}}",
+            pristine, epoch
+        );
+    }
+
+    pub(in crate::bridge) fn clear_calibration(&mut self) {
+        if self.calibration.take().is_some() {
+            self.last_render = None;
+        }
+    }
+
+    pub(in crate::bridge) fn calibration_active(&self) -> bool {
+        self.calibration
+            .as_ref()
+            .is_some_and(|c| c.active && c.enabled)
+    }
+
+    /// 「视图 → PS 原合成校准」的开关。关闭是立即生效的；重新打开时只有
+    /// 文档仍处于原始状态才会恢复，不会把已经改过的画面盖回原图。
+    pub(in crate::bridge) fn set_calibration_enabled(&mut self, on: bool) {
+        let Some(cal) = self.calibration.as_mut() else {
+            return;
+        };
+        cal.enabled = on;
+        cal.active = on && cal.epoch == self.doc.edit_epoch && !self.dirty;
+        self.last_render = None;
+    }
+
     pub(in crate::bridge) fn refit(&mut self, viewport: Size) {
         self.zoom = fit_zoom(self.doc.canvas, viewport, self.dpr);
         self.fit = true;
@@ -916,6 +1002,34 @@ impl Session {
             return Err("empty canvas".into());
         }
         self.last_display = display;
+        let special = self.adjust.is_some()
+            || self.preview_hidden_mark >= 0
+            || self.transform.as_ref().is_some_and(|t| t.special());
+        // ★ 原生预览校准的失效判定必须放在 GPU 快路径的早退**之前**：
+        // 拖动期间 render() 会直接返回上一帧 URL，如果失效发生在后面，
+        // 旧的合并图会永久盖住画面（和历史上 gpuLive 盖旧纹理是同一类坑）。
+        if self.calibration.as_ref().is_some_and(|c| c.active && c.enabled) {
+            let clean = self
+                .calibration
+                .as_ref()
+                .is_some_and(|c| c.epoch == self.doc.edit_epoch)
+                && !self.dirty
+                && !special
+                && self.transform.is_none()
+                && !self.gpu_live
+                && self.gesture < 0
+                && !self.quick_mask
+                && self.brush_live.is_none()
+                && self.gradient_live.is_none()
+                && self.patch_live.is_none();
+            if !clean {
+                self.calibration.as_mut().expect("checked").active = false;
+                self.last_render = None;
+                self.composer = render::PreviewComposer::new();
+                println!("{{\"phase\":\"ui\",\"event\":\"calibration-off\"}}");
+            }
+        }
+        let calibrated = self.calibration_active();
         // ★Tier 1：GPU 快路径期间主预览不产生新帧。三层里只有活动层在动，
         // QML 直接改它的位置/尺寸/不透明度即可，CPU 全幅合成、BMP 编码、
         // 临时文件写入、Qt 解码全部跳过（拖动帧合成次数 = 0）。
@@ -931,9 +1045,6 @@ impl Session {
                 return Ok(Rendered { url, display, preview, histogram: None });
             }
         }
-        let special = self.adjust.is_some()
-            || self.preview_hidden_mark >= 0
-            || self.transform.as_ref().is_some_and(|t| t.special());
         if zoom_only && !special {
             let reusable = self.last_render.as_ref().is_some_and(|c| {
                 !c.special && size_close(c.target, target) && c.epoch == self.doc.edit_epoch
@@ -962,21 +1073,56 @@ impl Session {
             .adjust
             .map(|state| (state.target, state.params));
         let hidden_idx = self.preview_hidden_mark;
-        let image = if hidden_idx >= 0 {
-            // 预览时临时隐藏某个标记：可见性在图层上，绕开历史直接改。
-            match self.doc.mark_layer_index(hidden_idx as usize) {
-                Some(li) => {
-                    let saved = self.doc.layers[li].visible;
-                    self.doc.layers[li].visible = false;
-                    let img = self.composite_for_preview(target, adjust);
-                    self.doc.layers[li].visible = saved;
-                    img
-                }
-                None => self.composite_for_preview(target, adjust),
+        let layer_count = self.doc.layers.len();
+        // 校准生效时改用合并图合成。它和保真显示走的是同一个
+        // PreviewComposer 路径，缩放 / 抗锯齿行为完全一致，所以结果是
+        // 逐像素相等，而不是「误差很小」。
+        let calibrated_frame = if calibrated {
+            let cal = self.calibration.as_mut().expect("checked");
+            let reference = &cal.reference;
+            let frame = cal.composer.composite(reference, target);
+            if !cal.reported {
+                cal.reported = true;
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"calibration-frame\",\"target\":\"{}x{}\",\"layers\":{}}}",
+                    target.width, target.height, layer_count
+                );
             }
+            Some(frame)
         } else {
-            self.composite_for_preview(target, adjust)
+            None
         };
+        // 诊断开关：额外合成一次重建帧，量化「校准究竟替换掉了多少误差」。
+        // 默认关闭，只在探针里打开，避免拖慢正常首帧。
+        if let Some(frame) = calibrated_frame.as_ref() {
+            if std::env::var_os("IMAGEEDIT_CALIBRATION_MAE").is_some()
+                && self.calibration.as_ref().is_some_and(|c| !c.mae_reported)
+            {
+                self.calibration.as_mut().expect("checked").mae_reported = true;
+                let rebuilt = self.composite_for_preview(target, None);
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"calibration-mae\",\"value\":{:.3}}}",
+                    frame_mae(frame, &rebuilt)
+                );
+            }
+        }
+        let image = calibrated_frame.unwrap_or_else(|| {
+            if hidden_idx >= 0 {
+                // 预览时临时隐藏某个标记：可见性在图层上，绕开历史直接改。
+                match self.doc.mark_layer_index(hidden_idx as usize) {
+                    Some(li) => {
+                        let saved = self.doc.layers[li].visible;
+                        self.doc.layers[li].visible = false;
+                        let img = self.composite_for_preview(target, adjust);
+                        self.doc.layers[li].visible = saved;
+                        img
+                    }
+                    None => self.composite_for_preview(target, adjust),
+                }
+            } else {
+                self.composite_for_preview(target, adjust)
+            }
+        });
         let composite_ms = prof_t0.elapsed().as_millis();
         // The panel graph reflects the ADJUSTED preview (like Preview), so it
         // is computed from the composited pixels and only while it is open.
@@ -1260,7 +1406,11 @@ impl Session {
         dpr: f64,
     ) -> bool {
         self.gpu_end();
-        if self.adjust.is_some()
+        // 校准期间画面是合并图，GPU 快路径的「静态底图 + QML 移动活动层」
+        // 却是按重建栈生成的，两者叠在一起会重影。手势一开始校准就会失效，
+        // 所以这里只是兜底。
+        if self.calibration_active()
+            || self.adjust.is_some()
             || self.quick_mask
             || self.preview_hidden_mark >= 0
             || self.doc.layers.iter().any(|l| l.is_mark() && l.visible)
@@ -1514,6 +1664,27 @@ impl Session {
 /// Quick-mask overlay (PS's Q): multiply the pixels OUTSIDE the selection
 /// toward black so the feathered edge becomes visible. Preview only — the
 /// document pixels and the saved file are untouched.
+/// Mean absolute per-channel difference between two preview frames (RGB only;
+/// alpha is a UI concern here, both frames are opaque canvas composites).
+fn frame_mae(a: &RgbaImage, b: &RgbaImage) -> f64 {
+    if a.width() != b.width() || a.height() != b.height() {
+        return f64::NAN;
+    }
+    let mut sum = 0u64;
+    let mut n = 0u64;
+    for (pa, pb) in a.pixels().zip(b.pixels()) {
+        for i in 0..3 {
+            sum += (pa.0[i] as i32 - pb.0[i] as i32).abs() as u64;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        0.0
+    } else {
+        sum as f64 / n as f64
+    }
+}
+
 fn apply_quick_mask(image: &mut RgbaImage, sel: Option<&SelectionState>, canvas: Size) {
     let Some(state) = sel else {
         return;
