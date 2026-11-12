@@ -81,7 +81,12 @@ def run_script(path, script, timeout=30.0):
 
 
 def our_layers(lines):
-    """从 layers-dump 事件里取出图层表（去掉背景行，保持 顶→底 顺序）。"""
+    """从 layers-dump 事件里取出图层表，去掉背景行并翻成 底→顶。
+
+    `layers-dump` 是给面板看的顺序（顶→底），而 psd-tools 与 PSD 文件本身都是
+    底→顶。以前这里直接拿顶→底的表去比，顺序一反就被当成「层表结构不同」跳过，
+    恰好把「读进来的图层顺序整体反了」这种致命 bug 藏了过去。
+    """
     for line in lines:
         if '"event":"layers-dump"' not in line:
             continue
@@ -90,7 +95,7 @@ def our_layers(lines):
         except ValueError:
             continue
         rows = payload.get("layers") or []
-        return [r for r in rows if not r.get("bg")]
+        return list(reversed([r for r in rows if not r.get("bg")]))
     return None
 
 
@@ -99,7 +104,7 @@ def op_percent(opacity_255):
 
 
 def psd_layers(psd):
-    """psd-tools 的 顶→底 图层表（只取 pixel / smartobject 这类叶层）。"""
+    """psd-tools 的 底→顶 图层表（只取 pixel / smartobject 这类叶层）。"""
     out = []
     for layer in psd.descendants():
         out.append({

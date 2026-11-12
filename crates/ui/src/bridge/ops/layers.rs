@@ -65,6 +65,65 @@ impl qobject::Bridge {
         }
     }
 
+    /// 显示 / 隐藏 PSD 的标注层（「标注 / 备注」文件夹里的尺寸、色值等说明
+    /// 性图层）。一次性提交成一条 `Batch` 历史，撤销一下就全回来。
+    ///
+    /// 记录的是一组**稳定 id**：图层重排、删层之后下标会变，id 不变。
+    pub fn toggle_annotation_layers(mut self: Pin<&mut Self>) -> bool {
+        let ids = self.annotation_ids.borrow().clone();
+        if ids.is_empty() {
+            return *self.annotations_hidden();
+        }
+        let hide = !*self.annotations_hidden();
+        let viewport = *self.viewport.borrow();
+        let mut ops: Vec<EditOp> = Vec::new();
+        {
+            let guard = self.session.borrow();
+            let Some(session) = guard.as_ref() else {
+                return *self.annotations_hidden();
+            };
+            for id in &ids {
+                let Some(index) = session.doc.layers.iter().position(|l| l.id == *id) else {
+                    continue;
+                };
+                let from = session.doc.layers[index].visible;
+                if from != !hide {
+                    ops.push(EditOp::SetVisible {
+                        index,
+                        from,
+                        to: !hide,
+                    });
+                }
+            }
+        }
+        if !ops.is_empty() {
+            let result = {
+                let mut guard = self.session.borrow_mut();
+                match guard.as_mut() {
+                    None => Err("no document".to_string()),
+                    Some(session) => session
+                        .doc
+                        .execute(EditOp::Batch(ops))
+                        .map_err(|e| e.to_string()),
+                }
+            };
+            if let Err(message) = result {
+                self.as_mut().set_status(QString::from(message.as_str()));
+                return *self.annotations_hidden();
+            }
+            {
+                let mut guard = self.session.borrow_mut();
+                if let Some(session) = guard.as_mut() {
+                    session.refit_if_needed(viewport);
+                    session.dirty = true;
+                }
+            }
+            self.as_mut().refresh_preview();
+        }
+        self.as_mut().set_annotations_hidden(hide);
+        hide
+    }
+
     pub fn set_layer_visible_at(mut self: Pin<&mut Self>, index: i32, visible: bool) {
         if index < 0 {
             return;

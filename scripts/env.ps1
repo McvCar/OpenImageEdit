@@ -1,8 +1,15 @@
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
-$qtRoot = if ($env:IMAGEEDIT_QT_ROOT) { $env:IMAGEEDIT_QT_ROOT } else { 'D:\Qt\6.8.3\msvc2022_64' }
-if (-not (Test-Path -LiteralPath (Join-Path $qtRoot 'bin\qmake.exe'))) {
-    throw "Qt not found at '$qtRoot'. Set IMAGEEDIT_QT_ROOT to override."
+# Qt may live on either drive: the machine had it on D: until that disk started
+# throwing I/O errors, so a copy now sits on C:. Prefer whichever one actually
+# has qmake.
+$qtCandidates = if ($env:IMAGEEDIT_QT_ROOT) { @($env:IMAGEEDIT_QT_ROOT) } else { @(
+    'D:\Qt\6.8.3\msvc2022_64',
+    'C:\Qt\6.8.3\msvc2022_64'
+) }
+$qtRoot = $qtCandidates | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'bin\qmake.exe') } | Select-Object -First 1
+if (-not $qtRoot) {
+    throw "Qt not found at any of: $($qtCandidates -join ', '). Set IMAGEEDIT_QT_ROOT to override."
 }
 
 # The machine-wide CC/CXX point at LLVM clang, which cannot compile against MSVC

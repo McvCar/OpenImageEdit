@@ -460,6 +460,9 @@ impl qobject::Bridge {
                     );
                 }
                 *self.session.borrow_mut() = Some(session);
+                // 诊断：旧 Session 已在这一行被替换掉，读数里若没有回落，
+                // 说明有东西替旧文档继续持有那批图层像素。
+                mem::log("after-session");
                 self.as_mut().update_file_info();
                 self.as_mut().refresh_preview();
                 // LAST: the QML window-fit handler reads `image_width` /
@@ -657,12 +660,37 @@ impl qobject::Bridge {
         let bytes = set.bytes;
         let degraded = set.degraded.clone();
         let canvas = set.canvas;
-        let doc = Document::from_psd_layers(canvas, set.into_seeds());
+        // Annotation layers ("标注 / 备注" folders) are notes for the
+        // implementer, not artwork. Remember their stable ids so the view menu
+        // can hide / show them after the stack is editable.
+        let annotation_flags: Vec<bool> = set.layers.iter().map(|l| l.annotation).collect();
+        let mut doc = Document::from_psd_layers(canvas, set.into_seeds());
+        let mut annotation_ids: Vec<u32> = Vec::new();
+        for (i, flag) in annotation_flags.iter().enumerate() {
+            if !*flag {
+                continue;
+            }
+            // `from_psd_layers` prepends the background layer.
+            if let Some(layer) = doc.layers.get(i + 1) {
+                annotation_ids.push(layer.id);
+            }
+        }
+        // Hide them up front when the toggle is on — directly, not through a
+        // history op: the freshly assembled document must keep `edit_epoch` at
+        // 0 so the queued thumbnails below still match their cache keys.
+        if !annotation_ids.is_empty() && *self.annotations_hidden() {
+            for id in &annotation_ids {
+                if let Some(layer) = doc.layers.iter_mut().find(|l| l.id == *id) {
+                    layer.visible = false;
+                }
+            }
+        }
         // C7: keep an explicit hint for very large stacks. Realtime preview
         // rebuild is O(layers), so warn instead of silently freezing.
         let heavy = count > 32 || bytes > 256 * 1024 * 1024;
         let thumb_t0 = Instant::now();
         let mut seeded = 0usize;
+        let annotation_layers_present;
         {
             let mut guard = self.session.borrow_mut();
             let Some(session) = guard.as_mut() else {
@@ -671,6 +699,9 @@ impl qobject::Bridge {
             session.doc = doc;
             // The real layer stack is now in memory; Ctrl+S may write it back.
             session.psd_layered = true;
+            // Publish the annotation-layer bookkeeping for the view menu.
+            *self.annotation_ids.borrow_mut() = annotation_ids;
+            annotation_layers_present = !annotation_flags.is_empty();
             // Cached previews were built from the 1-layer placeholder.
             session.composer = render::PreviewComposer::new();
             session.last_render = None;
@@ -703,6 +734,7 @@ impl qobject::Bridge {
             session.note = Some(note.clone());
         }
         self.as_mut().set_thumbs_pending(seeded > 0);
+        self.as_mut().set_has_annotations(annotation_layers_present);
         // The stack is editable, but a write-back would bake in every loss the
         // load reported (groups, masks, blend modes, clipped pixels). QML asks
         // for confirmation once per document before overwriting the source.
@@ -738,6 +770,8 @@ impl qobject::Bridge {
             "{{\"phase\":\"ui\",\"event\":\"psd-layer-bytes\",\"value\":{}}}",
             bytes
         );
+        // 诊断：装配完成后的驻留量，与 `load-start` / `after-session` 对比。
+        mem::log("after-install");
         if !degraded.is_empty() {
             self.as_mut().set_psd_notice(QString::from(format!(
                 "已还原 {count} 个可编辑图层，其中 {} 项按降级处理：\n{}",

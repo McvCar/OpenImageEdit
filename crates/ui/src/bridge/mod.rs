@@ -12,7 +12,7 @@ use decode::{
     SaveFormat,
 };
 use editcore::{
-    adjust_json, Adjust, AdjustTarget, BoundsSolve, Document, Field, Histogram, Layer,
+    adjust_json, Adjust, AdjustTarget, BoundsSolve, Document, EditOp, Field, Histogram, Layer,
     LayerTransform, Mark, MarkKind, PickedColor, QuickSelectOptions, Rect, ReferencePoint, SelOps,
     SelectionMask, SelectionState, Size, Transform, WandOptions,
 };
@@ -24,10 +24,12 @@ mod config;
 mod paths;
 mod prewarm;
 mod session;
+mod meminfo;
 pub(in crate::bridge) use geom::*;
 pub(in crate::bridge) use config::*;
 pub(in crate::bridge) use paths::*;
 pub(in crate::bridge) use session::*;
+pub(in crate::bridge) use meminfo as mem;
 
 /// Kick off the decode of the first file before the window exists, so the
 /// decode overlaps Qt/QML start-up instead of following it. See the module
@@ -162,6 +164,12 @@ pub mod qobject {
         #[qproperty(bool, psd_write_lossy, cxx_name = "psdWriteLossy")]
         /// The user already accepted that lossy overwrite for this document.
         #[qproperty(bool, psd_lossy_ack, cxx_name = "psdLossyAck")]
+        /// PSD files often keep a "标注" folder holding measurements, colour
+        /// codes and font specs. Those layers are not artwork, so the view menu
+        /// can hide them while the design is being inspected.
+        #[qproperty(bool, annotations_hidden, cxx_name = "annotationsHidden")]
+        /// Whether THIS document actually has annotation layers (menu enable).
+        #[qproperty(bool, has_annotations, cxx_name = "hasAnnotations")]
         /// True while a save is being encoded on the worker thread; keeps the
         /// existing 50 ms timer alive and gates the save entry points.
         #[qproperty(bool, saving)]
@@ -929,6 +937,10 @@ pub mod qobject {
         fn update_show_guides(self: Pin<&mut Self>, value: bool);
         #[qinvokable]
         fn update_snap_enabled(self: Pin<&mut Self>, value: bool);
+        /// 显示 / 隐藏标注层（PSD 里「标注 / 备注」文件夹中的尺寸、色值等
+        /// 说明性图层）。返回切换后的状态。
+        #[qinvokable]
+        fn toggle_annotation_layers(self: Pin<&mut Self>) -> bool;
         /// 数值面板写回：x/y/w/h 是变换后外接框（图像坐标），rotation 单位度。
         /// 一次调用 = 一条 SetLayerTransform 历史。
         #[qinvokable]
@@ -1243,6 +1255,10 @@ pub struct BridgeRust {
     /// (see the `psd_write_lossy` property) + whether the user accepted it.
     psd_write_lossy: bool,
     psd_lossy_ack: bool,
+    /// 标注层当前是否被隐藏 + 这些图层的稳定 id（下标会随重排变化）。
+    annotations_hidden: bool,
+    has_annotations: bool,
+    annotation_ids: RefCell<Vec<u32>>,
     /// In-flight background encode. The worker owns a Document snapshot; the
     /// UI thread only performs the atomic rename and the dirty/source update.
     saving: bool,
@@ -1382,6 +1398,9 @@ impl Default for BridgeRust {
             psd_notice: QString::default(),
             psd_write_lossy: false,
             psd_lossy_ack: false,
+            annotations_hidden: false,
+            has_annotations: false,
+            annotation_ids: RefCell::new(Vec::new()),
             saving: false,
             save_job: RefCell::new(None),
             thumbs_pending: false,
@@ -1661,6 +1680,8 @@ impl qobject::Bridge {
             "{{\"phase\":\"ui\",\"event\":\"load\",\"file\":\"{}\"}}",
             path.to_string_lossy().replace('\\', "/")
         );
+        // 诊断：此刻上一份文档还在内存里，作为「一次加载的增量」基准。
+        mem::log("load-start");
         // Prewarmed in `main()` before the window existed: the pixels may
         // already be decoded by now, so just claim the receiver instead of
         // starting a second decode (see the `prewarm` module).
@@ -1726,6 +1747,7 @@ impl qobject::Bridge {
                 self.as_mut().set_decode_ms(ms);
                 let lossy = session.psd_lossy;
                 *self.session.borrow_mut() = Some(session);
+                mem::log("sync-after-session");
                 self.as_mut().set_psd_write_lossy(lossy);
                 self.as_mut().update_file_info();
                 self.as_mut().refresh_preview();

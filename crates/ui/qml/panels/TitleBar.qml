@@ -151,6 +151,11 @@ Rectangle {
                   run: function () { host.toggleAdjustPanel() } },
                 { l: "尺子（测量坐标）", ok: bridge.image_width > 0,
                   run: function () { host.toggleRuler() } },
+                // PSD 里的「标注 / 备注」文件夹放的是尺寸、色值这些说明图层，
+                // 不是画面内容；做像素对照时把它们收起来更清爽。
+                { l: (bridge.annotationsHidden ? "✓ " : "　 ") + "隐藏标注层",
+                  ok: bridge.hasAnnotations,
+                  run: function () { bridge.toggle_annotation_layers() } },
                 { l: "拾色器…", ok: bridge.image_width > 0,
                   run: function () { host.togglePickerPanel() } }
             ] },
