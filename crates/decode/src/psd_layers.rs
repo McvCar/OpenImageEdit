@@ -87,9 +87,18 @@ where
     // (including our own channel expansion) stays inside catch_unwind (C5).
     let mut progress = progress;
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let t_parse = std::time::Instant::now();
         let psd = psd::Psd::from_bytes(bytes)
             .map_err(|e| format!("PSD 分层解析失败：{e:?}"))?;
-        build_layers(&psd, (width, height), &mut progress)
+        let parse_ms = t_parse.elapsed().as_millis();
+        let set = build_layers(&psd, (width, height), &mut progress)?;
+        if std::env::var_os("IMAGEEDIT_PSD_PROFILE").is_some() {
+            println!(
+                "{{\"phase\":\"ui\",\"event\":\"psd-decode-split\",\"parse_ms\":{parse_ms},\"build_ms\":{}}}",
+                t_parse.elapsed().as_millis().saturating_sub(parse_ms)
+            );
+        }
+        Ok(set)
     }));
     match built {
         Ok(Ok(mut set)) => {
@@ -1000,5 +1009,40 @@ mod tests {
             "expected a degrade note, got {:?}",
             set.degraded
         );
+    }
+
+    /// Diagnostic benchmark for real user files (ignored by default):
+    ///
+    /// ```text
+    /// set IMAGEEDIT_PROFILE_PSD=<file.psd>
+    /// cargo test -p imageedit-decode profile_real_psd -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn profile_real_psd() {
+        let Ok(path) = std::env::var("IMAGEEDIT_PROFILE_PSD") else {
+            return;
+        };
+        let t = std::time::Instant::now();
+        let bytes = std::fs::read(&path).expect("read");
+        println!("read      {:>8.1} ms  ({} MB)", ms(t), bytes.len() / 1_048_576);
+        let t = std::time::Instant::now();
+        let psd = psd::Psd::from_bytes(&bytes).expect("parse");
+        println!("vendor    {:>8.1} ms  ({} layers)", ms(t), psd.layers().len());
+        let t = std::time::Instant::now();
+        let set = decode_psd_layers(&bytes, DecodeOptions::default()).expect("layers");
+        println!(
+            "full      {:>8.1} ms  ({} layers, {} MB)",
+            ms(t),
+            set.layer_count(),
+            set.bytes / 1_048_576
+        );
+        let t = std::time::Instant::now();
+        let _ = decode_psd_layers(&bytes, DecodeOptions::default()).expect("layers");
+        println!("full #2   {:>8.1} ms  (warm)", ms(t));
+    }
+
+    fn ms(t: std::time::Instant) -> f64 {
+        t.elapsed().as_secs_f64() * 1000.0
     }
 }

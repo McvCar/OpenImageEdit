@@ -57,7 +57,12 @@ impl LayerProperties {
             layer_bottom: layer_record.bottom,
             layer_right: layer_record.right,
             opacity: layer_record.opacity,
-            clipping_mask: layer_record.clipping_base,
+            // `clipping_base` is TRUE for base layers (the file stores 0 = base,
+            // 1 = non-base / clipping). Assigning it straight into
+            // `clipping_mask` inverted the flag, so every ordinary layer looked
+            // like a clipping mask and the "裁剪蒙版未保留" degradation fired on
+            // files that have none.
+            clipping_mask: !layer_record.clipping_base,
             visible: layer_record.visible,
             blend_mode: layer_record.blend_mode,
             psd_width,

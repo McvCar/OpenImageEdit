@@ -155,6 +155,13 @@ pub mod qobject {
         /// One-shot PSD notice for the info overlay (degraded layers /
         /// composite-only / downsampled read-only). Never blocks saving.
         #[qproperty(QString, psd_notice, cxx_name = "psdNotice")]
+        /// True when the opened PSD lost structure on load (groups flattened,
+        /// masks / clipping dropped, non-Normal blend modes, layers clipped to
+        /// the canvas or skipped). Overwriting the source would bake those
+        /// losses in permanently, so QML asks once per document.
+        #[qproperty(bool, psd_write_lossy, cxx_name = "psdWriteLossy")]
+        /// The user already accepted that lossy overwrite for this document.
+        #[qproperty(bool, psd_lossy_ack, cxx_name = "psdLossyAck")]
         /// True while a save is being encoded on the worker thread; keeps the
         /// existing 50 ms timer alive and gates the save entry points.
         #[qproperty(bool, saving)]
@@ -315,6 +322,11 @@ pub mod qobject {
         /// Dismiss the PSD info overlay (degraded / loading / read-only).
         #[qinvokable]
         fn clear_psd_notice(self: Pin<&mut Self>);
+
+        /// The user chose "仍然覆盖" in the lossy-PSD save warning: stop asking
+        /// for the rest of this document's lifetime.
+        #[qinvokable]
+        fn ack_psd_write_loss(self: Pin<&mut Self>);
 
         /// Toggle downsampling-first open for very large images.
         #[qinvokable]
@@ -1227,6 +1239,10 @@ pub struct BridgeRust {
     psd_job: RefCell<Option<mpsc::Receiver<PsdLayerMsg>>>,
     /// One-shot PSD notice (degraded / composite-only / downsampled read-only).
     psd_notice: QString,
+    /// The loaded PSD lost structure that a write-back cannot represent
+    /// (see the `psd_write_lossy` property) + whether the user accepted it.
+    psd_write_lossy: bool,
+    psd_lossy_ack: bool,
     /// In-flight background encode. The worker owns a Document snapshot; the
     /// UI thread only performs the atomic rename and the dirty/source update.
     saving: bool,
@@ -1364,6 +1380,8 @@ impl Default for BridgeRust {
             psd_progress: QString::default(),
             psd_job: RefCell::new(None),
             psd_notice: QString::default(),
+            psd_write_lossy: false,
+            psd_lossy_ack: false,
             saving: false,
             save_job: RefCell::new(None),
             thumbs_pending: false,
@@ -1637,6 +1655,8 @@ impl qobject::Bridge {
         self.as_mut().cancel_save("new-load");
         self.as_mut().cancel_thumbs("new-load");
         self.as_mut().clear_psd_notice();
+        self.as_mut().set_psd_write_lossy(false);
+        self.as_mut().set_psd_lossy_ack(false);
         println!(
             "{{\"phase\":\"ui\",\"event\":\"load\",\"file\":\"{}\"}}",
             path.to_string_lossy().replace('\\', "/")
@@ -1686,6 +1706,8 @@ impl qobject::Bridge {
         self.as_mut().cancel_save("sync-load");
         self.as_mut().cancel_thumbs("sync-load");
         self.as_mut().clear_psd_notice();
+        self.as_mut().set_psd_write_lossy(false);
+        self.as_mut().set_psd_lossy_ack(false);
         println!(
             "{{\"phase\":\"ui\",\"event\":\"load\",\"file\":\"{}\"}}",
             path.to_string_lossy().replace('\\', "/")
@@ -1702,7 +1724,9 @@ impl qobject::Bridge {
                 }
                 self.as_mut().set_load_failed(false);
                 self.as_mut().set_decode_ms(ms);
+                let lossy = session.psd_lossy;
                 *self.session.borrow_mut() = Some(session);
+                self.as_mut().set_psd_write_lossy(lossy);
                 self.as_mut().update_file_info();
                 self.as_mut().refresh_preview();
                 // LAST: the QML window-fit handler reads `image_width` /

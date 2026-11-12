@@ -374,6 +374,13 @@ impl qobject::Bridge {
         self.as_mut().set_psd_notice(QString::from(""));
     }
 
+    /// The user accepted "仍然覆盖" in the lossy-PSD save warning. Keep the
+    /// acceptance for the rest of this document (a fresh load resets it).
+    pub fn ack_psd_write_loss(mut self: Pin<&mut Self>) {
+        self.as_mut().set_psd_lossy_ack(true);
+        println!("{{\"phase\":\"ui\",\"event\":\"psd-lossy-save-accepted\"}}");
+    }
+
     pub fn poll_decode(mut self: Pin<&mut Self>) {
         // 拿到结果（或上一轮就已按住的）之后，还要等 QML 报上 viewport。
         // 预热会让解码在布局之前就完成：那时 viewport 还是 0×0，直接套用会
@@ -696,6 +703,11 @@ impl qobject::Bridge {
             session.note = Some(note.clone());
         }
         self.as_mut().set_thumbs_pending(seeded > 0);
+        // The stack is editable, but a write-back would bake in every loss the
+        // load reported (groups, masks, blend modes, clipped pixels). QML asks
+        // for confirmation once per document before overwriting the source.
+        self.as_mut().set_psd_write_lossy(!degraded.is_empty());
+        self.as_mut().set_psd_lossy_ack(false);
         println!(
             "{{\"phase\":\"ui\",\"event\":\"layer-thumb-first-ms\",\"value\":{},\"layers\":{},\"seeded\":{}}}",
             thumb_t0.elapsed().as_millis(),

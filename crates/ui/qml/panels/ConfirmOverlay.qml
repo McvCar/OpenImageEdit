@@ -14,7 +14,7 @@ Item {
     // warning icon + message, footer with right-aligned actions.
     Rectangle {
         width: 420
-        height: 190
+        height: host.confirmMode === "psd-lossy" ? 244 : 190
         anchors.centerIn: parent
         radius: 8
         color: "#25272b"
@@ -31,7 +31,9 @@ Item {
                 anchors.left: parent.left
                 anchors.leftMargin: 14
                 anchors.verticalCenter: parent.verticalCenter
-                text: "未保存的更改"
+                text: host.confirmMode === "psd-lossy"
+                      ? "覆盖保存会丢失 PSD 结构"
+                      : "未保存的更改"
                 color: "#e9eaec"
                 font.pixelSize: 13
                 font.bold: true
@@ -82,6 +84,8 @@ Item {
                       ? "打开新文件将放弃当前图片的未保存修改。"
                       : host.confirmMode === "nav"
                       ? "切换到其他图片将放弃当前图片的未保存修改。"
+                      : host.confirmMode === "psd-lossy"
+                      ? "这份 PSD 装载时有图层按降级处理（组结构、蒙版、混合模式或越界像素）。覆盖保存只会写回普通位图图层，原文件里的那些结构将永久丢失。\n建议先「另存为」新文件，确认无误后再替换原文件。"
                       : "关闭窗口将放弃当前图片的未保存修改。"
                 color: "#c9cdd2"
                 font.pixelSize: 13
@@ -110,6 +114,7 @@ Item {
                 anchors.rightMargin: 14
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 8
+                visible: host.confirmMode !== "psd-lossy"
 
                 ToolButton {
                     label: "取消"
@@ -132,6 +137,33 @@ Item {
                          : "放弃并关闭"
                     active: true
                     onClicked: host.confirmProceed()
+                }
+            }
+
+            // 覆盖写回会丢结构：只有「另存为」和「仍然覆盖」两个出口，
+            // 默认高亮给「另存为」，避免顺手一个回车把结构烧掉。
+            Row {
+                anchors.right: parent.right
+                anchors.rightMargin: 14
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: 8
+                visible: host.confirmMode === "psd-lossy"
+
+                ToolButton {
+                    label: "取消"
+                    active: true
+                    onClicked: host.confirmCancel()
+                }
+                ToolButton {
+                    label: "仍然覆盖"
+                    active: true
+                    onClicked: host.confirmLossyOverwrite()
+                }
+                ToolButton {
+                    label: "另存为…"
+                    active: true
+                    selected: true
+                    onClicked: host.confirmLossySaveAs()
                 }
             }
         }

@@ -23,7 +23,7 @@ Phases (each launches a fresh process, so "reopen" is a real reopen):
                but a plain PNG export is still possible (covered by the
                `validate_save_target` unit tests in paths.rs).
 
-Usage: python scripts/probe_psd_roundtrip.py [--only write|reopen|stable|composite|all]
+Usage: python scripts/probe_psd_roundtrip.py [--only write|reopen|stable|composite|saveas|lossy|all]
 """
 
 import argparse
@@ -182,6 +182,11 @@ def fatal(lines):
 
 def run_script(path, script, needle, extra_env=None):
     return launch([path, "--script=" + script], needle, extra_env=extra_env)
+
+
+def marks(lines):
+    """`bridge.mark(name)` 走的是 event=mark + name 的形式。"""
+    return [e.get("name") for e in parse_events(lines, "mark")]
 
 
 def rows(lines):
@@ -368,10 +373,81 @@ def phase_saveas():
     return problems
 
 
+def phase_lossy():
+    """Ctrl+S on a PSD whose load degraded structure must ask first.
+
+    `small-layers.psd` reports degradation notes (clipping mask / group /
+    blend modes), so `psdWriteLossy` is true: the QML guard must stop the
+    overwrite and leave the bytes alone. With the probe-only accept hook the
+    same flow must go through and rewrite the file. A PSD that loaded with no
+    degradation at all must NOT be interrupted (otherwise the guard breaks
+    every ordinary save).
+    """
+    print("--- lossy: overwrite guard asks before dropping structure ---", flush=True)
+    os.makedirs(WORK_DIR, exist_ok=True)
+    work = os.path.join(WORK_DIR, "lossy.psd")
+    problems = []
+
+    # 1) 降级 PSD：警告拦住，原文件不动。
+    shutil.copyfile(FIXTURE, work)
+    before = sha(work)
+    guard = launch([work, "--probe-save"], '"event":"psd-install-ms"',
+                   timeout=45.0, settle=2.5)
+    if fatal(guard):
+        problems.append("QML 加载报错")
+    if "psd-lossy-save-warn" not in marks(guard):
+        problems.append("降级 PSD 按 Ctrl+S 没有弹覆盖警告")
+    if parse_events(guard, "saved") or parse_events(guard, "psd-encode-ms"):
+        problems.append("警告没拦住，文件被直接覆盖了")
+    if sha(work) != before:
+        problems.append("被拦住的保存仍然改写了原文件")
+    print("  guard warn=%s saved=%s unchanged=%s" % (
+        "psd-lossy-save-warn" in marks(guard),
+        bool(parse_events(guard, "saved")), sha(work) == before))
+
+    # 2) 确认「仍然覆盖」：写回发生，且确认状态被记住。
+    accepted = launch([work, "--probe-save", "--probe-accept-lossy"],
+                      '"event":"saved"', timeout=45.0, settle=1.0)
+    if fatal(accepted):
+        problems.append("QML 加载报错（accept 轮）")
+    if not parse_events(accepted, "psd-lossy-save-accepted"):
+        problems.append("「仍然覆盖」没有记录确认状态")
+    if not parse_events(accepted, "saved"):
+        problems.append("确认之后仍然没有写回")
+    if sha(work) == before:
+        problems.append("确认之后文件没有变化")
+    print("  accepted=%s saved=%s rewritten=%s" % (
+        bool(parse_events(accepted, "psd-lossy-save-accepted")),
+        bool(parse_events(accepted, "saved")), sha(work) != before))
+
+    # 3) 干净 PSD（我们自己写出来的单层文件）：不得被打扰。
+    plain = os.path.join(WORK_DIR, "clean.psd")
+    from PIL import Image
+    png = os.path.join(WORK_DIR, "clean.png")
+    Image.new("RGBA", (24, 16), (30, 60, 90, 255)).save(png)
+    run_script(png, "save-as:" + plain.replace("\\", "/"), '"event":"saved"')
+    plain_before = sha(plain)
+    # 先改一点东西再按 Ctrl+S：内容没变时编码结果字节完全一致，sha 对比
+    # 分辨不出「写没写」，这里用显隐切换保证字节真的会变。
+    clean = launch([plain, "--script=select-layer:1;toggle-visible-selected",
+                    "--probe-save"], '"event":"saved"', timeout=45.0, settle=1.0)
+    if "psd-lossy-save-warn" in marks(clean):
+        problems.append("没有降级的 PSD 也被覆盖警告拦住了")
+    if not parse_events(clean, "saved"):
+        problems.append("干净的 PSD 按 Ctrl+S 没有直接保存")
+    if sha(plain) == plain_before:
+        problems.append("干净的 PSD 按 Ctrl+S 没有真正改写")
+    print("  clean warn=%s saved=%s rewritten=%s" % (
+        "psd-lossy-save-warn" in marks(clean),
+        bool(parse_events(clean, "saved")), sha(plain) != plain_before))
+    return problems
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", choices=["write", "raw", "reopen", "stable",
-                                       "composite", "saveas", "all"], default="all")
+                                       "composite", "saveas", "lossy", "all"],
+                    default="all")
     args = ap.parse_args()
     if not os.path.exists(EXE):
         print("FAIL debug exe 不存在:", EXE)
@@ -392,6 +468,8 @@ def main():
         problems += ["composite: " + p for p in phase_composite()]
     if args.only in ("saveas", "all"):
         problems += ["saveas: " + p for p in phase_saveas()]
+    if args.only in ("lossy", "all"):
+        problems += ["lossy: " + p for p in phase_lossy()]
     if problems:
         for p in problems:
             print("FAIL " + p)

@@ -23,6 +23,9 @@ Item {
     property var pendingOpenUrl: null
     property int pendingNavDir: 0
     property string confirmMode: ""
+    // 覆盖写回会丢结构的 PSD 时，如果这次保存是「保存并打开/切换/关闭」的
+    // 第一半，确认后再继续的动作记在这里（open / nav / close）。
+    property string lossyAfter: ""
     signal requestNewWindow(url fileUrl)
     property bool firstFrameSeen: false
     property bool imageRendered: false
@@ -1919,9 +1922,13 @@ function onEscape() {
 }
 
 function onEnter() {
-    // 模态确认框：回车 = 默认动作（保存并打开/切换/关闭）。
+    // 模态确认框：回车 = 默认动作（保存并打开/切换/关闭）。覆盖丢结构那
+    // 一档的默认动作是「另存为…」，不拿回车去覆盖原文件。
     if (confirmOverlay.visible) {
-        confirmSaveProceed()
+        if (root.confirmMode === "psd-lossy")
+            confirmLossySaveAs()
+        else
+            confirmSaveProceed()
         return
     }
     // 多边形套索进行中：回车 = 闭合（不要把已有选区拿去裁剪）。
@@ -2712,10 +2719,48 @@ function saveOrSaveAs() {
     // 后台编码期间不允许叠加第二次保存。
     if (bridge.saving)
         return
-    if (bridge.fileName.length > 0)
+    if (bridge.fileName.length > 0) {
+        // 这份 PSD 装载时降级过（组/蒙版/混合模式/裁剪），覆盖写回会把这些
+        // 结构永久烧掉。每个文档只问一次。
+        if (needsLossySaveWarn()) {
+            root.lossyAfter = ""
+            root.confirmMode = "psd-lossy"
+            confirmOverlay.visible = true
+            bridge.mark("psd-lossy-save-warn")
+            return
+        }
         bridge.save_edited()
-    else
+    } else {
         saveDialog.open()
+    }
+}
+
+// 覆盖写回会丢结构、且用户还没确认过 → 需要先弹一次警告。
+function needsLossySaveWarn() {
+    return bridge.psdWriteLossy && !bridge.psdLossyAck
+}
+
+// 「仍然覆盖」：记住这次确认，然后走原来的保存动作（以及被中断的后续动作）。
+function confirmLossyOverwrite() {
+    bridge.ack_psd_write_loss()
+    const after = root.lossyAfter
+    root.lossyAfter = ""
+    root.confirmMode = ""
+    confirmOverlay.visible = false
+    bridge.save_edited()
+    if (after.length > 0)
+        finishPendingAction(after)
+}
+
+// 「另存为…」：不碰原文件，直接转另存为对话框。
+function confirmLossySaveAs() {
+    bridge.ack_psd_write_loss()
+    root.lossyAfter = ""
+    root.pendingOpenUrl = null
+    root.pendingNavDir = 0
+    root.confirmMode = ""
+    confirmOverlay.visible = false
+    saveDialog.open()
 }
 
 // Default (highlighted) action of the unsaved-changes dialog: save the
@@ -2737,9 +2782,22 @@ function confirmSaveProceed() {
     }
     // PSD sources are saved in place just like any other document; the
     // Rust gate reports an actionable hint if write-back is unsafe.
+    if (needsLossySaveWarn()) {
+        // 这次保存属于「保存并打开/切换/关闭」的前半段：先确认覆盖会丢结构，
+        // 确认后接着做完后面的动作。
+        root.lossyAfter = mode
+        root.confirmMode = "psd-lossy"
+        bridge.mark("psd-lossy-save-warn")
+        return
+    }
     bridge.save_edited()
     confirmOverlay.visible = false
     root.confirmMode = ""
+    finishPendingAction(mode)
+}
+
+// 保存完成之后要接着做的事（打开另一个文件 / 切换上下张 / 关闭窗口）。
+function finishPendingAction(mode) {
     if (mode === "open") {
         const url = root.pendingOpenUrl
         root.pendingOpenUrl = null
@@ -2762,6 +2820,7 @@ function confirmSaveProceed() {
 function confirmCancel() {
     root.pendingOpenUrl = null
     root.pendingNavDir = 0
+    root.lossyAfter = ""
     root.confirmMode = ""
     confirmOverlay.visible = false
 }
@@ -3146,9 +3205,32 @@ Timer {
 // the ORIGINAL file path (overwrite semantics).
 Timer {
     id: saveProbeTimer
-    interval: 900
+    // 等到「图片已在、且编辑锁已解除」再按 Ctrl+S（PSD 分层加载期间保存
+    // 入口本来就是灰的，早按只会拿到 psd_locked_hint）。
+    interval: 700
+    repeat: true
+    running: root.probeSave && root.primary && bridge.image_width > 0
+             && !bridge.editingLocked && !bridge.saving
+    onTriggered: {
+        stop()
+        saveOrSaveAs()
+    }
+}
+
+// Probe: --probe-accept-lossy 接在 --probe-save 之后，等「覆盖会丢结构」的
+// 确认框弹出来再点「仍然覆盖」。不带这个参数时表单必须原样不动（对照组）。
+Timer {
+    id: lossyAcceptProbeTimer
+    interval: 400
+    repeat: true
     running: root.probeSave && root.primary
-    onTriggered: saveOrSaveAs()
+             && Qt.application.arguments.indexOf("--probe-accept-lossy") !== -1
+    onTriggered: {
+        if (confirmOverlay.visible && root.confirmMode === "psd-lossy") {
+            stop()
+            confirmLossyOverwrite()
+        }
+    }
 }
 
 // Probe timer: --probe-adjust opens the 调整颜色 panel (live preview of the

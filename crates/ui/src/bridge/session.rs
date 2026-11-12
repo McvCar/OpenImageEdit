@@ -53,6 +53,11 @@ pub(in crate::bridge) struct Session {
     /// layer stack (§8). Plain image documents leave this false but can still
     /// be "Saved As" a new PSD (a fresh layered file from their flat pixels).
     pub(in crate::bridge) psd_layered: bool,
+    /// True when the layer stack lost structure that a PSD write-back cannot
+    /// represent (groups flattened, masks / clipping dropped, non-Normal
+    /// blend modes, layers clipped to the canvas or skipped). Ctrl+S asks for
+    /// confirmation once instead of baking those losses into the source file.
+    pub(in crate::bridge) psd_lossy: bool,
     /// Decoder hint shown in the status bar (e.g. PSD flattened preview).
     pub(in crate::bridge) note: Option<String>,
     /// Screen device-pixel-ratio (OS scaling, e.g. 1.25 at 125%). Kept on the
@@ -377,24 +382,49 @@ pub(in crate::bridge) fn spawn_psd_layer_job(
             .unwrap_or(0);
         let nap = std::time::Duration::from_millis(per_layer_ms);
         let force_fail = std::env::var("IMAGEEDIT_PSD_STAGE2_FAIL").is_ok();
+        let profile = std::env::var("IMAGEEDIT_PSD_PROFILE").is_ok();
+        let mut read_ms = 0u64;
+        let mut decode_ms = 0u64;
         let result = if force_fail {
             Err("模拟分层解析失败（自动化测试钩子）".into())
         } else {
             (|| -> Result<decode::PsdLayerSet, String> {
+                let t_read = Instant::now();
                 let bytes = std::fs::read(&owned).map_err(|e| e.to_string())?;
-                decode::decode_psd_layers_with_progress(&bytes, opts, |done, total| {
-                    let _ = tx.send(PsdLayerMsg::Progress { done, total });
+                read_ms = t_read.elapsed().as_millis() as u64;
+                let t_decode = Instant::now();
+                // 进度消息不能一层一条：691 层就是 691 次 QML 属性写 + 整块
+                // 图层面板重绘，UI 线程被自己的进度条拖住，反而把后台线程
+                // 的墙钟时间拉长（实测 193ms 的解析变成 2010ms）。按总层数
+                // 摊成 ~40 条，配合首尾两条，进度条依旧连续。
+                let mut step = 1usize;
+                let set = decode::decode_psd_layers_with_progress(&bytes, opts, |done, total| {
+                    if done == 0 {
+                        step = (total / 40).max(1);
+                    }
+                    if done == 0 || done == total || done % step == 0 {
+                        let _ = tx.send(PsdLayerMsg::Progress { done, total });
+                    }
                     if !nap.is_zero() {
                         std::thread::sleep(nap);
                     }
                 })
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string());
+                decode_ms = t_decode.elapsed().as_millis() as u64;
+                set
             })()
         };
+        let t_thumb = Instant::now();
         let thumbs = match &result {
             Ok(set) => psd_thumb_images(set),
             Err(_) => Vec::new(),
         };
+        if profile {
+            println!(
+                "{{\"phase\":\"ui\",\"event\":\"psd-stage2-split\",\"read_ms\":{read_ms},\"decode_ms\":{decode_ms},\"thumb_ms\":{}}}",
+                t_thumb.elapsed().as_millis()
+            );
+        }
         let _ = tx.send(PsdLayerMsg::Done {
             result,
             elapsed_ms: t0.elapsed().as_millis().min(u64::MAX as u128) as u64,
@@ -726,6 +756,7 @@ impl Session {
     ) -> (Self, i32) {
         let t0 = Instant::now();
         let layered = matches!(&layers, Some(set) if !set.layers.is_empty());
+        let lossy = matches!(&layers, Some(set) if !set.layers.is_empty() && !set.degraded.is_empty());
         let (doc, note) = match layers {
             Some(set) if !set.layers.is_empty() => {
                 let mut text = format!("PSD 分层已就绪：{} 个可编辑图层", set.layer_count());
@@ -770,6 +801,7 @@ impl Session {
                 adjust: None,
                 downsampled_from: decoded.downsampled_from,
                 psd_layered: layered,
+                psd_lossy: lossy,
                 note,
                 dpr,
                 quick_mask: false,
@@ -824,10 +856,18 @@ impl Session {
             && decoded.downsampled_from.is_none()
             && !force_composite
         {
-            std::fs::read(path)
+            let t_layers = Instant::now();
+            let set = std::fs::read(path)
                 .ok()
                 .and_then(|bytes| decode::decode_psd_layers(&bytes, opts).ok())
-                .filter(|set| !set.layers.is_empty())
+                .filter(|set| !set.layers.is_empty());
+            if std::env::var_os("IMAGEEDIT_PSD_PROFILE").is_some() {
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"psd-sync-layers-ms\",\"value\":{}}}",
+                    t_layers.elapsed().as_millis()
+                );
+            }
+            set
         } else {
             None
         };
