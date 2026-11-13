@@ -472,8 +472,17 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
     if layer_mask_data_len >= 20 {
         let top = cursor.read_i32();
         let left = cursor.read_i32();
+        // ★ PSD 文件里蒙版矩形的 bottom/right 存的是**边界**（right = left +
+        //   宽度，psd-tools 实测确认），而本 crate 的矩形约定是「右下角 =
+        //   最后一个像素」（宽 = right-left+1），所以减 1 换算。
+        //   不减这一下，蒙版会同时错两个地方：通道的行表按「高度」剥，
+        //   多剥一行 = 整段 RLE 前移 2 字节；平面又按多 1 的宽度当 stride，
+        //   每行右移 1 像素。表现是「某一层整片消失」，只看合成结果根本
+        //   定位不到（实测 `图层 58` 的蒙版在该点解出 0，参考实现是 255）。
         let bottom = cursor.read_i32();
+        let bottom = if bottom == 0 { 0 } else { bottom - 1 };
         let right = cursor.read_i32();
+        let right = if right == 0 { 0 } else { right - 1 };
         let default_color = cursor.read_u8();
         // bit 0 = mask position relative to layer; bit 1 = mask disabled
         let flags = cursor.read_u8();

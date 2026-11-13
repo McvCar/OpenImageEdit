@@ -566,6 +566,60 @@ fn build_layers<F: FnMut(usize, usize)>(
             }
         }
 
+        // ---- 逐层像素探针 ---------------------------------------------
+        // `IMAGEEDIT_PSD_TRACE_AT=x,y` 打印每个覆盖该点的图层的**解码后**像素，
+        // 与 psd-tools 的 `layer.topil()` 逐层对照，就能判断差异来自解码还是
+        // 合成。合成图对不上时，这一步能把问题从「整幅」缩到「某一层」。
+        if let Some((px, py)) = mask_probe_at("IMAGEEDIT_PSD_TRACE_AT") {
+            let lx = px - layer_offset.0;
+            let ly = py - layer_offset.1;
+            if lx >= 0 && ly >= 0 && lx < image.width() as i32 && ly < image.height() as i32 {
+                let p = image.get_pixel(lx as u32, ly as u32).0;
+                println!(
+                    "{{\"phase\":\"decode\",\"event\":\"layer-at\",\"name\":\"{}\",\
+                     \"px\":[{},{},{},{}],\"off\":[{},{}],\"size\":[{},{}],\"vis\":{}}}",
+                    layer.name(),
+                    p[0],
+                    p[1],
+                    p[2],
+                    p[3],
+                    layer_offset.0,
+                    layer_offset.1,
+                    image.width(),
+                    image.height(),
+                    layer.visible()
+                );
+            }
+        }
+
+        // ---- 单层位图导出 ---------------------------------------------
+        // `IMAGEEDIT_PSD_DUMP_LAYER=<图层名子串>` 把解码后的位图写到临时目录，
+        // 与 psd-tools 的 `layer.topil()` 逐像素对照。合成图的差异经常落在
+        // 「某一层的位图本身就不对」上，这时候只比合成图是查不出来的。
+        if let Ok(want) = std::env::var("IMAGEEDIT_PSD_DUMP_LAYER") {
+            if !want.is_empty() && layer.name().contains(&want) {
+                let safe: String = layer
+                    .name()
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                    .collect();
+                let path = std::env::temp_dir()
+                    .join(format!("imageedit-layer-{}-{}.png", safe, layer_offset.0));
+                if image.save(&path).is_ok() {
+                    println!(
+                        "{{\"phase\":\"decode\",\"event\":\"dump-layer\",\"name\":\"{}\",\
+                         \"path\":\"{}\",\"off\":[{},{}],\"size\":[{},{}]}}",
+                        layer.name(),
+                        path.display().to_string().replace('\\', "/"),
+                        layer_offset.0,
+                        layer_offset.1,
+                        image.width(),
+                        image.height()
+                    );
+                }
+            }
+        }
+
         // ---- layer mask (`-2`) -----------------------------------------
         // The mask channel is compressed against the mask's OWN rectangle,
         // which is usually the whole canvas while the layer is a small
@@ -577,6 +631,64 @@ fn build_layers<F: FnMut(usize, usize)>(
         };
         if mask.is_some() {
             masked_layers += 1;
+        }
+        // 诊断：`IMAGEEDIT_PSD_MASK_TRACE=1` 打印每个蒙版的矩形与取值分布。
+        // 蒙版解错（全零 / 矩形错位）时合成图表现为「某一层整片消失」，而
+        // 单看合成结果很难判断是蒙版、剪贴还是像素本身的问题。
+        if std::env::var("IMAGEEDIT_PSD_MASK_TRACE").ok().as_deref() == Some("1") {
+            let probe = mask_probe();
+            if let Some(r) = layer.mask_rect() {
+                println!(
+                    "{{\"phase\":\"decode\",\"event\":\"mask-rect\",\"name\":\"{}\",\
+                     \"ltrb\":[{},{},{},{}],\"wh\":[{},{}]}}",
+                    layer.name(),
+                    r.left,
+                    r.top,
+                    r.right,
+                    r.bottom,
+                    r.width(),
+                    r.height()
+                );
+            }
+            match &mask {
+                Some(m) => {
+                    let mut min = 255u8;
+                    let mut max = 0u8;
+                    let mut sum = 0u64;
+                    let n = m.image.pixels().count() as u64;
+                    for p in m.image.pixels() {
+                        min = min.min(p.0[0]);
+                        max = max.max(p.0[0]);
+                        sum += p.0[0] as u64;
+                    }
+                    println!(
+                        "{{\"phase\":\"decode\",\"event\":\"mask\",\"name\":\"{}\",\
+                         \"rect\":\"{}x{}+{},{} \",\"off\":[{},{}],\"default\":{},\
+                         \"min\":{},\"max\":{},\"mean\":{:.1},\"at\":{}}}",
+                        layer.name(),
+                        m.image.width(),
+                        m.image.height(),
+                        m.offset.0,
+                        m.offset.1,
+                        m.offset.0,
+                        m.offset.1,
+                        m.default,
+                        min,
+                        max,
+                        sum as f64 / n.max(1) as f64,
+                        mask_at(m, probe)
+                    );
+                }
+                None => {
+                    if layer.has_active_mask() {
+                        println!(
+                            "{{\"phase\":\"decode\",\"event\":\"mask-none\",\"name\":\"{}\",\
+                             \"active\":true}}",
+                            layer.name()
+                        );
+                    }
+                }
+            }
         }
 
         // ---- layer styles (lfx2) ---------------------------------------
@@ -1066,6 +1178,24 @@ fn channel_plane(
 /// 蒙版矩形通常就是整幅画布，而图层往往只是画布上的一个小贴片 —— 用图层
 /// 矩形去解释蒙版通道会把蒙版错位。取不到通道 / 蒙版被 PS 关掉时返回 `None`
 /// （等价于「无蒙版」，不会误把整层遮住）。
+/// 诊断用：`IMAGEEDIT_PSD_MASK_AT=x,y` 指定要打印蒙版取值的画布坐标。
+fn mask_probe() -> Option<(i32, i32)> {
+    mask_probe_at("IMAGEEDIT_PSD_MASK_AT")
+}
+
+fn mask_probe_at(key: &str) -> Option<(i32, i32)> {
+    let raw = std::env::var(key).ok()?;
+    let (x, y) = raw.split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+fn mask_at(m: &editcore::LayerMask, probe: Option<(i32, i32)>) -> i32 {
+    match probe {
+        Some((x, y)) => (m.coverage(x, y) * 255.0).round() as i32,
+        None => -1,
+    }
+}
+
 fn decode_mask(
     layer: &psd::PsdLayer,
     chans: &psd::LayerChannels,
@@ -1717,6 +1847,23 @@ mod tests {
         out
     }
 
+    /// 每行取不同值的通道：用来验证「行表按谁的高度剥」和「平面 stride」两件事。
+    /// 值 = 行号 * 10，任何错位都会在断言里立刻显形（均匀值则查不出来）。
+    fn packbits_channel_rows(rows: u32, width: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        for _ in 0..rows {
+            push_u16(&mut body, 2);
+        }
+        for r in 0..rows {
+            body.push((1i16 - width as i16) as i8 as u8);
+            body.push((r * 10) as u8);
+        }
+        let mut out = Vec::new();
+        push_u16(&mut out, 1); // RLE
+        out.extend_from_slice(&body);
+        out
+    }
+
     /// A one-layer PSD with an optional user-mask channel. Photoshop stores the
     /// mask rectangle separately from the layer rectangle, so the mask channel
     /// legitimately has fewer scanlines than the layer — that combination used
@@ -1731,7 +1878,7 @@ mod tests {
         ];
         let mask_len = match mask_side {
             Some(m) => {
-                chans.push((-2, packbits_channel(m, m, 128, None)));
+                chans.push((-2, packbits_channel_rows(m, m)));
                 20usize
             }
             None => 0,
@@ -1757,9 +1904,11 @@ mod tests {
         if let Some(m) = mask_side {
             push_i32(&mut extra, 0);
             push_i32(&mut extra, 0);
-            // Rectangle is inclusive: a `m`-wide mask ends at `m - 1`.
-            push_i32(&mut extra, (m - 1) as i32);
-            push_i32(&mut extra, (m - 1) as i32);
+            // 与图层矩形同一约定：右下角存的是**边界**（宽 = right - left）。
+            // 写 `m - 1` 会让解码端按「最后一个像素」理解，整块蒙版错一行一列
+            // ——真实文件（`0302-界面UI-1.psd`）里 right 就是 left + 宽度。
+            push_i32(&mut extra, m as i32);
+            push_i32(&mut extra, m as i32);
             extra.push(0); // default colour
             extra.push(0); // flags
             extra.extend_from_slice(&[0, 0]);
@@ -1818,7 +1967,15 @@ mod tests {
         let mask = set.layers[0].mask.as_ref().expect("用户蒙版应被保留");
         assert_eq!(mask.image.dimensions(), (2, 2));
         assert_eq!(mask.offset, (0, 0));
-        assert_eq!(mask.image.get_pixel(0, 0).0[0], 128);
+        // 行取值各不相同，所以「行表剥错 2 字节」或「stride 多一列」都会让
+        // 这里对不上（实测真实文件的蒙版就错在这两处）。
+        for y in 0..2u32 {
+            assert_eq!(
+                mask.image.get_pixel(0, y).0[0],
+                (y * 10) as u8,
+                "mask row {y} decoded at the wrong offset"
+            );
+        }
         assert_eq!(set.masked, 1);
     }
 
