@@ -793,7 +793,11 @@ impl Session {
         let lossy = matches!(&layers, Some(set) if !set.layers.is_empty() && !set.degraded.is_empty());
         let (doc, note) = match layers {
             Some(set) if !set.layers.is_empty() => {
+                let group_count = set.groups.len();
                 let mut text = format!("PSD 分层已就绪：{} 个可编辑图层", set.layer_count());
+                if group_count > 0 {
+                    text.push_str(&format!("、{group_count} 个图层组"));
+                }
                 if !set.degraded.is_empty() {
                     text.push_str(&format!(
                         "（已降级 {} 项：{}）",
@@ -801,8 +805,13 @@ impl Session {
                         set.degraded.join("、")
                     ));
                 }
+                let group_seeds = set.group_seeds();
                 (
-                    Document::from_psd_layers(set.canvas, set.into_seeds()),
+                    Document::from_psd_layers_with_groups(
+                        set.canvas,
+                        set.into_seeds(),
+                        group_seeds,
+                    ),
                     Some(text),
                 )
             }
@@ -1392,39 +1401,57 @@ impl Session {
     }
 
     /// 面板用的分组列表。组不是图层，QML 把它和 `layers_json` 合成显示行
-    /// （组标题行插在最高成员之前，折叠时隐藏成员行）。
+    /// （组标题行插在其子树最上面那个成员之前，折叠时整棵子树隐藏）。
     ///
-    /// `mids` 是成员稳定 id（显示顺序 = 顶 → 底），`c` 折叠、`v` 组眼睛、
-    /// `l` 整组是否已锁、`cnt` 成员数。一次遍历 `layers` 收集所有组的成员，
-    /// 避免每帧 O(组数 × 层数)。
+    /// 字段：`id` / `n` 名字 / `c` 折叠 / `v` **有效**眼睛（自己 & 全部祖先）/
+    /// `sv` 自己的眼睛（点眼睛时按它取反）/ `l` 整组是否已锁 / `cnt` 子树
+    /// 图层数 / `mids` 子树成员的稳定 id / `p` 父组（0 = 顶层）/ `d` 深度。
+    ///
+    /// 一次遍历 `layers` 按组反查再沿父子链累加，复杂度 O(组数 × 层数)，
+    /// 只在图层/组变化时调用（不是每帧）。
     pub(in crate::bridge) fn groups_json(&self) -> String {
         if self.doc.groups.is_empty() {
             return "[]".to_string();
         }
-        let mut members: std::collections::HashMap<u32, Vec<String>> =
-            std::collections::HashMap::new();
-        let mut locked: std::collections::HashMap<u32, bool> =
-            std::collections::HashMap::new();
-        for layer in self.doc.layers.iter().rev() {
-            if let Some(gid) = layer.group {
-                members.entry(gid).or_default().push(layer.id.to_string());
-                let all_locked = locked.entry(gid).or_insert(true);
-                *all_locked &= layer.locked;
-            }
-        }
         let mut parts: Vec<String> = Vec::new();
         for group in &self.doc.groups {
             let name = group.name.replace('\\', "\\\\").replace('"', "\\\"");
-            let ids = members.get(&group.id).cloned().unwrap_or_default();
-            let cnt = ids.len();
-            let all_locked = *locked.get(&group.id).unwrap_or(&false);
+            // 子树成员：嵌套组的成员也算「整组」的一部分（显隐 / 锁定 / 高亮）。
+            let members = self.doc.group_subtree_layers(group.id);
+            let mut ids: Vec<String> = Vec::with_capacity(members.len());
+            let mut all_locked = !members.is_empty();
+            for &i in &members {
+                let layer = &self.doc.layers[i];
+                ids.push(layer.id.to_string());
+                all_locked &= layer.locked;
+            }
+            // 祖先组隐藏时，子组的眼睛要跟着灰掉 —— 合成只认成员，但面板
+            // 显示必须如实。点眼睛写回去用 `sv`，否则会「点了没反应」。
+            let mut effective = group.visible;
+            let mut next = group.parent;
+            let mut guard = 0;
+            while let Some(pid) = next {
+                guard += 1;
+                if guard > 64 {
+                    break;
+                }
+                let Some(parent) = self.doc.find_group(pid) else {
+                    break;
+                };
+                effective &= parent.visible;
+                next = parent.parent;
+            }
             parts.push(format!(
-                "{{\"id\":{},\"n\":\"{name}\",\"c\":{},\"v\":{},\"l\":{},\"cnt\":{cnt},\"mids\":[{}]}}",
+                "{{\"id\":{},\"n\":\"{name}\",\"c\":{},\"v\":{},\"sv\":{},\"l\":{},\"cnt\":{},\"mids\":[{}],\"p\":{},\"d\":{}}}",
                 group.id,
                 group.collapsed,
+                effective,
                 group.visible,
                 all_locked,
-                ids.join(",")
+                ids.len(),
+                ids.join(","),
+                group.parent.unwrap_or(0),
+                self.doc.group_depth(group.id)
             ));
         }
         format!("[{}]", parts.join(","))

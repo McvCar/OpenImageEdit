@@ -143,6 +143,21 @@ pub struct PsdLayerSeed {
     pub opacity: f32,
     /// Blend mode carried by the PSD layer record.
     pub blend: BlendMode,
+    /// PSD 里这层所属的组（`PsdGroupSeed::psd_id`）。PSD 用 u32 给组编号，
+    /// 我们的 `GroupId` 是进程内自增，装配时再映射一次。
+    pub group: Option<u32>,
+}
+
+/// One PSD folder ("layer group"). `layers` 里的成员通过 `PsdLayerSeed::group`
+/// 反查，组与组的嵌套通过 `parent` 表达。
+#[derive(Debug, Clone)]
+pub struct PsdGroupSeed {
+    pub psd_id: u32,
+    pub parent: Option<u32>,
+    pub name: String,
+    pub collapsed: bool,
+    /// Photoshop 的「组隐藏」旗标：组记录自己的 visible。
+    pub visible: bool,
 }
 
 #[cfg(test)]
@@ -165,6 +180,7 @@ mod psd_assembly_tests {
             visible,
             opacity,
             blend: BlendMode::Normal,
+            group: None,
         }
     }
 
@@ -257,9 +273,37 @@ impl Document {
     /// layer becomes an ordinary raster layer above it, bottom -> top.
     /// A PSD file is therefore opened with `1 + N` rows in the layer panel.
     pub fn from_psd_layers(canvas: (u32, u32), seeds: Vec<PsdLayerSeed>) -> Self {
+        Self::from_psd_layers_with_groups(canvas, seeds, Vec::new())
+    }
+
+    /// Same as [`Document::from_psd_layers`], plus the PSD folder tree.
+    ///
+    /// Groups are **parallel metadata** (they never enter `layers`), so the
+    /// composite still sees exactly the same pixel stack. `psd_groups` is in the
+    /// same order as the file (bottom -> top), and a child group can appear
+    /// before its parent, so the parent links are resolved in a second pass.
+    pub fn from_psd_layers_with_groups(
+        canvas: (u32, u32),
+        seeds: Vec<PsdLayerSeed>,
+        psd_groups: Vec<PsdGroupSeed>,
+    ) -> Self {
         let size = Size::new(canvas.0.max(1), canvas.1.max(1));
         let mut layers = Vec::with_capacity(seeds.len() + 1);
         layers.push(Layer::background(RgbaImage::new(size.width, size.height)));
+        let mut groups: Vec<LayerGroup> = Vec::with_capacity(psd_groups.len());
+        let mut group_of: std::collections::HashMap<u32, GroupId> =
+            std::collections::HashMap::with_capacity(psd_groups.len());
+        for seed in &psd_groups {
+            let group = LayerGroup::imported(seed.name.clone(), seed.collapsed);
+            group_of.insert(seed.psd_id, group.id);
+            groups.push(group);
+        }
+        // 父组回填（子组可能排在自己的父组之前）。
+        for (i, seed) in psd_groups.iter().enumerate() {
+            let parent = seed.parent.and_then(|pid| group_of.get(&pid).copied());
+            groups[i].parent = parent;
+            groups[i].visible = seed.visible;
+        }
         for seed in seeds {
             let mut layer = Layer::new(seed.name, seed.image);
             layer.visible = seed.visible;
@@ -267,6 +311,7 @@ impl Document {
             layer.blend = seed.blend;
             layer.locked = false;
             layer.background = false;
+            layer.group = seed.group.and_then(|gid| group_of.get(&gid).copied());
             if let Some(raster) = layer.raster_mut() {
                 raster.offset = seed.offset;
             }
@@ -277,7 +322,7 @@ impl Document {
             canvas: size,
             view: Rect::new(0, 0, size.width, size.height),
             layers,
-            groups: Vec::new(),
+            groups,
             selection: None,
             edit_epoch: 0,
             next_layer_seq: 0,

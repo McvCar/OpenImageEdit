@@ -33,12 +33,29 @@ pub struct PsdLayerData {
     pub annotation: bool,
     /// Per-layer "something was simplified" notes.
     pub degraded: Vec<String>,
+    /// PSD 里这层所属的文件夹（u32 是 PSD 自己的组编号，装配时再映射）。
+    pub group: Option<u32>,
+}
+
+/// One PSD folder. `parent` / `psd_id` 用 PSD 自己的编号，`PsdLayerData::group`
+/// 通过同样的编号指回来。
+#[derive(Debug, Clone)]
+pub struct PsdGroupData {
+    pub psd_id: u32,
+    pub parent: Option<u32>,
+    pub name: String,
+    pub collapsed: bool,
+    pub visible: bool,
+    /// 组内成员数（含嵌套组的成员），面板「N 项」与空组判定用它。
+    pub count: usize,
 }
 
 /// Result of the second-stage parse. `layers` is bottom -> top.
 #[derive(Debug, Clone)]
 pub struct PsdLayerSet {
     pub layers: Vec<PsdLayerData>,
+    /// 文件夹（PSD 的组）。空 = 文件里没有分组，或为兼容旧路径而忽略。
+    pub groups: Vec<PsdGroupData>,
     pub canvas: (u32, u32),
     /// File-level degradation notes (groups flattened, blend modes, ...).
     pub degraded: Vec<String>,
@@ -78,6 +95,21 @@ impl PsdLayerSet {
                 visible: l.visible,
                 opacity: l.opacity,
                 blend: l.blend,
+                group: l.group,
+            })
+            .collect()
+    }
+
+    /// 文件夹树 -> core 的组种子（不含位图，先取它再 `into_seeds`）。
+    pub fn group_seeds(&self) -> Vec<editcore::PsdGroupSeed> {
+        self.groups
+            .iter()
+            .map(|g| editcore::PsdGroupSeed {
+                psd_id: g.psd_id,
+                parent: g.parent,
+                name: g.name.clone(),
+                collapsed: g.collapsed,
+                visible: g.visible,
             })
             .collect()
     }
@@ -293,14 +325,13 @@ fn build_layers<F: FnMut(usize, usize)>(
             notes.push(format!("混合模式 {:?} 不支持，已按正常处理", layer.blend_mode()));
         }
         let blend = blend.unwrap_or_default();
-        if layer.parent_id().is_some() {
-            notes.push("组结构已展平".into());
-        }
+        // 组不再摊平：整棵树由 `psd.groups()` 交出去（见函数末尾），这里
+        // 只把「这层属于哪个组」记在层上，让面板能还原缩进与折叠。
         // A group's own visibility and opacity live on the folder record, not on
         // its children: Photoshop keeps the children's flags untouched and hides
-        // them through the group. Flattening drops that, so a hidden group (an
-        // alternate screen state, a popup variant) would pop into the canvas.
-        // Fold every ancestor group's flag into the child.
+        // them through the group. The canvas must still match the composite, so
+        // every ancestor group's flag is folded into the child here; the group
+        // row keeps its own state for the panel.
         let (ancestor_visible, ancestor_opacity) = inherited_group_state(groups, layer.parent_id());
         if !ancestor_visible && layer.visible() {
             inherited_hidden = true;
@@ -399,6 +430,7 @@ fn build_layers<F: FnMut(usize, usize)>(
         degraded.extend(notes.iter().cloned());
         layers.push(PsdLayerData {
             annotation: ancestor_is_annotation_group(groups, layer.parent_id()),
+            group: layer.parent_id(),
             name: layer.name().to_string(),
             offset: layer_offset,
             image,
@@ -427,8 +459,43 @@ fn build_layers<F: FnMut(usize, usize)>(
             "{styled_layers} 个图层的样式（阴影/描边/渐变叠加等）已烘焙进图层像素"
         ));
     }
+    // ---- 文件夹树（PSD 的组，不再摊平）---------------------------------
+    // `group_ids_in_order` 是 Photoshop 面板的顺序（底 -> 顶），照抄即可；
+    // 成员数按**子树**统计（嵌套组的成员也算父组的一项），面板的「N 项」
+    // 与空组判定都用它。
+    let mut group_list: Vec<PsdGroupData> = Vec::with_capacity(groups.len());
+    for gid in psd.group_ids_in_order() {
+        let Some(group) = groups.get(gid) else {
+            continue;
+        };
+        let mut count = 0usize;
+        for layer in &layers {
+            let mut next = layer.group;
+            let mut guard = 0;
+            while let Some(id) = next {
+                if id == *gid {
+                    count += 1;
+                    break;
+                }
+                guard += 1;
+                if guard > 64 {
+                    break;
+                }
+                next = groups.get(&id).and_then(|g| g.parent_id());
+            }
+        }
+        group_list.push(PsdGroupData {
+            psd_id: *gid,
+            parent: group.parent_id(),
+            name: group.name().to_string(),
+            collapsed: group.collapsed(),
+            visible: group.visible(),
+            count,
+        });
+    }
     Ok(PsdLayerSet {
         layers,
+        groups: group_list,
         canvas,
         degraded,
         // Stage 1 always has the composite from `decode_psd_bytes`; if it

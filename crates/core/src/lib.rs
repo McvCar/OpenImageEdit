@@ -54,7 +54,7 @@ pub use retouch::{
     heal_clone, patch_fill, spot_heal, stroke_mask, BrushSpec, StrokeMask,
 };
 pub use op::{EditError, EditOp};
-pub use document::{Document, PsdLayerSeed};
+pub use document::{Document, PsdGroupSeed, PsdLayerSeed};
 pub(crate) use document::DocumentSnapshot;
 
 // Cross-module private helpers (kept `pub(crate)` + re-exported so each

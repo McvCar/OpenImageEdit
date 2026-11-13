@@ -205,6 +205,8 @@ pub struct PsdGroup {
     pub(crate) contained_layers: Range<usize>,
     /// Common layer properties
     pub(crate) layer_properties: LayerProperties,
+    /// `lsct` type 2: the folder was saved collapsed in Photoshop.
+    pub(crate) collapsed: bool,
 }
 
 impl PsdGroup {
@@ -220,17 +222,24 @@ impl PsdGroup {
     ) -> Self {
         let layer_properties =
             LayerProperties::from_layer_record(name, layer_record, psd_width, psd_height, group_id);
+        let collapsed = matches!(layer_record.divider_type, Some(GroupDivider::CloseFolder));
 
         PsdGroup {
             id,
             contained_layers,
             layer_properties,
+            collapsed,
         }
     }
 
     /// A unique identifier for the layer within the PSD file
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// Whether the folder was stored closed ("collapsed") in the file.
+    pub fn collapsed(&self) -> bool {
+        self.collapsed
     }
 }
 

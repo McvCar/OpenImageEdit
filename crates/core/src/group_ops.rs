@@ -26,9 +26,69 @@ impl Document {
         self.layers.get(index)?.group
     }
 
+    /// 直接的子组（不含孙子）。
+    pub fn child_groups(&self, id: GroupId) -> Vec<GroupId> {
+        self.groups
+            .iter()
+            .filter(|g| g.parent == Some(id))
+            .map(|g| g.id)
+            .collect()
+    }
+
+    /// 组的深度（顶层 = 0）。带环路保护，坏数据不会把面板递归打穿。
+    pub fn group_depth(&self, id: GroupId) -> usize {
+        let mut depth = 0usize;
+        let mut next = self.find_group(id).and_then(|g| g.parent);
+        while let Some(pid) = next {
+            depth += 1;
+            if depth > 64 {
+                break;
+            }
+            next = self.find_group(pid).and_then(|g| g.parent);
+        }
+        depth
+    }
+
+    /// 组及其所有后代组（不含自己）。
+    pub fn descendant_groups(&self, id: GroupId) -> Vec<GroupId> {
+        let mut out = Vec::new();
+        let mut stack = vec![id];
+        let mut guard = 0;
+        while let Some(next) = stack.pop() {
+            guard += 1;
+            if guard > 4096 {
+                break;
+            }
+            for child in self.child_groups(next) {
+                if !out.contains(&child) && child != id {
+                    out.push(child);
+                    stack.push(child);
+                }
+            }
+        }
+        out
+    }
+
+    /// 「整组」语义要覆盖嵌套：组自己的成员 + 所有后代组的成员，升序。
+    /// 合成/显隐/锁定/点选都走这个，只有面板缩进用 `group_members`。
+    pub fn group_subtree_layers(&self, id: GroupId) -> Vec<usize> {
+        let mut ids = self.descendant_groups(id);
+        ids.push(id);
+        self.layers
+            .iter()
+            .enumerate()
+            .filter(|(_, layer)| layer.group.map(|g| ids.contains(&g)).unwrap_or(false))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// 把选中的多个层归到一个新组。**不重排 `layers`**：编组只是打标签，
     /// 保持每个像素的 z 序原样（保真优先，编组不该改变画面）。
-    /// 背景层、越界下标、已经属于其它组的层会被跳过；不足 2 层报错。
+    /// 背景层、越界下标会被跳过；跨组混选（一半在 A 组、一半在 B 组或散层）
+    /// 也跳过，因为没法判断新组该挂在哪。
+    ///
+    /// 同一个组里的若干层再编组 = 在它里面建子组（PS 也是这样），新组的
+    /// 父组就是那个共同组。不足 2 层报错。
     pub fn group_layers(
         &mut self,
         indices: &[usize],
@@ -38,18 +98,36 @@ impl Document {
         picked.sort_unstable();
         picked.dedup();
         let mut clean = Vec::new();
+        // 三态：还没见过 / 见过且都属于同一个组（含 None）/ 出现了分歧。
+        let mut common: Option<Option<GroupId>> = None;
+        let mut mixed = false;
         for i in picked {
             let layer = self.layers.get(i).ok_or(EditError::LayerIndex(i))?;
-            if i == 0 || layer.background || layer.group.is_some() {
+            if i == 0 || layer.background {
                 continue;
+            }
+            match common {
+                None => common = Some(layer.group),
+                Some(seen) if seen == layer.group => {}
+                _ => {
+                    mixed = true;
+                    continue;
+                }
             }
             clean.push(i);
         }
-        if clean.len() < 2 {
+        if mixed || clean.len() < 2 {
             return Err(EditError::GroupNeedsTwoLayers);
         }
+        let parent = common.flatten();
+        if let Some(pid) = parent {
+            if self.find_group(pid).is_none() {
+                return Err(EditError::GroupNotFound(pid));
+            }
+        }
         let name = name.unwrap_or_else(|| format!("组 {}", self.groups.len() + 1));
-        let group = LayerGroup::new(name);
+        let mut group = LayerGroup::new(name);
+        group.parent = parent;
         let gid = group.id;
         let mut groups = self.groups.clone();
         groups.push(group);
@@ -62,7 +140,7 @@ impl Document {
         for i in &clean {
             ops.push(EditOp::SetLayerGroup {
                 index: *i,
-                from: None,
+                from: self.layers[*i].group,
                 to: Some(gid),
             });
         }
@@ -71,13 +149,21 @@ impl Document {
     }
 
     /// 解散分组：只摘掉组的标签，图层本身与 z 序完全保留。
+    /// 子组不会被一起删掉，而是挂到被解散组的父组上（否则它们会悬空，
+    /// 变成面板里再也渲染不出来的孤儿组）。
     pub fn ungroup(&mut self, gid: GroupId) -> Result<(), EditError> {
-        if self.find_group(gid).is_none() {
-            return Err(EditError::GroupNotFound(gid));
-        }
+        let group = self
+            .find_group(gid)
+            .ok_or(EditError::GroupNotFound(gid))?;
+        let parent = group.parent;
         let members = self.group_members(gid);
         let mut groups = self.groups.clone();
         groups.retain(|g| g.id != gid);
+        for child in groups.iter_mut() {
+            if child.parent == Some(gid) {
+                child.parent = parent;
+            }
+        }
         let mut ops: Vec<EditOp> = members
             .iter()
             .map(|&i| EditOp::SetLayerGroup {
@@ -141,7 +227,8 @@ impl Document {
         if before.visible == visible {
             return Ok(());
         }
-        let members = self.group_members(gid);
+        // 整组 = 自己的成员 + 所有后代组的成员（嵌套组的眼睛要一次点亮到底）。
+        let members = self.group_subtree_layers(gid);
         let mut groups = self.groups.clone();
         let mut ops: Vec<EditOp> = Vec::new();
         {
@@ -198,12 +285,12 @@ impl Document {
         self.execute(EditOp::Batch(ops))
     }
 
-    /// 整组锁定 / 解锁（批量写成员 `locked`，可撤销）。
+    /// 整组锁定 / 解锁（批量写成员 `locked`，可撤销）。同样覆盖嵌套子组。
     pub fn set_group_locked(&mut self, gid: GroupId, locked: bool) -> Result<(), EditError> {
         if self.find_group(gid).is_none() {
             return Err(EditError::GroupNotFound(gid));
         }
-        let members = self.group_members(gid);
+        let members = self.group_subtree_layers(gid);
         let mut ops: Vec<EditOp> = Vec::new();
         for i in members {
             let layer = &self.layers[i];
@@ -324,6 +411,64 @@ mod group_tests {
 
         doc.undo().unwrap();
         assert!(doc.group_members(gid).iter().all(|&i| !doc.layers[i].visible));
+    }
+
+    #[test]
+    fn nested_groups_from_psd_keep_parent_links_and_cover_subtree() {
+        let seed = |name: &str, group: Option<u32>| PsdLayerSeed {
+            name: name.into(),
+            offset: (0, 0),
+            image: RgbaImage::from_pixel(4, 4, Rgba([9, 9, 9, 255])),
+            visible: true,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            group,
+        };
+        // 底 -> 顶：底层无组，中层在「内层」组，顶层在「外层」组。
+        let mut doc = Document::from_psd_layers_with_groups(
+            (8, 8),
+            vec![seed("松", None), seed("内", Some(9)), seed("外", Some(7))],
+            vec![
+                PsdGroupSeed {
+                    psd_id: 9,
+                    parent: Some(7),
+                    name: "内层".into(),
+                    collapsed: true,
+                    visible: true,
+                },
+                PsdGroupSeed {
+                    psd_id: 7,
+                    parent: None,
+                    name: "外层".into(),
+                    collapsed: false,
+                    visible: true,
+                },
+            ],
+        );
+        assert_eq!(doc.groups.len(), 2);
+        let outer = doc.groups.iter().find(|g| g.name == "外层").unwrap().id;
+        let inner = doc.groups.iter().find(|g| g.name == "内层").unwrap().id;
+        assert!(doc.find_group(inner).unwrap().collapsed, "PSD 的关闭态要保留");
+        assert_eq!(doc.find_group(inner).unwrap().parent, Some(outer));
+        assert_eq!(doc.layers[1].group, None);
+        assert_eq!(doc.layers[2].group, Some(inner));
+        assert_eq!(doc.layers[3].group, Some(outer));
+        assert_eq!(doc.group_depth(inner), 1);
+        assert_eq!(doc.group_depth(outer), 0);
+        assert_eq!(doc.descendant_groups(outer), vec![inner]);
+        // 「整组」必须一起盖住嵌套成员，否则眼睛只关一半。
+        assert_eq!(doc.group_subtree_layers(outer), vec![2, 3]);
+        assert_eq!(doc.group_members(outer), vec![3], "直接成员只有一层");
+        doc.set_group_visible(outer, false).unwrap();
+        assert!(!doc.layers[2].visible && !doc.layers[3].visible);
+        doc.set_group_visible(outer, true).unwrap();
+        assert!(doc.layers[2].visible && doc.layers[3].visible);
+        // 解散父组：子组挂到父组的父组（这里就是顶层），不能变孤儿。
+        doc.ungroup(outer).unwrap();
+        assert_eq!(doc.groups.len(), 1);
+        assert_eq!(doc.find_group(inner).unwrap().parent, None);
+        assert_eq!(doc.layers[3].group, None);
+        assert_eq!(doc.layers[2].group, Some(inner));
     }
 
     #[test]

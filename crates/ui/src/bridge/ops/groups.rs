@@ -76,6 +76,24 @@ impl qobject::Bridge {
                     }
                 }
             }
+            // 嵌套时只解散「最外层」那批：否则点父组解组会把子组一起拆掉，
+            // 与 PS 的 Ctrl+Shift+G 语义（只解一层）不一致。
+            let all = gids.clone();
+            gids.retain(|gid| {
+                let mut next = session.doc.find_group(*gid).and_then(|g| g.parent);
+                let mut guard = 0;
+                while let Some(pid) = next {
+                    guard += 1;
+                    if guard > 64 {
+                        break;
+                    }
+                    if all.contains(&pid) {
+                        return false;
+                    }
+                    next = session.doc.find_group(pid).and_then(|g| g.parent);
+                }
+                true
+            });
             let mut done = 0usize;
             let mut failure: Option<String> = None;
             for gid in &gids {
@@ -139,7 +157,7 @@ impl qobject::Bridge {
         }
     }
 
-    /// 点组标题行：选中整组，主选中层为组内最上层（z 序最高）。
+    /// 点组标题行：选中整组（含嵌套子组的成员），主选中层为组内最上层。
     pub fn select_group(mut self: Pin<&mut Self>, group_id: i32) {
         if group_id <= 0 {
             return;
@@ -147,7 +165,7 @@ impl qobject::Bridge {
         let members = {
             let guard = self.session.borrow();
             match guard.as_ref() {
-                Some(session) => session.doc.group_members(group_id as u32),
+                Some(session) => session.doc.group_subtree_layers(group_id as u32),
                 None => Vec::new(),
             }
         };

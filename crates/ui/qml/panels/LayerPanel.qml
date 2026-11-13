@@ -430,10 +430,41 @@ Item {
         }
     }
 
+    // ================= 保真态提示 =================
+    // 保真显示时文档只有 1 层（PS 原合成），分组与图层都还不存在 —— 不给
+    // 入口的话，用户会以为「这个 PSD 里没有分组」。
+    Rectangle {
+        id: fidelityHint
+        visible: bridge.fidelityMode && bridge.hasPsdLayers
+        anchors.top: header.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: visible ? 44 : 0
+        color: "#2a3646"
+
+        Text {
+            anchors.left: parent.left
+            anchors.leftMargin: 10
+            anchors.right: parent.right
+            anchors.rightMargin: 10
+            anchors.verticalCenter: parent.verticalCenter
+            text: "正在显示 PS 原合成（1 层）· 点此进入分层编辑，查看图层与分组"
+            color: "#a8cbef"
+            font.pixelSize: 11
+            wrapMode: Text.WordWrap
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: bridge.enter_layered_editing()
+        }
+    }
+
     // ================= 列表 =================
     Flickable {
         id: listArea
-        anchors.top: header.bottom
+        anchors.top: fidelityHint.visible ? fidelityHint.bottom : header.bottom
         anchors.bottom: panelFooter.top
         anchors.left: parent.left
         anchors.right: parent.right
@@ -473,9 +504,8 @@ Item {
                             ? layerPanel.renamingGroupId === row.gid
                             : (host.renamingIndex !== -1
                                && host.renamingIndex === row.i))
-                    // 组内成员缩进一点，组标题行贴左边。
-                    readonly property int indent: row && !layerRow.isGroup
-                        && row.g > 0 ? 14 : 0
+                    // 嵌套缩进：组行与层行都按 depth 排，PSD 的组套组才看得出来。
+                    readonly property int indent: row && row.d ? row.d * 14 : 0
                     // 缩略图：layerEpoch = 像素变化，thumbEpoch = 后台分批
                     // 写入完成（C6）。两者都读一遍当依赖，避免 100 层首次
                     // 展开时 UI 线程同步缩图。组标题行没有位图，别去问
@@ -557,7 +587,7 @@ Item {
                     Item {
                         id: groupArrow
                         z: 3
-                        x: 9
+                        x: 9 + layerRow.indent
                         anchors.verticalCenter: parent.verticalCenter
                         width: 34
                         height: 34
@@ -727,7 +757,9 @@ Item {
                             onClicked: if (layerRow.row) {
                                 if (layerRow.isGroup)
                                     bridge.set_group_visible(layerRow.row.gid,
-                                                             !layerRow.row.v)
+                                                             !(layerRow.row.sv === undefined
+                                                               ? layerRow.row.v
+                                                               : layerRow.row.sv))
                                 else if (layerRow.isBase)
                                     bridge.toggle_base_visible()
                                 else

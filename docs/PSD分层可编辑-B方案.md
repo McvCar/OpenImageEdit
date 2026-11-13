@@ -930,3 +930,98 @@ python scripts/probe_psd_roundtrip.py --only saveas
 | 普通 PNG → 新 `.psd` | `saved` 事件、无 `save-error`、文件 1 层且可见位不被置为隐藏 |
 | 合并预览态 PSD → 另一个 `.psd` | 放行且写出 1 个平铺图层（覆盖源仍由 `--only composite` 验证被拒） |
 | 分组文档 → `.psd` | `psd-saved.groups >= 1`，文件层记录保持平铺 5 层 |
+
+## 19. PSD 图层分组（真实组树，2026-11-13 追加）
+
+### 19.1 之前的问题
+
+老实现把 PSD 的文件夹**摊平**成平级图层，并在降级清单里写「组结构已展平」。
+后果是打开一份 UI 稿，617 层平铺在一个列表里，看不出层级，也无法整组显隐。
+分组功能（§13 之后的图层分组）当时只是编辑器内的元数据，PSD 读入时一律
+`group = None`，所以「打开 PSD 看不到分组」是必然的。
+
+### 19.2 读：把 PSD 的文件夹树还原
+
+PSD 用两条 `8BIMlsct` 分隔记录夹住成员（文件顺序自底向上）：
+
+```
+[lsct 3 组底边界]  成员…（自底向上）  [lsct 1 展开 / 2 折叠 的文件夹行，带组名]
+```
+
+- `vendor/psd`：`PsdGroup` 增加 `collapsed`（由文件夹行的 `lsct` 类型 2 判定），
+  新增 `collapsed()` 访问器；`Psd::group_ids_in_order()` 保持 Photoshop 面板顺序。
+- `crates/decode/src/psd_layers.rs`：`PsdLayerData.group`（叶子所属组）、
+  `PsdLayerSet.groups: Vec<PsdGroupData>`（`psd_id / parent / name / collapsed /
+  visible / count`，`count` 按子树统计）。不再产出「组结构已展平」降级项。
+- 组的显隐与不透明度**仍然**折叠进子层（画布必须与合并图一致），组的眼睛
+  状态单独留在组记录上给面板显示。
+- `core`：`LayerGroup.parent: Option<GroupId>` 支持嵌套；`Document::
+  from_psd_layers_with_groups` 负责装配并把 PSD 的 u32 组号映射成本进程的
+  `GroupId`（子组可能排在父组之前，父链二次回填）。
+- `GroupId` 是**进程内**自增，不写进 PSD；落盘靠重新扫描组归属，所以撤销 /
+  重做 / 另存都不会串号。
+
+### 19.3 语义变化（嵌套）
+
+| 操作 | 语义 |
+| --- | --- |
+| `group_members(gid)` | **直接**成员（面板缩进用） |
+| `group_subtree_layers(gid)` | 子树成员（整组显隐 / 锁定 / 点选 / 面板高亮） |
+| `set_group_visible / locked` | 覆盖子树，父组一关全关 |
+| `ungroup(gid)` | 只摘这一层，子组挂到它的父组（不留孤儿组） |
+| `group_layers` | 同一组里的若干层再编组 = 建**子组**；跨组混选直接拒绝 |
+
+面板显示行改为递归：按层的祖先链（根 → 叶）逐级补组标题行，链上有任意一组
+折叠就整棵子树收起来；空组只在「确实没有成员、且祖先都没折叠」时补一行
+（否则折叠的父组下面会漏出「X（空）」）。
+
+### 19.4 写：分组写回 PSD
+
+`crates/decode/src/psd_write.rs` 现在按 `doc.groups` 生成 `PsdRecord`：
+
+- 进入一个组（遇到它的最低成员）先写 `lsct 3`（组底边界），离开（最高成员
+  之后）再写 `lsct 1|2`（文件夹行，带组名，折叠态原样带上）；
+- 嵌套组按祖先链的自然顺序展开，切换组时「先按内→外关、再按外→内开」；
+- 空组补一对空壳记录，避免重开时组凭空消失；
+- 分隔记录是空矩形 + 4 个「只有压缩标记」的通道（`channel_len = 2`），
+  与 Photoshop / psd-tools 的写法一致。
+
+### 19.5 验收
+
+```
+python scripts/probe_psd_groups.py          # 5 段：组树 / 归属 / 折叠 / 整组显隐 / 写回
+python scripts/probe_psd_roundtrip.py       # 写回、隐藏位、降级拦截
+python scripts/crosscheck_psd.py --only all # psd-tools 独立实现对照
+```
+
+实测（`0302-界面UI-1.psd`，117 MB）：**617 层 / 197 个组**，最深 3 层，
+状态栏报「617 个可编辑图层、197 个图层组」。`nested-groups.psd`
+（psd-tools 生成，Open/Closed/嵌套各一）导出后 `psd-tools` 读回的层级、
+折叠态与原名一致。
+
+### 19.6 已知边界
+
+- 组的 `lsdk`（混合模式 / 不透明度 / 蒙版）仍未写回，组透明度按成员折叠。
+- `lsct` 只写「展开/折叠」两种，`lsdk` 的「组作剪切蒙版」不支持。
+- 面板拖拽排序落到组标题行时不移动（`i = -1`），要拖到具体图层行上。
+
+### 19.7 发现性：保真态的图层面板提示条
+
+默认打开 PSD 走保真模式（阶段 1 只解合并图），此时文档只有 **1 层**，
+面板里自然看不到任何分组 —— 这正是「PSD 打开没有看见分组」的另一半原因
+（组树已经解析好了，只是还没装进文档）。面板顶部因此加了一条提示条：
+
+```qml
+// crates/ui/qml/panels/LayerPanel.qml
+visible: bridge.fidelityMode && bridge.hasPsdLayers
+text:    "正在显示 PS 原合成（1 层）· 点此进入分层编辑，查看图层与分组"
+onClicked: bridge.enter_layered_editing()
+```
+
+- 只在「保真 + 这个 PSD 确实有可解析图层」时出现，分层态不占高度；
+- 点它等同菜单「视图 → 进入分层编辑」，解析期间照旧锁编辑工具；
+- `listArea.anchors.top` 跟着它切换（`fidelityHint.bottom` / `header.bottom`），
+  高度 44（两行 11 px 文案不挤压首行图层）。
+
+写回状态文案同步改口：分组现在会写成 `lsct` 记录，所以保存后报
+「已保存 PSD：路径（N 个图层、M 个图层组）」，不再说「分组已展开，不写入 PSD」。

@@ -481,7 +481,7 @@ Item {
         for (var i = 0; i < layerList.length; i++) {
             const l = layerList[i]
             s += l.i + ":" + l.id + ":" + l.n + ":" + l.v + ":" + l.l + ":"
-                 + Math.round(l.o) + ";"
+                 + (l.g || 0) + ":" + Math.round(l.o) + ";"
         }
         return s
     }
@@ -621,6 +621,9 @@ Item {
     readonly property bool probeClipboard: Qt.application.arguments.indexOf("--probe-clipboard") !== -1
     readonly property bool probeRuler: Qt.application.arguments.indexOf("--probe-ruler") !== -1
     readonly property bool probePicker: Qt.application.arguments.indexOf("--probe-picker") !== -1
+    // 把面板显示行（组标题 / 缩进 / 折叠后的行序）上报给探针。这些行是 QML
+    // 拼的，Rust 侧看不到，靠截图猜层级太脆。
+    readonly property bool probePanelRows: Qt.application.arguments.indexOf("--probe-panel-rows") !== -1
     // Exercises the Ctrl+S / menu 保存 path (saveOrSaveAs → save_edited)
     // so QML scope errors on that route fail loudly in probe runs.
     readonly property bool probeSave: Qt.application.arguments.indexOf("--probe-save") !== -1
@@ -2574,29 +2577,81 @@ function buildLayerPanelRows() {
         return {
             i: -1, id: -grp.id, gid: grp.id, k: "group",
             n: empty ? grp.n + "（空）" : grp.n,
-            v: grp.v, l: grp.l, o: 100,
-            c: grp.c, cnt: empty ? 0 : grp.cnt, mids: grp.mids || [],
-            x: 0, y: 0, w: 0, h: 0, g: 0, base: false
+            v: grp.v, sv: grp.sv === undefined ? grp.v : grp.sv,
+            l: grp.l, o: 100, c: grp.c, d: grp.d || 0,
+            cnt: empty ? 0 : grp.cnt, mids: grp.mids || [],
+            x: 0, y: 0, w: 0, h: 0, g: grp.p || 0, base: false
         }
+    }
+    // 祖先链（根 → 自身）。PSD 的组可以套组，折叠必须整棵子树一起收：
+    // 只要链上有任意一组折叠，这层就不出行；组的标题行只在第一次遇到
+    // 它的成员（自上而下）时插入，位置天然就是「子树最上面那行」。
+    function chainOf(gid) {
+        const path = []
+        let next = gid
+        let guard = 0
+        while (next > 0 && byId[next] && guard < 64) {
+            path.unshift(byId[next])
+            next = byId[next].p || 0
+            guard++
+        }
+        return path
     }
     for (var i = 0; i < layerList.length; i++) {
         const l = layerList[i]
         const gid = l.g || 0
+        let hidden = false
+        let depth = 0
         if (gid > 0 && byId[gid]) {
-            const grp = byId[gid]
-            if (!emitted[gid]) {
-                emitted[gid] = true
-                rows.push(groupRow(grp, false))
+            const path = chainOf(gid)
+            depth = path.length
+            for (var k = 0; k < path.length; k++) {
+                const grp = path[k]
+                if (!emitted[grp.id]) {
+                    emitted[grp.id] = true
+                    rows.push(groupRow(grp, false))
+                }
+                if (grp.c) {
+                    hidden = true
+                    break
+                }
             }
-            if (grp.c)
-                continue
         }
-        rows.push(l)
+        if (hidden)
+            continue
+        // 层行补一个 d（缩进深度）。拷贝一份，别把 d 写回 layerList ——
+        // 那份数据还被画布点选 / 选框等逻辑当唯一真值用。
+        const row = {}
+        for (const key in l)
+            row[key] = l[key]
+        row.d = depth
+        rows.push(row)
     }
     // 成员被删光的空组仍要留一行，否则用户没有入口把它解散。
-    for (var k = 0; k < groups.length; k++)
-        if (!emitted[groups[k].id])
-            rows.push(groupRow(groups[k], true))
+    // 注意两个坑：① 有成员的组「没被 emit」通常是祖先折叠了，不能补一行，
+    // 否则折叠的父组下面会漏出「Inner（空）」；② 空组若在折叠的父组里，
+    // 也要跟着父组一起藏起来。
+    for (var m = 0; m < groups.length; m++) {
+        const grp = groups[m]
+        if (emitted[grp.id])
+            continue
+        if ((grp.cnt || 0) > 0)
+            continue
+        let foldedParent = false
+        let next = grp.p || 0
+        let guard = 0
+        while (next > 0 && byId[next] && guard < 64) {
+            if (byId[next].c) {
+                foldedParent = true
+                break
+            }
+            next = byId[next].p || 0
+            guard++
+        }
+        if (foldedParent)
+            continue
+        rows.push(groupRow(grp, true))
+    }
     return rows
 }
 
@@ -3281,6 +3336,22 @@ Timer {
             root.hoverFy = bridge.image_height * 0.58
             root.hoverValid = true
         }
+    }
+}
+
+// Probe: --probe-panel-rows 上报面板显示行（组标题行 / 层行 / 缩进深度 /
+// 文档下标）。折叠态由 --script="group-collapse:<id>,0|1" 先摆好。
+Timer {
+    id: panelRowsProbe
+    interval: 900
+    running: root.probePanelRows
+    onTriggered: {
+        const out = []
+        for (var i = 0; i < root.layerPanelList.length; i++) {
+            const r = root.layerPanelList[i]
+            out.push({ n: r.n, k: r.k || "layer", d: r.d || 0, i: r.i })
+        }
+        bridge.dump_panel_rows(JSON.stringify(out))
     }
 }
 

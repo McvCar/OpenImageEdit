@@ -41,6 +41,10 @@ pub struct LayerGroup {
     /// 隐藏整组之前记下各成员自己的显隐，重新显示时按 id 还原 ——
     /// 否则组里原本手动隐藏的层会被「显示整组」一起点亮。
     pub hidden_snapshot: Vec<(LayerId, bool)>,
+    /// 父组。PSD 的组可以嵌套，摊平会把层级变成一堆平级标题行。
+    /// `None` = 顶层组；成员关系仍由 `Layer::group` 反查，这里是**组与组**
+    /// 之间的父子关系，两者合起来才是完整树。
+    pub parent: Option<GroupId>,
 }
 
 impl LayerGroup {
@@ -51,10 +55,18 @@ impl LayerGroup {
             collapsed: false,
             visible: true,
             hidden_snapshot: Vec::new(),
+            parent: None,
         }
     }
-}
 
+    /// PSD 导入专用：组名可能带「空组」等标记，折叠态来自 `lsct` 的
+    /// open / closed，其他字段与 `new` 一致（id 仍由这里自增分配）。
+    pub fn imported(name: impl Into<String>, collapsed: bool) -> Self {
+        let mut group = Self::new(name);
+        group.collapsed = collapsed;
+        group
+    }
+}
 /// 位图内容：像素 + 画布相对偏移 + 非破坏性变换参数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RasterLayer {

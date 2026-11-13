@@ -40,3 +40,4 @@ probe_layer_ops.log
 probe_layer_groups.png
 probe_layer_groups.log
 test_workspace.log
+build_test.log

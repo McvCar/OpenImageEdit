@@ -45,7 +45,11 @@ WORK_DIR = os.path.join(ROOT, "tmp", "psd-roundtrip")
 WORK = os.path.join(WORK_DIR, "work.psd")
 COMPOSITE = os.path.join(WORK_DIR, "composite.psd")
 EXPECTED_LAYERS = 5  # PSD layer records (the synthetic background is skipped)
-TOGGLED_NAME = "普通图层"
+# fixture 的文档顺序（底 -> 顶）：背景底色 / 半透明 50% / 隐藏图层 / 负偏移+越界。
+# 选一个**原本可见**的层（半透明 50%，下标 3）切隐藏，才能验证「隐藏位真的
+# 写出去了」——切一个本来就隐藏的层只会把它点亮，flags 仍是 8，测不出问题。
+TOGGLED_INDEX = 3
+TOGGLED_NAME = "半透明 50%"
 HOOKS = (
     "IMAGEEDIT_PSD_STAGE2_DELAY_MS",
     "IMAGEEDIT_PSD_STAGE2_FAIL",
@@ -205,7 +209,7 @@ def phase_write():
     before = sha(WORK)
     lines = run_script(
         WORK,
-        "layers-dump;select-layer:2;toggle-visible-selected;save",
+        "layers-dump;select-layer:%d;toggle-visible-selected;save" % TOGGLED_INDEX,
         '"event":"saved"',
     )
     problems = []
@@ -420,10 +424,14 @@ def phase_saveas():
         problems.append("分组文档导出的 PSD 不存在")
     else:
         grouped = parse_psd(grp_dst)
-        if len(grouped["layers"]) != EXPECTED_LAYERS:
-            problems.append("分组导出后层记录 %d，应保持平铺 %d 层"
-                            % (len(grouped["layers"]), EXPECTED_LAYERS))
-        print("  grouped-export layers=%d groups=%s" % (
+        # 5 个图层 + 1 个组的两条分隔记录（组底 lsct 3 / 文件夹行 lsct 1|2）。
+        want = EXPECTED_LAYERS + 2
+        if len(grouped["layers"]) != want:
+            problems.append("分组导出后层记录 %d，应为 %d（组会写成两条分隔记录）"
+                            % (len(grouped["layers"]), want))
+        if not any(l["name"] == "组 1" for l in grouped["layers"]):
+            problems.append("分组导出后找不到组名记录（lsct 文件夹行没写）")
+        print("  grouped-export records=%d groups=%s" % (
             len(grouped["layers"]),
             saved[-1].get("groups") if saved else None))
     return problems

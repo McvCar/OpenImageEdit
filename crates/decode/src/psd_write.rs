@@ -77,6 +77,15 @@ struct PreparedLayer {
     visible: bool,
     blend: editcore::BlendMode,
     planes: [Vec<u8>; 4],
+    /// 所属分组（写 PSD 时要按它插 `lsct` 分隔记录）。
+    group: Option<editcore::GroupId>,
+}
+
+/// 一条 PSD 层记录：真图层，或者分组的分隔记录（文件夹行 / 组底边界）。
+enum PsdRecord {
+    Layer(PreparedLayer),
+    /// `section`：1 = 展开的文件夹，2 = 折叠的文件夹，3 = 组底边界。
+    Divider { name: String, section: u32 },
 }
 
 /// Build the PSD layer records. A PSD file stores layer records bottom-to-top,
@@ -146,6 +155,7 @@ fn prepare_layers(doc: &Document) -> Result<Vec<PreparedLayer>, crate::DecodeErr
             visible: layer.visible,
             blend: layer.blend,
             planes,
+            group: layer.group,
         });
     }
 
@@ -195,34 +205,76 @@ fn write_layer_record(out: &mut Vec<u8>, l: &PreparedLayer) -> Result<(), crate:
     if channel_len > u32::MAX as u64 {
         return Err(crate::DecodeError::Psd("层通道数据过大".into()));
     }
-    let channel_len = channel_len as u32;
+    write_record(
+        out,
+        (l.top, l.left, l.bottom, l.right),
+        channel_len as u32,
+        blend_key(l.blend),
+        l.opacity,
+        // Adobe's layer flags bit 1 is INVERTED: SET means HIDDEN. Photoshop
+        // writes bit 3 (`1 for Photoshop 5.0 and later`) on visible layers and
+        // never sets bit 1 unless the layer is hidden. Writing the vendor
+        // parser's old (wrong) `2 = visible` convention made every layer appear
+        // hidden in Photoshop / Krita / GIMP.
+        if l.visible { 8 } else { 8 | 2 },
+        &l.name,
+        None,
+    );
+    Ok(())
+}
 
-    push_i32(out, l.top);
-    push_i32(out, l.left);
-    push_i32(out, l.bottom); // exclusive (parser subtracts one)
-    push_i32(out, l.right);  // exclusive (parser subtracts one)
-    push_u16(out, 4);        // R, G, B, TransparencyMask
+/// 分组分隔记录：空矩形 + 4 个「只有压缩标记」的通道 + `8BIMlsct`。
+///
+/// Photoshop 的落盘顺序是**自底向上**，一个组在文件里长这样：
+/// `[lsct 3 组底边界] 成员… [lsct 1|2 文件夹行（带组名）]`。所以组底的
+/// 边界要在最低成员之前写，文件夹行在最高成员之后写（见 `prepare_records`）。
+fn write_divider_record(out: &mut Vec<u8>, name: &str, section: u32) {
+    write_record(
+        out,
+        (0, 0, 0, 0),
+        2, // 空通道：只有 2 字节压缩标记
+        b"norm",
+        255,
+        8,
+        name,
+        Some(section),
+    );
+}
+
+/// 单条记录的公共写手（图层与分隔记录只差 `lsct`）。
+#[allow(clippy::too_many_arguments)]
+fn write_record(
+    out: &mut Vec<u8>,
+    rect: (i32, i32, i32, i32),
+    channel_len: u32,
+    blend: &[u8; 4],
+    opacity: u8,
+    flags: u8,
+    name: &str,
+    lsct: Option<u32>,
+) {
+    let (top, left, bottom, right) = rect;
+    push_i32(out, top);
+    push_i32(out, left);
+    push_i32(out, bottom); // exclusive (parser subtracts one)
+    push_i32(out, right);  // exclusive (parser subtracts one)
+    push_u16(out, 4);      // R, G, B, TransparencyMask
     for id in [0i16, 1, 2, -1] {
         push_i16(out, id);
         push_u32(out, channel_len);
     }
     push_bytes(out, b"8BIM");
-    push_bytes(out, blend_key(l.blend));
-    push_u8(out, l.opacity); // 0 = transparent, 255 = opaque
-    push_u8(out, 0);         // clipping: base
-    // Adobe's layer flags bit 1 is INVERTED: SET means HIDDEN. Photoshop
-    // writes bit 3 (`1 for Photoshop 5.0 and later`) on visible layers and
-    // never sets bit 1 unless the layer is hidden. Writing the vendor
-    // parser's old (wrong) `2 = visible` convention made every layer appear
-    // hidden in Photoshop / Krita / GIMP.
-    push_u8(out, if l.visible { 8 } else { 8 | 2 });
+    push_bytes(out, blend);
+    push_u8(out, opacity); // 0 = transparent, 255 = opaque
+    push_u8(out, 0);       // clipping: base
+    push_u8(out, flags);
     push_u8(out, 0); // filler
 
     // ---- extra data ----
     let mut extra = Vec::new();
     push_u32(&mut extra, 0); // layer mask data length
     push_u32(&mut extra, 0); // layer blending ranges length
-    let ascii = ascii_placeholder(&l.name);
+    let ascii = ascii_placeholder(name);
     push_u8(&mut extra, ascii.len() as u8);
     push_bytes(&mut extra, &ascii);
     // Pascal name (1 length byte + bytes) is padded to a multiple of 4.
@@ -234,7 +286,7 @@ fn write_layer_record(out: &mut Vec<u8>, l: &PreparedLayer) -> Result<(), crate:
     // whole block to a 4-byte boundary and declare that padded length.
     push_bytes(&mut extra, b"8BIM");
     push_bytes(&mut extra, b"luni");
-    let units: Vec<u16> = l.name.encode_utf16().collect();
+    let units: Vec<u16> = name.encode_utf16().collect();
     let data_no_pad = 4usize + 2 * units.len();
     let pad = (4 - data_no_pad % 4) % 4;
     push_u32(&mut extra, (data_no_pad + pad) as u32);
@@ -244,9 +296,103 @@ fn write_layer_record(out: &mut Vec<u8>, l: &PreparedLayer) -> Result<(), crate:
     }
     push_zeros(&mut extra, pad);
 
+    // `8BIMlsct`: 分组分隔设置。4 字节类型，长度正好 4，无需补位。
+    if let Some(section) = lsct {
+        push_bytes(&mut extra, b"8BIM");
+        push_bytes(&mut extra, b"lsct");
+        push_u32(&mut extra, 4);
+        push_u32(&mut extra, section);
+    }
+
     push_u32(out, extra.len() as u32); // extra data length
     push_bytes(out, &extra);
-    Ok(())
+}
+
+/// 把图层与分组拼成一条自底向上的记录序列。
+///
+/// 组在 PSD 里是「两条分隔记录夹住成员」：底部一条 `lsct 3`，顶部一条带
+/// 组名的 `lsct 1|2`。嵌套组天然按同样规则递归（外层的组底更靠下）。
+fn prepare_records(doc: &editcore::Document, layers: Vec<PreparedLayer>) -> Vec<PsdRecord> {
+    // 组的祖先链（外层 → 内层）。
+    fn chain(doc: &editcore::Document, leaf: editcore::GroupId) -> Vec<editcore::GroupId> {
+        let mut out = Vec::new();
+        let mut next = Some(leaf);
+        let mut guard = 0;
+        while let Some(gid) = next {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(group) = doc.find_group(gid) else {
+                break;
+            };
+            out.push(group.id);
+            next = group.parent;
+        }
+        out.reverse();
+        out
+    }
+
+    let mut records: Vec<PsdRecord> = Vec::with_capacity(layers.len());
+    // 当前打开的组（外层 → 内层）
+    let mut open: Vec<editcore::GroupId> = Vec::new();
+    let mut written: std::collections::HashSet<editcore::GroupId> = Default::default();
+
+    for layer in layers {
+        let want = match layer.group {
+            Some(gid) => chain(doc, gid),
+            None => Vec::new(),
+        };
+        // 共同前缀保持不变，剩下的先关（内 → 外，文件夹行），再开（外 → 内，
+        // 组底边界）。顺序反了 Photoshop 会读成错乱的嵌套。
+        let common = open
+            .iter()
+            .zip(want.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        for gid in open[common..].iter().rev() {
+            if let Some(group) = doc.find_group(*gid) {
+                records.push(PsdRecord::Divider {
+                    name: group.name.clone(),
+                    section: if group.collapsed { 2 } else { 1 },
+                });
+            }
+        }
+        for gid in &want[common..] {
+            written.insert(*gid);
+            records.push(PsdRecord::Divider {
+                name: "</Layer group>".to_string(),
+                section: 3,
+            });
+        }
+        open = want;
+        records.push(PsdRecord::Layer(layer));
+    }
+    // 收尾：还开着的组从内往外关。
+    for gid in open.iter().rev() {
+        if let Some(group) = doc.find_group(*gid) {
+            records.push(PsdRecord::Divider {
+                name: group.name.clone(),
+                section: if group.collapsed { 2 } else { 1 },
+            });
+        }
+    }
+    // 一个成员都没写出的组（空组 / 成员全在画布外）：补一对空壳记录，
+    // 否则重开文件时这个组会凭空消失。
+    for group in &doc.groups {
+        if written.contains(&group.id) {
+            continue;
+        }
+        records.push(PsdRecord::Divider {
+            name: "</Layer group>".to_string(),
+            section: 3,
+        });
+        records.push(PsdRecord::Divider {
+            name: group.name.clone(),
+            section: if group.collapsed { 2 } else { 1 },
+        });
+    }
+    records
 }
 
 /// Encode a document as an 8-bit RGB PSD, one PSD layer per document layer
@@ -263,6 +409,7 @@ pub fn encode_psd(doc: &Document, _quality: u8) -> Result<Vec<u8>, crate::Decode
         return Err(crate::DecodeError::Psd("合成图尺寸与画布不一致".into()));
     }
     let layers = prepare_layers(doc)?;
+    let records = prepare_records(doc, layers);
 
     let mut out = Vec::new();
     // ---- File Header (26 bytes) ----
@@ -284,16 +431,34 @@ pub fn encode_psd(doc: &Document, _quality: u8) -> Result<Vec<u8>, crate::Decode
     // Positive layer_count: the parser takes abs(); a negative count only
     // signals a "first alpha = merged result" convention we don't rely on,
     // because our composite alpha lives in the Image Data section.
-    push_i16(&mut layer_info, layers.len() as i16);
-    for l in &layers {
-        write_layer_record(&mut layer_info, l)?;
+    if records.len() > i16::MAX as usize {
+        return Err(crate::DecodeError::Psd("图层数超过 PSD 上限 (32767)".into()));
+    }
+    push_i16(&mut layer_info, records.len() as i16);
+    for record in &records {
+        match record {
+            PsdRecord::Layer(l) => write_layer_record(&mut layer_info, l)?,
+            PsdRecord::Divider { name, section } => {
+                write_divider_record(&mut layer_info, name, *section)
+            }
+        }
     }
     // All channel DATA follows all records, in the same order the channel
-    // declarations above were written.
-    for l in &layers {
-        for plane in &l.planes {
-            push_u16(&mut layer_info, 0); // compression = RAW
-            push_bytes(&mut layer_info, plane);
+    // declarations above were written. Dividers declare four empty channels,
+    // so each contributes exactly the 2-byte compression marker.
+    for record in &records {
+        match record {
+            PsdRecord::Layer(l) => {
+                for plane in &l.planes {
+                    push_u16(&mut layer_info, 0); // compression = RAW
+                    push_bytes(&mut layer_info, plane);
+                }
+            }
+            PsdRecord::Divider { .. } => {
+                for _ in 0..4 {
+                    push_u16(&mut layer_info, 0);
+                }
+            }
         }
     }
     // Adobe spec: the Layer Info length is rounded up to a multiple of 2,
@@ -527,6 +692,7 @@ mod tests {
             visible: true,
             opacity: 1.0,
             blend: editcore::BlendMode::Normal,
+            group: None,
         };
         let doc = Document::from_psd_layers((4, 4), vec![seed("上层"), seed("下层")]);
         assert_eq!(doc.layers.len(), 3, "background + 2 seeds");

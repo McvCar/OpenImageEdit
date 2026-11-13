@@ -23,6 +23,13 @@ impl qobject::Bridge {
         );
     }
 
+    pub fn dump_panel_rows(self: Pin<&mut Self>, rows_json: &QString) {
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"panel-rows-dump\",\"rows\":{}}}",
+            rows_json
+        );
+    }
+
     pub fn open_file(mut self: Pin<&mut Self>, url: &QUrl) {
         let path = PathBuf::from(url.to_local_file_or_default().to_string());
         self.as_mut().load_path(&path);
@@ -325,8 +332,9 @@ impl qobject::Bridge {
             self.as_mut().set_dirty(false);
         }
         self.as_mut().update_file_info();
-        // PSD 写出的「层数 / 分组数」要如实报出来：分组只是本编辑器的元
-        // 数据，PSD 里会被展开成平级图层 —— 不提示的话，用户会以为是丢了。
+        // PSD 写出的「层数 / 分组数」要如实报出来。分组现在会写成 PSD 的
+        // lsct 分隔记录（PS 里看到的文件夹），所以这里只报数量，不再提示
+        // 「已展开」—— 那句话在分组写回落地后就是错的。
         let psd_report = if matches!(job.format, SaveFormat::Psd) {
             let (layers, groups) = self
                 .session
@@ -348,7 +356,7 @@ impl qobject::Bridge {
         if let Some((layers, groups)) = psd_report {
             let text = if groups > 0 {
                 format!(
-                    "已保存 PSD：{}（{layers} 个图层；{groups} 个分组已展开，不写入 PSD）",
+                    "已保存 PSD：{}（{layers} 个图层、{groups} 个图层组）",
                     job.path.display()
                 )
             } else {
@@ -951,7 +959,8 @@ impl qobject::Bridge {
         // implementer, not artwork. Remember their stable ids so the view menu
         // can hide / show them after the stack is editable.
         let annotation_flags: Vec<bool> = set.layers.iter().map(|l| l.annotation).collect();
-        let mut doc = Document::from_psd_layers(canvas, set.into_seeds());
+        let group_seeds = set.group_seeds();
+        let mut doc = Document::from_psd_layers_with_groups(canvas, set.into_seeds(), group_seeds);
         let mut annotation_ids: Vec<u32> = Vec::new();
         for (i, flag) in annotation_flags.iter().enumerate() {
             if !*flag {

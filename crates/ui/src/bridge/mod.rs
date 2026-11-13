@@ -277,6 +277,12 @@ pub mod qobject {
         #[qinvokable]
         fn mark(self: Pin<&mut Self>, name: &QString);
 
+        /// 探针：把 QML 侧算出来的「面板显示行」原样打个结构化事件。
+        /// 显示行（组标题 + 缩进 + 折叠）是 QML 拼的，Rust 看不到，所以由
+        /// QML 主动上报，探针再断言，避免用截图去猜层级。
+        #[qinvokable]
+        fn dump_panel_rows(self: Pin<&mut Self>, rows_json: &QString);
+
         #[qinvokable]
         fn open_file(self: Pin<&mut Self>, url: &QUrl);
 
