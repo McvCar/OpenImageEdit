@@ -693,6 +693,8 @@ mod tests {
             opacity: 1.0,
             blend: editcore::BlendMode::Normal,
             group: None,
+            mask: None,
+            clipping: false,
         };
         let doc = Document::from_psd_layers((4, 4), vec![seed("上层"), seed("下层")]);
         assert_eq!(doc.layers.len(), 3, "background + 2 seeds");

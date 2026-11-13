@@ -10,7 +10,7 @@
 //! into the layer rectangle (C3), then crop to the canvas. For a 4000x3000
 //! document with ten 10%-area layers this is ~48 MB instead of ~480 MB.
 
-use image::RgbaImage;
+use image::{GrayImage, Luma, RgbaImage};
 use psd::{ChannelBytes, PsdChannelKind};
 use std::collections::HashMap;
 
@@ -35,6 +35,10 @@ pub struct PsdLayerData {
     pub degraded: Vec<String>,
     /// PSD 里这层所属的文件夹（u32 是 PSD 自己的组编号，装配时再映射）。
     pub group: Option<u32>,
+    /// 图层蒙版（`-2` 通道），已按蒙版自己的矩形裁剪到画布范围。
+    pub mask: Option<editcore::LayerMask>,
+    /// 该层是剪贴蒙版（只在下层基底的不透明区域内可见）。
+    pub clipping: bool,
 }
 
 /// One PSD folder. `parent` / `psd_id` 用 PSD 自己的编号，`PsdLayerData::group`
@@ -59,6 +63,9 @@ pub struct PsdLayerSet {
     pub canvas: (u32, u32),
     /// File-level degradation notes (groups flattened, blend modes, ...).
     pub degraded: Vec<String>,
+    /// 带图层蒙版的层数 / 剪贴蒙版层数（诊断与探针用，二者现已正确参与合成）。
+    pub masked: usize,
+    pub clipped: usize,
     /// Whether the file carries a flattened composite (stage 1 uses it).
     pub has_composite: bool,
     /// Total bytes held by the layer bitmaps, for the memory budget probes.
@@ -96,6 +103,8 @@ impl PsdLayerSet {
                 opacity: l.opacity,
                 blend: l.blend,
                 group: l.group,
+                mask: l.mask,
+                clipping: l.clipping,
             })
             .collect()
     }
@@ -283,8 +292,17 @@ fn build_layers<F: FnMut(usize, usize)>(
     let mut total_bytes = 0usize;
     let mut baked_adjustments = 0usize;
     let mut styled_layers = 0usize;
+    let mut masked_layers = 0usize;
+    let mut clipped_layers = 0usize;
     let groups = psd.groups();
     let mut inherited_hidden = false;
+    // 诊断开关：把某一项特性关掉再合成，用 `dump-flat` 与 PS 合并图比对，
+    // 就能量出「这一项到底贡献了多少误差」。只在排查时用，平时全开。
+    let off = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
+    let no_styles = off("IMAGEEDIT_PSD_NO_STYLES");
+    let no_masks = off("IMAGEEDIT_PSD_NO_MASKS");
+    let no_clip = off("IMAGEEDIT_PSD_NO_CLIP");
+    let no_adjust = off("IMAGEEDIT_PSD_NO_ADJUST");
 
     // Bottom -> top: the vendor hands records back top -> bottom (it reverses
     // them on read), and `PsdLayerSet::layers` is documented as bottom -> top.
@@ -309,7 +327,7 @@ fn build_layers<F: FnMut(usize, usize)>(
         let bc = layer.brightness_contrast();
         let hs = layer.hue_saturation();
         if bc.is_some() || hs.is_some() {
-            if layer.visible() && layer.opacity() > 0 {
+            if !no_adjust && layer.visible() && layer.opacity() > 0 {
                 let clipped = layer.is_clipping_mask();
                 let start = adjustment_scope(&clips, clipped, layers.len());
                 apply_adjustment(&mut layers[start..], bc, hs);
@@ -336,8 +354,9 @@ fn build_layers<F: FnMut(usize, usize)>(
         if !ancestor_visible && layer.visible() {
             inherited_hidden = true;
         }
-        if layer.is_clipping_mask() {
-            notes.push("裁剪蒙版未保留".into());
+        let clipping = !no_clip && layer.is_clipping_mask();
+        if clipping {
+            clipped_layers += 1;
         }
         if left < 0 || top < 0 || right + 1 > cw || bottom + 1 > ch {
             notes.push("层越出画布，已按画布裁剪".into());
@@ -411,12 +430,25 @@ fn build_layers<F: FnMut(usize, usize)>(
         let mut image = image;
         let mut layer_offset = (x0, y0);
 
+        // ---- layer mask (`-2`) -----------------------------------------
+        // The mask channel is compressed against the mask's OWN rectangle,
+        // which is usually the whole canvas while the layer is a small
+        // sticker. Reading it at the layer rect shears the mask.
+        let mask = if no_masks {
+            None
+        } else {
+            decode_mask(layer, chans, cw, ch)
+        };
+        if mask.is_some() {
+            masked_layers += 1;
+        }
+
         // ---- layer styles (lfx2) ---------------------------------------
         // Photoshop stores shadow / stroke / overlay as parameters; without
         // baking them the layer looks flat (a title loses its gradient fill,
         // a button loses its outline). `bake` renders them into the bitmap and
         // reports any style it could not draw.
-        if let Some(effects) = layer.layer_effects() {
+        if let Some(effects) = layer.layer_effects().filter(|_| !no_styles) {
             if let Some(baked) = crate::psd_effects::bake(&image, layer_offset, effects) {
                 image = baked.image;
                 layer_offset = baked.offset;
@@ -438,6 +470,8 @@ fn build_layers<F: FnMut(usize, usize)>(
             opacity: (layer.opacity() as f32 / 255.0) * ancestor_opacity,
             blend,
             degraded: notes,
+            mask,
+            clipping,
         });
         clips.push(layer.is_clipping_mask());
         progress(step + 1, total);
@@ -498,6 +532,8 @@ fn build_layers<F: FnMut(usize, usize)>(
         groups: group_list,
         canvas,
         degraded,
+        masked: masked_layers,
+        clipped: clipped_layers,
         // Stage 1 always has the composite from `decode_psd_bytes`; if it
         // failed the file would not have been opened at all.
         has_composite: true,
@@ -710,6 +746,60 @@ fn channel_plane(
         }
         ChannelBytes::RleCompressed(v) => Some(unpack_packbits(v, pixels)),
     }
+}
+
+/// 解出一层的图层蒙版（`-2` 通道），按**蒙版自己的矩形**裁剪到画布范围。
+///
+/// 蒙版矩形通常就是整幅画布，而图层往往只是画布上的一个小贴片 —— 用图层
+/// 矩形去解释蒙版通道会把蒙版错位。取不到通道 / 蒙版被 PS 关掉时返回 `None`
+/// （等价于「无蒙版」，不会误把整层遮住）。
+fn decode_mask(
+    layer: &psd::PsdLayer,
+    chans: &psd::LayerChannels,
+    cw: i32,
+    ch: i32,
+) -> Option<editcore::LayerMask> {
+    if !layer.has_active_mask() {
+        return None;
+    }
+    let m = layer.mask_rect()?;
+    let (mw, mh) = (m.width(), m.height());
+    if mw == 0 || mh == 0 {
+        return None;
+    }
+    let pixels = mw as u64 * mh as u64;
+    if pixels > 300_000_000 {
+        return None;
+    }
+    let mut plane = channel_plane(
+        chans,
+        PsdChannelKind::UserSuppliedLayerMask,
+        pixels as usize,
+    )?;
+    // 通道数据比矩形短（截断文件）时按 0 补齐：蒙版缺数据 = 遮住，绝不能
+    // 让下面的平面索引越界。
+    plane.resize(pixels as usize, 0);
+    let x0 = m.left.max(0);
+    let y0 = m.top.max(0);
+    let x1 = ((m.right as i64 + 1).min(cw as i64)) as i32;
+    let y1 = ((m.bottom as i64 + 1).min(ch as i64)) as i32;
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let mut img = GrayImage::new((x1 - x0) as u32, (y1 - y0) as u32);
+    for y in y0..y1 {
+        let sy = (y - m.top) as usize;
+        for x in x0..x1 {
+            let sx = (x - m.left) as usize;
+            let v = plane[sy * mw as usize + sx];
+            img.put_pixel((x - x0) as u32, (y - y0) as u32, Luma([v]));
+        }
+    }
+    Some(editcore::LayerMask::with_default(
+        img,
+        (x0, y0),
+        m.default_color,
+    ))
 }
 
 fn unpack_packbits(data: &[u8], expected: usize) -> Vec<u8> {
@@ -1354,8 +1444,9 @@ mod tests {
         if let Some(m) = mask_side {
             push_i32(&mut extra, 0);
             push_i32(&mut extra, 0);
-            push_i32(&mut extra, m as i32);
-            push_i32(&mut extra, m as i32);
+            // Rectangle is inclusive: a `m`-wide mask ends at `m - 1`.
+            push_i32(&mut extra, (m - 1) as i32);
+            push_i32(&mut extra, (m - 1) as i32);
             extra.push(0); // default colour
             extra.push(0); // flags
             extra.extend_from_slice(&[0, 0]);
@@ -1409,6 +1500,22 @@ mod tests {
             "unexpected degrade notes: {:?}",
             set.degraded
         );
+        // The mask itself must come out at its own size (2x2), not at the
+        // layer's 8x8: the channel is compressed against the mask rectangle.
+        let mask = set.layers[0].mask.as_ref().expect("用户蒙版应被保留");
+        assert_eq!(mask.image.dimensions(), (2, 2));
+        assert_eq!(mask.offset, (0, 0));
+        assert_eq!(mask.image.get_pixel(0, 0).0[0], 128);
+        assert_eq!(set.masked, 1);
+    }
+
+    /// A layer without `-2` must not sprout an empty mask (which would hide it).
+    #[test]
+    fn layer_without_mask_channel_has_no_mask() {
+        let bytes = make_psd_with_mask(8, None, false);
+        let set = decode_psd_layers(&bytes, DecodeOptions::default()).expect("parses");
+        assert!(set.layers[0].mask.is_none());
+        assert_eq!(set.masked, 0);
     }
 
     #[test]
@@ -1448,6 +1555,12 @@ mod tests {
             ms(t),
             set.layer_count(),
             set.bytes / 1_048_576
+        );
+        let visible_masked = set.layers.iter().filter(|l| l.mask.is_some() && l.visible).count();
+        let visible_clipped = set.layers.iter().filter(|l| l.clipping && l.visible).count();
+        println!(
+            "masks     {:>8} (visible {}), clipping {:>4} (visible {})",
+            set.masked, visible_masked, set.clipped, visible_clipped
         );
         let t = std::time::Instant::now();
         let _ = decode_psd_layers(&bytes, DecodeOptions::default()).expect("layers");

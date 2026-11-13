@@ -47,6 +47,46 @@ pub struct LayerProperties {
     /// Layer styles (`lfx2` block), when present. Disabled styles are kept:
     /// the decoder filters on `enabled`.
     pub(crate) layer_effects: Option<Vec<crate::effects::LayerEffect>>,
+    /// Rectangle of the user layer mask (channel `-2`), when the layer has one.
+    pub(crate) mask_rect: Option<MaskRect>,
+}
+
+/// Where a layer's mask lives, plus the "mask disabled" flag.
+///
+/// The mask channel is compressed against **its own** rectangle, which is not
+/// the layer rectangle: a mask is often the whole canvas while the layer is a
+/// small sticker. Reading the layer rect for the mask shears it, and reading
+/// the mask rect for the layer shears the layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaskRect {
+    /// Top edge of the mask rectangle, in canvas pixels.
+    pub top: i32,
+    /// Left edge of the mask rectangle, in canvas pixels.
+    pub left: i32,
+    /// Bottom edge of the mask rectangle, in canvas pixels.
+    pub bottom: i32,
+    /// Right edge of the mask rectangle, in canvas pixels.
+    pub right: i32,
+    /// Photoshop's "disable layer mask" checkbox: the pixels are still in the
+    /// file, but the mask does not take part in the composite.
+    pub disabled: bool,
+    /// Colour used for every pixel *outside* the mask rectangle (0 or 255).
+    ///
+    /// A mask rectangle smaller than its layer is normal (Photoshop shrinks it
+    /// to the edited area); everything outside takes this value. Treating it as
+    /// 0 unconditionally hides content the artist never masked out.
+    pub default_color: u8,
+}
+
+impl MaskRect {
+    /// Width of the mask rectangle in pixels.
+    pub fn width(&self) -> u32 {
+        (self.right - self.left + 1).max(0) as u32
+    }
+    /// Height of the mask rectangle in pixels.
+    pub fn height(&self) -> u32 {
+        (self.bottom - self.top + 1).max(0) as u32
+    }
 }
 
 /// Brightness/contrast adjustment layer settings (`brit`).
@@ -115,7 +155,19 @@ impl LayerProperties {
             brightness_contrast: layer_record.brightness_contrast,
             hue_saturation: layer_record.hue_saturation,
             layer_effects: layer_record.layer_effects.clone(),
+            mask_rect: layer_record.mask_rect,
         }
+    }
+
+    /// Rectangle of this layer's user mask, if it has one.
+    pub fn mask_rect(&self) -> Option<MaskRect> {
+        self.mask_rect
+    }
+
+    /// `true` when the layer carries a mask that actually takes part in the
+    /// composite (present and not disabled).
+    pub fn has_active_mask(&self) -> bool {
+        matches!(self.mask_rect, Some(m) if !m.disabled)
     }
 
     /// Brightness/contrast settings, when this layer is such an adjustment.
@@ -484,6 +536,8 @@ pub struct LayerRecord {
     pub(super) hue_saturation: Option<HueSaturation>,
     /// Layer styles ("lfx2"), when present
     pub(super) layer_effects: Option<Vec<crate::effects::LayerEffect>>,
+    /// User layer mask rectangle (channel `-2`), when present
+    pub(super) mask_rect: Option<MaskRect>,
 }
 
 impl LayerRecord {

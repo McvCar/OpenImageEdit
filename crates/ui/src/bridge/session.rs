@@ -798,6 +798,12 @@ impl Session {
                 if group_count > 0 {
                     text.push_str(&format!("、{group_count} 个图层组"));
                 }
+                if set.masked > 0 || set.clipped > 0 {
+                    text.push_str(&format!(
+                        "、{} 个图层蒙版、{} 个剪贴蒙版",
+                        set.masked, set.clipped
+                    ));
+                }
                 if !set.degraded.is_empty() {
                     text.push_str(&format!(
                         "（已降级 {} 项：{}）",

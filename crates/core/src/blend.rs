@@ -111,6 +111,38 @@ pub(crate) fn blend_normal(out: &mut [u8; 4], src: [u8; 4], a: f32) {
     out[3] = ((a + out[3] as f32 / 255.0 * inv) * 255.0).round() as u8;
 }
 
+/// `blend_pixel` 的浮点版本，用于整幅合成。
+///
+/// 输出缓冲是**直通 alpha 的 f32**（0..=1），颜色分量也是 0..=1。公式与
+/// `blend_pixel` 逐项一致，唯一区别是中间结果不再每层 round 到 u8 —— 一张
+/// 有几十层堆叠的 PSD 每层都舍入一次会累积 1~2/255 的系统性偏移，保真模式
+/// 下这就是可见的色差。
+pub(crate) fn blend_pixel_f32(out: &mut [f32; 4], src: [f32; 4], opacity: f32, mode: BlendMode) {
+    let a = src[3] * opacity;
+    if a <= 0.0 {
+        return;
+    }
+    if mode.is_normal() {
+        let inv = 1.0 - a;
+        for c in 0..3 {
+            out[c] = src[c] * a + out[c] * inv;
+        }
+        out[3] = a + out[3] * inv;
+        return;
+    }
+    let ab = out[3];
+    let cb = [out[0], out[1], out[2]];
+    let cs = [src[0], src[1], src[2]];
+    let mixed = blend_rgb(mode, cb, cs);
+    let inv = 1.0 - a;
+    for c in 0..3 {
+        // 背景透明处没有可混合的颜色，源色自己保留（与 u8 版一致）。
+        let eff = cs[c] * (1.0 - ab) + mixed[c] * ab;
+        out[c] = eff * a + cb[c] * inv;
+    }
+    out[3] = a + ab * inv;
+}
+
 /// Blend two straight colours (0..=1 components), returning the blended colour.
 fn blend_rgb(mode: BlendMode, b: [f32; 3], s: [f32; 3]) -> [f32; 3] {
     match mode {

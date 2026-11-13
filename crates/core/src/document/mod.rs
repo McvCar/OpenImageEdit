@@ -146,6 +146,10 @@ pub struct PsdLayerSeed {
     /// PSD 里这层所属的组（`PsdGroupSeed::psd_id`）。PSD 用 u32 给组编号，
     /// 我们的 `GroupId` 是进程内自增，装配时再映射一次。
     pub group: Option<u32>,
+    /// 图层蒙版（`-2` 通道），已裁剪到画布范围。
+    pub mask: Option<LayerMask>,
+    /// 该层是剪贴蒙版（只在下层基底的不透明区域内可见）。
+    pub clipping: bool,
 }
 
 /// One PSD folder ("layer group"). `layers` 里的成员通过 `PsdLayerSeed::group`
@@ -181,6 +185,8 @@ mod psd_assembly_tests {
             opacity,
             blend: BlendMode::Normal,
             group: None,
+            mask: None,
+            clipping: false,
         }
     }
 
@@ -229,6 +235,59 @@ mod psd_assembly_tests {
             vec![seed("hidden", (0, 0), [200, 10, 30, 255], (4, 4), false, 1.0)],
         );
         assert_eq!(doc.flatten().get_pixel(1, 1).0[3], 0);
+    }
+
+    /// 蒙版把 alpha 按 `mask/255` 缩放：左边遮住的部分完全透明。
+    #[test]
+    fn layer_mask_multiplies_alpha() {
+        use image::{GrayImage, Luma};
+        let mut s = seed("masked", (0, 0), [200, 10, 30, 255], (4, 1), true, 1.0);
+        let mut m = GrayImage::new(4, 1);
+        for x in 0..4u32 {
+            m.put_pixel(x, 0, Luma([if x < 2 { 0 } else { 255 }]));
+        }
+        s.mask = Some(LayerMask::new(m, (0, 0)));
+        let doc = Document::from_psd_layers((4, 1), vec![s]);
+        let flat = doc.flatten();
+        assert_eq!(flat.get_pixel(0, 0).0[3], 0, "蒙版 0 处必须透明");
+        assert_eq!(flat.get_pixel(3, 0).0, [200, 10, 30, 255]);
+    }
+
+    /// 剪贴层只在基底不透明的地方出现。
+    #[test]
+    fn clipped_layer_only_shows_where_base_is_opaque() {
+        let base = seed("base", (0, 0), [0, 0, 0, 255], (2, 4), true, 1.0);
+        let mut top = seed("clip", (0, 0), [255, 0, 0, 255], (4, 4), true, 1.0);
+        top.clipping = true;
+        let doc = Document::from_psd_layers((4, 4), vec![base, top]);
+        let flat = doc.flatten();
+        assert_eq!(flat.get_pixel(0, 0).0, [255, 0, 0, 255], "基底内应显示剪贴层");
+        assert_eq!(flat.get_pixel(3, 0).0[3], 0, "基底外剪贴层必须不可见");
+    }
+
+    /// 基底被隐藏时，整条剪贴链跟着消失（PS 语义）。
+    #[test]
+    fn hidden_base_hides_the_whole_clip_chain() {
+        let mut base = seed("base", (0, 0), [0, 0, 0, 255], (4, 4), true, 1.0);
+        base.visible = false;
+        let mut top = seed("clip", (0, 0), [255, 0, 0, 255], (4, 4), true, 1.0);
+        top.clipping = true;
+        let doc = Document::from_psd_layers((4, 4), vec![base, top]);
+        assert_eq!(doc.flatten().get_pixel(1, 1).0[3], 0);
+    }
+
+    /// 剪贴链共享最下面那个非剪贴基底：两张剪贴层叠起来仍受同一个基底约束。
+    #[test]
+    fn clip_chain_shares_one_base() {
+        let base = seed("base", (0, 0), [0, 0, 0, 255], (2, 2), true, 1.0);
+        let mut a = seed("a", (0, 0), [255, 0, 0, 255], (4, 4), true, 1.0);
+        a.clipping = true;
+        let mut b = seed("b", (0, 0), [0, 0, 255, 255], (4, 4), true, 1.0);
+        b.clipping = true;
+        let doc = Document::from_psd_layers((4, 4), vec![base, a, b]);
+        let flat = doc.flatten();
+        assert_eq!(flat.get_pixel(0, 0).0, [0, 0, 255, 255]);
+        assert_eq!(flat.get_pixel(3, 3).0[3], 0);
     }
 
     #[test]
@@ -309,6 +368,8 @@ impl Document {
             layer.visible = seed.visible;
             layer.opacity = seed.opacity.clamp(0.0, 1.0);
             layer.blend = seed.blend;
+            layer.mask = seed.mask;
+            layer.clipping = seed.clipping;
             layer.locked = false;
             layer.background = false;
             layer.group = seed.group.and_then(|gid| group_of.get(&gid).copied());
@@ -1286,49 +1347,87 @@ impl Document {
 
     /// 全幅合成：按 `layers` 顺序自底向上，位图按 offset + 不透明度混合，
     /// 标记按不透明度栅格化到累积图。**顺序即 z 序** —— 标记不再天然置顶。
+    ///
+    /// 两件 PSD 语义在这里落地：
+    /// - **图层蒙版**：`alpha *= mask/255`（蒙版有自己的矩形）；
+    /// - **剪贴蒙版**：剪贴层只在下方第一个非剪贴层的不透明区域内可见。
+    ///
+    /// 累积缓冲是 f32 直通 alpha，**整幅只在最后量化一次**。旧实现每叠一层
+    /// 就 round 到 u8，这个文件平均每像素叠 33 层，累积漂移 1~2/255 —— 在
+    /// 保真模式下就是肉眼可见的色差。
     pub fn flatten(&self) -> RgbaImage {
-        let mut out = RgbaImage::new(self.canvas.width, self.canvas.height);
+        let w = self.canvas.width;
+        let h = self.canvas.height;
+        if w == 0 || h == 0 {
+            return RgbaImage::new(w, h);
+        }
+        let n = w as usize * h as usize;
+        let mut acc = vec![[0f32; 4]; n];
+        // 剪贴基底层的 alpha 覆盖率（不含不透明度）。剪贴层逐像素乘上它；
+        // 隐藏的基底覆盖率是 0，于是整条剪贴链一起消失 —— 与 PS 一致。
+        let mut clip = vec![0f32; n];
         for layer in &self.layers {
+            if !layer.clipping {
+                // 隐藏 / 全透明的基底覆盖率为 0，于是整条剪贴链一起消失。
+                // 注意：基底只是「半透明」（opacity 0.5）时覆盖率仍是满的 ——
+                // PS 里降基底层不透明度不会削弱上面的剪贴层。
+                if layer.visible && layer.opacity > 0.0 {
+                    fill_clip_coverage(&mut clip, w, h, layer);
+                } else {
+                    clip.fill(0.0);
+                }
+            }
             if !layer.visible || layer.opacity <= 0.0 {
                 continue;
             }
+            let clip_alpha = if layer.clipping {
+                Some(&clip[..])
+            } else {
+                None
+            };
             match &layer.content {
                 LayerContent::Raster(r) => {
-                    blend_raster_into(&mut out, r, layer.opacity, layer.blend)
+                    composite_raster(&mut acc, w, h, r, layer, clip_alpha)
                 }
                 LayerContent::Mark(m) => {
+                    // 标记不能先栅格化到空图：马赛克要采样**当前已合成**的
+                    // 画面才能算出块平均。所以先把累积缓冲物化，再按旧语义
+                    // 直接画上去，最后写回。
+                    let mut tmp = acc_to_image(&acc, w, h);
                     if layer.opacity >= 0.999 {
-                        m.draw(&mut out);
-                    } else {
-                        // 标记的不透明度：先画到副本，再按系数回混。
-                        let mut tmp = out.clone();
                         m.draw(&mut tmp);
-                        for (dst, src) in out.pixels_mut().zip(tmp.pixels()) {
+                    } else {
+                        let before = tmp.clone();
+                        m.draw(&mut tmp);
+                        for (dst, src) in tmp.pixels_mut().zip(before.pixels()) {
                             let p = dst.0;
+                            let q = src.0;
                             dst.0 = [
                                 (p[0] as f32 * (1.0 - layer.opacity)
-                                    + src.0[0] as f32 * layer.opacity)
+                                    + q[0] as f32 * layer.opacity)
                                     .round() as u8,
                                 (p[1] as f32 * (1.0 - layer.opacity)
-                                    + src.0[1] as f32 * layer.opacity)
+                                    + q[1] as f32 * layer.opacity)
                                     .round() as u8,
                                 (p[2] as f32 * (1.0 - layer.opacity)
-                                    + src.0[2] as f32 * layer.opacity)
+                                    + q[2] as f32 * layer.opacity)
                                     .round() as u8,
                                 (p[3] as f32 * (1.0 - layer.opacity)
-                                    + src.0[3] as f32 * layer.opacity)
+                                    + q[3] as f32 * layer.opacity)
                                     .round() as u8,
                             ];
                         }
                     }
+                    store_image(&mut acc, &tmp);
                 }
             }
         }
-        out
+        acc_to_image(&acc, w, h)
     }
 }
 
 /// 把 `src` 按 `opacity` 叠到 `out` 上（正常模式，与旧 `composite_pixel` 逐像素一致）。
+#[allow(dead_code)]
 pub(crate) fn blend_over(out: &mut [u8; 4], src: [u8; 4], opacity: f32) {
     blend_over_with(out, src, opacity, BlendMode::Normal);
 }
@@ -1344,7 +1443,135 @@ pub(crate) fn blend_over_with(
 }
 
 /// 把一个位图图层按 offset 混合进整幅画布。
+#[allow(dead_code)]
 fn blend_raster_into(out: &mut RgbaImage, r: &RasterLayer, opacity: f32, mode: BlendMode) {
     blend_image_at_mode(out, &r.image, r.offset.0, r.offset.1, opacity, mode);
+}
+
+/// 把 f32 累积缓冲量化成一张 8 位图（整幅唯一的一次量化）。
+fn acc_to_image(acc: &[[f32; 4]], w: u32, h: u32) -> RgbaImage {
+    let mut out = RgbaImage::new(w, h);
+    for (px, v) in out.pixels_mut().zip(acc.iter()) {
+        px.0 = [
+            (v[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (v[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (v[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (v[3] * 255.0).round().clamp(0.0, 255.0) as u8,
+        ];
+    }
+    out
+}
+
+/// 把一张 8 位图写回 f32 累积缓冲（标记直绘之后用）。
+fn store_image(acc: &mut [[f32; 4]], img: &RgbaImage) {
+    for (v, px) in acc.iter_mut().zip(img.pixels()) {
+        let p = px.0;
+        *v = [
+            p[0] as f32 / 255.0,
+            p[1] as f32 / 255.0,
+            p[2] as f32 / 255.0,
+            p[3] as f32 / 255.0,
+        ];
+    }
+}
+
+/// 写出一层自身的 alpha 覆盖率（位图 alpha × 蒙版），画布尺寸、f32 0..=1。
+///
+/// 只用于剪贴蒙版的基底层：剪贴层看到的是基底的**不透明度**，而不是它的
+/// 混合效果，所以这里不能走合成路径。隐藏的基底同样要写（写出来是 0），
+/// 否则上一条剪贴链会错误地沿用更下面那层的覆盖率。
+fn fill_clip_coverage(out: &mut [f32], w: u32, h: u32, layer: &Layer) {
+    out.fill(0.0);
+    match &layer.content {
+        LayerContent::Raster(r) => {
+            write_coverage(out, w, h, &r.image, r.offset, layer.mask.as_ref())
+        }
+        LayerContent::Mark(_) => {
+            let (plane, offset) = layer.plane();
+            write_coverage(out, w, h, &plane, offset, layer.mask.as_ref())
+        }
+    }
+}
+
+fn write_coverage(
+    out: &mut [f32],
+    w: u32,
+    h: u32,
+    img: &RgbaImage,
+    offset: (i32, i32),
+    mask: Option<&LayerMask>,
+) {
+    let x0 = offset.0.max(0);
+    let y0 = offset.1.max(0);
+    let x1 = (offset.0 + img.width() as i32).min(w as i32);
+    let y1 = (offset.1 + img.height() as i32).min(h as i32);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let a = img.get_pixel((x - offset.0) as u32, (y - offset.1) as u32).0[3];
+            if a == 0 {
+                continue;
+            }
+            let mut cov = a as f32 / 255.0;
+            if let Some(m) = mask {
+                cov *= m.coverage(x, y);
+            }
+            if cov > 0.0 {
+                out[y as usize * w as usize + x as usize] = cov;
+            }
+        }
+    }
+}
+
+/// 一层位图叠进 f32 累积缓冲（蒙版、剪贴、混合模式都在这里生效）。
+fn composite_raster(
+    acc: &mut [[f32; 4]],
+    w: u32,
+    h: u32,
+    r: &RasterLayer,
+    layer: &Layer,
+    clip: Option<&[f32]>,
+) {
+    if layer.opacity <= 0.0 {
+        return;
+    }
+    let x0 = r.offset.0.max(0);
+    let y0 = r.offset.1.max(0);
+    let x1 = (r.offset.0 + r.image.width() as i32).min(w as i32);
+    let y1 = (r.offset.1 + r.image.height() as i32).min(h as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let px = r
+                .image
+                .get_pixel((x - r.offset.0) as u32, (y - r.offset.1) as u32)
+                .0;
+            if px[3] == 0 {
+                continue;
+            }
+            let mut src = [
+                px[0] as f32 / 255.0,
+                px[1] as f32 / 255.0,
+                px[2] as f32 / 255.0,
+                px[3] as f32 / 255.0,
+            ];
+            if let Some(m) = &layer.mask {
+                src[3] *= m.coverage(x, y);
+            }
+            if let Some(c) = clip {
+                src[3] *= c[y as usize * w as usize + x as usize];
+            }
+            if src[3] <= 0.0 {
+                continue;
+            }
+            crate::blend::blend_pixel_f32(
+                &mut acc[y as usize * w as usize + x as usize],
+                src,
+                layer.opacity,
+                layer.blend,
+            );
+        }
+    }
 }
 

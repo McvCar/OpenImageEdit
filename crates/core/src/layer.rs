@@ -1,5 +1,6 @@
 // crates/core/src/layer.rs
 use super::*;
+use image::GrayImage;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// 稳定图层 id。
@@ -93,6 +94,50 @@ pub enum LayerContent {
     Mark(Mark),
 }
 
+/// 图层蒙版：灰度图（0 = 完全遮住，255 = 完全显示）+ 它的画布坐标偏移。
+///
+/// 蒙版有自己的矩形（通常是整幅画布），与图层位图的矩形无关 —— 用图层矩形
+/// 去解释蒙版通道会把蒙版错位/剪切。合成时 `alpha *= mask/255`。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayerMask {
+    pub image: GrayImage,
+    pub offset: (i32, i32),
+    /// 蒙版矩形**外**的取值（PS 只存 0 或 255）。
+    ///
+    /// 蒙版矩形比图层小是正常现象（PS 会把矩形缩到真正涂过的区域），矩形
+    /// 外按这个默认色算。一律当成 0 会把用户从没遮掉的内容藏起来。
+    pub default: u8,
+}
+
+impl LayerMask {
+    pub fn new(image: GrayImage, offset: (i32, i32)) -> Self {
+        Self {
+            image,
+            offset,
+            default: 0,
+        }
+    }
+
+    /// 带「矩形外默认色」的构造（PSD 导入用）。
+    pub fn with_default(image: GrayImage, offset: (i32, i32), default: u8) -> Self {
+        Self {
+            image,
+            offset,
+            default,
+        }
+    }
+
+    /// 某个画布坐标上的覆盖系数，0.0..=1.0；蒙版矩形外取 `default`。
+    pub fn coverage(&self, x: i32, y: i32) -> f32 {
+        let lx = x - self.offset.0;
+        let ly = y - self.offset.1;
+        if lx < 0 || ly < 0 || lx >= self.image.width() as i32 || ly >= self.image.height() as i32 {
+            return self.default as f32 / 255.0;
+        }
+        self.image.get_pixel(lx as u32, ly as u32).0[0] as f32 / 255.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Layer {
     pub id: LayerId,
@@ -105,6 +150,12 @@ pub struct Layer {
     pub background: bool,
     /// 与下方已合成内容混合的方式（PSD 打开时带入，默认正常）。
     pub blend: BlendMode,
+    /// 图层蒙版（PSD 的 `-2` 通道），`None` = 无蒙版。
+    pub mask: Option<LayerMask>,
+    /// 剪贴蒙版：本层只在**下方第一个非剪贴层**的不透明区域内可见。
+    ///
+    /// 一组连续的剪贴层共享同一个基底层（PSD 里「剪贴蒙版」的语义）。
+    pub clipping: bool,
     /// 所属分组（`None` = 不属于任何组）。组只影响面板组织与批量显隐，
     /// 不改变 z 序、不参与合成。`duplicated()` 会继承它。
     pub group: Option<GroupId>,
@@ -143,6 +194,8 @@ impl Layer {
             opacity: 1.0,
             background: false,
             blend: BlendMode::Normal,
+            mask: None,
+            clipping: false,
             group: None,
             content: LayerContent::Raster(RasterLayer {
                 image,
@@ -219,6 +272,8 @@ impl Layer {
             opacity: 1.0,
             background: false,
             blend: BlendMode::Normal,
+            mask: None,
+            clipping: false,
             group: None,
             content: LayerContent::Mark(mark),
         }

@@ -423,6 +423,8 @@ mod group_tests {
             opacity: 1.0,
             blend: BlendMode::Normal,
             group,
+            mask: None,
+            clipping: false,
         };
         // 底 -> 顶：底层无组，中层在「内层」组，顶层在「外层」组。
         let mut doc = Document::from_psd_layers_with_groups(

@@ -336,25 +336,31 @@ impl qobject::Bridge {
         // lsct 分隔记录（PS 里看到的文件夹），所以这里只报数量，不再提示
         // 「已展开」—— 那句话在分组写回落地后就是错的。
         let psd_report = if matches!(job.format, SaveFormat::Psd) {
-            let (layers, groups) = self
+            let (layers, groups, masks, clips) = self
                 .session
                 .borrow()
                 .as_ref()
-                .map(|s| (s.doc.layers.len(), s.doc.groups.len()))
-                .unwrap_or((0, 0));
+                .map(|s| {
+                    let masks = s.doc.layers.iter().filter(|l| l.mask.is_some()).count();
+                    let clips = s.doc.layers.iter().filter(|l| l.clipping).count();
+                    (s.doc.layers.len(), s.doc.groups.len(), masks, clips)
+                })
+                .unwrap_or((0, 0, 0, 0));
             println!(
-                "{{\"phase\":\"ui\",\"event\":\"psd-saved\",\"path\":\"{}\",\"layers\":{},\"groups\":{}}}",
+                "{{\"phase\":\"ui\",\"event\":\"psd-saved\",\"path\":\"{}\",\"layers\":{},\"groups\":{},\"masks\":{},\"clips\":{}}}",
                 job.path.display().to_string().replace('\\', "/"),
                 layers,
-                groups
+                groups,
+                masks,
+                clips
             );
-            Some((layers, groups))
+            Some((layers, groups, masks, clips))
         } else {
             None
         };
         self.as_mut().report_save(Ok(job.path.clone()));
-        if let Some((layers, groups)) = psd_report {
-            let text = if groups > 0 {
+        if let Some((layers, groups, masks, clips)) = psd_report {
+            let mut text = if groups > 0 {
                 format!(
                     "已保存 PSD：{}（{layers} 个图层、{groups} 个图层组）",
                     job.path.display()
@@ -365,6 +371,13 @@ impl qobject::Bridge {
                     job.path.display()
                 )
             };
+            // 蒙版 / 剪贴还没写进 PSD（P0 只做了读与合成）。不说清楚的话，
+            // 用户下次打开会发现蒙版没了 —— 那才是真正的数据丢失。
+            if masks > 0 || clips > 0 {
+                text.push_str(&format!(
+                    "；{masks} 个图层蒙版、{clips} 个剪贴层暂未写回 PSD"
+                ));
+            }
             self.as_mut().set_status(QString::from(text.as_str()));
         }
     }

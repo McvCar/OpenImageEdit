@@ -7,7 +7,7 @@ use crate::sections::image_data_section::ChannelBytes;
 use crate::sections::layer_and_mask_information_section::groups::Groups;
 use crate::sections::layer_and_mask_information_section::layer::{
     BlendMode, BrightnessContrast, GroupDivider, HueSaturation, LayerChannels, LayerRecord,
-    PsdGroup, PsdLayer, PsdLayerError,
+    MaskRect, PsdGroup, PsdLayer, PsdLayerError,
 };
 use crate::sections::layer_and_mask_information_section::layers::Layers;
 use crate::sections::PsdCursor;
@@ -249,14 +249,10 @@ impl LayerAndMaskInformationSection {
 
         let mut result = vec![];
         for layer_record in layer_records {
-            // `height()` is `bottom - top + 1`; a corrupt record can make it
-            // negative, and `as usize` would turn that into a huge scanline
-            // count (then `2 * scanlines` overflows and panics).
-            let scanlines = layer_record.height().max(0) as usize;
             let channels = read_layer_channels(
                 cursor,
                 &layer_record.channel_data_lengths,
-                scanlines,
+                &layer_record,
             )?;
 
             result.push((layer_record, channels));
@@ -284,15 +280,34 @@ impl LayerAndMaskInformationSection {
 }
 
 /// Reads layer channels
+///
+/// Each channel's RLE payload starts with a per-scanline byte-count table, and
+/// the number of scanlines is **per channel**, not per layer: the mask channels
+/// (`-2` / `-3`) are compressed against the mask rectangle, which is often a
+/// completely different size from the layer. Stripping the table with the
+/// layer's height threw those channels away (they looked "too short") and the
+/// mask came out empty — the whole layer then showed at full opacity.
 fn read_layer_channels(
     cursor: &mut PsdCursor,
     channel_data_lengths: &Vec<(PsdChannelKind, u32)>,
-    scanlines: usize,
+    layer_record: &LayerRecord,
 ) -> Result<LayerChannels, PsdLayerError> {
     let capacity = channel_data_lengths.len();
     let mut channels = HashMap::with_capacity(capacity);
 
     for (channel_kind, channel_length) in channel_data_lengths.iter() {
+        // `height()` is `bottom - top + 1`; a corrupt record can make it
+        // negative, and `as usize` would turn that into a huge scanline count
+        // (then `2 * scanlines` overflows and panics).
+        let scanlines = match channel_kind {
+            PsdChannelKind::UserSuppliedLayerMask | PsdChannelKind::RealUserSuppliedLayerMask => {
+                layer_record
+                    .mask_rect
+                    .map(|m| m.height() as usize)
+                    .unwrap_or(0)
+            }
+            _ => layer_record.height().max(0) as usize,
+        };
         let compression = cursor.read_u16();
         let compression = PsdChannelCompression::new(compression)
             .ok_or(PsdLayerError::InvalidCompression { compression })?;
@@ -441,9 +456,37 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
     // We do not currently use the length of the extra data field, skip it
     cursor.read_4();
 
-    // We do not currently use the layer mask data, skip it
-    let layer_mask_data_len = cursor.read_u32();
-    cursor.read(layer_mask_data_len);
+    // Layer mask / adjustment layer data. A non-empty block starts with the
+    // mask's own rectangle (not the layer's), then default colour, flags, 2 pad
+    // bytes; a "real" user mask block follows when the length reaches 36.
+    // We keep the rectangle + disabled flag: the mask channel `-2` is
+    // compressed against that rectangle, and without it the mask would be
+    // applied at the layer's coordinates (sheared whenever the two differ).
+    let layer_mask_data_len = cursor.read_u32() as usize;
+    let mut mask_rect = None;
+    if layer_mask_data_len >= 20 {
+        let top = cursor.read_i32();
+        let left = cursor.read_i32();
+        let bottom = cursor.read_i32();
+        let right = cursor.read_i32();
+        let default_color = cursor.read_u8();
+        // bit 0 = mask position relative to layer; bit 1 = mask disabled
+        let flags = cursor.read_u8();
+        cursor.read_2();
+        mask_rect = Some(MaskRect {
+            top,
+            left,
+            bottom,
+            right,
+            disabled: flags & 2 != 0,
+            default_color,
+        });
+        // Rect + default colour + flags + pad is 20 bytes; a "real" user mask
+        // block (another 16 in the 36-byte variant) follows and is skipped.
+        cursor.read((layer_mask_data_len - 20) as u32);
+    } else {
+        cursor.read(layer_mask_data_len as u32);
+    }
 
     // We do not currently use the layer blending range, skip it
     let layer_blending_range_data_len = cursor.read_u32();
@@ -576,5 +619,6 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
         brightness_contrast,
         hue_saturation,
         layer_effects,
+        mask_rect,
     })
 }

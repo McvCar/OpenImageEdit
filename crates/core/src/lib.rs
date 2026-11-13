@@ -37,7 +37,7 @@ pub use selection::{
 };
 pub use mark::{MarkKind, Mark};
 pub use layer::{
-    next_group_id, thumbnail_image, GroupId, Layer, LayerContent, LayerGroup, LayerId,
+    next_group_id, thumbnail_image, GroupId, Layer, LayerContent, LayerGroup, LayerId, LayerMask,
     RasterLayer,
 };
 pub use layer_ops::{AlignEdge, DistributeAxis};

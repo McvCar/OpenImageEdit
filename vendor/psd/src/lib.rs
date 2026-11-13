@@ -26,7 +26,7 @@ pub use crate::sections::image_resources_section::ImageResource;
 use crate::sections::image_resources_section::ImageResourcesSection;
 pub use crate::sections::image_resources_section::{DescriptorField, UnitFloatStructure};
 pub use crate::sections::layer_and_mask_information_section::layer::{
-    BlendMode, BrightnessContrast, HueSaturation, LayerChannels, PsdGroup, PsdLayer,
+    BlendMode, BrightnessContrast, HueSaturation, LayerChannels, MaskRect, PsdGroup, PsdLayer,
 };
 use crate::sections::layer_and_mask_information_section::LayerAndMaskInformationSection;
 use crate::sections::MajorSections;
