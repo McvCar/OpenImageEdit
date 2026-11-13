@@ -447,6 +447,60 @@ impl qobject::Bridge {
                             });
                     }
                 }
+                // `layer-list` —— 每层一行 JSON（下标 / 名字 / 尺寸 / offset），
+                // 逐层保真比对时先用它把 PSD 里的层名对到本项目的下标。
+                "layer-list" => {
+                    let guard = self.session.borrow();
+                    if let Some(session) = guard.as_ref() {
+                        for (ix, layer) in session.doc.layers.iter().enumerate() {
+                            let img = layer.img();
+                            let name = layer.name.replace('\\', "\\\\").replace('"', "\\\"");
+                            println!(
+                                "{{\"phase\":\"ui\",\"event\":\"layer\",\"index\":{ix},\
+                                 \"name\":\"{name}\",\"w\":{},\"h\":{},\"ox\":{},\"oy\":{},\
+                                 \"visible\":{},\"opacity\":{:.3},\"blend\":\"{:?}\"}}",
+                                img.width(),
+                                img.height(),
+                                layer.offset().0,
+                                layer.offset().1,
+                                layer.visible,
+                                layer.opacity,
+                                layer.blend
+                            );
+                        }
+                    }
+                }
+                // `dump-layer:index[,path]` —— 把单个图层的位图写成 PNG，
+                // 供逐层保真比对（跟 PSD 里同层的 topil() 比）。逐层比才能
+                // 把「合成语义错」和「样式烘焙错」分开。
+                other if other.starts_with("dump-layer:") => {
+                    let rest = other.trim_start_matches("dump-layer:");
+                    let mut parts = rest.splitn(2, ',');
+                    let ix: i32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+                    let path = parts.next().unwrap_or("").trim().to_string();
+                    let guard = self.session.borrow();
+                    if let Some(session) = guard.as_ref() {
+                        if let Some(layer) = session.doc.layers.get(ix.max(0) as usize) {
+                            let img = layer.img();
+                            let out = if path.is_empty() {
+                                format!("tmp/layer-{ix}.png")
+                            } else {
+                                path
+                            };
+                            let _ = encode(img, Format::Png, 92).map(|bytes| {
+                                std::fs::write(&out, bytes).ok();
+                                println!(
+                                    "{{\"phase\":\"ui\",\"event\":\"dump-layer\",\"index\":{ix},\
+                                     \"path\":\"{out}\",\"w\":{},\"h\":{},\"ox\":{},\"oy\":{}}}",
+                                    img.width(),
+                                    img.height(),
+                                    layer.offset().0,
+                                    layer.offset().1
+                                );
+                            });
+                        }
+                    }
+                }
                 "marks-undo" => {                    self.as_mut().undo();
                     self.as_mut().undo();
                     self.as_mut().undo();

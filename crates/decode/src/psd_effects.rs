@@ -24,6 +24,24 @@
 //! stroke, inner shadow, inner glow   (clipped to the content)
 //! colour / gradient overlay          (over the content)
 //! ```
+//!
+//! Geometry follows Photoshop, not convenience, because a style baked *slightly*
+//! wrong is worse than one baked coarsely — it moves hundreds of layers' pixels
+//! in a consistent direction:
+//!
+//! * the shadow offset is `(-cos, +sin) × distance` (light at 90° comes from the
+//!   top, so the shadow falls down), rounded to whole pixels;
+//! * an inner shadow moves the *hole* along that same vector, so it lands on the
+//!   lit side;
+//! * a linear gradient spans the *chord* of the bounds along its angle, not the
+//!   projection of the bounds;
+//! * soft falloffs are two box passes of width `size` (a tent), which is what
+//!   Photoshop's Size slider draws — a gaussian of `σ = size / 2` spreads the same
+//!   mass much further out and dims the edge;
+//! * spread / choke dilates by `size × spread` whole pixels and blurs with the
+//!   remaining `size × (1 - spread)`, instead of brightening a band by hand;
+//! * distances are a 5 × 5 chamfer (steps 1, √2, √5) seeded by the alpha, which
+//!   is the metric Photoshop's stroke and glow edges follow.
 
 use image::{Rgba, RgbaImage};
 use psd::effects::{
@@ -69,6 +87,26 @@ fn skip_kind(kind: EffectKind) -> bool {
     list.iter().any(|s| s == name || s == "all")
 }
 
+/// Diagnostic ablation of the *geometry* rules, so each can be measured on its own
+/// against the PSD's merged image: `IMAGEEDIT_FX_LEGACY=dir,grad,bounds,blur,dist`.
+///
+/// `dir` puts the shadows back on the old offset vector, `grad` spans the bounds'
+/// projection instead of the chord, `bounds` lays gradients out over the ink
+/// instead of the layer rect, `blur` uses the old gaussian, `dist` the old 3 × 3
+/// chamfer. Off by default; a wrong value here is a bug, not an option.
+fn legacy(axis: &str) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("IMAGEEDIT_FX_LEGACY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    list.iter().any(|s| s == axis || s == "all")
+}
+
 /// Bake every enabled style into `image`.
 ///
 /// Returns `None` when there is nothing to do, so callers can keep the
@@ -93,18 +131,22 @@ pub fn bake(image: &RgbaImage, offset: (i32, i32), effects: &[LayerEffect]) -> O
     let mut pad = Padding::default();
     for e in &active {
         match e.kind {
-            EffectKind::DropShadow | EffectKind::OuterGlow => {
-                let margin = blur_margin(e.size);
-                let (dx, dy) = (e.distance * e.angle.to_radians().cos(), e.distance * e.angle.to_radians().sin());
-                let (dx, dy) = if e.kind == EffectKind::DropShadow {
-                    (dx.round() as i32, dy.round() as i32)
-                } else {
-                    (0, 0)
-                };
-                pad.left = pad.left.max(margin + (-dx).max(0));
-                pad.right = pad.right.max(margin + dx.max(0));
-                pad.top = pad.top.max(margin + (-dy).max(0));
-                pad.bottom = pad.bottom.max(margin + dy.max(0));
+            EffectKind::DropShadow => {
+                // The shadow is the shape moved by the offset and then blurred by
+                // `size`, so its reach is both.
+                let (dx, dy) = offset_vector(e.distance, e.angle);
+                let reach = blur_margin(e.size);
+                pad.left = pad.left.max(reach - dx.min(0));
+                pad.right = pad.right.max(reach + dx.max(0));
+                pad.top = pad.top.max(reach - dy.min(0));
+                pad.bottom = pad.bottom.max(reach + dy.max(0));
+            }
+            EffectKind::OuterGlow => {
+                let reach = blur_margin(e.size);
+                pad.left = pad.left.max(reach);
+                pad.right = pad.right.max(reach);
+                pad.top = pad.top.max(reach);
+                pad.bottom = pad.bottom.max(reach);
             }
             EffectKind::Stroke => {
                 let reach = match e.stroke_position {
@@ -179,40 +221,41 @@ pub fn bake(image: &RgbaImage, offset: (i32, i32), effects: &[LayerEffect]) -> O
     }
 
     // ---- 3. inside the content: stroke, inner shadow, inner glow --------
-    let bbox = alpha_bounds(&alpha, w, h);
-    // One distance field per direction, shared by every style that needs it.
-    let need_in = active.iter().any(|e| {
-        e.kind == EffectKind::InnerGlow
-            || e.kind == EffectKind::InnerShadow
-            || (e.kind == EffectKind::Stroke && e.stroke_position != StrokePosition::Outside)
-    });
-    let need_out = active.iter().any(|e| {
-        e.kind == EffectKind::OuterGlow
-            || (e.kind == EffectKind::Stroke && e.stroke_position != StrokePosition::Inside)
-    });
-    let inside: Vec<bool> = alpha.iter().map(|a| *a >= 0.5).collect();
-    let outside: Vec<bool> = inside.iter().map(|b| !b).collect();
-    let dist_in = if need_in {
-        distance_to(&outside, w, h)
+    // Overlays and the gradient stroke are laid out over the *layer's* bounds (a
+    // style with `Algn` covers the layer rect, not the ink), so that is the frame
+    // they run across.
+    let bounds_layer = [ox as f32, oy as f32, (ox + iw as i64 - 1) as f32, (oy + ih as i64 - 1) as f32];
+    let bounds = if legacy("bounds") {
+        alpha_bounds(&alpha, w, h)
     } else {
-        Vec::new()
+        bounds_layer
     };
-    let dist_out = if need_out {
-        distance_to(&inside, w, h)
+    // Distance fields, one per side, built only for what actually needs them.
+    let strokes: Vec<&&LayerEffect> = active.iter().filter(|e| e.kind == EffectKind::Stroke).collect();
+    let need_in = strokes.iter().any(|e| e.stroke_position != StrokePosition::Outside);
+    let need_out = strokes.iter().any(|e| e.stroke_position != StrokePosition::Inside);
+    let (dist_in, dist_out) = if legacy("dist") {
+        let inside: Vec<bool> = alpha.iter().map(|a| *a >= 0.5).collect();
+        let outside: Vec<bool> = inside.iter().map(|b| !b).collect();
+        let din = if need_in { distance_to(&outside, w, h) } else { Vec::new() };
+        let dout = if need_out { distance_to(&inside, w, h) } else { Vec::new() };
+        (din, dout)
     } else {
-        Vec::new()
+        let din = if need_in { dist_inside(&alpha, w, h) } else { Vec::new() };
+        let dout = if need_out { dist_outside(&alpha, w, h) } else { Vec::new() };
+        (din, dout)
     };
 
     for e in &active {
         match e.kind {
             EffectKind::Stroke => {
-                draw_stroke(&mut out, w, h, &alpha, &dist_in, &dist_out, bbox, e);
+                draw_stroke(&mut out, w, h, &alpha, &dist_in, &dist_out, bounds, e);
             }
             EffectKind::InnerShadow => {
-                draw_inner_shadow(&mut out, w, h, &alpha, &dist_in, e);
+                draw_inner_shadow(&mut out, w, h, &alpha, e);
             }
             EffectKind::InnerGlow => {
-                draw_inner_glow(&mut out, w, h, &alpha, &dist_in, e);
+                draw_inner_glow(&mut out, w, h, &alpha, e);
             }
             _ => {}
         }
@@ -222,7 +265,7 @@ pub fn bake(image: &RgbaImage, offset: (i32, i32), effects: &[LayerEffect]) -> O
     for e in &active {
         match e.kind {
             EffectKind::ColorOverlay => draw_color_overlay(&mut out, w, h, &alpha, e),
-            EffectKind::GradientOverlay => draw_gradient_overlay(&mut out, w, h, &alpha, bbox, e),
+            EffectKind::GradientOverlay => draw_gradient_overlay(&mut out, w, h, &alpha, bounds, e),
             EffectKind::PatternOverlay => {
                 notes.push("图层样式「图案叠加」暂不支持".into());
             }
@@ -234,6 +277,20 @@ pub fn bake(image: &RgbaImage, offset: (i32, i32), effects: &[LayerEffect]) -> O
     }
 
     let new_offset = (offset.0 - pad.left, offset.1 - pad.top);
+    if let Ok(v) = std::env::var("IMAGEEDIT_FX_TRACE") {
+        if let Some((tx, ty)) = v.split_once(',').and_then(|(a, b)| {
+            Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?))
+        }) {
+            if tx < w && ty < h {
+                eprintln!(
+                    "fx-result   [{}] ({tx},{ty}) = {:?}  offset {new_offset:?} pad {:?}",
+                    trace_label(),
+                    out.get_pixel(tx, ty).0,
+                    (pad.left, pad.top),
+                );
+            }
+        }
+    }
     Some(Baked {
         image: out,
         offset: new_offset,
@@ -249,28 +306,10 @@ struct Padding {
     bottom: i32,
 }
 
-/// How far a gaussian of `size` reaches before it is visually zero.
+/// How far a tent of `size` reaches before it is visually zero: its half-width is
+/// `size` (two box passes of that width), plus a pixel of slack.
 fn blur_margin(size: f32) -> i32 {
-    (size * 1.5).ceil() as i32 + 2
-}
-
-/// Axis-aligned bounds of everything with alpha above noise, in pixels.
-fn alpha_bounds(alpha: &[f32], w: u32, h: u32) -> [f32; 4] {
-    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-    for y in 0..h {
-        for x in 0..w {
-            if alpha[(y * w + x) as usize] > 0.02 {
-                x0 = x0.min(x as f32);
-                y0 = y0.min(y as f32);
-                x1 = x1.max(x as f32);
-                y1 = y1.max(y as f32);
-            }
-        }
-    }
-    if x0 > x1 {
-        return [0.0, 0.0, w as f32 - 1.0, h as f32 - 1.0];
-    }
-    [x0, y0, x1, y1]
+    size.ceil() as i32 + 2
 }
 
 fn composite(
@@ -286,6 +325,12 @@ fn composite(
     if a <= 0.0 {
         return;
     }
+    if trace_at(x, y) {
+        eprintln!(
+            "fx-composite [{}] ({x},{y}) color {color:?} cov {coverage:.3} op {opacity:.3} mode {mode:?}",
+            trace_label()
+        );
+    }
     let w = out.width();
     let idx = ((y * w + x) * 4) as usize;
     let data = out.as_mut();
@@ -299,15 +344,53 @@ fn composite(
     data[idx..idx + 4].copy_from_slice(&px);
 }
 
+/// Diagnostic: `IMAGEEDIT_FX_TRACE=x,y` prints every style composite at that
+/// pixel (buffer coordinates), so a wrong colour can be traced to the effect and
+/// the value that produced it.
+fn trace_at(x: u32, y: u32) -> bool {
+    static TRACE: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+    let at = TRACE.get_or_init(|| {
+        let v = std::env::var("IMAGEEDIT_FX_TRACE").ok()?;
+        let mut it = v.split(',');
+        let x = it.next()?.trim().parse().ok()?;
+        let y = it.next()?.trim().parse().ok()?;
+        Some((x, y))
+    });
+    *at == Some((x, y))
+}
+
+/// The layer whose styles are being baked, for [`trace_at`]'s output: tracing a
+/// pixel is useless without knowing which layer's buffer it is.
+static TRACE_LABEL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Name the layer that [`bake`] is about to render (diagnostics only).
+pub fn set_trace_label(name: &str) {
+    if let Ok(mut slot) = TRACE_LABEL.lock() {
+        slot.clear();
+        slot.push_str(name);
+    }
+}
+
+fn trace_label() -> String {
+    TRACE_LABEL
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_default()
+}
+
 fn draw_drop_shadow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: &LayerEffect) {
     let (dx, dy) = offset_vector(e.distance, e.angle);
-    let shifted = shift_mask(alpha, w, h, dx, dy);
-    let soft = blur_mask(&shifted, w, h, e.size);
+    let shifted = shift_mask(alpha, w, h, dx, dy, 0.0);
+    // Photoshop splits Size into spread and blur: the spread grows the outline by
+    // whole pixels first, the blur keeps what is left.
+    let (grow, soft) = spread_split(e.size, e.choke);
+    let grown = dilate(&shifted, w, h, grow);
+    let blurred = tent_blur(&grown, w, h, soft);
     let mode = blend_of(e.blend);
     for y in 0..h {
         for x in 0..w {
             let i = (y * w + x) as usize;
-            let mut cov = soft[i];
+            let mut cov = blurred[i];
             if e.knocks_out {
                 cov *= 1.0 - alpha[i];
             }
@@ -320,17 +403,16 @@ fn draw_drop_shadow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: &Laye
 }
 
 fn draw_outer_glow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: &LayerEffect) {
-    let inside: Vec<bool> = alpha.iter().map(|a| *a >= 0.5).collect();
-    let dist = distance_to(&inside, w, h);
-    let radius = e.size.max(0.5);
+    // The default "Softer" technique: the shape's outline grown by the spread and
+    // blurred, read through the default 50 % Range (which doubles the blurred
+    // edge's 0.5 to full strength).
+    let (grow, soft) = spread_split(e.size, e.choke);
+    let grown = dilate(alpha, w, h, grow);
+    let blurred = tent_blur(&grown, w, h, soft);
     let mode = blend_of(e.blend);
     for y in 0..h {
         for x in 0..w {
-            let d = dist[(y * w + x) as usize];
-            if d <= 0.0 {
-                continue;
-            }
-            let cov = (1.0 - d / radius).clamp(0.0, 1.0);
+            let cov = (blurred[(y * w + x) as usize] * 2.0).min(1.0);
             if cov <= 0.002 {
                 continue;
             }
@@ -346,43 +428,44 @@ fn draw_stroke(
     alpha: &[f32],
     dist_in: &[f32],
     dist_out: &[f32],
-    bbox: [f32; 4],
+    bounds: [f32; 4],
     e: &LayerEffect,
 ) {
     let size = e.size.max(0.5);
     let mode = blend_of(e.blend);
     let gradient = e.gradient.as_ref().filter(|_| e.stroke_fill == StrokeFill::Gradient);
+    // The band is measured from the shape's edge outwards / inwards, so an
+    // outside stroke is exactly `size` px wide whatever the edge's angle.
+    let (out_half, in_half) = match e.stroke_position {
+        StrokePosition::Outside => (size, 0.0),
+        StrokePosition::Inside => (0.0, size),
+        StrokePosition::Center => (size / 2.0, size / 2.0),
+    };
     for y in 0..h {
         for x in 0..w {
             let i = (y * w + x) as usize;
-            let cov = match e.stroke_position {
-                StrokePosition::Outside => {
-                    let d = dist_out.get(i).copied().unwrap_or(0.0);
-                    if d < 0.5 {
-                        continue;
-                    }
-                    (size + 0.5 - d).clamp(0.0, 1.0)
-                }
-                StrokePosition::Inside => {
-                    let d = dist_in.get(i).copied().unwrap_or(0.0);
-                    (size + 0.5 - d).clamp(0.0, 1.0) * alpha[i]
-                }
-                StrokePosition::Center => {
-                    let half = size / 2.0;
-                    let d = if dist_out.get(i).copied().unwrap_or(0.0) > 0.0 {
-                        dist_out[i]
-                    } else {
-                        dist_in.get(i).copied().unwrap_or(0.0)
-                    };
-                    (half + 0.5 - d).clamp(0.0, 1.0)
-                }
-            };
+            let a = alpha[i];
+            let mut cov = 0.0f32;
+            // The inside half of the band lies over the content, so it takes the
+            // content's alpha.
+            if in_half > 0.0 && a > INSIDE_EPS {
+                let d = dist_in.get(i).copied().unwrap_or(0.0).max(0.0);
+                cov = (in_half - d).clamp(0.0, 1.0) * a;
+            }
+            // The outside half follows the contour, which runs *through* an
+            // antialiased border pixel: only its uncovered share is outside.
+            if out_half > 0.0 && a < 1.0 - INSIDE_EPS {
+                let d = dist_out.get(i).copied().unwrap_or(0.0).max(0.0);
+                let band = (out_half - d).clamp(0.0, 1.0);
+                let share = if a <= INSIDE_EPS { 1.0 } else { 1.0 - a };
+                cov = cov.max(band * share);
+            }
             if cov <= 0.002 {
                 continue;
             }
             let (color, mut a) = match gradient {
                 Some(g) => {
-                    let t = gradient_t(x as f32, y as f32, bbox, g);
+                    let t = gradient_t(x as f32, y as f32, bounds, g);
                     let (c, ga) = g.sample(t);
                     (c, ga)
                 }
@@ -397,36 +480,22 @@ fn draw_stroke(
     }
 }
 
-fn draw_inner_shadow(
-    out: &mut RgbaImage,
-    w: u32,
-    h: u32,
-    alpha: &[f32],
-    dist_in: &[f32],
-    e: &LayerEffect,
-) {
+fn draw_inner_shadow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: &LayerEffect) {
     let (dx, dy) = offset_vector(e.distance, e.angle);
-    // The shadow is the shape's silhouette moved the other way, blurred, then
-    // clipped to the shape: exactly Photoshop's "inner shadow".
+    // The shadow is the *hole* (everything outside the shape) moved by the same
+    // offset the light would push it, blurred, then clipped to the shape: that
+    // puts the shadow on the lit side, as Photoshop's inner shadow does.
     let inverse: Vec<f32> = alpha.iter().map(|a| 1.0 - a).collect();
-    let shifted = shift_mask(&inverse, w, h, -dx, -dy);
-    let mut soft = blur_mask(&shifted, w, h, e.size);
-    if e.choke > 0.0 {
-        // Choke pulls the shadow towards the edge; approximating it by
-        // dropping the blurred value where the pixel is "far enough" in.
-        let reach = e.choke / 100.0 * e.size.max(1.0);
-        for i in 0..soft.len() {
-            let d = dist_in.get(i).copied().unwrap_or(0.0);
-            if d > 0.0 && d < reach {
-                soft[i] = soft[i].max(0.5);
-            }
-        }
-    }
+    let (sx, sy) = if legacy("dir") { (-dx, -dy) } else { (dx, dy) };
+    let shifted = shift_mask(&inverse, w, h, sx, sy, 1.0);
+    let (grow, soft) = spread_split(e.size, e.choke);
+    let grown = dilate(&shifted, w, h, grow);
+    let blurred = tent_blur(&grown, w, h, soft);
     let mode = blend_of(e.blend);
     for y in 0..h {
         for x in 0..w {
             let i = (y * w + x) as usize;
-            let cov = alpha[i] * soft[i];
+            let cov = alpha[i] * blurred[i];
             if cov <= 0.002 {
                 continue;
             }
@@ -435,28 +504,26 @@ fn draw_inner_shadow(
     }
 }
 
-fn draw_inner_glow(
-    out: &mut RgbaImage,
-    w: u32,
-    h: u32,
-    alpha: &[f32],
-    dist_in: &[f32],
-    e: &LayerEffect,
-) {
-    let radius = e.size.max(0.5);
+fn draw_inner_glow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: &LayerEffect) {
+    let inverse: Vec<f32> = alpha.iter().map(|a| 1.0 - a).collect();
+    let (grow, soft) = spread_split(e.size, e.choke);
+    let grown = dilate(&inverse, w, h, grow);
+    let blurred = tent_blur(&grown, w, h, soft);
     let mode = blend_of(e.blend);
+    let from_center = e.glow_source == GlowSource::Center;
     for y in 0..h {
         for x in 0..w {
             let i = (y * w + x) as usize;
             if alpha[i] <= 0.002 {
                 continue;
             }
-            let d = dist_in.get(i).copied().unwrap_or(0.0);
-            let t = match e.glow_source {
-                GlowSource::Edge => 1.0 - d / radius,
-                GlowSource::Center => d / radius,
+            // Default 50 % Range: what the contour leaves at half strength is full.
+            let mut t = (blurred[i] * 2.0).min(1.0);
+            if from_center {
+                // A centre-source glow is the edge glow inverted, measured after
+                // the range (Photoshop 27.11).
+                t = 1.0 - t;
             }
-            .clamp(0.0, 1.0);
             let cov = alpha[i] * t;
             if cov <= 0.002 {
                 continue;
@@ -513,19 +580,87 @@ fn blend_of(mode: psd::BlendMode) -> editcore::BlendMode {
 
 /// Photoshop's angle/distance pair as an image-space offset.
 ///
-/// Photoshop measures the light angle counter-clockwise from the +x axis with
-/// +y pointing **up**, so 90° is "light from the top" and pushes a drop shadow
-/// down the screen. Image rows grow downwards, hence the unchanged sign on y.
+/// The light angle is measured counter-clockwise with +y pointing **up**, so 90°
+/// is "light from the top"; the shadow falls *away* from the light, i.e. down the
+/// screen. Image rows grow downwards, so the vertical component keeps its sign
+/// while the horizontal one flips — Photoshop's default 120°/5 px shadow lands
+/// bottom-right, which is what this produces. Photoshop snaps the offset to whole
+/// pixels.
 fn offset_vector(distance: f32, angle_deg: f32) -> (i32, i32) {
     let rad = angle_deg.to_radians();
+    if legacy("dir") {
+        return (
+            (distance * rad.cos()).round() as i32,
+            (distance * rad.sin()).round() as i32,
+        );
+    }
     (
-        (distance * rad.cos()).round() as i32,
+        (-distance * rad.cos()).round() as i32,
         (distance * rad.sin()).round() as i32,
     )
 }
 
+/// Axis-aligned bounds of everything with alpha above noise, in pixels.
+fn alpha_bounds(alpha: &[f32], w: u32, h: u32) -> [f32; 4] {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for y in 0..h {
+        for x in 0..w {
+            if alpha[(y * w + x) as usize] > 0.02 {
+                x0 = x0.min(x as f32);
+                y0 = y0.min(y as f32);
+                x1 = x1.max(x as f32);
+                y1 = y1.max(y as f32);
+            }
+        }
+    }
+    if x0 > x1 {
+        return [0.0, 0.0, w as f32 - 1.0, h as f32 - 1.0];
+    }
+    [x0, y0, x1, y1]
+}
+
 /// Position of `(x, y)` along the ramp, 0..1.
-fn gradient_t(x: f32, y: f32, bbox: [f32; 4], g: &Gradient) -> f32 {
+///
+/// A Linear or Reflected gradient spans the **chord** of the bounds along its
+/// angle (`min(w / |cos|, h / |sin|)`), not the projection of the bounds: on a
+/// wide, flat layer at 45° the two differ by several times, and Photoshop uses
+/// the chord.
+fn gradient_t(x: f32, y: f32, bounds: [f32; 4], g: &Gradient) -> f32 {
+    if legacy("grad") {
+        return gradient_t_projected(x, y, bounds, g);
+    }
+    let w = (bounds[2] - bounds[0] + 1.0).max(1.0);
+    let h = (bounds[3] - bounds[1] + 1.0).max(1.0);
+    // Pixel centres: (x0 + x1 + 1) / 2.
+    let cx = bounds[0] + w * 0.5;
+    let cy = bounds[1] + h * 0.5;
+    let scale = (g.scale / 100.0).clamp(0.01, 100.0);
+    let rad = g.angle.to_radians();
+    let (s, c) = rad.sin_cos();
+    let dx = x - cx;
+    let dy = y - cy;
+    // Distance along the gradient direction (image rows grow downwards).
+    let along = dx * c - dy * s;
+    let across = dx * s + dy * c;
+    let chord = ((w / c.abs().max(1e-6)).min(h / s.abs().max(1e-6)).max(1.0)) * scale;
+    let len = ((c * w).powi(2) + (s * h).powi(2)).sqrt().max(1.0) * scale;
+    // Linear samples the pixel's top-left corner, half a pixel before its centre.
+    let corner = 0.5 * (c - s);
+    let t = match g.kind {
+        GradientKind::Linear => (along - corner) / chord + 0.5,
+        GradientKind::Reflected => ((along - corner) / (chord * 0.5)).abs(),
+        GradientKind::Radial => (dx * dx + dy * dy).sqrt() / (len * 0.5),
+        GradientKind::Angle => {
+            // Clockwise sweep starting at the gradient angle.
+            (rad - (-dy).atan2(dx)) / std::f32::consts::TAU
+        }
+        GradientKind::Diamond => (along.abs() + across.abs()) / (len * 0.5),
+    };
+    t.clamp(0.0, 1.0)
+}
+
+/// The pre-2026-11 geometry: the ramp spans the bounds' projection onto the angle.
+fn gradient_t_projected(x: f32, y: f32, bbox: [f32; 4], g: &Gradient) -> f32 {
     let cx = (bbox[0] + bbox[2]) * 0.5;
     let cy = (bbox[1] + bbox[3]) * 0.5;
     let hw = ((bbox[2] - bbox[0]) * 0.5).max(0.5);
@@ -534,7 +669,6 @@ fn gradient_t(x: f32, y: f32, bbox: [f32; 4], g: &Gradient) -> f32 {
     let t = match g.kind {
         GradientKind::Linear | GradientKind::Reflected => {
             let rad = g.angle.to_radians();
-            // +y is up for Photoshop angles, so negate the row component.
             let dir = (rad.cos(), -rad.sin());
             let proj = (x - cx) * dir.0 + (y - cy) * dir.1;
             let half = (hw * dir.0.abs() + hh * dir.1.abs()).max(0.5) * scale;
@@ -564,31 +698,254 @@ fn gradient_t(x: f32, y: f32, bbox: [f32; 4], g: &Gradient) -> f32 {
 }
 
 /// `out[p] = mask[p - (dx, dy)]`, i.e. the mask's content moved by (+dx, +dy).
-fn shift_mask(mask: &[f32], w: u32, h: u32, dx: i32, dy: i32) -> Vec<f32> {
-    let mut out = vec![0.0f32; mask.len()];
-    if dx == 0 && dy == 0 {
-        out.copy_from_slice(mask);
-        return out;
-    }
-    for y in 0..h as i32 {
+///
+/// `outside` fills what the shift pulls in from beyond the buffer: a shadow moves
+/// a transparent shape (0), an inner shadow moves the *hole* (1).
+fn shift_mask(mask: &[f32], w: u32, h: u32, dx: i32, dy: i32, outside: f32) -> Vec<f32> {
+    let mut out = vec![outside; mask.len()];
+    let (wi, hi) = (w as i32, h as i32);
+    for y in 0..hi {
         let sy = y - dy;
-        if sy < 0 || sy >= h as i32 {
+        if sy < 0 || sy >= hi {
             continue;
         }
-        for x in 0..w as i32 {
+        for x in 0..wi {
             let sx = x - dx;
-            if sx < 0 || sx >= w as i32 {
+            if sx < 0 || sx >= wi {
                 continue;
             }
-            out[(y as u32 * w + x as u32) as usize] = mask[(sy as u32 * w + sx as u32) as usize];
+            out[(y * wi + x) as usize] = mask[(sy * wi + sx) as usize];
         }
     }
     out
 }
 
-/// Three box passes ≈ a gaussian of `sigma = size / 2`, which is how Photoshop
-/// scales its "size" slider.
-fn blur_mask(mask: &[f32], w: u32, h: u32, size: f32) -> Vec<f32> {
+/// Photoshop's Size/Spread split: the spread grows the outline by `size × spread`
+/// whole pixels, the blur keeps the remaining `size × (1 - spread)`.
+fn spread_split(size: f32, spread_pct: f32) -> (f32, f32) {
+    let spread = (spread_pct / 100.0).clamp(0.0, 1.0);
+    ((size * spread).round(), size * (1.0 - spread))
+}
+
+/// Grows a soft map by `r` px (anti-aliased): a partly covered pixel grows from its
+/// own coverage, so a small spread does not turn every edge pixel opaque.
+fn dilate(map: &[f32], w: u32, h: u32, r: f32) -> Vec<f32> {
+    if !(r > 0.0) {
+        return map.to_vec();
+    }
+    let dist = dist_outside(map, w, h);
+    map.iter()
+        .zip(&dist)
+        .map(|(&v, &d)| {
+            if d < 0.0 {
+                (v + r).min(1.0)
+            } else {
+                v.max((r + 0.5 - d).clamp(0.0, 1.0))
+            }
+        })
+        .collect()
+}
+
+/// A style's soft falloff: two box passes of width `size` along each axis (a tent),
+/// which is what Photoshop's Size slider draws.
+///
+/// Replaces a three-pass gaussian of `σ = size / 2`: that spreads the same mass
+/// over a much longer tail and leaves the edge dimmer than Photoshop's.
+fn tent_blur(map: &[f32], w: u32, h: u32, size: f32) -> Vec<f32> {
+    if legacy("blur") {
+        return gaussian_blur(map, w, h, size);
+    }
+    if !(size > 0.05) || w < 2 || h < 2 {
+        return map.to_vec();
+    }
+    let (radius, taps) = box_taps(size);
+    if radius == 0 {
+        return map.to_vec();
+    }
+    let (wu, hu) = (w as usize, h as usize);
+    let mut cur = box_pass(map, wu, hu, radius, &taps, true);
+    cur = box_pass(&cur, wu, hu, radius, &taps, true);
+    cur = box_pass(&cur, wu, hu, radius, &taps, false);
+    box_pass(&cur, wu, hu, radius, &taps, false)
+}
+
+/// The taps of a centred box of (fractional) width `w`: `radius` whole taps each
+/// side of the centre, and the two end taps at `f`.
+fn box_taps(w: f32) -> (usize, Vec<f32>) {
+    let w = if w.is_finite() { w.clamp(1.0, 512.0) } else { 1.0 };
+    let half = w / 2.0;
+    let radius = ((half - 0.5).ceil()).max(0.0) as usize;
+    let f = (half - (radius as f32 - 0.5)).clamp(0.0, 1.0);
+    let norm = 1.0 / w;
+    let mut taps = vec![norm; radius * 2 + 1];
+    if radius > 0 {
+        taps[0] = f * norm;
+        taps[radius * 2] = f * norm;
+    }
+    (radius, taps)
+}
+
+fn box_pass(src: &[f32], w: usize, h: usize, radius: usize, taps: &[f32], horizontal: bool) -> Vec<f32> {
+    let mut out = vec![0.0f32; src.len()];
+    let r = radius as i64;
+    if horizontal {
+        for y in 0..h {
+            let row = y * w;
+            for x in 0..w {
+                let mut acc = 0.0;
+                for (k, t) in taps.iter().enumerate() {
+                    let xx = x as i64 + k as i64 - r;
+                    if xx >= 0 && xx < w as i64 {
+                        acc += src[row + xx as usize] * t;
+                    }
+                }
+                out[row + x] = acc;
+            }
+        }
+    } else {
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = 0.0;
+                for (k, t) in taps.iter().enumerate() {
+                    let yy = y as i64 + k as i64 - r;
+                    if yy >= 0 && yy < h as i64 {
+                        acc += src[yy as usize * w + x] * t;
+                    }
+                }
+                out[y * w + x] = acc;
+            }
+        }
+    }
+    out
+}
+
+/// Alpha below this reads as empty: style maps only paint where the layer has ink.
+const INSIDE_EPS: f32 = 0.004;
+
+const CHAMFER_INF: f32 = 1.0e20;
+
+/// Forward-pass neighbours of a 5 × 5 chamfer (the backward pass mirrors them).
+///
+/// Steps are exact Euclidean lengths (1, √2, √5). Photoshop's effect distances
+/// follow this metric — its stroke corners measure 3.236 at offset (1, 3) and 3.650
+/// at (2, 3), where a 3 × 3 chamfer would say 4 and 4.24.
+const CHAMFER_FWD: [(i64, i64, f32); 8] = [
+    (-1, 0, 1.0),
+    (-1, -1, std::f32::consts::SQRT_2),
+    (0, -1, 1.0),
+    (1, -1, std::f32::consts::SQRT_2),
+    (-1, -2, 2.236_068),
+    (1, -2, 2.236_068),
+    (-2, -1, 2.236_068),
+    (2, -1, 2.236_068),
+];
+
+fn chamfer_from(starts: &[f32], w: u32, h: u32) -> Vec<f32> {
+    let mut d = starts.to_vec();
+    let (wi, hi) = (w as i64, h as i64);
+    for y in 0..hi {
+        for x in 0..wi {
+            let i = (y * wi + x) as usize;
+            let mut best = d[i];
+            for &(ox, oy, wt) in &CHAMFER_FWD {
+                let (nx, ny) = (x + ox, y + oy);
+                if nx < 0 || ny < 0 || nx >= wi || ny >= hi {
+                    continue;
+                }
+                let c = d[(ny * wi + nx) as usize] + wt;
+                if c < best {
+                    best = c;
+                }
+            }
+            d[i] = best;
+        }
+    }
+    for y in (0..hi).rev() {
+        for x in (0..wi).rev() {
+            let i = (y * wi + x) as usize;
+            let mut best = d[i];
+            for &(ox, oy, wt) in &CHAMFER_FWD {
+                let (nx, ny) = (x - ox, y - oy);
+                if nx < 0 || ny < 0 || nx >= wi || ny >= hi {
+                    continue;
+                }
+                let c = d[(ny * wi + nx) as usize] + wt;
+                if c < best {
+                    best = c;
+                }
+            }
+            d[i] = best;
+        }
+    }
+    d
+}
+
+/// Distance from each pixel centre to the shape's edge: positive outside, −0.5
+/// inside.
+///
+/// The edge is seeded from the alpha, so a 25 %-covered border pixel puts the
+/// contour a quarter pixel in from its boundary instead of snapping to the pixel
+/// grid: that is what makes a 1 px stroke follow a curve smoothly.
+fn dist_outside(alpha: &[f32], w: u32, h: u32) -> Vec<f32> {
+    let starts: Vec<f32> = alpha
+        .iter()
+        .map(|&a| {
+            if a > INSIDE_EPS {
+                1.0 - a.min(1.0)
+            } else {
+                CHAMFER_INF
+            }
+        })
+        .collect();
+    let d = chamfer_from(&starts, w, h);
+    d.iter()
+        .zip(alpha)
+        .map(|(d, &a)| if a > INSIDE_EPS { -0.5 } else { d - 0.5 })
+        .collect()
+}
+
+/// Distance from each pixel centre to the shape's edge: positive inside, −0.5
+/// outside.
+fn dist_inside(alpha: &[f32], w: u32, h: u32) -> Vec<f32> {
+    let (wi, hi) = (w as i64, h as i64);
+    let mut starts = vec![CHAMFER_INF; alpha.len()];
+    for y in 0..hi {
+        for x in 0..wi {
+            let i = (y * wi + x) as usize;
+            let a = alpha[i];
+            if a <= INSIDE_EPS {
+                starts[i] = 0.0;
+                continue;
+            }
+            // A pixel dimmer than its neighbourhood sits on the edge, at its own
+            // coverage from the contour.
+            let mut mx = a;
+            for dy in -1..=1i64 {
+                for dx in -1..=1i64 {
+                    let (nx, ny) = (x + dx, y + dy);
+                    if nx < 0 || ny < 0 || nx >= wi || ny >= hi {
+                        continue;
+                    }
+                    mx = mx.max(alpha[(ny * wi + nx) as usize]);
+                }
+            }
+            let coverage = (a / mx).min(1.0);
+            starts[i] = if coverage < 1.0 - INSIDE_EPS {
+                coverage
+            } else {
+                CHAMFER_INF
+            };
+        }
+    }
+    let d = chamfer_from(&starts, w, h);
+    d.iter()
+        .zip(alpha)
+        .map(|(d, &a)| if a <= INSIDE_EPS { -0.5 } else { d - 0.5 })
+        .collect()
+}
+
+/// The pre-2026-11 falloff: three box passes ≈ a gaussian of `σ = size / 2`.
+fn gaussian_blur(mask: &[f32], w: u32, h: u32, size: f32) -> Vec<f32> {
     if size <= 0.05 || w < 2 || h < 2 {
         return mask.to_vec();
     }
@@ -607,7 +964,6 @@ fn box_blur(src: &[f32], w: u32, h: u32, radius: i32) -> Vec<f32> {
     let mut tmp = vec![0.0f32; src.len()];
     let mut out = vec![0.0f32; src.len()];
     let window = (radius * 2 + 1) as f32;
-    // Horizontal.
     for y in 0..hu {
         let row = y * wu;
         let mut sum = 0.0f32;
@@ -628,7 +984,6 @@ fn box_blur(src: &[f32], w: u32, h: u32, radius: i32) -> Vec<f32> {
             }
         }
     }
-    // Vertical.
     for x in 0..wu {
         let mut sum = 0.0f32;
         for y in 0..=radius as usize {
@@ -651,10 +1006,7 @@ fn box_blur(src: &[f32], w: u32, h: u32, radius: i32) -> Vec<f32> {
     out
 }
 
-/// Distance from every pixel to the nearest pixel where `mask` is true.
-///
-/// Two-pass chamfer with 1 / √2 steps. Good enough for stroke bands and glows,
-/// and O(pixels) instead of the O(pixels × radius) of a dilation loop.
+/// The pre-2026-11 distance: 3 × 3 chamfer over a boolean mask.
 fn distance_to(mask: &[bool], w: u32, h: u32) -> Vec<f32> {
     let (wu, hu) = (w as usize, h as usize);
     const INF: f32 = 1.0e9;
@@ -830,23 +1182,134 @@ mod tests {
     }
 
     #[test]
-    fn distance_transform_is_zero_inside_and_counts_outwards() {
+    fn distance_fields_are_signed_and_start_at_the_edge() {
         let (w, h) = (5u32, 5u32);
-        let mut mask = vec![false; 25];
-        mask[12] = true; // centre
-        let d = distance_to(&mask, w, h);
-        assert_eq!(d[12], 0.0);
-        assert!((d[13] - 1.0).abs() < 1e-3);
-        assert!((d[8] - std::f32::consts::SQRT_2).abs() < 1e-3);
+        let mut alpha = vec![0.0f32; 25];
+        alpha[12] = 1.0; // centre
+        let out = dist_outside(&alpha, w, h);
+        assert_eq!(out[12], -0.5, "inside is −0.5");
+        assert!((out[13] - 0.5).abs() < 1e-3, "one pixel out is 0.5 px from the edge");
+        assert!((out[8] - 0.914).abs() < 0.01, "diagonal uses √2, not a chamfer of 1.5");
+
+        let din = dist_inside(&alpha, w, h);
+        assert!(din[13] < 0.0, "outside is −0.5");
+        assert!((din[12] - 0.5).abs() < 1e-3, "a 1 px blob is half a pixel from its edge");
     }
 
     #[test]
-    fn box_blur_keeps_the_mass() {
-        let mut src = vec![0.0f32; 49];
-        src[24] = 1.0;
-        let blurred = box_blur(&src, 7, 7, 1);
+    fn a_five_by_five_chamfer_keeps_the_diagonal_exact() {
+        let (w, h) = (9u32, 9u32);
+        let mut alpha = vec![0.0f32; 81];
+        alpha[4 * 9 + 4] = 1.0; // (4, 4)
+        let d = dist_outside(&alpha, w, h);
+        // (1, 2) is a √5 step, (2, 3) is √5 + √2: Photoshop measures 3.236 and 3.650,
+        // where a 3 × 3 chamfer would say 4 and 4.24.
+        let s5 = 2.236_068;
+        assert!((d[6 * 9 + 5] - (s5 - 0.5)).abs() < 1e-3, "{}", d[6 * 9 + 5]);
+        assert!(
+            (d[7 * 9 + 6] - (s5 + std::f32::consts::SQRT_2 - 0.5)).abs() < 1e-3,
+            "{}",
+            d[7 * 9 + 6]
+        );
+    }
+
+    #[test]
+    fn tent_blur_keeps_the_mass_and_spreads_by_size() {
+        let (w, h) = (17u32, 17u32);
+        let mut src = vec![0.0f32; (w * h) as usize];
+        src[(8 * w + 8) as usize] = 1.0;
+        let blurred = tent_blur(&src, w, h, 4.0);
         let sum: f32 = blurred.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-3, "sum {sum}");
+        assert!((sum - 1.0).abs() < 1e-2, "sum {sum}");
+        // A tent of width 4 reaches four pixels out and is zero beyond.
+        assert!(blurred[(8 * w + 12) as usize] > 1e-3, "reaches 4 px");
+        assert!(blurred[(8 * w + 14) as usize] < 1e-6, "and stops there");
+        // Monotonic falloff: a tent, not a gaussian's long tail.
+        let at = |dx: u32| blurred[(8 * w + 8 + dx) as usize];
+        assert!(at(0) > at(1) && at(1) > at(2) && at(2) > at(3), "{} {} {} {}", at(0), at(1), at(2), at(3));
+    }
+
+    #[test]
+    fn spread_grows_the_shape_before_it_blurs() {
+        // Size 4 at 50 % spread: two whole pixels of dilation, two of blur.
+        let (w, h) = (21u32, 21u32);
+        let mut alpha = vec![0.0f32; (w * h) as usize];
+        for y in 8..13 {
+            for x in 8..13 {
+                alpha[(y * w + x) as usize] = 1.0;
+            }
+        }
+        let (grow, soft) = spread_split(4.0, 50.0);
+        assert_eq!((grow, soft), (2.0, 2.0));
+        let grown = dilate(&alpha, w, h, grow);
+        assert!(grown[(10 * w + 7) as usize] > 0.99, "grown 1 px out, solid");
+        assert!(grown[(10 * w + 6) as usize] > 0.99, "2 px out, still solid");
+        assert_eq!(grown[(10 * w + 5) as usize], 0.0, "3 px out is beyond the spread");
+        // No spread: the outline is untouched.
+        let same = dilate(&alpha, w, h, 0.0);
+        assert_eq!(same[(10 * w + 7) as usize], 0.0);
+    }
+
+    #[test]
+    fn shadow_offset_follows_photoshop_light_angles() {
+        // 90° is light from the top: the shadow falls straight down.
+        assert_eq!(offset_vector(5.0, 90.0), (0, 5));
+        // 120° is light from the upper left: the default shadow lands bottom-right.
+        let (dx, dy) = offset_vector(5.0, 120.0);
+        assert!(dx > 0 && dy > 0, "({dx}, {dy})");
+        // 0° is light from the right: the shadow goes left.
+        assert_eq!(offset_vector(4.0, 0.0), (-4, 0));
+    }
+
+    #[test]
+    fn inner_shadow_lands_on_the_lit_side() {
+        // Light from the top (90°): the shadow is the band along the top inner edge.
+        let img = layer(20, 20, [255, 255, 255, 255], 0);
+        let mut e = effect(EffectKind::InnerShadow);
+        e.size = 0.0;
+        e.distance = 3.0;
+        e.color = [0, 0, 0];
+        e.opacity = 1.0;
+        let baked = bake(&img, (0, 0), &[e]).expect("baked");
+        let top = baked.image.get_pixel(10, 1).0[0];
+        let bottom = baked.image.get_pixel(10, 18).0[0];
+        assert!(top < 60, "top row should carry the shadow, got {top}");
+        assert!(bottom > 200, "bottom row should be clear, got {bottom}");
+    }
+
+    #[test]
+    fn gradient_spans_the_chord_not_the_projection() {
+        // A 60 × 12 layer at 45°: the ramp runs 12 / sin45 ≈ 17 px along the chord,
+        // not the 51 px the bounds project to, so it saturates well before the edge.
+        let img = layer(60, 12, [0, 0, 0, 255], 0);
+        let mut e = effect(EffectKind::GradientOverlay);
+        e.gradient = Some(Gradient {
+            color_stops: vec![
+                psd::effects::ColorStop {
+                    location: 0.0,
+                    color: [0, 0, 0],
+                },
+                psd::effects::ColorStop {
+                    location: 1.0,
+                    color: [255, 255, 255],
+                },
+            ],
+            alpha_stops: vec![psd::effects::AlphaStop {
+                location: 0.0,
+                alpha: 1.0,
+            }],
+            kind: GradientKind::Linear,
+            angle: 45.0,
+            reverse: false,
+            align: true,
+            scale: 100.0,
+        });
+        let baked = bake(&img, (0, 0), &[e]).expect("baked");
+        // The ramp runs bottom-left (black) to top-right (white).
+        let bright = baked.image.get_pixel(45, 0).0[0];
+        let dark = baked.image.get_pixel(5, 11).0[0];
+        assert!(bright > 240, "top right is already white: {bright}");
+        assert!(dark < 15, "bottom left stays black: {dark}");
     }
 }
 

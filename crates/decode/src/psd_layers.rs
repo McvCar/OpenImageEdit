@@ -329,8 +329,22 @@ fn build_layers<F: FnMut(usize, usize)>(
         if bc.is_some() || hs.is_some() {
             if !no_adjust && layer.visible() && layer.opacity() > 0 {
                 let clipped = layer.is_clipping_mask();
-                let start = adjustment_scope(&clips, clipped, layers.len());
-                apply_adjustment(&mut layers[start..], bc, hs);
+                let start = adjustment_scope(
+                    &layers,
+                    &clips,
+                    layer.parent_id(),
+                    clipped,
+                    adjust_scope_mode(),
+                );
+                // An adjustment's own mask decides where it applies: a hue shift
+                // painted into half of a button must not recolour the other half.
+                // Its pixels are irrelevant, but the `-2` channel is not.
+                let mask = if no_masks {
+                    None
+                } else {
+                    decode_mask(layer, layer.channel_bytes(), cw, ch)
+                };
+                apply_adjustment(&mut layers[start..], bc, hs, mask.as_ref());
                 baked_adjustments += 1;
             }
             progress(step + 1, total);
@@ -449,6 +463,36 @@ fn build_layers<F: FnMut(usize, usize)>(
         // a button loses its outline). `bake` renders them into the bitmap and
         // reports any style it could not draw.
         if let Some(effects) = layer.layer_effects().filter(|_| !no_styles) {
+            // 诊断：`IMAGEEDIT_PSD_DUMP_FX=<图层名子串>` 打印解析到的样式参数。
+            // 保真差异按块归因到某个图层后，用它确认「是解析错了还是画错了」。
+            if let Ok(want) = std::env::var("IMAGEEDIT_PSD_DUMP_FX") {
+                if !want.is_empty() && layer.name().contains(&want) {
+                    for e in effects.iter().filter(|e| e.enabled) {
+                        println!(
+                            "{{\"fx\":\"{}\",\"kind\":\"{:?}\",\"blend\":\"{:?}\",\"op\":{:.3},\
+                             \"ang\":{:.1},\"dist\":{:.2},\"size\":{:.2},\"choke\":{:.1},\
+                             \"color\":[{},{},{}],\"pos\":\"{:?}\",\"fill\":\"{:?}\",\
+                             \"grad\":{},\"knock\":{}}}",
+                            layer.name(),
+                            e.kind,
+                            e.blend,
+                            e.opacity,
+                            e.angle,
+                            e.distance,
+                            e.size,
+                            e.choke,
+                            e.color[0],
+                            e.color[1],
+                            e.color[2],
+                            e.stroke_position,
+                            e.stroke_fill,
+                            e.gradient.is_some(),
+                            e.knocks_out
+                        );
+                    }
+                }
+            }
+            crate::psd_effects::set_trace_label(layer.name());
             if let Some(baked) = crate::psd_effects::bake(&image, layer_offset, effects) {
                 image = baked.image;
                 layer_offset = baked.offset;
@@ -584,20 +628,71 @@ fn map_blend_mode(mode: psd::BlendMode) -> Option<editcore::BlendMode> {
 /// Which already-pushed layers an adjustment layer applies to.
 ///
 /// A clipped adjustment (Photoshop's "剪贴蒙版", the usual way a designer
-/// recolours one button graphic) only touches the chain it clips to: the run of
-/// trailing clipping layers plus the base layer under them. An unclipped one
-/// affects everything below it — we approximate the group scope by taking every
-/// layer already emitted.
-fn adjustment_scope(clips: &[bool], clipped: bool, len: usize) -> usize {
-    if !clipped {
-        return 0;
+/// recolours one button graphic) only touches the chain it clips to. Whether
+/// that means "the whole clip chain plus its base" or "just the layer directly
+/// below" is measurable, not obvious — Photoshop chains adjustments through each
+/// other, which a flat baking pass cannot do exactly — so both are available
+/// under `IMAGEEDIT_PSD_ADJUST_SCOPE` for the fidelity harness to decide.
+///
+/// The result is always clamped to the adjustment's own group: a group is a
+/// separate composite in Photoshop, so layers outside it are never in scope.
+fn adjustment_scope(
+    layers: &[PsdLayerData],
+    clips: &[bool],
+    group: Option<u32>,
+    clipped: bool,
+    mode: ScopeMode,
+) -> usize {
+    let len = layers.len();
+    let mut start = match mode {
+        ScopeMode::All => 0,
+        ScopeMode::Last => len.saturating_sub(1),
+        ScopeMode::Chain => {
+            if !clipped {
+                0
+            } else {
+                let mut s = len;
+                while s > 0 && clips[s - 1] {
+                    s -= 1;
+                }
+                // Include the base layer the chain clips to.
+                s.saturating_sub(1)
+            }
+        }
+    };
+    if !cross_group() {
+        // Back up to the first layer of this group's contiguous run, so the
+        // adjustment never leaks into a sibling group's pixels.
+        let mut g = len;
+        while g > 0 && layers[g - 1].group == group {
+            g -= 1;
+        }
+        start = start.max(g);
     }
-    let mut start = len;
-    while start > 0 && clips[start - 1] {
-        start -= 1;
+    start.min(len)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ScopeMode {
+    /// Everything below (the pre-2026-11 fallback).
+    All,
+    /// Only the layer directly below (Photoshop's literal clip target).
+    Last,
+    /// The trailing clip run plus the base it clips to.
+    Chain,
+}
+
+fn adjust_scope_mode() -> ScopeMode {
+    match std::env::var("IMAGEEDIT_PSD_ADJUST_SCOPE").ok().as_deref() {
+        Some("all") => ScopeMode::All,
+        Some("last") => ScopeMode::Last,
+        _ => ScopeMode::Chain,
     }
-    // Include the base layer the chain clips to.
-    start.saturating_sub(1)
+}
+
+fn cross_group() -> bool {
+    static CROSS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CROSS.get_or_init(|| std::env::var("IMAGEEDIT_PSD_ADJUST_CROSS_GROUP").ok().as_deref() == Some("1"))
 }
 
 /// Bake one adjustment layer's effect into the pixels of `targets`.
@@ -610,25 +705,65 @@ fn apply_adjustment(
     targets: &mut [PsdLayerData],
     bc: Option<psd::BrightnessContrast>,
     hs: Option<psd::HueSaturation>,
+    mask: Option<&editcore::LayerMask>,
 ) {
     for layer in targets.iter_mut() {
         if !layer.visible || layer.opacity <= 0.0 {
             continue;
         }
-        for px in layer.image.pixels_mut() {
-            if px.0[3] == 0 {
-                continue;
+        // Fast path: no mask means every pixel takes the full adjustment, which is
+        // the common case and must stay as cheap as the original loop.
+        let Some(mask) = mask else {
+            for px in layer.image.pixels_mut() {
+                if px.0[3] == 0 {
+                    continue;
+                }
+                let mut rgb = [px.0[0], px.0[1], px.0[2]];
+                if let Some(hs) = hs {
+                    rgb = hue_saturation(rgb, hs);
+                }
+                if let Some(bc) = bc {
+                    rgb = brightness_contrast(rgb, bc);
+                }
+                px.0[0] = rgb[0];
+                px.0[1] = rgb[1];
+                px.0[2] = rgb[2];
             }
-            let mut rgb = [px.0[0], px.0[1], px.0[2]];
-            if let Some(hs) = hs {
-                rgb = hue_saturation(rgb, hs);
+            continue;
+        };
+        let (ox, oy) = layer.offset;
+        let (w, h) = (layer.image.width() as i32, layer.image.height() as i32);
+        for y in 0..h {
+            for x in 0..w {
+                // How much of the adjustment reaches this pixel: all of it where
+                // the adjustment's mask is white, none where it is black.
+                let k = mask.coverage(ox + x, oy + y).clamp(0.0, 1.0);
+                if k <= 0.0 {
+                    continue;
+                }
+                let px = layer.image.get_pixel_mut(x as u32, y as u32);
+                if px.0[3] == 0 {
+                    continue;
+                }
+                let src = px.0;
+                let mut rgb = [src[0], src[1], src[2]];
+                if let Some(hs) = hs {
+                    rgb = hue_saturation(rgb, hs);
+                }
+                if let Some(bc) = bc {
+                    rgb = brightness_contrast(rgb, bc);
+                }
+                if k < 1.0 {
+                    rgb = [
+                        (src[0] as f32 + (rgb[0] as f32 - src[0] as f32) * k).round() as u8,
+                        (src[1] as f32 + (rgb[1] as f32 - src[1] as f32) * k).round() as u8,
+                        (src[2] as f32 + (rgb[2] as f32 - src[2] as f32) * k).round() as u8,
+                    ];
+                }
+                px.0[0] = rgb[0];
+                px.0[1] = rgb[1];
+                px.0[2] = rgb[2];
             }
-            if let Some(bc) = bc {
-                rgb = brightness_contrast(rgb, bc);
-            }
-            px.0[0] = rgb[0];
-            px.0[1] = rgb[1];
-            px.0[2] = rgb[2];
         }
     }
 }
