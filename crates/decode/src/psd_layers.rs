@@ -353,6 +353,7 @@ fn build_layers<F: FnMut(usize, usize)>(
     let mut masked_layers = 0usize;
     let mut clipped_layers = 0usize;
     let mut vector_filled = 0usize;
+    let mut vector_clipped = 0usize;
     let groups = psd.groups();
     let mut inherited_hidden = false;
     // 诊断开关：把某一项特性关掉再合成，用 `dump-flat` 与 PS 合并图比对，
@@ -525,16 +526,34 @@ fn build_layers<F: FnMut(usize, usize)>(
         let mut layer_offset = (x0, y0);
 
         // ---- 形状图层的矢量填充（`vmsk` / `vscg`）------------------------
-        // 形状层的通道数据是**空的**：像素由 PS 按矢量路径实时生成。只读通道
-        // 时这类层是一片透明，连它自己的描边/内阴影都画不出来（实测目标稿
-        // 5 张卡片的渐变描边整圈丢失）。只在位图确实为空时才栅格化 —— 有位图
-        // 的形状层说明缓存里已经有渲染结果，再填一遍反而会盖掉它。
+        // 形状层的像素由 PS 按矢量路径实时生成。两类洞都要补：① 通道完全
+        // 为空的层（实测目标稿 5 张卡片的渐变描边整圈丢失）；② 缓存接近
+        // 覆盖整个路径的实心形状层（路径比缓存大一圈，边缘渐变丢失）。
+        // fill 内部只补透明像素、不覆盖缓存。没有 vscg 或覆盖率低的层
+        // （描边环 / 纹理）不受影响。
         if !off("IMAGEEDIT_PSD_NO_VECTOR") {
             if let Some(vm) = layer.vector_mask() {
-                let empty = image.pixels().all(|p| p.0[3] == 0);
+                // 一次遍历同时算出「全空」与「缓存覆盖率」。两类层需要补洞：
+                // ① 全空（通道没缓存，5 张卡片渐变描边整圈丢失）；② 缓存
+                // 几乎填满路径的**实心形状**（实测 `矩形 556 拷贝` 覆盖率
+                // 99.4%，矢量路径比缓存大一圈，边缘渐变整条缺失）。覆盖率
+                // 低的层（描边环 18%、纹理 0.8%）透明是有意义的内容，
+                // 绝不能拿 vscg 去填 —— 实测整幅填了 MAE 从 7.2 炸到 128。
+                let mut opaque = 0usize;
+                let mut total = 0usize;
+                for p in image.pixels() {
+                    total += 1;
+                    if p.0[3] > 0 {
+                        opaque += 1;
+                    }
+                }
+                let empty = opaque == 0;
+                let cached_shape = opaque as f32 / total.max(1) as f32 > 0.8;
+                let has_fill = layer.vector_fill().is_some();
                 let trace =
                     std::env::var("IMAGEEDIT_PSD_VECTOR_TRACE").ok().as_deref() == Some("1");
-                if empty
+                if has_fill
+                    && (empty || cached_shape)
                     && crate::psd_vector::fill_shape(
                         &mut image,
                         layer_offset,
@@ -547,21 +566,37 @@ fn build_layers<F: FnMut(usize, usize)>(
                     if trace {
                         println!(
                             "{{\"phase\":\"decode\",\"event\":\"vector-fill\",\"name\":\"{}\",\
-                             \"offset\":[{},{}],\"size\":[{},{}],\"groups\":{}}}",
+                             \"offset\":[{},{}],\"size\":[{},{}],\"groups\":{},\"hole\":{}}}",
                             layer.name(),
                             layer_offset.0,
                             layer_offset.1,
                             image.width(),
                             image.height(),
-                            vm.subpaths.len()
+                            vm.subpaths.len(),
+                            !empty
                         );
                     }
                 } else if trace && !empty {
                     println!(
                         "{{\"phase\":\"decode\",\"event\":\"vector-skip\",\"name\":\"{}\",\
-                         \"why\":\"has-raster\"}}",
-                        layer.name()
+                         \"why\":\"has-raster\",\"has_fill\":{},\"cov\":{:.3}}}",
+                        layer.name(),
+                        has_fill,
+                        opaque as f32 / total.max(1) as f32
                     );
+                }
+                // ---- 缓存过期裁剪（实验性，默认关）--------------------
+                // 形状层的显示 = 内容 ∩ 矢量路径，是「缓存过期」的修复方向
+                // （路径改过、缓存还是旧形状）。但实测这份设计稿里 PS 合并
+                // 图对两类层的行为相反：`矩形 670 拷贝`（按钮）按路径显示、
+                // `椭圆 623`（气泡尾巴超出椭圆路径）按缓存显示 —— psd-tools
+                // 的全局裁剪同样顾此失彼。净效果 MAE 5.37→6.44（倒退），
+                // 所以默认不裁；`IMAGEEDIT_PSD_VCLIP=1` 供单轴消融与排查。
+                if off("IMAGEEDIT_PSD_VCLIP") {
+                    if crate::psd_vector::clip_shape(&mut image, layer_offset, (cw as u32, ch as u32), vm)
+                    {
+                        vector_clipped += 1;
+                    }
                 }
             }
         }
@@ -796,6 +831,11 @@ fn build_layers<F: FnMut(usize, usize)>(
             "{vector_filled} 个形状图层按矢量路径栅格化（PSD 里这类层的通道是空的）"
         ));
     }
+    if vector_clipped > 0 {
+        degraded.push(format!(
+            "{vector_clipped} 个形状图层按矢量路径重新裁剪（通道缓存与路径不一致）"
+        ));
+    }
     // ---- 文件夹树（PSD 的组，不再摊平）---------------------------------
     // `group_ids_in_order` 是 Photoshop 面板的顺序（底 -> 顶），照抄即可；
     // 成员数按**子树**统计（嵌套组的成员也算父组的一项），面板的「N 项」
@@ -830,6 +870,29 @@ fn build_layers<F: FnMut(usize, usize)>(
             count,
         });
     }
+
+    // ---- 组级样式（folder record 上的 lfx2）----------------------------
+    // Photoshop 对组只画一次样式（整个组合成结果的轮廓描一圈边、投一次影）。
+    // 拆成两张位图层插进组的层序区间：投影插组底、描边插组顶。
+    if !off("IMAGEEDIT_PSD_NO_GROUP_FX") {
+        let (group_fx_count, group_fx_notes) =
+            bake_group_style_layers(&mut layers, groups, (cw as u32, ch as u32));
+        if group_fx_count > 0 {
+            degraded.push(format!(
+                "{group_fx_count} 个组的样式（投影/描边）已烘焙进独立图层"
+            ));
+            // 插入的位图按实际尺寸重新计量（层循环只累加了原始层的字节）。
+            total_bytes = layers
+                .iter()
+                .map(|l| {
+                    let (w, h) = l.image.dimensions();
+                    w as usize * h as usize * 4
+                })
+                .sum();
+        }
+        degraded.extend(group_fx_notes);
+    }
+
     Ok(PsdLayerSet {
         layers,
         groups: group_list,
@@ -847,6 +910,233 @@ fn build_layers<F: FnMut(usize, usize)>(
 fn dedup(v: &mut Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     v.retain(|s| seen.insert(s.clone()));
+}
+
+/// Bake the styles carried on **folder records** (`lfx2` on a group) into two
+/// extra raster layers: the shadow below the group's lowest member, the stroke
+/// above its highest one.
+///
+/// Photoshop renders a group's styles once around the group's composite
+/// outline — one ring around every child, not one per child. The group is a
+/// contiguous run in the stack, so inserting the two rasters inside that run
+/// composites exactly like Photoshop's group container would. Groups are
+/// processed deepest first, so a parent's joint alpha already includes the
+/// rings of the groups nested inside it.
+///
+/// Returns the number of rasters inserted and the degradation notes.
+fn bake_group_style_layers(
+    layers: &mut Vec<PsdLayerData>,
+    groups: &HashMap<u32, psd::PsdGroup>,
+    canvas: (u32, u32),
+) -> (usize, Vec<String>) {
+    // Deepest group first: a parent drawn after its children must see the
+    // children's baked rings in its own joint alpha.
+    let depth_of = |mut id: u32| -> usize {
+        let mut d = 0;
+        while let Some(g) = groups.get(&id) {
+            match g.parent_id() {
+                Some(p) => {
+                    id = p;
+                    d += 1;
+                    if d > 64 {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        d
+    };
+    let mut styled: Vec<&psd::PsdGroup> = groups
+        .values()
+        .filter(|g| {
+            g.layer_effects()
+                .map(|fx| fx.iter().any(|e| e.enabled))
+                .unwrap_or(false)
+        })
+        .collect();
+    styled.sort_by_key(|g| std::cmp::Reverse(depth_of(g.id())));
+
+    let mut notes: Vec<String> = Vec::new();
+    let mut inserted = 0usize;
+    for group in styled {
+        let Some(fx) = group.layer_effects() else { continue };
+        let fx: Vec<psd::effects::LayerEffect> =
+            fx.iter().filter(|e| e.enabled).cloned().collect();
+        if fx.is_empty() {
+            continue;
+        }
+        // The group and everything nested inside it: a member's `group` field
+        // is the PSD id of its immediate parent, so collect the subtree first.
+        let mut descendants: Vec<u32> = vec![group.id()];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for g in groups.values() {
+                if let Some(p) = g.parent_id() {
+                    if descendants.contains(&p) && !descendants.contains(&g.id()) {
+                        descendants.push(g.id());
+                        changed = true;
+                    }
+                }
+            }
+        }
+        let Some(b) = members_union(layers, &descendants) else {
+            continue;
+        };
+        let (w, h) = ((b.2 - b.0).max(1) as u32, (b.3 - b.1).max(1) as u32);
+        if w as u64 * h as u64 > 30_000_000 {
+            notes.push("组样式需要过大的画布，已跳过".into());
+            continue;
+        }
+        // Joint alpha of the visible members, over-blended (alpha composition
+        // is blend-mode independent — every PSD blend keeps `a_out = a_s +
+        // a_b*(1-a_s)`). Members already carry their ancestors' opacity.
+        // Clipping members are skipped: their own bitmap reaches far past the
+        // base they clip to, and only the base's coverage is visible — counting
+        // the clipper whole would draw the group ring around a shape the
+        // composite never shows.
+        let mut alpha = vec![0.0f32; (w * h) as usize];
+        for layer in layers.iter() {
+            if !layer.visible || layer.opacity <= 0.0 || layer.clipping {
+                continue;
+            }
+            let Some(g) = layer.group else { continue };
+            if !descendants.contains(&g) {
+                continue;
+            }
+            let (lw, lh) = layer.image.dimensions();
+            let (lx, ly) = layer.offset;
+            for y in 0..lh {
+                let cy = ly + y as i32 - b.1;
+                if cy < 0 || cy >= h as i32 {
+                    continue;
+                }
+                for x in 0..lw {
+                    let cx = lx + x as i32 - b.0;
+                    if cx < 0 || cx >= w as i32 {
+                        continue;
+                    }
+                    let a = layer.image.get_pixel(x, y).0[3] as f32 / 255.0 * layer.opacity;
+                    if a <= 0.0 {
+                        continue;
+                    }
+                    let i = (cy as u32 * w + cx as u32) as usize;
+                    alpha[i] = a + alpha[i] * (1.0 - a);
+                }
+            }
+        }
+        if alpha.iter().all(|a| *a <= 0.0) {
+            continue;
+        }
+        let Some(baked) =
+            crate::psd_effects::bake_group_effects(&alpha, (w, h), (b.0, b.1), &fx)
+        else {
+            continue;
+        };
+        notes.extend(baked.notes);
+        let group_visible = group_chain_visible(groups, group.id());
+        let is_member =
+            |l: &PsdLayerData| l.group.map(|g| descendants.contains(&g)).unwrap_or(false);
+        // Rasters move as each is inserted, so look the run bounds up per one.
+        if let Some(front) = baked.front {
+            if let Some(last) = layers.iter().rposition(is_member) {
+                layers.insert(
+                    last + 1,
+                    PsdLayerData {
+                        annotation: false,
+                        group: Some(group.id()),
+                        name: format!("组「{}」描边(烘焙)", group.name()),
+                        offset: baked.offset,
+                        image: front,
+                        visible: group_visible,
+                        opacity: 1.0,
+                        blend: editcore::BlendMode::Normal,
+                        degraded: Vec::new(),
+                        mask: None,
+                        clipping: false,
+                        content_alpha: None,
+                    },
+                );
+                inserted += 1;
+            }
+        }
+        if let Some(behind) = baked.behind {
+            if let Some(first) = layers.iter().position(is_member) {
+                layers.insert(
+                    first,
+                    PsdLayerData {
+                        annotation: false,
+                        group: Some(group.id()),
+                        name: format!("组「{}」投影(烘焙)", group.name()),
+                        offset: baked.offset,
+                        image: behind,
+                        visible: group_visible,
+                        opacity: 1.0,
+                        blend: editcore::BlendMode::Normal,
+                        degraded: Vec::new(),
+                        mask: None,
+                        clipping: false,
+                        content_alpha: None,
+                    },
+                );
+                inserted += 1;
+            }
+        }
+    }
+    let _ = canvas;
+    (inserted, notes)
+}
+
+/// Bounding box (left, top, right, bottom — exclusive right/bottom) of every
+/// member's bitmap, `None` when the group paints nothing.
+fn members_union(layers: &[PsdLayerData], descendants: &[u32]) -> Option<(i32, i32, i32, i32)> {
+    let mut acc: Option<(i32, i32, i32, i32)> = None;
+    for layer in layers {
+        if !layer.visible || layer.opacity <= 0.0 || layer.clipping {
+            continue;
+        }
+        let Some(g) = layer.group else { continue };
+        if !descendants.contains(&g) {
+            continue;
+        }
+        let (lw, lh) = layer.image.dimensions();
+        if lw == 0 || lh == 0 {
+            continue;
+        }
+        let (lx, ly) = layer.offset;
+        let (l, t, r, btm) = (lx, ly, lx + lw as i32, ly + lh as i32);
+        acc = Some(match acc {
+            None => (l, t, r, btm),
+            Some((al, at, ar, ab)) => (al.min(l), at.min(t), ar.max(r), ab.max(btm)),
+        });
+    }
+    acc
+}
+
+/// Whether a group and all of its ancestors have the eye on.
+fn group_chain_visible(groups: &HashMap<u32, psd::PsdGroup>, mut id: u32) -> bool {
+    let mut guard = 0;
+    loop {
+        match groups.get(&id) {
+            None => return true,
+            Some(g) => {
+                if !g.visible() {
+                    return false;
+                }
+                match g.parent_id() {
+                    Some(p) => {
+                        id = p;
+                        guard += 1;
+                        if guard > 64 {
+                            return true;
+                        }
+                    }
+                    None => return true,
+                }
+            }
+        }
+    }
 }
 
 /// Blend mode for anything outside a layer record (layer styles).

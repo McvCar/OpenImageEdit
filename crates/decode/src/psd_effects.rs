@@ -324,6 +324,164 @@ struct Padding {
     bottom: i32,
 }
 
+/// Styles rendered for a **group** (the `lfx2` on a folder record), split into
+/// the two rasters a group's effect stack produces:
+///
+/// * `behind` — drop shadow / outer glow, drawn *below* the group's content;
+/// * `front` — the stroke ring, drawn *above* it.
+///
+/// The group is a contiguous run of the layer stack, so inserting these as two
+/// extra raster layers inside that run composites exactly like Photoshop's
+/// group container would.
+pub struct GroupBaked {
+    pub behind: Option<RgbaImage>,
+    pub front: Option<RgbaImage>,
+    /// Canvas position of both rasters' top-left corner.
+    pub offset: (i32, i32),
+    pub notes: Vec<String>,
+}
+
+/// Bake the styles of a **group** onto its members' joint alpha.
+///
+/// `alpha` is the group's composite coverage (every member blended over, which
+/// for alpha is blend-mode independent), `size` its pixel size and `offset`
+/// where it sits on the canvas. Only the style pixels are rendered — the
+/// members themselves stay separate layers.
+pub fn bake_group_effects(
+    alpha: &[f32],
+    size: (u32, u32),
+    offset: (i32, i32),
+    effects: &[LayerEffect],
+) -> Option<GroupBaked> {
+    let active: Vec<&LayerEffect> = effects
+        .iter()
+        .filter(|e| e.enabled && !skip_kind(e.kind))
+        .collect();
+    if active.is_empty() || alpha.len() as u64 != size.0 as u64 * size.1 as u64 {
+        return None;
+    }
+    let (iw, ih) = size;
+    if iw == 0 || ih == 0 {
+        return None;
+    }
+
+    // ---- how far the styles reach outside the group's rectangle ----------
+    let mut pad = Padding::default();
+    for e in &active {
+        match e.kind {
+            EffectKind::DropShadow => {
+                let (dx, dy) = offset_vector(e.distance, e.angle);
+                let reach = blur_margin(e.size);
+                pad.left = pad.left.max(reach - dx.min(0));
+                pad.right = pad.right.max(reach + dx.max(0));
+                pad.top = pad.top.max(reach - dy.min(0));
+                pad.bottom = pad.bottom.max(reach + dy.max(0));
+            }
+            EffectKind::OuterGlow => {
+                let reach = blur_margin(e.size);
+                pad.left = pad.left.max(reach);
+                pad.right = pad.right.max(reach);
+                pad.top = pad.top.max(reach);
+                pad.bottom = pad.bottom.max(reach);
+            }
+            EffectKind::Stroke => {
+                let reach = match e.stroke_position {
+                    StrokePosition::Outside => e.size.ceil() as i32 + 2,
+                    StrokePosition::Center => (e.size / 2.0).ceil() as i32 + 2,
+                    StrokePosition::Inside => 0,
+                };
+                pad.left = pad.left.max(reach);
+                pad.right = pad.right.max(reach);
+                pad.top = pad.top.max(reach);
+                pad.bottom = pad.bottom.max(reach);
+            }
+            _ => {}
+        }
+    }
+    // A group spans the whole panel; an unbounded margin would explode the
+    // bitmap long before the per-layer cap does. 64 px of ring is far beyond
+    // any style this file format carries.
+    let cap = 64;
+    pad.left = pad.left.min(cap);
+    pad.right = pad.right.min(cap);
+    pad.top = pad.top.min(cap);
+    pad.bottom = pad.bottom.min(cap);
+
+    let (w, h) = (
+        (iw as i64 + pad.left as i64 + pad.right as i64).max(1) as u32,
+        (ih as i64 + pad.top as i64 + pad.bottom as i64).max(1) as u32,
+    );
+    if w as u64 * h as u64 > 30_000_000 {
+        return None;
+    }
+
+    // The joint alpha, expanded into the padded coordinate system.
+    let mut big = vec![0.0f32; (w * h) as usize];
+    for y in 0..ih {
+        for x in 0..iw {
+            let (tx, ty) = ((x as i64 + pad.left as i64) as u32, (y as i64 + pad.top as i64) as u32);
+            big[(ty * w + tx) as usize] = alpha[(y * iw + x) as usize];
+        }
+    }
+
+    let mut notes = Vec::new();
+    let empty = || RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 0]));
+
+    // ---- behind: drop shadow / outer glow --------------------------------
+    let mut behind = empty();
+    for e in &active {
+        match e.kind {
+            EffectKind::DropShadow => draw_drop_shadow(&mut behind, w, h, &big, e),
+            EffectKind::OuterGlow => draw_outer_glow(&mut behind, w, h, &big, e),
+            _ => {}
+        }
+    }
+
+    // ---- front: the stroke ring ------------------------------------------
+    let mut front = empty();
+    let strokes: Vec<&&LayerEffect> = active.iter().filter(|e| e.kind == EffectKind::Stroke).collect();
+    if !strokes.is_empty() {
+        let need_in = strokes.iter().any(|e| e.stroke_position != StrokePosition::Outside);
+        let need_out = strokes.iter().any(|e| e.stroke_position != StrokePosition::Inside);
+        let din = if need_in { dist_inside(&big, w, h) } else { Vec::new() };
+        let dout = if need_out { dist_outside(&big, w, h) } else { Vec::new() };
+        // A group stroke's gradient (if any) runs across the group's ink, not
+        // its bounding rectangle of member layers.
+        let bounds = alpha_bounds(&big, w, h);
+        for e in &strokes {
+            draw_stroke(&mut front, w, h, &big, &din, &dout, bounds, e);
+        }
+    }
+    for e in &active {
+        match e.kind {
+            EffectKind::InnerShadow | EffectKind::InnerGlow => {
+                notes.push("组样式「内阴影/内发光」暂不支持（组级）".into());
+            }
+            EffectKind::ColorOverlay | EffectKind::GradientOverlay | EffectKind::PatternOverlay
+            | EffectKind::BevelEmboss => {
+                notes.push("组样式「叠加/浮雕」暂不支持（组级）".into());
+            }
+            _ => {}
+        }
+    }
+
+    let new_offset = (offset.0 - pad.left, offset.1 - pad.top);
+    // A fully transparent raster carries nothing: skip it so the caller does
+    // not insert an invisible layer.
+    let has_px = |img: &RgbaImage| img.pixels().any(|p| p.0[3] > 0);
+    let behind = if has_px(&behind) { Some(behind) } else { None };
+    let front = if has_px(&front) { Some(front) } else { None };
+    if behind.is_none() && front.is_none() {
+        return None;
+    }
+    Some(GroupBaked {
+        behind,
+        front,
+        offset: new_offset,
+        notes,
+    })
+}
+
 /// How far a tent of `size` reaches before it is visually zero: its half-width is
 /// `size` (two box passes of that width), plus a pixel of slack.
 fn blur_margin(size: f32) -> i32 {
@@ -1139,6 +1297,70 @@ mod tests {
         disabled.enabled = false;
         let img = layer(8, 8, [10, 20, 30, 255], 2);
         assert!(bake(&img, (0, 0), &[disabled]).is_none());
+    }
+
+    /// A group's stroke is one ring around the group's joint alpha, on a
+    /// raster of its own — the members are not touched.
+    #[test]
+    fn group_stroke_rings_the_joint_alpha() {
+        // Two squares apart: the ring must follow each outline, and nothing
+        // is painted between them.
+        let (w, h) = (20u32, 10u32);
+        let mut alpha = vec![0.0f32; (w * h) as usize];
+        for y in 2..5 {
+            for x in 2..5 {
+                alpha[(y * w + x) as usize] = 1.0;
+            }
+            for x in 10..13 {
+                alpha[(y * w + x) as usize] = 1.0;
+            }
+        }
+        let mut e = effect(EffectKind::Stroke);
+        e.size = 1.0;
+        e.color = [187, 123, 15];
+        let baked = bake_group_effects(&alpha, (w, h), (5, 7), &[e]).expect("baked");
+        let front = baked.front.expect("stroke raster");
+        assert!(baked.behind.is_none(), "no shadow, no behind raster");
+        // Padded by size+2 on each side; the offset moves accordingly.
+        assert_eq!(baked.offset, (2, 4));
+        // One pixel outside each square's edge carries the ring (the edge
+        // pixel itself is half-covered by the band — same semantics the
+        // per-layer stroke uses; on a transparent background the premultiplied
+        // colour halves too). The rasters sit at canvas - offset, i.e. alpha
+        // coords shifted by the pad (+3).
+        let ring = front.get_pixel(5 + 3, 3 + 3).0;
+        assert!(ring[3] > 0 && ring[0] > 0, "ring right of square 1");
+        assert!(front.get_pixel(9 + 3, 3 + 3).0[3] > 0, "ring left of square 2");
+        // Between the squares there is no ring.
+        assert_eq!(front.get_pixel(8 + 3, 3 + 3).0[3], 0);
+        // Inside a square the ring does not reach (outside stroke).
+        assert_eq!(front.get_pixel(3 + 3, 3 + 3).0[3], 0);
+    }
+
+    /// A group's drop shadow lands below the joint alpha, offset by the light.
+    #[test]
+    fn group_shadow_is_one_blur_behind_every_member() {
+        let (w, h) = (12u32, 12u32);
+        let mut alpha = vec![0.0f32; (w * h) as usize];
+        for y in 3..6 {
+            for x in 3..6 {
+                alpha[(y * w + x) as usize] = 1.0;
+            }
+        }
+        let mut e = effect(EffectKind::DropShadow);
+        e.color = [115, 115, 115];
+        e.distance = 2.0;
+        e.angle = 90.0;
+        e.size = 0.0;
+        let baked = bake_group_effects(&alpha, (w, h), (0, 0), &[e]).expect("baked");
+        let behind = baked.behind.expect("shadow raster");
+        assert!(baked.front.is_none());
+        // Light from the top: the shadow falls straight down, so the pixel
+        // just under the square is full shadow colour.
+        let px = behind.get_pixel(4 + 3, 6 + 3).0;
+        assert_eq!(px, [115, 115, 115, 255], "shadow below the shape");
+        // Above the shape there is nothing.
+        assert_eq!(behind.get_pixel(4 + 3, 1 + 3).0[3], 0);
     }
 
     #[test]

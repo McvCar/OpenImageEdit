@@ -278,6 +278,9 @@ pub struct PsdGroup {
     pub(crate) layer_properties: LayerProperties,
     /// `lsct` type 2: the folder was saved collapsed in Photoshop.
     pub(crate) collapsed: bool,
+    /// Group styles (`lfx2` on the folder record), when present. Disabled
+    /// styles are kept: the decoder filters on `enabled`.
+    pub(crate) layer_effects: Option<Vec<crate::effects::LayerEffect>>,
 }
 
 impl PsdGroup {
@@ -300,6 +303,7 @@ impl PsdGroup {
             contained_layers,
             layer_properties,
             collapsed,
+            layer_effects: layer_record.layer_effects.clone(),
         }
     }
 
@@ -311,6 +315,14 @@ impl PsdGroup {
     /// Whether the folder was stored closed ("collapsed") in the file.
     pub fn collapsed(&self) -> bool {
         self.collapsed
+    }
+
+    /// Group styles (`lfx2` on the folder record), in file order, including
+    /// disabled ones. Photoshop draws these once over the group's composite
+    /// outline, so a group stroke is one ring around every child, not one per
+    /// child.
+    pub fn layer_effects(&self) -> Option<&[crate::effects::LayerEffect]> {
+        self.layer_effects.as_deref()
     }
 }
 

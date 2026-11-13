@@ -168,6 +168,29 @@ pub fn parse_vector_mask(bytes: &[u8]) -> Option<VectorMask> {
     Some(mask)
 }
 
+/// 解析形状填充的 sheet setting（`SoCo` / `GdFl`）：负载 = u32 版本（实测
+/// 16）+ 描述符本体，比 `vscg` 少一层 key 头。`SoCo` 的实色在 `Clr `，
+/// `GdFl` 的渐变在 `Grad` 子描述符里 —— 与 `vscg` 内层结构一致。
+pub fn parse_sheet_fill(bytes: &[u8]) -> Option<VectorFill> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let desc = descriptor::parse_body(&bytes[4..])?;
+    let mut fill = VectorFill::default();
+    if let Some(clr) = desc.descriptor(b"Clr ") {
+        fill.solid = rgb_from(clr);
+    }
+    if fill.solid.is_none() {
+        if let Some(g) = desc.descriptor(b"Grad") {
+            fill.gradient = Some(crate::effects::gradient_from_descriptor(&desc, g));
+        }
+    }
+    if fill.solid.is_none() && fill.gradient.is_none() {
+        return None;
+    }
+    Some(fill)
+}
+
 /// 解析 `vscg` 的负载：`4 字节 key + u32 version + descriptor body`。
 pub fn parse_vector_fill(bytes: &[u8]) -> Option<VectorFill> {
     if bytes.len() < 12 {

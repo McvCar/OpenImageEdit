@@ -19,28 +19,37 @@ const CURVE_STEPS: usize = 24;
 /// 每像素纵向超采样数（横向走解析覆盖率，所以 4 就够）。
 const SUBSAMPLES: usize = 4;
 
-/// 把形状画到 `image` 上（`offset` 是这张位图左上角的画布坐标）。
+/// 栅格化早退时给 `IMAGEEDIT_PSD_VECTOR_TRACE` 一条可定位的日志。
+fn trace_fail(why: &str) {
+    if std::env::var("IMAGEEDIT_PSD_VECTOR_TRACE").ok().as_deref() == Some("1") {
+        println!(
+            "{{\"phase\":\"decode\",\"event\":\"vector-fail\",\"why\":\"{}\"}}",
+            why
+        );
+    }
+}
+
+/// 把 `mask` 的闭式子路径栅格化到**位图局部坐标**的覆盖率平面。
 ///
-/// 返回 `false` 表示路径不可用（空、坐标不是有限数、完全落在位图外），
-/// 调用方据此保持原样。
-pub fn fill_shape(
-    image: &mut RgbaImage,
+/// 返回 `(cov, 路径包围盒@局部)`；`None` 表示路径不可用（空、坐标不是
+/// 有限数、完全落在位图外），调用方据此保持原样。
+fn shape_coverage(
+    mask: &VectorMask,
+    w: u32,
+    h: u32,
     offset: (i32, i32),
     canvas: (u32, u32),
-    mask: &VectorMask,
-    fill: Option<&VectorFill>,
-) -> bool {
-    let (w, h) = image.dimensions();
+) -> Option<(Vec<f32>, [f32; 4])> {
     if w == 0 || h == 0 {
-        return false;
+        trace_fail("empty-image");
+        return None;
     }
     let Some((bx0, by0, bx1, by1)) = mask.bounds() else {
-        return false;
+        trace_fail("no-bounds");
+        return None;
     };
     // 尺度判断：PS 原生写像素，本仓库的素材写 0..1 的比例。
-    let normalized = [bx0, by0, bx1, by1]
-        .iter()
-        .all(|v| v.abs() <= 4.0);
+    let normalized = [bx0, by0, bx1, by1].iter().all(|v| v.abs() <= 4.0);
     let (sx, sy) = if normalized {
         (canvas.0 as f32, canvas.1 as f32)
     } else {
@@ -78,7 +87,8 @@ pub fn fill_shape(
         }
     }
     if polys.is_empty() {
-        return false;
+        trace_fail("no-closed-subpath");
+        return None;
     }
 
     // 路径包围盒在位图内的部分（局部坐标，浮点）。
@@ -87,7 +97,8 @@ pub fn fill_shape(
     let px1 = ((bx0.max(bx1) * sx) - offset.0 as f32).min(w as f32);
     let py1 = ((by0.max(by1) * sy) - offset.1 as f32).min(h as f32);
     if px1 <= px0 || py1 <= py0 {
-        return false;
+        trace_fail("bbox-outside");
+        return None;
     }
 
     let mut cov = vec![0f32; (w * h) as usize];
@@ -97,13 +108,30 @@ pub fn fill_shape(
             *v = 1.0 - *v;
         }
     }
+    Some((cov, [px0, py0, px1, py1]))
+}
+
+/// 把形状画到 `image` 上（`offset` 是这张位图左上角的画布坐标）。
+///
+/// 返回 `false` 表示路径不可用（空、坐标不是有限数、完全落在位图外），
+/// 调用方据此保持原样。
+pub fn fill_shape(
+    image: &mut RgbaImage,
+    offset: (i32, i32),
+    canvas: (u32, u32),
+    mask: &VectorMask,
+    fill: Option<&VectorFill>,
+) -> bool {
+    let (w, h) = image.dimensions();
+    let Some((cov, gb)) = shape_coverage(mask, w, h, offset, canvas) else {
+        return false;
+    };
 
     // 填充色：纯色优先，其次渐变（按路径包围盒做基准，与 PS 一致），
     // 都没有就当作纯白 —— 无填充的形状在 PS 里也只显示描边，这里由
     // 后续描边样式覆盖，不会漏出白色。
     let solid = fill.and_then(|f| f.solid);
     let gradient = fill.and_then(|f| f.gradient.as_ref());
-    let gb = [px0, py0, px1, py1];
     let mut painted = false;
     for y in 0..h {
         for x in 0..w {
@@ -124,6 +152,15 @@ pub fn fill_shape(
                 continue;
             }
             let px = image.get_pixel_mut(x, y);
+            // 洞填充：位图已有 alpha 的像素保持不动。PS 的形状内容 = 矢量
+            // 填充实时渲染，但通道里缓存的内填与 PS 输出逐像素一致（实测
+            // 面板内部 MAE 0），用我们的近似渐变覆盖它反而会倒退。缓存缺失
+            // 的洞必须补：矢量路径可能比缓存位图大一圈（实测 `矩形 556 拷贝`
+            // 的路径边界在位图外 1px，边缘整条渐变丢失）。全空位图的层所有
+            // 像素都是洞，行为与旧的「全空才整张填」完全一致。
+            if px.0[3] > 0 {
+                continue;
+            }
             let src = [color[0], color[1], color[2], a];
             // 源覆盖：形状自己的位图通常全透明，但外描边扩边后可能已有
             // 内容，直接覆盖会吃掉描边。
@@ -138,6 +175,37 @@ pub fn fill_shape(
         }
     }
     painted
+}
+
+/// 把位图裁到矢量路径内：`alpha *= cov`（PS 显示形状层 = 内容 ∩ 路径）。
+///
+/// PS 保存的缓存像素一般已按路径烘焙，裁剪是恒等变换；但文件里存在
+/// 「缓存过期」的形状层 —— 路径改过之后 PS 只按路径实时渲染，通道里的
+/// 缓存还是旧形状（实测底部按钮行 `矩形 670 拷贝` 的缓存是直角、路径
+/// 是圆角，圆角外多出一圈红）。psd-tools 同样对位图应用 vmsk。
+pub fn clip_shape(
+    image: &mut RgbaImage,
+    offset: (i32, i32),
+    canvas: (u32, u32),
+    mask: &VectorMask,
+) -> bool {
+    let (w, h) = image.dimensions();
+    let Some((cov, _gb)) = shape_coverage(mask, w, h, offset, canvas) else {
+        return false;
+    };
+    let mut clipped = false;
+    for (px, c) in image.pixels_mut().zip(cov.iter()) {
+        if *c >= 0.999 || px.0[3] == 0 {
+            continue;
+        }
+        let keep = (c.clamp(0.0, 1.0) * 255.0).round();
+        let a = ((px.0[3] as f32) * keep / 255.0).round() as u8;
+        if a != px.0[3] {
+            px.0[3] = a;
+            clipped = true;
+        }
+    }
+    clipped
 }
 
 /// 三次贝塞尔在 `t` 处的点。
