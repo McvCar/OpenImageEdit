@@ -39,6 +39,64 @@ pub struct PsdLayerData {
     pub mask: Option<editcore::LayerMask>,
     /// 该层是剪贴蒙版（只在下层基底的不透明区域内可见）。
     pub clipping: bool,
+    /// 烘焙图层样式**之前**的 alpha 平面，见 [`ContentAlpha`]。
+    ///
+    /// Photoshop 的剪贴调整层只受基底「内容」的 alpha 限制：样式额外画出来的
+    /// 像素（外描边、投影）不算内容，所以剪到按钮上的色相/饱和度会把按钮变色、
+    /// 却把它的描边留在原色。没有这一层信息就只能按烘焙后的 alpha 平均对待，
+    /// 描边会被一起改色（实测把 #4a0621 的描边刷成洋红）。
+    /// 只有带样式的层才需要，没有样式时是 `None`（不占内存）。
+    pub content_alpha: Option<ContentAlpha>,
+}
+
+/// 烘焙样式前的 alpha 平面（1 字节/像素，行优先）连同它自己的矩形。
+///
+/// 必须带上矩形：`bake` 会为外描边/投影把位图**扩边**，扩出来的那圈像素在
+/// 原图上根本没有对应值。只记 `Vec<u8>` 再按新尺寸取下标就是越界 panic
+/// （曾经真的这么挂过一次，整个 PSD 退化成合并预览）。
+#[derive(Debug, Clone)]
+pub struct ContentAlpha {
+    pub alpha: Vec<u8>,
+    pub offset: (i32, i32),
+    pub size: (u32, u32),
+}
+
+impl ContentAlpha {
+    /// 画布坐标处的覆盖率；落在原矩形外就是 0（那里本来什么都没有）。
+    pub fn at(&self, x: i32, y: i32) -> f32 {
+        let (ox, oy) = self.offset;
+        let (x, y) = (x - ox, y - oy);
+        if x < 0 || y < 0 || x >= self.size.0 as i32 || y >= self.size.1 as i32 {
+            return 0.0;
+        }
+        self.alpha[y as usize * self.size.0 as usize + x as usize] as f32 / 255.0
+    }
+
+    /// 「内容」平面 = 样式烘焙前的 alpha 扣掉样式自己画上去的那一份。
+    ///
+    /// 两个坐标系统不一样：`content` 是烘焙**前**的矩形，`size` 是烘焙后
+    /// （可能被外描边/投影扩过边）的矩形，所以逐像素按画布坐标对齐。
+    fn from_baked(
+        content: &ContentAlpha,
+        offset: (i32, i32),
+        size: (u32, u32),
+        effect_coverage: &[u8],
+    ) -> ContentAlpha {
+        let (w, h) = size;
+        let mut plane = Vec::with_capacity((w as usize) * (h as usize));
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                let a = content.at(offset.0 + x, offset.1 + y);
+                let c = effect_coverage[(y as usize) * (w as usize) + x as usize] as f32 / 255.0;
+                plane.push((a * (1.0 - c.clamp(0.0, 1.0)) * 255.0).round().clamp(0.0, 255.0) as u8);
+            }
+        }
+        ContentAlpha {
+            alpha: plane,
+            offset,
+            size,
+        }
+    }
 }
 
 /// One PSD folder. `parent` / `psd_id` 用 PSD 自己的编号，`PsdLayerData::group`
@@ -344,7 +402,28 @@ fn build_layers<F: FnMut(usize, usize)>(
                 } else {
                     decode_mask(layer, layer.channel_bytes(), cw, ch)
                 };
-                apply_adjustment(&mut layers[start..], bc, hs, mask.as_ref());
+                // 诊断：作用域算错时（剪贴调整层改了不该改的图层）只能靠打印
+                // 目标区间来定位，像素差本身分不清「范围错」还是「公式错」。
+                if std::env::var("IMAGEEDIT_PSD_TRACE_ADJUST").ok().as_deref() == Some("1") {
+                    let head: Vec<String> = layers[start..]
+                        .iter()
+                        .take(3)
+                        .map(|l| format!("{}#{:?}", l.name, l.group))
+                        .collect();
+                    println!(
+                        "{{\"phase\":\"decode\",\"event\":\"adjust\",\"name\":\"{}\",\
+                         \"parent\":{:?},\"clip\":{},\"mode\":\"{}\",\"start\":{},\"len\":{},\
+                         \"targets\":{:?}}}",
+                        layer.name(),
+                        layer.parent_id(),
+                        clipped,
+                        scope_mode_name(adjust_scope_mode()),
+                        start,
+                        layers.len(),
+                        head
+                    );
+                }
+                apply_adjustment(&mut layers[start..], bc, hs, mask.as_ref(), clipped);
                 baked_adjustments += 1;
             }
             progress(step + 1, total);
@@ -462,6 +541,17 @@ fn build_layers<F: FnMut(usize, usize)>(
         // baking them the layer looks flat (a title loses its gradient fill,
         // a button loses its outline). `bake` renders them into the bitmap and
         // reports any style it could not draw.
+        // 烘焙前留一份 alpha：剪贴调整层按「内容」限幅，见字段注释。
+        let pre_alpha = if layer.layer_effects().is_some() {
+            Some(ContentAlpha {
+                alpha: image.pixels().map(|p| p.0[3]).collect::<Vec<u8>>(),
+                offset: layer_offset,
+                size: (image.width(), image.height()),
+            })
+        } else {
+            None
+        };
+        let mut content_alpha = None;
         if let Some(effects) = layer.layer_effects().filter(|_| !no_styles) {
             // 诊断：`IMAGEEDIT_PSD_DUMP_FX=<图层名子串>` 打印解析到的样式参数。
             // 保真差异按块归因到某个图层后，用它确认「是解析错了还是画错了」。
@@ -494,6 +584,14 @@ fn build_layers<F: FnMut(usize, usize)>(
             }
             crate::psd_effects::set_trace_label(layer.name());
             if let Some(baked) = crate::psd_effects::bake(&image, layer_offset, effects) {
+                if let Some(pre) = pre_alpha.as_ref() {
+                    content_alpha = Some(ContentAlpha::from_baked(
+                        pre,
+                        baked.offset,
+                        baked.image.dimensions(),
+                        &baked.effect_coverage,
+                    ));
+                }
                 image = baked.image;
                 layer_offset = baked.offset;
                 notes.extend(baked.notes);
@@ -516,6 +614,7 @@ fn build_layers<F: FnMut(usize, usize)>(
             degraded: notes,
             mask,
             clipping,
+            content_alpha,
         });
         clips.push(layer.is_clipping_mask());
         progress(step + 1, total);
@@ -690,6 +789,14 @@ fn adjust_scope_mode() -> ScopeMode {
     }
 }
 
+fn scope_mode_name(mode: ScopeMode) -> &'static str {
+    match mode {
+        ScopeMode::All => "all",
+        ScopeMode::Last => "last",
+        ScopeMode::Chain => "chain",
+    }
+}
+
 fn cross_group() -> bool {
     static CROSS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CROSS.get_or_init(|| std::env::var("IMAGEEDIT_PSD_ADJUST_CROSS_GROUP").ok().as_deref() == Some("1"))
@@ -706,14 +813,24 @@ fn apply_adjustment(
     bc: Option<psd::BrightnessContrast>,
     hs: Option<psd::HueSaturation>,
     mask: Option<&editcore::LayerMask>,
+    clipped: bool,
 ) {
+    // 剪贴调整层只吃基底的「内容」alpha；非剪贴的调整层（作用于整条链）没有
+    // 这个限制。可用 `IMAGEEDIT_PSD_ADJUST_FULL_ALPHA=1` 关掉做消融。
+    let content_alpha = clipped && !full_alpha_adjust();
     for layer in targets.iter_mut() {
         if !layer.visible || layer.opacity <= 0.0 {
             continue;
         }
-        // Fast path: no mask means every pixel takes the full adjustment, which is
-        // the common case and must stay as cheap as the original loop.
-        let Some(mask) = mask else {
+        let pre = if content_alpha {
+            layer.content_alpha.as_ref()
+        } else {
+            None
+        };
+        // Fast path: no mask and no content-alpha limit means every pixel takes
+        // the full adjustment, which is the common case and must stay as cheap
+        // as the original loop.
+        if mask.is_none() && pre.is_none() {
             for px in layer.image.pixels_mut() {
                 if px.0[3] == 0 {
                     continue;
@@ -730,14 +847,22 @@ fn apply_adjustment(
                 px.0[2] = rgb[2];
             }
             continue;
-        };
+        }
         let (ox, oy) = layer.offset;
         let (w, h) = (layer.image.width() as i32, layer.image.height() as i32);
         for y in 0..h {
             for x in 0..w {
                 // How much of the adjustment reaches this pixel: all of it where
-                // the adjustment's mask is white, none where it is black.
-                let k = mask.coverage(ox + x, oy + y).clamp(0.0, 1.0);
+                // the adjustment's mask is white, none where it is black, times
+                // the base layer's content alpha for a clipped adjustment.
+                let mut k = match mask {
+                    Some(mask) => mask.coverage(ox + x, oy + y),
+                    None => 1.0,
+                };
+                if let Some(pre) = pre {
+                    k *= pre.at(ox + x, oy + y);
+                }
+                let k = k.clamp(0.0, 1.0);
                 if k <= 0.0 {
                     continue;
                 }
@@ -766,6 +891,11 @@ fn apply_adjustment(
             }
         }
     }
+}
+
+fn full_alpha_adjust() -> bool {
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FULL.get_or_init(|| std::env::var("IMAGEEDIT_PSD_ADJUST_FULL_ALPHA").ok().as_deref() == Some("1"))
 }
 
 /// Photoshop's brightness/contrast sliders (legacy range -100..=100).

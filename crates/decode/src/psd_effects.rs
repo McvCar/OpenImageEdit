@@ -56,6 +56,14 @@ pub struct Baked {
     pub offset: (i32, i32),
     /// Per-layer notes (unsupported style kinds, size caps).
     pub notes: Vec<String>,
+    /// How much of each pixel the *styles* painted (0 = untouched content).
+    ///
+    /// Photoshop composites a layer's styles on top of its content, so an
+    /// adjustment layer clipped to that layer changes the content but never the
+    /// styles. Baking flattens both into one bitmap, which loses that
+    /// distinction; this plane puts it back. It is what stops a hue shift
+    /// clipped to a button from repainting the button's own outline.
+    pub effect_coverage: Vec<u8>,
 }
 
 /// Diagnostic ablation: `IMAGEEDIT_FX_SKIP=stroke,gradient` removes whole
@@ -181,6 +189,9 @@ pub fn bake(image: &RgbaImage, offset: (i32, i32), effects: &[LayerEffect]) -> O
     let mut out = RgbaImage::from_pixel(w, h, Rgba([0, 0, 0, 0]));
     let ox = pad.left as i64;
     let oy = pad.top as i64;
+    // 从这里开始记「样式画上去的像素」。内容那一步直接写 `out`，不经过
+    // `composite`，所以不会被记进来——正好是我们要的分界。
+    FX_COVER.with(|c| *c.borrow_mut() = Some(vec![0.0f32; (w * h) as usize]));
 
     // ---- layer alpha in the expanded coordinate system ------------------
     let mut alpha = vec![0.0f32; (w * h) as usize];
@@ -291,10 +302,17 @@ pub fn bake(image: &RgbaImage, offset: (i32, i32), effects: &[LayerEffect]) -> O
             }
         }
     }
+    let effect_coverage: Vec<u8> = FX_COVER
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+        .collect();
     Some(Baked {
         image: out,
         offset: new_offset,
         notes,
+        effect_coverage,
     })
 }
 
@@ -332,6 +350,7 @@ fn composite(
         );
     }
     let w = out.width();
+    record_effect_coverage(x, y, w, a);
     let idx = ((y * w + x) * 4) as usize;
     let data = out.as_mut();
     let mut px = [data[idx], data[idx + 1], data[idx + 2], data[idx + 3]];
@@ -342,6 +361,26 @@ fn composite(
         mode,
     );
     data[idx..idx + 4].copy_from_slice(&px);
+}
+
+thread_local! {
+    /// 当前 `bake` 正在记录「哪些像素是样式画上去的」。用一个线程内的暂存区，
+    /// 是为了不必给 8 个 `draw_*` 都加一个 out 参数——它们唯一共同的出口就是
+    /// [`composite`]。`bake` 之外始终是 `None`，[`composite`] 于是零成本。
+    static FX_COVER: std::cell::RefCell<Option<Vec<f32>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn record_effect_coverage(x: u32, y: u32, w: u32, alpha: f32) {
+    let i = (y * w + x) as usize;
+    let a = (alpha / 255.0).clamp(0.0, 1.0);
+    FX_COVER.with(|c| {
+        if let Some(cov) = c.borrow_mut().as_mut() {
+            if let Some(v) = cov.get_mut(i) {
+                // 多次叠加取并集：1-(1-a)(1-b)，描边 + 内阴影叠在一起仍然是 1。
+                *v = 1.0 - (1.0 - *v) * (1.0 - a);
+            }
+        }
+    });
 }
 
 /// Diagnostic: `IMAGEEDIT_FX_TRACE=x,y` prints every style composite at that
@@ -1133,9 +1172,36 @@ mod tests {
         assert_eq!(baked.image.get_pixel(0, 0).0[3], 0);
     }
 
+    /// A clipped adjustment layer must leave a layer's *styles* alone, so `bake`
+    /// has to say which pixels the styles painted. An inside stroke covers the
+    /// border of the content; the middle of the square stays untouched content.
     #[test]
-    fn drop_shadow_paints_below_the_content() {
-        let img = layer(6, 6, [255, 255, 255, 255], 1);
+    fn coverage_marks_the_pixels_the_styles_painted() {
+        // 16×16 的透明画布，中心 8×8 是内容；内描边 2px 只吃外圈两像素。
+        let img = layer(16, 16, [0, 0, 0, 255], 4);
+        let mut e = effect(EffectKind::Stroke);
+        e.size = 2.0;
+        e.color = [255, 0, 0];
+        e.stroke_position = StrokePosition::Inside;
+        let baked = bake(&img, (0, 0), &[e]).expect("baked");
+        assert_eq!(baked.image.dimensions(), (16, 16));
+        assert_eq!(baked.effect_coverage.len(), 16 * 16);
+        let cov = |x: u32, y: u32| baked.effect_coverage[(y * 16 + x) as usize];
+        // 外圈两像素是样式画的，四角也一样。
+        assert_eq!(cov(4, 4), 255, "stroke should own the corner of the ring");
+        assert_eq!(cov(4, 7), 255, "and the edge between the corners");
+        assert_eq!(cov(11, 11), 255);
+        // 中间仍是内容本身，没被样式碰过。
+        assert_eq!(cov(7, 7), 0, "the interior is content, not style");
+        // 形状之外什么都没画。
+        assert_eq!(cov(0, 0), 0);
+        // 像素本身：外圈被描边覆盖，中心保留原色。
+        assert_eq!(baked.image.get_pixel(4, 4).0, [255, 0, 0, 255]);
+        assert_eq!(baked.image.get_pixel(7, 7).0, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn drop_shadow_paints_below_the_content() {        let img = layer(6, 6, [255, 255, 255, 255], 1);
         let mut e = effect(EffectKind::DropShadow);
         e.size = 1.0;
         e.distance = 2.0;
