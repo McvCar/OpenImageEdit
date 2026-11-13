@@ -49,6 +49,10 @@ pub struct LayerProperties {
     pub(crate) layer_effects: Option<Vec<crate::effects::LayerEffect>>,
     /// Rectangle of the user layer mask (channel `-2`), when the layer has one.
     pub(crate) mask_rect: Option<MaskRect>,
+    /// 矢量蒙版（`vmsk` / `vsms`）：形状图层的轮廓，见 [`crate::vector`]。
+    pub(crate) vector_mask: Option<crate::vector::VectorMask>,
+    /// 形状图层的填充内容（`vscg`）：纯色或渐变。
+    pub(crate) vector_fill: Option<crate::vector::VectorFill>,
 }
 
 /// Where a layer's mask lives, plus the "mask disabled" flag.
@@ -156,6 +160,8 @@ impl LayerProperties {
             hue_saturation: layer_record.hue_saturation,
             layer_effects: layer_record.layer_effects.clone(),
             mask_rect: layer_record.mask_rect,
+            vector_mask: layer_record.vector_mask.clone(),
+            vector_fill: layer_record.vector_fill.clone(),
         }
     }
 
@@ -183,6 +189,19 @@ impl LayerProperties {
     /// Layer styles (`lfx2`), in file order, including disabled ones.
     pub fn layer_effects(&self) -> Option<&[crate::effects::LayerEffect]> {
         self.layer_effects.as_deref()
+    }
+
+    /// 形状图层的矢量轮廓（`vmsk` / `vsms`）。`None` 表示这层不是形状层。
+    ///
+    /// 形状图层的通道数据通常是**全透明**的：像素由 PS 用这条路径实时
+    /// 生成。要还原它的描边、内阴影，必须先按路径栅格化出一份 alpha。
+    pub fn vector_mask(&self) -> Option<&crate::vector::VectorMask> {
+        self.vector_mask.as_ref()
+    }
+
+    /// 形状图层的填充（`vscg`）。纯色 / 渐变 / 两者都没有（只有描边）。
+    pub fn vector_fill(&self) -> Option<&crate::vector::VectorFill> {
+        self.vector_fill.as_ref()
     }
 
     /// Get the name of the layer
@@ -538,6 +557,10 @@ pub struct LayerRecord {
     pub(super) layer_effects: Option<Vec<crate::effects::LayerEffect>>,
     /// User layer mask rectangle (channel `-2`), when present
     pub(super) mask_rect: Option<MaskRect>,
+    /// 矢量蒙版（`vmsk` / `vsms`）
+    pub(super) vector_mask: Option<crate::vector::VectorMask>,
+    /// 形状填充（`vscg`）
+    pub(super) vector_fill: Option<crate::vector::VectorFill>,
 }
 
 impl LayerRecord {

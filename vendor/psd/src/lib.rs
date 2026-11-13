@@ -28,6 +28,7 @@ pub use crate::sections::image_resources_section::{DescriptorField, UnitFloatStr
 pub use crate::sections::layer_and_mask_information_section::layer::{
     BlendMode, BrightnessContrast, HueSaturation, LayerChannels, MaskRect, PsdGroup, PsdLayer,
 };
+pub use vector::{VectorFill, VectorKnot, VectorMask, VectorSubpath};
 use crate::sections::layer_and_mask_information_section::LayerAndMaskInformationSection;
 use crate::sections::MajorSections;
 
@@ -40,6 +41,7 @@ mod sections;
 
 pub mod descriptor;
 pub mod effects;
+pub mod vector;
 
 pub use effects::{EffectKind, Gradient, GradientKind, LayerEffect, StrokeFill, StrokePosition};
 

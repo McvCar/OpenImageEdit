@@ -370,6 +370,9 @@ mod tests {
             brightness_contrast: None,
             hue_saturation: None,
             layer_effects: None,
+            mask_rect: None,
+            vector_mask: None,
+            vector_fill: None,
         };
 
         let layer = PsdLayer {

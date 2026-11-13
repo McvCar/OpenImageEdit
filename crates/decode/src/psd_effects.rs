@@ -664,7 +664,7 @@ fn alpha_bounds(alpha: &[f32], w: u32, h: u32) -> [f32; 4] {
 /// angle (`min(w / |cos|, h / |sin|)`), not the projection of the bounds: on a
 /// wide, flat layer at 45° the two differ by several times, and Photoshop uses
 /// the chord.
-fn gradient_t(x: f32, y: f32, bounds: [f32; 4], g: &Gradient) -> f32 {
+pub(crate) fn gradient_t(x: f32, y: f32, bounds: [f32; 4], g: &Gradient) -> f32 {
     if legacy("grad") {
         return gradient_t_projected(x, y, bounds, g);
     }

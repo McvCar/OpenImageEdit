@@ -12,6 +12,8 @@ pub use psd_layers::{
     decode_psd_layers, decode_psd_layers_with_progress, PsdLayerData, PsdLayerSet,
 };
 
+mod psd_vector;
+
 mod psd_write;
 pub use psd_write::{encode_document, encode_psd};
 

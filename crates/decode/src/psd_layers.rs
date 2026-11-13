@@ -352,6 +352,7 @@ fn build_layers<F: FnMut(usize, usize)>(
     let mut styled_layers = 0usize;
     let mut masked_layers = 0usize;
     let mut clipped_layers = 0usize;
+    let mut vector_filled = 0usize;
     let groups = psd.groups();
     let mut inherited_hidden = false;
     // 诊断开关：把某一项特性关掉再合成，用 `dump-flat` 与 PS 合并图比对，
@@ -523,6 +524,48 @@ fn build_layers<F: FnMut(usize, usize)>(
         let mut image = image;
         let mut layer_offset = (x0, y0);
 
+        // ---- 形状图层的矢量填充（`vmsk` / `vscg`）------------------------
+        // 形状层的通道数据是**空的**：像素由 PS 按矢量路径实时生成。只读通道
+        // 时这类层是一片透明，连它自己的描边/内阴影都画不出来（实测目标稿
+        // 5 张卡片的渐变描边整圈丢失）。只在位图确实为空时才栅格化 —— 有位图
+        // 的形状层说明缓存里已经有渲染结果，再填一遍反而会盖掉它。
+        if !off("IMAGEEDIT_PSD_NO_VECTOR") {
+            if let Some(vm) = layer.vector_mask() {
+                let empty = image.pixels().all(|p| p.0[3] == 0);
+                let trace =
+                    std::env::var("IMAGEEDIT_PSD_VECTOR_TRACE").ok().as_deref() == Some("1");
+                if empty
+                    && crate::psd_vector::fill_shape(
+                        &mut image,
+                        layer_offset,
+                        (cw as u32, ch as u32),
+                        vm,
+                        layer.vector_fill(),
+                    )
+                {
+                    vector_filled += 1;
+                    if trace {
+                        println!(
+                            "{{\"phase\":\"decode\",\"event\":\"vector-fill\",\"name\":\"{}\",\
+                             \"offset\":[{},{}],\"size\":[{},{}],\"groups\":{}}}",
+                            layer.name(),
+                            layer_offset.0,
+                            layer_offset.1,
+                            image.width(),
+                            image.height(),
+                            vm.subpaths.len()
+                        );
+                    }
+                } else if trace && !empty {
+                    println!(
+                        "{{\"phase\":\"decode\",\"event\":\"vector-skip\",\"name\":\"{}\",\
+                         \"why\":\"has-raster\"}}",
+                        layer.name()
+                    );
+                }
+            }
+        }
+
         // ---- layer mask (`-2`) -----------------------------------------
         // The mask channel is compressed against the mask's OWN rectangle,
         // which is usually the whole canvas while the layer is a small
@@ -634,6 +677,11 @@ fn build_layers<F: FnMut(usize, usize)>(
     if styled_layers > 0 {
         degraded.push(format!(
             "{styled_layers} 个图层的样式（阴影/描边/渐变叠加等）已烘焙进图层像素"
+        ));
+    }
+    if vector_filled > 0 {
+        degraded.push(format!(
+            "{vector_filled} 个形状图层按矢量路径栅格化（PSD 里这类层的通道是空的）"
         ));
     }
     // ---- 文件夹树（PSD 的组，不再摊平）---------------------------------

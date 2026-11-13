@@ -293,13 +293,15 @@ fn multi_mode() -> MultiMode {
         Some("reverse") => MultiMode::Reverse,
         Some("first") => MultiMode::First,
         Some("last") => MultiMode::Last,
-        // Measured against the PSD's own merged image (750x1700, 617 layers):
-        //   off 6.986 | file 6.971 | reverse 6.767 | first 6.674 | last 6.885
-        // Painting every entry of a `*Multi` stack accumulates errors in our
-        // baked renderer (no live style stack), and the extra entries are
-        // usually superseded drafts. Taking the top-most enabled entry is both
-        // the closest match and the cheapest to render.
-        _ => MultiMode::First,
+        // 实测（`0302-界面UI-1.psd`，重建合成 vs PSD 自带合并图，MAE/255）：
+        //   first+矢量 8.002 | first+无矢量 8.466
+        //   reverse+矢量 7.272 | reverse+无矢量 8.277
+        // `reverse`（文件里靠前的条目最后画，即 Photoshop 的堆叠顺序）在两种
+        // 配置下都更低，矢量填充又能把差值从 0.19 拉到 0.73：卡片那两圈渐变
+        // 描边（5px 米黄 + 7px 暗红）必须先有形状 alpha 才画得出来，而两者
+        // 缺一不可。`first` 只取一条，因此永远少一圈。
+        // 其它取值仍可用 `IMAGEEDIT_FX_MODE` 覆盖，便于回归对比。
+        _ => MultiMode::Reverse,
     }
 }
 
@@ -432,9 +434,13 @@ fn parse_effect(kind: EffectKind, d: &Descriptor) -> LayerEffect {
         };
     }
     if let Some(v) = d.enum_value(b"PntT") {
+        // `FrFX` 的填充分派：`SClr` 纯色 / `GrFl` 渐变 / `Pttr` 图案。
+        // ★ 早先按 `GRad`/`Ptrn` 匹配（那是渐变叠加里的写法），结果**每个
+        //   渐变描边都被当成纯色**：实测卡片那圈 5px 米黄渐变描边被画成
+        //   `#bb7b0f` 的土黄，比不画还差（MAE 8.47 → 9.14）。
         e.stroke_fill = match &v {
-            b"GRad" => StrokeFill::Gradient,
-            b"Ptrn" => StrokeFill::Pattern,
+            b"GrFl" | b"GRad" => StrokeFill::Gradient,
+            b"Pttr" | b"Ptrn" => StrokeFill::Pattern,
             _ => StrokeFill::Color,
         };
     }
@@ -449,6 +455,15 @@ fn parse_effect(kind: EffectKind, d: &Descriptor) -> LayerEffect {
         e.gradient = Some(parse_gradient(g, d));
     }
     e
+}
+
+/// 从描述符里的 `Grad` 子描述符读一个梯度。
+///
+/// 形状图层的填充（`vscg` 的 `GdFl`）和图层样式的渐变叠加用的是同一套
+/// 记录格式（`Clrs` / `Trns` / `Type` / `Angl`），所以共用这里，避免两处
+/// 各自解释 4096 为单位的色标位置。
+pub fn gradient_from_descriptor(container: &Descriptor, grad: &Descriptor) -> Gradient {
+    parse_gradient(grad, container)
 }
 
 fn parse_gradient(g: &Descriptor, effect: &Descriptor) -> Gradient {

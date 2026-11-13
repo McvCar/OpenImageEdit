@@ -34,6 +34,11 @@ const KEY_HUE_SATURATION: &[u8; 4] = b"hue2";
 /// art in folders) would lose the styles of everything in a group if only
 /// `lfx2` were read.
 const KEY_LAYER_EFFECTS: &[u8; 4] = b"lfx2";
+/// 矢量蒙版（形状图层的轮廓）。PS 存 `vmsk`，部分导出器写 `vsms`。
+const KEY_VECTOR_MASK: &[u8; 4] = b"vmsk";
+const KEY_VECTOR_MASK_ALT: &[u8; 4] = b"vsms";
+/// 形状图层的填充内容（纯色 / 渐变）。
+const KEY_VECTOR_STROKE_CONTENT: &[u8; 4] = b"vscg";
 const KEY_LAYER_EFFECTS_V0: &[u8; 4] = b"lmfx";
 const KEY_LAYER_EFFECTS_V1: &[u8; 4] = b"lfxs";
 
@@ -514,6 +519,9 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
     let mut hue_saturation = None;
     // Layer styles, kept so the decoder can bake the visible ones.
     let mut layer_effects: Option<Vec<crate::effects::LayerEffect>> = None;
+    // 形状图层的矢量轮廓与填充。
+    let mut vector_mask: Option<crate::vector::VectorMask> = None;
+    let mut vector_fill: Option<crate::vector::VectorFill> = None;
     // There can be multiple additional layer information sections so we'll loop
     // until we stop seeing them.
     while cursor.peek_4() == SIGNATURE_EIGHT_BIM || cursor.peek_4() == SIGNATURE_EIGHT_B64 {
@@ -597,6 +605,27 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
                 cursor.seek(end as u64);
             }
 
+            // 形状图层的矢量轮廓与填充：通道数据通常是全透明的，像素由 PS
+            // 按路径实时生成。没有这两块，形状层就是一个空层，它的描边和
+            // 内阴影跟着一起消失。
+            KEY_VECTOR_MASK | KEY_VECTOR_MASK_ALT | KEY_VECTOR_STROKE_CONTENT => {
+                let start = cursor.position() as usize;
+                let len = additional_layer_info_len as usize;
+                let block = cursor
+                    .get_ref()
+                    .get(start..start.checked_add(len).unwrap_or(usize::MAX))
+                    .unwrap_or(&[]);
+                if &key == KEY_VECTOR_STROKE_CONTENT {
+                    if let Some(f) = crate::vector::parse_vector_fill(block) {
+                        vector_fill = Some(f);
+                    }
+                } else if let Some(m) = crate::vector::parse_vector_mask(block) {
+                    vector_mask = Some(m);
+                }
+                let end = start.saturating_add(len).min(cursor.get_ref().len());
+                cursor.seek(end as u64);
+            }
+
             // TODO: Skipping other keys until we implement parsing for them
             _ => {
                 cursor.read(additional_layer_info_len);
@@ -620,5 +649,7 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
         hue_saturation,
         layer_effects,
         mask_rect,
+        vector_mask,
+        vector_fill,
     })
 }
