@@ -414,9 +414,197 @@ fn set_sat(c: [f32; 3], s: f32) -> [f32; 3] {
     res
 }
 
+/// 混合颜色带（Blend If）里的一个范围。
+///
+/// PSD 每个范围占 4 字节：黑起、黑止、白起、白止（0..=255）。未拆分时起止
+/// 相等，就是一条硬边；拆开后两值之间是线性斜坡。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlendRange {
+    pub black: [u8; 2],
+    pub white: [u8; 2],
+}
+
+impl Default for BlendRange {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl BlendRange {
+    /// 全可见（黑 0、白 255），PSD 里的全默认值。
+    pub const DEFAULT: Self = Self {
+        black: [0, 0],
+        white: [255, 255],
+    };
+
+    pub fn from_psd(bytes: [u8; 4]) -> Self {
+        Self {
+            black: [bytes[0], bytes[1]],
+            white: [bytes[2], bytes[3]],
+        }
+    }
+
+    pub fn to_psd(self) -> [u8; 4] {
+        [self.black[0], self.black[1], self.white[0], self.white[1]]
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::DEFAULT
+    }
+
+    /// `value` 落在这个范围里时的可见权重（0..=1）。
+    pub fn factor(&self, value: u8) -> f32 {
+        if self.is_default() {
+            return 1.0;
+        }
+        // 拆分时文件里按「低位、高位」存；个别写手会反过来，取大小序保证
+        // 斜坡方向总是「黑端抬升、白端下降」。
+        let b_lo = self.black[0].min(self.black[1]) as f32;
+        let b_hi = self.black[0].max(self.black[1]) as f32;
+        let w_lo = self.white[0].min(self.white[1]) as f32;
+        let w_hi = self.white[0].max(self.white[1]) as f32;
+        let v = value as f32;
+        if v < b_lo {
+            return 0.0;
+        }
+        if v < b_hi {
+            return (v - b_lo) / (b_hi - b_lo);
+        }
+        if v <= w_lo {
+            return 1.0;
+        }
+        if v < w_hi {
+            return (w_hi - v) / (w_hi - w_lo);
+        }
+        0.0
+    }
+}
+
+/// 混合颜色带：本图层（source，看图层自己的颜色）与下层（destination，
+/// 看已经合成好的背景色）两组范围。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlendIf {
+    pub source: BlendRange,
+    pub destination: BlendRange,
+    /// `true`：叠加每个通道的范围（PSD 里按 RGB 分通道设置的那一组）。
+    /// 灰度模式下只用 `source` / `destination` 两组合成范围。
+    pub rgb: bool,
+    pub source_channels: [BlendRange; 3],
+    pub destination_channels: [BlendRange; 3],
+}
+
+impl Default for BlendIf {
+    fn default() -> Self {
+        Self {
+            source: BlendRange::DEFAULT,
+            destination: BlendRange::DEFAULT,
+            rgb: false,
+            source_channels: [BlendRange::DEFAULT; 3],
+            destination_channels: [BlendRange::DEFAULT; 3],
+        }
+    }
+}
+
+impl BlendIf {
+    /// 所有范围都是默认值 = 不影响画面，解码时直接丢掉。
+    pub fn is_noop(&self) -> bool {
+        self.source.is_default()
+            && self.destination.is_default()
+            && (!self.rgb
+                || (self.source_channels.iter().all(|r| r.is_default())
+                    && self.destination_channels.iter().all(|r| r.is_default())))
+    }
+
+    /// 单个像素的可见权重；乘到图层 alpha 上就是 Blend If 的效果。
+    ///
+    /// 源色取图层自己（直通 RGB），目标色取下层已合成的直通 RGB。灰度按
+    /// Photoshop 的常见权重 0.299/0.587/0.114。
+    pub fn factor(&self, source: [u8; 3], destination: [u8; 3]) -> f32 {
+        self.source_factor(source) * self.destination_factor(destination)
+    }
+
+    /// 只看「本图层」那一半。下层是全透明时没有颜色可比，合成路径只乘这部分。
+    pub fn source_factor(&self, source: [u8; 3]) -> f32 {
+        let mut f = self.source.factor(gray(source));
+        if self.rgb {
+            for i in 0..3 {
+                f *= self.source_channels[i].factor(source[i]);
+            }
+        }
+        f
+    }
+
+    /// 只看「下层」那一半。
+    pub fn destination_factor(&self, destination: [u8; 3]) -> f32 {
+        let mut f = self.destination.factor(gray(destination));
+        if self.rgb {
+            for i in 0..3 {
+                f *= self.destination_channels[i].factor(destination[i]);
+            }
+        }
+        f
+    }
+}
+
+fn gray(rgb: [u8; 3]) -> u8 {
+    let v = 0.299 * rgb[0] as f32 + 0.587 * rgb[1] as f32 + 0.114 * rgb[2] as f32;
+    v.round().clamp(0.0, 255.0) as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blend_if_range_ramps_and_hard_edges() {
+        let split = BlendRange {
+            black: [40, 80],
+            white: [200, 240],
+        };
+        assert_eq!(split.factor(0), 0.0);
+        assert_eq!(split.factor(40), 0.0);
+        assert!((split.factor(60) - 0.5).abs() < 1e-6);
+        assert_eq!(split.factor(120), 1.0);
+        assert_eq!(split.factor(200), 1.0);
+        assert!((split.factor(220) - 0.5).abs() < 1e-6);
+        assert_eq!(split.factor(250), 0.0);
+
+        // 未拆分 = 硬边：黑端以下全无，白端以上全无。
+        let cut = BlendRange {
+            black: [128, 128],
+            white: [255, 255],
+        };
+        assert_eq!(cut.factor(127), 0.0);
+        assert_eq!(cut.factor(128), 1.0);
+        assert_eq!(BlendRange::DEFAULT.factor(0), 1.0);
+    }
+
+    #[test]
+    fn blend_if_uses_source_and_destination_gray() {
+        let source_only = BlendIf {
+            source: BlendRange {
+                black: [0, 0],
+                white: [128, 128],
+            },
+            ..Default::default()
+        };
+        assert_eq!(source_only.factor([255, 255, 255], [0, 0, 0]), 0.0);
+        assert_eq!(source_only.factor([0, 0, 0], [255, 255, 255]), 1.0);
+
+        let destination_only = BlendIf {
+            destination: BlendRange {
+                black: [0, 0],
+                white: [64, 64],
+            },
+            ..Default::default()
+        };
+        assert_eq!(destination_only.factor([255, 255, 255], [32, 32, 32]), 1.0);
+        assert_eq!(
+            destination_only.factor([255, 255, 255], [200, 200, 200]),
+            0.0
+        );
+        assert!(BlendIf::default().is_noop());
+    }
 
     fn over(b: [u8; 3], s: [u8; 3], mode: BlendMode) -> [u8; 3] {
         let mut out = [b[0], b[1], b[2], 255];

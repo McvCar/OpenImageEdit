@@ -211,6 +211,9 @@ pub struct Layer {
     /// 烘焙样式在内容之外的笔迹及其混合模式，`None` = 没有（或全是 Normal）。
     /// 见 [`StylePixels`]。
     pub style: Option<StylePixels>,
+    /// 混合颜色带（PSD 的 blending ranges + `lclr`）：按本层/下层的颜色范围
+    /// 进一步遮挡本层，`None` = 全默认。
+    pub blend_if: Option<BlendIf>,
     /// 所属分组（`None` = 不属于任何组）。组只影响面板组织与批量显隐，
     /// 不改变 z 序、不参与合成。`duplicated()` 会继承它。
     pub group: Option<GroupId>,
@@ -253,6 +256,7 @@ impl Layer {
             clipping: false,
             clip_shape: None,
             style: None,
+            blend_if: None,
             group: None,
             content: LayerContent::Raster(RasterLayer {
                 image,
@@ -333,6 +337,7 @@ impl Layer {
             clipping: false,
             clip_shape: None,
             style: None,
+            blend_if: None,
             group: None,
             content: LayerContent::Mark(mark),
         }

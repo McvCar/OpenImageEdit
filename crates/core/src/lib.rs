@@ -6,7 +6,7 @@ mod blend;
 mod color;
 pub mod font;
 pub use adjust::{adjust_json, Adjust, AdjustTarget, Histogram, BINS};
-pub use blend::{blend_pixel, dissolve_hit, BlendMode};
+pub use blend::{blend_pixel, dissolve_hit, BlendIf, BlendMode, BlendRange};
 pub use color::{cmyk_of, hsl_of, PickedColor};
 pub use font::{measure_text, FONTS};
 

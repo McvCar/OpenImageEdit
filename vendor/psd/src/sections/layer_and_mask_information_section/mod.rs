@@ -26,6 +26,7 @@ const KEY_SECTION_DIVIDER_SETTING: &[u8; 4] = b"lsct";
 const KEY_BRIGHTNESS_CONTRAST: &[u8; 4] = b"brit";
 /// Key of `Hue/saturation (photoshop 6.0)`, "hue2"
 const KEY_HUE_SATURATION: &[u8; 4] = b"hue2";
+
 /// Key of `Object-based effects layer info`, "lfx2" — layer styles.
 ///
 /// Photoshop picks the key by where the layer lives: `lfx2` at the root,
@@ -508,9 +509,28 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
         cursor.read(layer_mask_data_len as u32);
     }
 
-    // We do not currently use the layer blending range, skip it
+    // 混合颜色带（Blend If）：每组 4 字节，依次是 black_low / black_high /
+    // white_low / white_high。顺序为「合成源、合成目标，然后每个通道各一对」。
+    // 未拆分时 low == high（默认 0,0,255,255）；全默认就不保留，省得每层都带表。
     let layer_blending_range_data_len = cursor.read_u32();
-    cursor.read(layer_blending_range_data_len);
+    let mut blend_ranges: Option<Vec<[u8; 4]>> = None;
+    if layer_blending_range_data_len >= 4 {
+        let start = cursor.position();
+        let end = (start + layer_blending_range_data_len as u64)
+            .min(cursor.get_ref().len() as u64);
+        let mut parsed = Vec::new();
+        while cursor.position() + 4 <= end {
+            let mut range = [0u8; 4];
+            range.copy_from_slice(cursor.read_4());
+            parsed.push(range);
+        }
+        cursor.seek(end);
+        if parsed.iter().any(|r| *r != [0, 0, 255, 255]) {
+            blend_ranges = Some(parsed);
+        }
+    } else {
+        cursor.read(layer_blending_range_data_len);
+    }
 
     // Read the layer name
     let name_len = cursor.read_u8();
@@ -698,6 +718,7 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
         blend_mode,
         divider_type,
         divider_blend_mode,
+        blend_ranges,
         brightness_contrast,
         hue_saturation,
         layer_effects,

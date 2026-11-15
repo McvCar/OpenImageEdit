@@ -162,6 +162,8 @@ pub struct PsdLayerSeed {
     pub clip_shape: Option<LayerMask>,
     /// 烘焙样式画在内容之外的笔迹与它自己的混合模式（见 [`StylePixels`]）。
     pub style: Option<StylePixels>,
+    /// 混合颜色带（PSD blending ranges + `lclr`），全默认 = `None`。
+    pub blend_if: Option<BlendIf>,
 }
 
 /// One PSD folder ("layer group"). `layers` 里的成员通过 `PsdLayerSeed::group`
@@ -205,6 +207,7 @@ mod psd_assembly_tests {
             clipping: false,
             clip_shape: None,
             style: None,
+            blend_if: None,
         }
     }
 
@@ -262,6 +265,40 @@ mod psd_assembly_tests {
             vec![group_seed(3, "组", BlendMode::Normal, 0.5, true)],
         );
         assert_eq!(doc.flatten().get_pixel(0, 0).0, [159, 159, 159, 255]);
+    }
+
+    /// 混合颜色带按本层颜色遮罩：白端 128 以上整片消失，其余照常。
+    #[test]
+    fn blend_if_hides_source_pixels_outside_range() {
+        let white = seed("底", (0, 0), [255, 255, 255, 255], (2, 1), true, 1.0);
+        let mut layer = seed("灰黑", (0, 0), [200, 200, 200, 255], (2, 1), true, 1.0);
+        layer.image.put_pixel(1, 0, image::Rgba([0, 0, 0, 255]));
+        layer.blend_if = Some(BlendIf {
+            source: BlendRange {
+                black: [0, 0],
+                white: [128, 128],
+            },
+            ..Default::default()
+        });
+        let doc = Document::from_psd_layers((2, 1), vec![white, layer]);
+        let flat = doc.flatten();
+        assert_eq!(flat.get_pixel(0, 0).0, [255, 255, 255, 255], "亮像素被挡住");
+        assert_eq!(flat.get_pixel(1, 0).0, [0, 0, 0, 255], "暗像素保留");
+    }
+
+    /// 下层全透明时只按本层范围限制，不会因为「下层黑」把浮动图层吃掉。
+    #[test]
+    fn blend_if_ignores_destination_when_backdrop_is_transparent() {
+        let mut layer = seed("红", (0, 0), [255, 0, 0, 255], (2, 1), true, 1.0);
+        layer.blend_if = Some(BlendIf {
+            destination: BlendRange {
+                black: [64, 64],
+                white: [255, 255],
+            },
+            ..Default::default()
+        });
+        let doc = Document::from_psd_layers((2, 1), vec![layer]);
+        assert_eq!(doc.flatten().get_pixel(0, 0).0, [255, 0, 0, 255]);
     }
 
     #[test]
@@ -477,6 +514,7 @@ impl Document {
             layer.clipping = seed.clipping;
             layer.clip_shape = seed.clip_shape;
             layer.style = seed.style;
+            layer.blend_if = seed.blend_if;
             layer.locked = false;
             layer.background = false;
             layer.group = seed.group.and_then(|gid| group_of.get(&gid).copied());
@@ -1839,6 +1877,25 @@ fn composite_raster(
             }
             if let Some(c) = clip {
                 src[3] *= c[y as usize * w as usize + x as usize];
+            }
+            // 混合颜色带：按本层颜色 / 下层颜色再遮一层。蒙版与剪贴之后、
+            // 混合模式之前乘到 alpha 上 —— 若放在混合之后，被遮掉的像素
+            // 已经改过颜色，等于用 Blend If 半透明地盖了一层。
+            if let Some(bf) = layer.blend_if.as_ref() {
+                let dst = &acc[y as usize * w as usize + x as usize];
+                let f = if dst[3] > 0.0 {
+                    // 累积缓冲是预乘的，换回直通 RGB 再比范围。
+                    let dst_rgb = [
+                        (dst[0] / dst[3] * 255.0).round().clamp(0.0, 255.0) as u8,
+                        (dst[1] / dst[3] * 255.0).round().clamp(0.0, 255.0) as u8,
+                        (dst[2] / dst[3] * 255.0).round().clamp(0.0, 255.0) as u8,
+                    ];
+                    bf.factor([px[0], px[1], px[2]], dst_rgb)
+                } else {
+                    // 下层全透明时没有「下层颜色」可比，只按本层范围限制。
+                    bf.source_factor([px[0], px[1], px[2]])
+                };
+                src[3] *= f;
             }
             if src[3] <= 0.0 {
                 continue;

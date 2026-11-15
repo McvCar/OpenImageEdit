@@ -81,6 +81,8 @@ struct PreparedLayer {
     planes: [Vec<u8>; 4],
     /// 图层蒙版（`-2` 通道 + 它自己的矩形）。
     mask: Option<PreparedMask>,
+    /// 混合颜色带（Blend If）：全默认时 `None`，写回长度 0。
+    blend_if: Option<editcore::BlendIf>,
     /// 所属分组（写 PSD 时要按它插 `lsct` 分隔记录）。
     group: Option<editcore::GroupId>,
 }
@@ -202,6 +204,7 @@ fn prepare_layers(doc: &Document) -> Result<Vec<PreparedLayer>, crate::DecodeErr
                     plane: m.image.as_raw().clone(),
                 })
             }),
+            blend_if: layer.blend_if.clone(),
             group: layer.group,
         });
     }
@@ -276,6 +279,7 @@ fn write_layer_record(out: &mut Vec<u8>, l: &PreparedLayer) -> Result<(), crate:
         if l.visible { 8 } else { 8 | 2 },
         &l.name,
         l.mask.as_ref(),
+        l.blend_if.as_ref(),
         None,
     );
     Ok(())
@@ -307,6 +311,7 @@ fn write_divider_record(
         8,
         name,
         None,
+        None,
         Some((section, blend)),
     );
 }
@@ -323,6 +328,7 @@ fn write_record(
     flags: u8,
     name: &str,
     mask: Option<&PreparedMask>,
+    blend_if: Option<&editcore::BlendIf>,
     lsct: Option<(u32, &'static [u8; 4])>,
 ) {
     let (top, left, bottom, right) = rect;
@@ -367,7 +373,28 @@ fn write_record(
         push_u8(&mut extra, 0); // flags: bit1=0 -> 蒙版启用
         push_zeros(&mut extra, 2);
     }
-    push_u32(&mut extra, 0); // layer blending ranges length
+    // 混合颜色带：长度 + 每组 4 字节（8 位文档每个值 1 字节）。顺序是
+    // 「合成源、合成目标，然后每个通道各一对」；alpha 那对留默认，它和
+    // 逐像素 alpha 遮罩重复。全默认写长度 0，与 PS 的习惯一致。
+    let mut ranges: Vec<u8> = Vec::new();
+    if let Some(b) = blend_if {
+        for r in [
+            b.source,
+            b.destination,
+            b.source_channels[0],
+            b.destination_channels[0],
+            b.source_channels[1],
+            b.destination_channels[1],
+            b.source_channels[2],
+            b.destination_channels[2],
+            editcore::BlendRange::DEFAULT,
+            editcore::BlendRange::DEFAULT,
+        ] {
+            ranges.extend_from_slice(&r.to_psd());
+        }
+    }
+    push_u32(&mut extra, ranges.len() as u32);
+    push_bytes(&mut extra, &ranges);
     let ascii = ascii_placeholder(name);
     push_u8(&mut extra, ascii.len() as u8);
     push_bytes(&mut extra, &ascii);
@@ -797,6 +824,7 @@ mod tests {
             clipping: false,
             clip_shape: None,
             style: None,
+            blend_if: None,
         };
         let doc = Document::from_psd_layers_with_groups(
             (cw, ch),
@@ -824,6 +852,53 @@ mod tests {
         assert!((group.opacity - 0.5).abs() < 0.01, "opacity {}", group.opacity);
         assert!(!group.pass_through, "非穿透组不能退化成 pass");
         assert!(group.collapsed, "折叠状态应写回 lsct 2");
+    }
+
+    /// 2e) 混合颜色带写回：范围表按「合成源、合成目标、各通道源/目标」顺序
+    /// 落成 4 字节一组，读回来必须一致（含拆分值与 RGB 口径）。
+    #[test]
+    fn blend_if_round_trip() {
+        use editcore::{BlendIf, BlendMode, BlendRange, PsdLayerSeed};
+        let seed = PsdLayerSeed {
+            name: "带".into(),
+            offset: (0, 0),
+            image: solid(4, 4, [90, 90, 90, 255]),
+            visible: true,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            group: None,
+            mask: None,
+            clipping: false,
+            clip_shape: None,
+            style: None,
+            blend_if: None,
+        };
+        let mut doc = Document::from_psd_layers((4, 4), vec![seed]);
+        let want = BlendIf {
+            source: BlendRange {
+                black: [16, 64],
+                white: [200, 240],
+            },
+            destination: BlendRange {
+                black: [0, 0],
+                white: [128, 128],
+            },
+            rgb: true,
+            source_channels: [
+                BlendRange::DEFAULT,
+                BlendRange {
+                    black: [8, 8],
+                    white: [250, 250],
+                },
+                BlendRange::DEFAULT,
+            ],
+            destination_channels: [BlendRange::DEFAULT; 3],
+        };
+        doc.layers[1].blend_if = Some(want.clone());
+        let bytes = encode_psd(&doc, 90).expect("encode_psd");
+        let set = crate::psd_layers::decode_psd_layers(&bytes, crate::DecodeOptions::default())
+            .expect("decode_psd_layers");
+        assert_eq!(set.layers[0].blend_if.as_ref(), Some(&want));
     }
 
     /// 2b) Adobe's layer-flags bit 1 is INVERTED (SET = hidden). Photoshop
@@ -898,6 +973,7 @@ mod tests {
             clipping: false,
             clip_shape: None,
             style: None,
+            blend_if: None,
         };
         let doc = Document::from_psd_layers((4, 4), vec![seed("上层"), seed("下层")]);
         assert_eq!(doc.layers.len(), 3, "background + 2 seeds");

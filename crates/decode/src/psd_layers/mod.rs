@@ -71,6 +71,8 @@ pub struct PsdLayerData {
     /// 烘焙样式画在**内容之外**的笔迹，连同样式自己的混合模式（PSD `Md  `）。
     /// 那些像素在合成时要按样式模式与下层混合，见 [`editcore::StylePixels`]。
     pub style: Option<editcore::StylePixels>,
+    /// 混合颜色带（PSD blending ranges + `lclr`），全默认 = `None`。
+    pub blend_if: Option<editcore::BlendIf>,
 }
 
 /// 烘焙样式前的 alpha 平面（1 字节/像素，行优先）连同它自己的矩形。
@@ -200,6 +202,7 @@ impl PsdLayerSet {
                 clipping: l.clipping,
                 clip_shape: l.clip_shape,
                 style: l.style,
+                blend_if: l.blend_if,
             })
             .collect()
     }
@@ -381,6 +384,9 @@ fn build_layers<F: FnMut(usize, usize)>(
             notes.push(format!("混合模式 {:?} 不支持，已按正常处理", layer.blend_mode()));
         }
         let blend = blend.unwrap_or_default();
+        // 混合颜色带（`lclr` 口径位 + 每组 4 字节的范围表）。全默认时丢掉，
+        // 免得每层都挂一份不起作用的表。
+        let blend_if = layer_blend_if(layer);
         // 组不再摊平：整棵树由 `psd.groups()` 交出去（见函数末尾），这里
         // 只把「这层属于哪个组」记在层上，让面板能还原缩进与折叠。
         // A group's own visibility and opacity live on the folder record, not on
@@ -793,6 +799,7 @@ fn build_layers<F: FnMut(usize, usize)>(
             content_alpha,
             clip_shape,
             style,
+            blend_if,
         });
         clips.push(layer.is_clipping_mask());
         progress(step + 1, total);
@@ -925,6 +932,40 @@ fn build_layers<F: FnMut(usize, usize)>(
 fn dedup(v: &mut Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     v.retain(|s| seen.insert(s.clone()));
+}
+
+/// 把 vendored 解析出的混合颜色带映射成 `core` 的 [`editcore::BlendIf`]。
+///
+/// 字节表的顺序是「合成源、合成目标，然后每个通道各一对（源/目标）」；
+/// RGB 文件一共 10 组（2 + RGBA×2）。这里只取合成与 R/G/B 三对 —— alpha
+/// 那对与逐像素的 alpha 遮罩重复，忽略即可。
+///
+/// PSD 没有单独存「灰度 / RGB」这个开关（`lclr` 是图层颜色标签，不是它）：
+/// 灰度模式只写合成那两组，RGB 模式只写各通道那几组，所以「通道组是否
+/// 非默认」就是判断依据。
+fn layer_blend_if(layer: &psd::PsdLayer) -> Option<editcore::BlendIf> {
+    let ranges = layer.blend_ranges()?;
+    let range = |i: usize| {
+        ranges
+            .get(i)
+            .copied()
+            .map(editcore::BlendRange::from_psd)
+            .unwrap_or_default()
+    };
+    let source_channels = [range(2), range(4), range(6)];
+    let destination_channels = [range(3), range(5), range(7)];
+    let rgb = source_channels
+        .iter()
+        .chain(destination_channels.iter())
+        .any(|r| !r.is_default());
+    let blend_if = editcore::BlendIf {
+        source: range(0),
+        destination: range(1),
+        rgb,
+        source_channels,
+        destination_channels,
+    };
+    (!blend_if.is_noop()).then_some(blend_if)
 }
 
 /// Blend mode for anything outside a layer record (layer styles).

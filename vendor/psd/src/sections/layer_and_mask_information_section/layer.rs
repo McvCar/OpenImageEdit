@@ -55,6 +55,10 @@ pub struct LayerProperties {
     pub(crate) vector_fill: Option<crate::vector::VectorFill>,
     /// 形状图层的描边与填充开关（`vst2`）。
     pub(crate) vector_stroke: Option<crate::vector::VectorStroke>,
+    /// 混合颜色带（Blend If）的原始范围表：每项 4 字节
+    /// `black_low / black_high / white_low / white_high`，顺序为
+    /// 「合成源、合成目标，然后每个通道各一对」。全默认时为 `None`。
+    pub(crate) blend_ranges: Option<Vec<[u8; 4]>>,
 }
 
 /// Where a layer's mask lives, plus the "mask disabled" flag.
@@ -165,7 +169,13 @@ impl LayerProperties {
             vector_mask: layer_record.vector_mask.clone(),
             vector_fill: layer_record.vector_fill.clone(),
             vector_stroke: layer_record.vector_stroke.clone(),
+            blend_ranges: layer_record.blend_ranges.clone(),
         }
+    }
+
+    /// 混合颜色带（Blend If）原始范围表，见 [`LayerProperties::blend_ranges`]。
+    pub fn blend_ranges(&self) -> Option<&[[u8; 4]]> {
+        self.blend_ranges.as_deref()
     }
 
     /// Rectangle of this layer's user mask, if it has one.
@@ -593,6 +603,8 @@ pub struct LayerRecord {
     pub(super) vector_fill: Option<crate::vector::VectorFill>,
     /// 形状描边与填充开关（`vst2`）
     pub(super) vector_stroke: Option<crate::vector::VectorStroke>,
+    /// 混合颜色带（Blend If）原始范围表，见 [`LayerProperties::blend_ranges`]。
+    pub(super) blend_ranges: Option<Vec<[u8; 4]>>,
 }
 
 impl LayerRecord {
