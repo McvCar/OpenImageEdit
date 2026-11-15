@@ -223,6 +223,8 @@ pub struct LayerEffect {
     pub size: f32,
     /// `Ckmt` percent (0..100).
     pub choke: f32,
+    /// `Nose` percent (0..100)：投影/发光效果遮罩上的随机颗粒强度。
+    pub noise: f32,
     /// Stroke only.
     pub stroke_position: StrokePosition,
     /// Stroke only.
@@ -274,6 +276,7 @@ impl LayerEffect {
             distance: 0.0,
             size: 0.0,
             choke: 0.0,
+            noise: 0.0,
             stroke_position: StrokePosition::Outside,
             stroke_fill: StrokeFill::Color,
             gradient: None,
@@ -486,6 +489,10 @@ fn parse_effect(kind: EffectKind, d: &Descriptor) -> LayerEffect {
     }
     if let Some(v) = d.number(b"Ckmt") {
         e.choke = v as f32;
+    }
+    // `Nose`：效果噪声百分比（投影 / 内阴影 / 外发光 / 内发光）。
+    if let Some(v) = d.number(b"Nose") {
+        e.noise = (v as f32).clamp(0.0, 100.0);
     }
     if let Some(v) = d.boolean(b"layerConceals") {
         e.knocks_out = v;

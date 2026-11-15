@@ -24,6 +24,7 @@ fn effect(kind: EffectKind) -> LayerEffect {
         distance: 0.0,
         size: 0.0,
         choke: 0.0,
+        noise: 0.0,
         stroke_position: StrokePosition::Outside,
         stroke_fill: StrokeFill::Color,
         gradient: None,
@@ -279,6 +280,31 @@ fn drop_shadow_paints_below_the_content() {        let img = layer(6, 6, [255, 2
     assert!(below[0] < 200, "expected a shadow below, got {below:?}");
     let above = baked.image.get_pixel(3, 0).0;
     assert_eq!(above[3], 0, "no shadow above, got {above:?}");
+}
+
+/// `Nose` 颗粒乘在效果遮罩上：0 完全不动，100 让一部分像素掉出填充，
+/// 遮罩总量下降但不清零；同一份输入必须烘出同一份颗粒，否则每次打开
+/// 文件样式都会自己抖动。
+#[test]
+fn noise_speckles_the_effect_matte() {
+    let img = layer(16, 16, [255, 255, 255, 255], 4);
+    let mut e = effect(EffectKind::DropShadow);
+    e.size = 3.0;
+    e.distance = 2.0;
+    e.opacity = 1.0;
+    let clean = bake(&img, (0, 0), &[e.clone()]).expect("clean shadow");
+    let mut noisy = e;
+    noisy.noise = 100.0;
+    let grain = bake(&img, (0, 0), &[noisy.clone()]).expect("noisy shadow");
+    let sum = |b: &Baked| b.behind_coverage.iter().map(|&v| v as u32).sum::<u32>();
+    let (clean_sum, grain_sum) = (sum(&clean), sum(&grain));
+    assert!(grain_sum > 0, "噪声不能让投影整块消失");
+    assert!(
+        grain_sum < clean_sum,
+        "噪声应让遮罩总量下降: clean {clean_sum} noisy {grain_sum}"
+    );
+    let again = bake(&img, (0, 0), &[noisy]).expect("noisy shadow again");
+    assert_eq!(grain.image.as_raw(), again.image.as_raw(), "颗粒必须确定");
 }
 
 #[test]

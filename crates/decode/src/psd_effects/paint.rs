@@ -199,6 +199,33 @@ pub(super) fn trace_label() -> String {
         .unwrap_or_default()
 }
 
+/// Photoshop's `Nose` (noise) knob: a deterministic grain multiplier for the
+/// shadow / glow matte.
+///
+/// The knob is a percentage, so `0` has to be a strict no-op. Styles are baked
+/// into the layer bitmap on every open, so the grain must also be stable across
+/// renders — hence a hash of the pixel coordinate instead of an RNG.
+///
+/// Photoshop sprinkles the noise over the matte: the same shape keeps its edge,
+/// but individual pixels drop out of the fill. A per-pixel multiplier in
+/// `[1 - amount, 1]` does exactly that, and never *adds* coverage outside the
+/// effect's own footprint.
+pub(super) fn noise_factor(x: u32, y: u32, noise: f32) -> f32 {
+    let amount = (noise / 100.0).clamp(0.0, 1.0);
+    if amount <= 0.0 {
+        return 1.0;
+    }
+    let mut h = x
+        .wrapping_mul(0x9E37_79B1)
+        ^ y.wrapping_mul(0x85EB_CA77)
+        ^ 0xC2B2_AE3D;
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2545_F491);
+    h ^= h >> 13;
+    let r = (h & 0xFFFF) as f32 / 65535.0;
+    1.0 - amount * r
+}
+
 pub(super) fn draw_drop_shadow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: &LayerEffect) {
     let (dx, dy) = offset_vector(e.distance, e.angle);
     let shifted = shift_mask(alpha, w, h, dx, dy, 0.0);
@@ -215,6 +242,7 @@ pub(super) fn draw_drop_shadow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32
             if e.knocks_out {
                 cov *= 1.0 - alpha[i];
             }
+            cov *= noise_factor(x, y, e.noise);
             if cov <= 0.002 {
                 continue;
             }
@@ -233,7 +261,8 @@ pub(super) fn draw_outer_glow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32]
     let mode = blend_of(e.blend);
     for y in 0..h {
         for x in 0..w {
-            let cov = (blurred[(y * w + x) as usize] * 2.0).min(1.0);
+            let cov = (blurred[(y * w + x) as usize] * 2.0).min(1.0)
+                * noise_factor(x, y, e.noise);
             if cov <= 0.002 {
                 continue;
             }
@@ -413,7 +442,7 @@ pub(super) fn draw_inner_shadow(
             if alpha[i] <= INSIDE_EPS {
                 continue;
             }
-            let cov = blurred[i];
+            let cov = blurred[i] * noise_factor(x, y, e.noise);
             if cov <= 0.002 {
                 continue;
             }
@@ -459,7 +488,7 @@ pub(super) fn draw_inner_glow(
                 // the range (Photoshop 27.11).
                 t = 1.0 - t;
             }
-            let cov = t;
+            let cov = t * noise_factor(x, y, e.noise);
             if cov <= 0.002 {
                 continue;
             }
