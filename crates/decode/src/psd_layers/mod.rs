@@ -24,7 +24,10 @@ mod styles;
 mod tests;
 mod validate;
 
-use adjustments::{adjust_scope_mode, apply_adjustment, adjustment_scope, scope_mode_name};
+use adjustments::{
+    adjust_scope_mode, apply_adjustment, apply_content_adjustment, adjustment_scope,
+    scope_mode_name,
+};
 use group_styles::bake_group_style_layers;
 use groups::{ancestor_is_annotation_group, inherited_group_state};
 use masks::{channel_plane, decode_mask, mask_at, mask_probe, mask_probe_at};
@@ -322,6 +325,40 @@ fn build_layers<F: FnMut(usize, usize)>(
     let no_clip = off("IMAGEEDIT_PSD_NO_CLIP");
     let no_adjust = off("IMAGEEDIT_PSD_NO_ADJUST");
 
+    // 剪贴调整层在 Photoshop 里夹在「图层内容」与「图层样式」之间：它只调
+    // 内容像素，内阴影 / 描边保持设定色。烘焙顺序必须一致，否则样式会被
+    // 二次上色——按钮底部那条蓝色内阴影会被色相调整成灰蓝，整颗按钮看着
+    // 比 PS 浅。这里先算出「每一层的内容要被哪些剪贴调整层处理」。
+    let clip_flags: Vec<bool> = source
+        .iter()
+        .map(|l| !no_clip && l.is_clipping_mask())
+        .collect();
+    let mut pre_adjust: Vec<Vec<usize>> = vec![Vec::new(); total];
+    let mut adjust_in_pre: Vec<bool> = vec![false; total];
+    if !no_adjust {
+        for j in 0..total {
+            let adj = &source[j];
+            if !clip_flags[j] || !adj.visible() || adj.opacity() == 0 {
+                continue;
+            }
+            if adj.brightness_contrast().is_none() && adj.hue_saturation().is_none() {
+                continue;
+            }
+            // 剪贴链：正下方连续的剪贴层，加上它们贴住的基底。
+            let mut base = j + 1;
+            while base < total && clip_flags[base] {
+                base += 1;
+            }
+            if base >= total || source[base].parent_id() != adj.parent_id() {
+                continue;
+            }
+            for i in (j + 1)..=base {
+                pre_adjust[i].push(j);
+            }
+            adjust_in_pre[j] = true;
+        }
+    }
+
     // Bottom -> top: the vendor hands records back top -> bottom (it reverses
     // them on read), and `PsdLayerSet::layers` is documented as bottom -> top.
     // Iterating in the target order here means an adjustment layer can be baked
@@ -345,7 +382,11 @@ fn build_layers<F: FnMut(usize, usize)>(
         let bc = layer.brightness_contrast();
         let hs = layer.hue_saturation();
         if bc.is_some() || hs.is_some() {
-            if !no_adjust && layer.visible() && layer.opacity() > 0 {
+            if !no_adjust && adjust_in_pre[idx] {
+                // 剪贴调整层已在基底烘焙样式之前处理过（见 `pre_adjust` 的
+                // 说明），这里不能再对烘好的像素来一遍。
+                baked_adjustments += 1;
+            } else if !no_adjust && layer.visible() && layer.opacity() > 0 {
                 let clipped = layer.is_clipping_mask();
                 let start = adjustment_scope(
                     &layers,
@@ -769,6 +810,26 @@ fn build_layers<F: FnMut(usize, usize)>(
                         );
                     }
                 }
+            }
+        }
+
+        // ---- 剪贴调整层：先调内容，再画样式 ------------------------------
+        // 由下而上排：同一层上的多个剪贴调整层，越靠下的先生效。
+        if !pre_adjust[idx].is_empty() {
+            for &j in pre_adjust[idx].iter().rev() {
+                let adj = &source[j];
+                let adj_mask = if no_masks {
+                    None
+                } else {
+                    decode_mask(adj, adj.channel_bytes(), cw, ch)
+                };
+                apply_content_adjustment(
+                    &mut image,
+                    layer_offset,
+                    adj.brightness_contrast(),
+                    adj.hue_saturation(),
+                    adj_mask.as_ref(),
+                );
             }
         }
 

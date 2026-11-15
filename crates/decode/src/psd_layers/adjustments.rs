@@ -169,6 +169,74 @@ pub(super) fn apply_adjustment(
     }
 }
 
+/// 剪贴调整层按 Photoshop 的顺序作用在「图层内容」上：调整层夹在内容与
+/// 图层样式之间，所以内阴影 / 描边不会被二次上色。
+///
+/// 与 [`apply_adjustment`] 的区别只在对象与限幅：这里直接吃烘焙样式之前的
+/// 原始像素（alpha = 0 的像素没有颜色可调），覆盖面只由调整层自己的蒙版
+/// 决定，不再乘基底的「内容 alpha」。
+pub(super) fn apply_content_adjustment(
+    image: &mut image::RgbaImage,
+    offset: (i32, i32),
+    bc: Option<psd::BrightnessContrast>,
+    hs: Option<psd::HueSaturation>,
+    mask: Option<&editcore::LayerMask>,
+) {
+    if bc.is_none() && hs.is_none() {
+        return;
+    }
+    let (ox, oy) = offset;
+    let (w, h) = (image.width() as i32, image.height() as i32);
+    let Some(mask) = mask else {
+        for px in image.pixels_mut() {
+            if px.0[3] == 0 {
+                continue;
+            }
+            let mut rgb = [px.0[0], px.0[1], px.0[2]];
+            if let Some(hs) = hs {
+                rgb = hue_saturation(rgb, hs);
+            }
+            if let Some(bc) = bc {
+                rgb = brightness_contrast(rgb, bc);
+            }
+            px.0[0] = rgb[0];
+            px.0[1] = rgb[1];
+            px.0[2] = rgb[2];
+        }
+        return;
+    };
+    for y in 0..h {
+        for x in 0..w {
+            let k = mask.coverage(ox + x, oy + y).clamp(0.0, 1.0);
+            if k <= 0.0 {
+                continue;
+            }
+            let px = image.get_pixel_mut(x as u32, y as u32);
+            if px.0[3] == 0 {
+                continue;
+            }
+            let src = px.0;
+            let mut rgb = [src[0], src[1], src[2]];
+            if let Some(hs) = hs {
+                rgb = hue_saturation(rgb, hs);
+            }
+            if let Some(bc) = bc {
+                rgb = brightness_contrast(rgb, bc);
+            }
+            if k < 1.0 {
+                rgb = [
+                    (src[0] as f32 + (rgb[0] as f32 - src[0] as f32) * k).round() as u8,
+                    (src[1] as f32 + (rgb[1] as f32 - src[1] as f32) * k).round() as u8,
+                    (src[2] as f32 + (rgb[2] as f32 - src[2] as f32) * k).round() as u8,
+                ];
+            }
+            px.0[0] = rgb[0];
+            px.0[1] = rgb[1];
+            px.0[2] = rgb[2];
+        }
+    }
+}
+
 fn full_alpha_adjust() -> bool {
     static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FULL.get_or_init(|| std::env::var("IMAGEEDIT_PSD_ADJUST_FULL_ALPHA").ok().as_deref() == Some("1"))
