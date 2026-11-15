@@ -439,6 +439,9 @@ mod group_tests {
                     name: "内层".into(),
                     collapsed: true,
                     visible: true,
+                    blend: BlendMode::Normal,
+                    opacity: 1.0,
+                    pass_through: true,
                 },
                 PsdGroupSeed {
                     psd_id: 7,
@@ -446,6 +449,9 @@ mod group_tests {
                     name: "外层".into(),
                     collapsed: false,
                     visible: true,
+                    blend: BlendMode::Normal,
+                    opacity: 1.0,
+                    pass_through: true,
                 },
             ],
         );

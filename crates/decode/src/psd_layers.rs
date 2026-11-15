@@ -155,6 +155,12 @@ pub struct PsdGroupData {
     pub visible: bool,
     /// 组内成员数（含嵌套组的成员），面板「N 项」与空组判定用它。
     pub count: usize,
+    /// 组自己的混合模式（`pass` = 穿透，此时与 Normal 等价，见 `pass_through`）。
+    pub blend: editcore::BlendMode,
+    /// 组不透明度（0..=1），合成时整组一次性应用。
+    pub opacity: f32,
+    /// PSD 的 `pass`：成员直接与组下方的画面混合，不隔离。
+    pub pass_through: bool,
 }
 
 /// Result of the second-stage parse. `layers` is bottom -> top.
@@ -229,6 +235,9 @@ impl PsdLayerSet {
                 name: g.name.clone(),
                 collapsed: g.collapsed,
                 visible: g.visible,
+                blend: g.blend,
+                opacity: g.opacity,
+                pass_through: g.pass_through,
             })
             .collect()
     }
@@ -500,7 +509,8 @@ fn build_layers<F: FnMut(usize, usize)>(
         // them through the group. The canvas must still match the composite, so
         // every ancestor group's flag is folded into the child here; the group
         // row keeps its own state for the panel.
-        let (ancestor_visible, ancestor_opacity) = inherited_group_state(groups, layer.parent_id());
+        let (ancestor_visible, _ancestor_opacity) =
+            inherited_group_state(groups, layer.parent_id());
         if !ancestor_visible && layer.visible() {
             inherited_hidden = true;
         }
@@ -1000,7 +1010,9 @@ fn build_layers<F: FnMut(usize, usize)>(
             offset: layer_offset,
             image,
             visible: layer.visible() && ancestor_visible,
-            opacity: (layer.opacity() as f32 / 255.0) * ancestor_opacity,
+            // 组不透明度不再乘进成员：合成时整组一次性应用（否则成员重叠处
+            // 会叠两次，比 PS 更透）。
+            opacity: layer.opacity() as f32 / 255.0,
             blend,
             degraded: notes,
             mask,
@@ -1076,6 +1088,9 @@ fn build_layers<F: FnMut(usize, usize)>(
             collapsed: group.collapsed(),
             visible: group.visible(),
             count,
+            blend: map_blend_mode(group.blend_mode()).unwrap_or(editcore::BlendMode::Normal),
+            opacity: group.opacity() as f32 / 255.0,
+            pass_through: matches!(group.blend_mode(), psd::BlendMode::PassThrough),
         });
     }
 
@@ -1219,7 +1234,9 @@ fn bake_group_style_layers(
         }
         // Joint alpha of the visible members, over-blended (alpha composition
         // is blend-mode independent — every PSD blend keeps `a_out = a_s +
-        // a_b*(1-a_s)`). Members already carry their ancestors' opacity.
+        // a_b*(1-a_s)`). 成员只带自己的不透明度：组不透明度现在由合成阶段
+        // 对整个组（连同这里烘焙出的样式层）应用一次，若在这里再乘一遍就是
+        // 双重衰减；祖先组的样式同理交给各自的组处理。
         // Clipping members are skipped: their own bitmap reaches far past the
         // base they clip to, and only the base's coverage is visible — counting
         // the clipper whole would draw the group ring around a shape the

@@ -302,8 +302,12 @@ impl PsdGroup {
         psd_height: u32,
         group_id: Option<u32>,
     ) -> Self {
-        let layer_properties =
+        let mut layer_properties =
             LayerProperties::from_layer_record(name, layer_record, psd_width, psd_height, group_id);
+        // `lsct` 里的混合键才是组的真实模式（穿透组记录字段是 `norm`）。
+        if let Some(blend) = layer_record.divider_blend_mode {
+            layer_properties.blend_mode = blend;
+        }
         let collapsed = matches!(layer_record.divider_type, Some(GroupDivider::CloseFolder));
 
         PsdGroup {
@@ -569,6 +573,12 @@ pub struct LayerRecord {
     pub(super) blend_mode: BlendMode,
     /// Group divider tag
     pub(super) divider_type: Option<GroupDivider>,
+    /// 组自己的混合模式（`lsct` 块里的混合键）。
+    ///
+    /// 光看图层记录的混合字段不够：Photoshop 保存「穿透」组时把记录字段写成
+    /// `norm`，真正的 `pass` 只出现在这里；组用了别的模式时两处一致。缺失
+    /// （旧文件长度只有 4）时按记录字段解释。
+    pub(super) divider_blend_mode: Option<BlendMode>,
     /// Brightness/contrast adjustment settings ("brit"), when present
     pub(super) brightness_contrast: Option<BrightnessContrast>,
     /// Hue/saturation adjustment settings ("hue2"), when present

@@ -528,6 +528,7 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
     cursor.read(padding as u32);
 
     let mut divider_type = None;
+    let mut divider_blend_mode = None;
     // Adjustment-layer payloads, kept as parsed structs so the decoder can
     // bake them (we do not render live adjustment layers).
     let mut brightness_contrast = None;
@@ -558,10 +559,12 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
             KEY_SECTION_DIVIDER_SETTING => {
                 divider_type = GroupDivider::match_divider(cursor.read_i32());
 
-                // data present only if length >= 12
+                // data present only if length >= 12: 8BIM + 组混合键
                 if additional_layer_info_len >= 12 {
                     let _signature = cursor.read_4();
-                    let _key = cursor.read_4();
+                    let mut key = [0; 4];
+                    key.copy_from_slice(cursor.read_4());
+                    divider_blend_mode = BlendMode::match_mode(key);
                 }
 
                 // data present only if length >= 16
@@ -694,6 +697,7 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
         clipping_base,
         blend_mode,
         divider_type,
+        divider_blend_mode,
         brightness_contrast,
         hue_saturation,
         layer_effects,

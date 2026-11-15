@@ -174,6 +174,10 @@ pub struct PsdGroupSeed {
     pub collapsed: bool,
     /// Photoshop 的「组隐藏」旗标：组记录自己的 visible。
     pub visible: bool,
+    /// 组自己的混合模式、不透明度与穿透标记（合成时整组应用）。
+    pub blend: BlendMode,
+    pub opacity: f32,
+    pub pass_through: bool,
 }
 
 #[cfg(test)]
@@ -202,6 +206,62 @@ mod psd_assembly_tests {
             clip_shape: None,
             style: None,
         }
+    }
+
+    fn group_seed(
+        psd_id: u32,
+        name: &str,
+        blend: BlendMode,
+        opacity: f32,
+        pass_through: bool,
+    ) -> PsdGroupSeed {
+        PsdGroupSeed {
+            psd_id,
+            parent: None,
+            name: name.into(),
+            collapsed: false,
+            visible: true,
+            blend,
+            opacity,
+            pass_through,
+        }
+    }
+
+    /// 隔离组：组先合成一块，再按组模式与下层混合；穿透组：成员各自与下层混合。
+    ///
+    /// 用「组里只有一个滤色红层、组本身正片叠底」来区分：穿透时红色直接跟
+    /// 白底滤色（仍是白），隔离时它先在组里合成成纯红，再乘白底（仍是红）。
+    #[test]
+    fn isolated_group_multiplies_as_a_whole() {
+        let white = seed("底", (0, 0), [255, 255, 255, 255], (2, 2), true, 1.0);
+        let make = |pass_through: bool| {
+            let mut red = seed("红", (0, 0), [255, 0, 0, 255], (2, 2), true, 1.0);
+            red.group = Some(9);
+            red.blend = BlendMode::Screen;
+            Document::from_psd_layers_with_groups(
+                (2, 2),
+                vec![white.clone(), red],
+                vec![group_seed(9, "组", BlendMode::Multiply, 1.0, pass_through)],
+            )
+        };
+        assert_eq!(make(false).flatten().get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(make(true).flatten().get_pixel(0, 0).0, [255, 255, 255, 255]);
+    }
+
+    /// 组不透明度只应用一次：两个 50% 黑层在 50% 的组里应当是 0.375 的黑。
+    #[test]
+    fn group_opacity_applies_once_to_the_group() {
+        let white = seed("底", (0, 0), [255, 255, 255, 255], (2, 2), true, 1.0);
+        let mut a = seed("黑1", (0, 0), [0, 0, 0, 128], (2, 2), true, 1.0);
+        a.group = Some(3);
+        let mut b = seed("黑2", (0, 0), [0, 0, 0, 128], (2, 2), true, 1.0);
+        b.group = Some(3);
+        let doc = Document::from_psd_layers_with_groups(
+            (2, 2),
+            vec![white, a, b],
+            vec![group_seed(3, "组", BlendMode::Normal, 0.5, true)],
+        );
+        assert_eq!(doc.flatten().get_pixel(0, 0).0, [159, 159, 159, 255]);
     }
 
     #[test]
@@ -404,6 +464,9 @@ impl Document {
             let parent = seed.parent.and_then(|pid| group_of.get(&pid).copied());
             groups[i].parent = parent;
             groups[i].visible = seed.visible;
+            groups[i].blend = seed.blend;
+            groups[i].opacity = seed.opacity.clamp(0.0, 1.0);
+            groups[i].pass_through = seed.pass_through;
         }
         for seed in seeds {
             let mut layer = Layer::new(seed.name, seed.image);
@@ -1444,63 +1507,149 @@ impl Document {
         // 剪贴基底层的 alpha 覆盖率（不含不透明度）。剪贴层逐像素乘上它；
         // 隐藏的基底覆盖率是 0，于是整条剪贴链一起消失 —— 与 PS 一致。
         let mut clip = vec![0f32; n];
-        for layer in &self.layers {
+        self.composite_range(&self.layers, &mut acc, &mut clip, w, h, None);
+        acc_to_image(&acc, w, h)
+    }
+
+    /// 合成一段连续的图层：整份文档，或某个组的成员。
+    ///
+    /// PS 的组是「整组先合成一块，再按组自己的混合模式与不透明度盖到下层」，
+    /// 与成员模式逐层直接叠加是两回事。遇到需要隔离的组（非穿透，或组不透明度
+    /// < 100%）时，把它连续的成员递归合成到独立缓冲，再整体混合一次；穿透组
+    /// 仍按原来的逐层叠加走，保证既有画面不变。
+    fn composite_range(
+        &self,
+        layers: &[Layer],
+        acc: &mut [[f32; 4]],
+        clip: &mut [f32],
+        w: u32,
+        h: u32,
+        inside: Option<GroupId>,
+    ) {
+        let mut i = 0;
+        while i < layers.len() {
+            let layer = &layers[i];
+            if let Some(gid) = layer.group {
+                if inside != Some(gid) {
+                    if let Some(group) = self.groups.iter().find(|g| g.id == gid) {
+                        if group.isolated() {
+                            let end = self.group_run_end(layers, i, gid);
+                            let n = w as usize * h as usize;
+                            let mut sub = vec![[0f32; 4]; n];
+                            let mut sub_clip = vec![0f32; n];
+                            self.composite_range(
+                                &layers[i..end],
+                                &mut sub,
+                                &mut sub_clip,
+                                w,
+                                h,
+                                Some(gid),
+                            );
+                            blend_group(acc, &sub, group);
+                            i = end;
+                            continue;
+                        }
+                    }
+                }
+            }
             if !layer.clipping {
                 // 隐藏 / 全透明的基底覆盖率为 0，于是整条剪贴链一起消失。
                 // 注意：基底只是「半透明」（opacity 0.5）时覆盖率仍是满的 ——
                 // PS 里降基底层不透明度不会削弱上面的剪贴层。
                 if layer.visible && layer.opacity > 0.0 {
-                    fill_clip_coverage(&mut clip, w, h, layer);
+                    fill_clip_coverage(clip, w, h, layer);
                 } else {
                     clip.fill(0.0);
                 }
             }
-            if !layer.visible || layer.opacity <= 0.0 {
-                continue;
-            }
-            let clip_alpha = if layer.clipping {
-                Some(&clip[..])
-            } else {
-                None
-            };
-            match &layer.content {
-                LayerContent::Raster(r) => {
-                    composite_raster(&mut acc, w, h, r, layer, clip_alpha)
-                }
-                LayerContent::Mark(m) => {
-                    // 标记不能先栅格化到空图：马赛克要采样**当前已合成**的
-                    // 画面才能算出块平均。所以先把累积缓冲物化，再按旧语义
-                    // 直接画上去，最后写回。
-                    let mut tmp = acc_to_image(&acc, w, h);
-                    if layer.opacity >= 0.999 {
-                        m.draw(&mut tmp);
-                    } else {
-                        let before = tmp.clone();
-                        m.draw(&mut tmp);
-                        for (dst, src) in tmp.pixels_mut().zip(before.pixels()) {
-                            let p = dst.0;
-                            let q = src.0;
-                            dst.0 = [
-                                (p[0] as f32 * (1.0 - layer.opacity)
-                                    + q[0] as f32 * layer.opacity)
-                                    .round() as u8,
-                                (p[1] as f32 * (1.0 - layer.opacity)
-                                    + q[1] as f32 * layer.opacity)
-                                    .round() as u8,
-                                (p[2] as f32 * (1.0 - layer.opacity)
-                                    + q[2] as f32 * layer.opacity)
-                                    .round() as u8,
-                                (p[3] as f32 * (1.0 - layer.opacity)
-                                    + q[3] as f32 * layer.opacity)
-                                    .round() as u8,
-                            ];
+            if layer.visible && layer.opacity > 0.0 {
+                let clip_alpha = if layer.clipping {
+                    Some(&clip[..])
+                } else {
+                    None
+                };
+                match &layer.content {
+                    LayerContent::Raster(r) => composite_raster(acc, w, h, r, layer, clip_alpha),
+                    LayerContent::Mark(m) => {
+                        // 标记不能先栅格化到空图：马赛克要采样**当前已合成**的
+                        // 画面才能算出块平均。所以先把累积缓冲物化，再按旧语义
+                        // 直接画上去，最后写回。
+                        let mut tmp = acc_to_image(acc, w, h);
+                        if layer.opacity >= 0.999 {
+                            m.draw(&mut tmp);
+                        } else {
+                            let before = tmp.clone();
+                            m.draw(&mut tmp);
+                            for (dst, src) in tmp.pixels_mut().zip(before.pixels()) {
+                                let p = dst.0;
+                                let q = src.0;
+                                dst.0 = [
+                                    (p[0] as f32 * (1.0 - layer.opacity)
+                                        + q[0] as f32 * layer.opacity)
+                                        .round() as u8,
+                                    (p[1] as f32 * (1.0 - layer.opacity)
+                                        + q[1] as f32 * layer.opacity)
+                                        .round() as u8,
+                                    (p[2] as f32 * (1.0 - layer.opacity)
+                                        + q[2] as f32 * layer.opacity)
+                                        .round() as u8,
+                                    (p[3] as f32 * (1.0 - layer.opacity)
+                                        + q[3] as f32 * layer.opacity)
+                                        .round() as u8,
+                                ];
+                            }
                         }
+                        store_image(acc, &tmp);
                     }
-                    store_image(&mut acc, &tmp);
                 }
+            }
+            i += 1;
+        }
+    }
+
+    /// `gid` 组从 `start` 开始的一段连续成员（含嵌套组）。PSD 里组总是连续
+    /// 的一块，应用内拖动也可能把成员拖散 —— 拖散后按连续段处理，行为可预测。
+    fn group_run_end(&self, layers: &[Layer], start: usize, gid: GroupId) -> usize {
+        let mut end = start;
+        while end < layers.len() {
+            match layers[end].group {
+                Some(g) if self.belongs_to_group(g, gid) => end += 1,
+                _ => break,
             }
         }
-        acc_to_image(&acc, w, h)
+        end.max(start + 1)
+    }
+
+    fn belongs_to_group(&self, gid: GroupId, target: GroupId) -> bool {
+        let mut cur = Some(gid);
+        let mut guard = 0;
+        while let Some(g) = cur {
+            if g == target {
+                return true;
+            }
+            cur = self.groups.iter().find(|x| x.id == g).and_then(|x| x.parent);
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+        }
+        false
+    }
+}
+
+/// 把隔离组的合成结果整体混合到下层：颜色/覆盖率来自组缓冲，模式和
+/// 不透明度来自组记录。
+fn blend_group(acc: &mut [[f32; 4]], sub: &[[f32; 4]], group: &LayerGroup) {
+    if group.opacity <= 0.0 {
+        return;
+    }
+    for (dst, src) in acc.iter_mut().zip(sub.iter()) {
+        let a = src[3];
+        if a <= 0.0 {
+            continue;
+        }
+        let straight = [src[0] / a, src[1] / a, src[2] / a, a];
+        crate::blend::blend_pixel_f32(dst, straight, group.opacity, group.blend);
     }
 }
 

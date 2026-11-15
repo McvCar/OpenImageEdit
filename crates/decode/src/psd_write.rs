@@ -105,7 +105,17 @@ struct PreparedMask {
 enum PsdRecord {
     Layer(PreparedLayer),
     /// `section`：1 = 展开的文件夹，2 = 折叠的文件夹，3 = 组底边界。
-    Divider { name: String, section: u32 },
+    ///
+    /// 文件夹行（1/2）同时带着组自己的混合模式与不透明度：PSD 的组属性就
+    /// 存在这条记录上，不写回去的话「组正片叠底 + 50%」保存再打开会变成
+    /// 普通组，而成员的不透明度已经不再替组承担这份衰减。
+    Divider {
+        name: String,
+        section: u32,
+        /// 已经是 4 字节 PSD 键：穿透组要写 `pass`，不能退化成 `norm`。
+        blend: &'static [u8; 4],
+        opacity: u8,
+    },
 }
 
 /// Build the PSD layer records. A PSD file stores layer records bottom-to-top,
@@ -276,18 +286,28 @@ fn write_layer_record(out: &mut Vec<u8>, l: &PreparedLayer) -> Result<(), crate:
 /// Photoshop 的落盘顺序是**自底向上**，一个组在文件里长这样：
 /// `[lsct 3 组底边界] 成员… [lsct 1|2 文件夹行（带组名）]`。所以组底的
 /// 边界要在最低成员之前写，文件夹行在最高成员之后写（见 `prepare_records`）。
-fn write_divider_record(out: &mut Vec<u8>, name: &str, section: u32) {
+fn write_divider_record(
+    out: &mut Vec<u8>,
+    name: &str,
+    section: u32,
+    blend: &'static [u8; 4],
+    opacity: u8,
+) {
+    // 组混合模式落在 `lsct` 块里（PS 的约定）：穿透组记录字段是 `norm`，
+    // 真正的 `pass` 写在 lsct 的混合键上；其他模式两处一致。读回来时解码器
+    // 优先用 lsct 的键，否则「穿透」会退化成普通隔离组。
+    let record_blend: &'static [u8; 4] = if blend == b"pass" { b"norm" } else { blend };
     write_record(
         out,
         (0, 0, 0, 0),
         2, // 空通道：只有 2 字节压缩标记
-        b"norm",
-        255,
+        record_blend,
+        opacity,
         false,
         8,
         name,
         None,
-        Some(section),
+        Some((section, blend)),
     );
 }
 
@@ -303,7 +323,7 @@ fn write_record(
     flags: u8,
     name: &str,
     mask: Option<&PreparedMask>,
-    lsct: Option<u32>,
+    lsct: Option<(u32, &'static [u8; 4])>,
 ) {
     let (top, left, bottom, right) = rect;
     push_i32(out, top);
@@ -370,12 +390,14 @@ fn write_record(
     }
     push_zeros(&mut extra, pad);
 
-    // `8BIMlsct`: 分组分隔设置。4 字节类型，长度正好 4，无需补位。
-    if let Some(section) = lsct {
+    // `8BIMlsct`：分组分隔设置。类型 + 8BIM + 组混合键 = 12 字节，无需补位。
+    if let Some((section, blend)) = lsct {
         push_bytes(&mut extra, b"8BIM");
         push_bytes(&mut extra, b"lsct");
-        push_u32(&mut extra, 4);
+        push_u32(&mut extra, 12);
         push_u32(&mut extra, section);
+        push_bytes(&mut extra, b"8BIM");
+        push_bytes(&mut extra, blend);
     }
 
     push_u32(out, extra.len() as u32); // extra data length
@@ -429,6 +451,8 @@ fn prepare_records(doc: &editcore::Document, layers: Vec<PreparedLayer>) -> Vec<
                 records.push(PsdRecord::Divider {
                     name: group.name.clone(),
                     section: if group.collapsed { 2 } else { 1 },
+                    blend: group_blend_key(group),
+                    opacity: group_opacity(group),
                 });
             }
         }
@@ -437,6 +461,8 @@ fn prepare_records(doc: &editcore::Document, layers: Vec<PreparedLayer>) -> Vec<
             records.push(PsdRecord::Divider {
                 name: "</Layer group>".to_string(),
                 section: 3,
+                blend: b"norm",
+                opacity: 255,
             });
         }
         open = want;
@@ -448,6 +474,8 @@ fn prepare_records(doc: &editcore::Document, layers: Vec<PreparedLayer>) -> Vec<
             records.push(PsdRecord::Divider {
                 name: group.name.clone(),
                 section: if group.collapsed { 2 } else { 1 },
+                blend: group_blend_key(group),
+                opacity: group_opacity(group),
             });
         }
     }
@@ -460,13 +488,32 @@ fn prepare_records(doc: &editcore::Document, layers: Vec<PreparedLayer>) -> Vec<
         records.push(PsdRecord::Divider {
             name: "</Layer group>".to_string(),
             section: 3,
+            blend: b"norm",
+            opacity: 255,
         });
         records.push(PsdRecord::Divider {
             name: group.name.clone(),
             section: if group.collapsed { 2 } else { 1 },
+            blend: group_blend_key(group),
+            opacity: group_opacity(group),
         });
     }
     records
+}
+
+/// 组不透明度落到 PSD 文件夹行的 0..=255 字节。
+fn group_opacity(group: &editcore::LayerGroup) -> u8 {
+    (group.opacity.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// 组的 4 字节 PSD 混合键。穿透不是一种 `BlendMode`，必须单独写 `pass`；
+/// 写 `norm` 会让「穿透组」在重开时变成「正常模式的隔离组」，画面会变。
+fn group_blend_key(group: &editcore::LayerGroup) -> &'static [u8; 4] {
+    if group.pass_through {
+        b"pass"
+    } else {
+        blend_key(group.blend)
+    }
 }
 
 /// 图像资源段：目前只写回文档内嵌的 ICC（资源 1039）。
@@ -537,9 +584,12 @@ pub fn encode_psd(doc: &Document, _quality: u8) -> Result<Vec<u8>, crate::Decode
     for record in &records {
         match record {
             PsdRecord::Layer(l) => write_layer_record(&mut layer_info, l)?,
-            PsdRecord::Divider { name, section } => {
-                write_divider_record(&mut layer_info, name, *section)
-            }
+            PsdRecord::Divider {
+                name,
+                section,
+                blend,
+                opacity,
+            } => write_divider_record(&mut layer_info, name, *section, *blend, *opacity),
         }
     }
     // All channel DATA follows all records, in the same order the channel
@@ -727,6 +777,53 @@ mod tests {
                 opacity
             );
         }
+    }
+
+    /// 2d) 组自己的混合模式 / 不透明度 / 穿透标记必须写回文件夹行并读回来。
+    /// 成员不再替组承担不透明度，丢了这几个字段保存再打开画面就会变。
+    #[test]
+    fn group_blend_opacity_and_pass_through_round_trip() {
+        use editcore::{BlendMode, PsdGroupSeed, PsdLayerSeed};
+        let (cw, ch) = (8u32, 8u32);
+        let member = PsdLayerSeed {
+            name: "成员".into(),
+            offset: (0, 0),
+            image: solid(cw, ch, [10, 20, 30, 255]),
+            visible: true,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            group: Some(1),
+            mask: None,
+            clipping: false,
+            clip_shape: None,
+            style: None,
+        };
+        let doc = Document::from_psd_layers_with_groups(
+            (cw, ch),
+            vec![member],
+            vec![PsdGroupSeed {
+                psd_id: 1,
+                parent: None,
+                name: "组".into(),
+                collapsed: true,
+                visible: true,
+                blend: BlendMode::Multiply,
+                opacity: 0.5,
+                pass_through: false,
+            }],
+        );
+        let bytes = encode_psd(&doc, 90).expect("encode_psd");
+        let set = crate::psd_layers::decode_psd_layers(&bytes, crate::DecodeOptions::default())
+            .expect("decode_psd_layers");
+        let group = set
+            .groups
+            .iter()
+            .find(|g| g.name == "组")
+            .expect("组记录应写回");
+        assert_eq!(group.blend, BlendMode::Multiply);
+        assert!((group.opacity - 0.5).abs() < 0.01, "opacity {}", group.opacity);
+        assert!(!group.pass_through, "非穿透组不能退化成 pass");
+        assert!(group.collapsed, "折叠状态应写回 lsct 2");
     }
 
     /// 2b) Adobe's layer-flags bit 1 is INVERTED (SET = hidden). Photoshop

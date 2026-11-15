@@ -46,6 +46,15 @@ pub struct LayerGroup {
     /// `None` = 顶层组；成员关系仍由 `Layer::group` 反查，这里是**组与组**
     /// 之间的父子关系，两者合起来才是完整树。
     pub parent: Option<GroupId>,
+    /// 组自己的混合模式。PS 的组是「整组先合成、再按这个模式盖到下层」，
+    /// 与成员各自的模式是两回事。
+    pub blend: BlendMode,
+    /// 组不透明度：整组合成后一次性应用。以前把它乘进每个成员，成员重叠处
+    /// 会叠两次，比 PS 更透。
+    pub opacity: f32,
+    /// PSD 的 `pass`（穿透）：成员直接与组下方的画面混合，组不是隔离容器。
+    /// 应用里新建的组只是标签，默认保持穿透以免改变既有渲染。
+    pub pass_through: bool,
 }
 
 impl LayerGroup {
@@ -57,7 +66,15 @@ impl LayerGroup {
             visible: true,
             hidden_snapshot: Vec::new(),
             parent: None,
+            blend: BlendMode::Normal,
+            opacity: 1.0,
+            pass_through: true,
         }
+    }
+
+    /// 这一组是否必须单独合成一块再混合：穿透组只有在整体不透明度时才需要。
+    pub fn isolated(&self) -> bool {
+        !self.pass_through || self.opacity < 0.999
     }
 
     /// PSD 导入专用：组名可能带「空组」等标记，折叠态来自 `lsct` 的
