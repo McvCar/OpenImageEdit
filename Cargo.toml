@@ -41,6 +41,9 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 anyhow = "1"
 thiserror = "2"
+# 色彩管理：PSD 内嵌 ICC（图像资源 1039）-> sRGB。lcms2 是 Little CMS 的
+# 绑定，C 源码由 lcms2-sys 用 cc 编译（与 cxx-qt 一样走 MSVC 工具链）。
+lcms2 = "6"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 

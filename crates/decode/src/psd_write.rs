@@ -460,6 +460,31 @@ fn prepare_records(doc: &editcore::Document, layers: Vec<PreparedLayer>) -> Vec<
     records
 }
 
+/// 图像资源段：目前只写回文档内嵌的 ICC（资源 1039）。
+///
+/// `display` 路径的图层像素是**文档色彩空间**，profile 必须原样带回去；
+/// 少了它 PS 会按 sRGB 解读，整幅偏色（`decode` 路径的图层已经是 sRGB，
+/// `Document::icc` 为空，这里就与旧行为一致写长度 0）。
+fn push_image_resources(out: &mut Vec<u8>, doc: &Document) {
+    let Some(guard) = doc.icc.as_ref().and_then(|icc| icc.lock().ok()) else {
+        push_u32(out, 0);
+        return;
+    };
+    let data = guard.raw();
+    let mut block = Vec::with_capacity(data.len() + 12);
+    push_bytes(&mut block, b"8BIM");
+    push_i16(&mut block, 1039);
+    // Pascal 名字：空名字也要占两个字节（长度字节 + 1 字节补齐）。
+    push_zeros(&mut block, 2);
+    push_u32(&mut block, data.len() as u32);
+    push_bytes(&mut block, data);
+    if data.len() % 2 == 1 {
+        block.push(0);
+    }
+    push_u32(out, block.len() as u32);
+    push_bytes(out, &block);
+}
+
 /// Encode a document as an 8-bit RGB PSD, one PSD layer per document layer
 /// (including layer 0). Always writes a flattened composite in the Image Data
 /// section so readers without layer support still show the right picture.
@@ -469,7 +494,7 @@ pub fn encode_psd(doc: &Document, _quality: u8) -> Result<Vec<u8>, crate::Decode
     if cw == 0 || ch == 0 {
         return Err(crate::DecodeError::Psd("画布尺寸为 0".into()));
     }
-    let composite = doc.flatten();
+    let composite = doc.flatten_in_doc_space();
     if composite.width() != cw || composite.height() != ch {
         return Err(crate::DecodeError::Psd("合成图尺寸与画布不一致".into()));
     }
@@ -487,9 +512,9 @@ pub fn encode_psd(doc: &Document, _quality: u8) -> Result<Vec<u8>, crate::Decode
     push_u16(&mut out, 8); // depth: 8 bits
     push_u16(&mut out, 3); // color mode: RGB
 
-    // ---- Color Mode Data / Image Resources (empty) ----
+    // ---- Color Mode Data / Image Resources ----
     push_u32(&mut out, 0);
-    push_u32(&mut out, 0);
+    push_image_resources(&mut out, doc);
 
     // ---- Layer & Mask Info ----
     let mut layer_info = Vec::new();
@@ -861,5 +886,53 @@ mod tests {
         let decoded = crate::decode_bytes(&png, crate::DecodeOptions::default())
             .expect("decode_bytes");
         assert_same(&decoded.image, &flat);
+    }
+
+    /// 5) `display` 路径写回：像素必须是**文档色彩空间**，profile 原样保留。
+    ///
+    /// 用 gamma 1.0 的 RGB profile 凸出两者的差别：转 sRGB 会把中间调显著
+    /// 提亮，所以「写 display 像素」和「写 doc 像素」不可能碰巧相等。
+    #[test]
+    fn write_back_keeps_doc_space_pixels_and_icc() {
+        let white = lcms2::CIExyY {
+            x: 0.3127,
+            y: 0.3290,
+            Y: 1.0,
+        };
+        let primaries = lcms2::CIExyYTRIPLE {
+            Red: lcms2::CIExyY {
+                x: 0.64,
+                y: 0.33,
+                Y: 1.0,
+            },
+            Green: lcms2::CIExyY {
+                x: 0.30,
+                y: 0.60,
+                Y: 1.0,
+            },
+            Blue: lcms2::CIExyY {
+                x: 0.15,
+                y: 0.06,
+                Y: 1.0,
+            },
+        };
+        let gamma = lcms2::ToneCurve::new(1.0);
+        let profile = lcms2::Profile::new_rgb(&white, &primaries, &[&gamma, &gamma, &gamma])
+            .expect("gamma 1.0 RGB profile");
+        let icc = profile.icc().expect("serialize profile");
+
+        let mut doc = Document::from_image(solid(8, 4, [128, 64, 200, 255]));
+        doc.icc = editcore::IccTransform::shared(&icc);
+        assert_ne!(
+            doc.flatten().as_raw(),
+            doc.flatten_in_doc_space().as_raw(),
+            "the fake profile must visibly change display pixels"
+        );
+
+        let bytes = encode_psd(&doc, 90).expect("encode_psd");
+        let psd = psd::Psd::from_bytes(&bytes).expect("re-parse");
+        assert_eq!(psd.icc_profile(), Some(&icc[..]));
+        // 用 psd 的原始合并图（不走解码器的 ICC 转换）确认写入的是文档空间。
+        assert_eq!(psd.rgba(), doc.flatten_in_doc_space().into_raw());
     }
 }

@@ -26,6 +26,7 @@ mod document;
 mod selection;
 mod paint;
 mod retouch;
+mod psd_color;
 
 pub use geometry::{Size, Rect, Selection};
 pub use gesture::{
@@ -52,6 +53,9 @@ pub use transform::{
 pub use paint::{crop_region, flood_fill, gradient_fill, Patch};
 pub use retouch::{
     heal_clone, patch_fill, spot_heal, stroke_mask, BrushSpec, StrokeMask,
+};
+pub use psd_color::{
+    IccMode, IccTransform, SharedIcc, DEFAULT_MODE as DEFAULT_ICC_MODE, ICC_ENV,
 };
 pub use op::{EditError, EditOp};
 pub use document::{Document, PsdGroupSeed, PsdLayerSeed};

@@ -12,3 +12,4 @@ name = "editcore"
 image = { workspace = true }
 thiserror = { workspace = true }
 ab_glyph = "0.2"
+lcms2 = { workspace = true }

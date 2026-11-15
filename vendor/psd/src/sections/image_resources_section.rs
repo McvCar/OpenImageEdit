@@ -13,6 +13,9 @@ const EXPECTED_DESCRIPTOR_VERSION: u32 = 16;
 const RESOURCE_SLICES_INFO: i16 = 1050;
 /// Pattern resources: `2491` (Patt), `2492` (Pat2), `2493` (Pat3).
 const RESOURCE_PATTERNS: std::ops::RangeInclusive<i16> = 2491..=2493;
+/// ICC profile (resource id `1039`). Raw bytes are the embedded colour profile
+/// that maps the document's colour space onto a display/print space.
+const RESOURCE_ICC_PROFILE: i16 = 1039;
 
 mod image_resource;
 
@@ -63,6 +66,15 @@ impl ImageResourcesSection {
                 // 图案（Patt/Pat2/Pat3）留给解码器：通道要按 PackBits 解压，
                 // 与图层通道同一套逻辑。
                 _ if RESOURCE_PATTERNS.contains(&rid) => {
+                    let data = cursor.get_ref()[block.data_range].to_vec();
+                    resources.push(ImageResource::Raw(RawImageResource {
+                        resource_id: rid,
+                        name: block.name,
+                        data,
+                    }));
+                }
+                // 内嵌 ICC：解析与转换都归解码器（lcms），这里只保留负载。
+                _ if rid == RESOURCE_ICC_PROFILE => {
                     let data = cursor.get_ref()[block.data_range].to_vec();
                     resources.push(ImageResource::Raw(RawImageResource {
                         resource_id: rid,

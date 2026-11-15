@@ -973,7 +973,10 @@ impl qobject::Bridge {
         // can hide / show them after the stack is editable.
         let annotation_flags: Vec<bool> = set.layers.iter().map(|l| l.annotation).collect();
         let group_seeds = set.group_seeds();
+        let icc_profile = set.icc_profile.clone();
         let mut doc = Document::from_psd_layers_with_groups(canvas, set.into_seeds(), group_seeds);
+        // 显示时转：图层保持文档空间，合成出口（flatten / 预览）统一转 sRGB。
+        doc.set_icc_profile(icc_profile.as_deref());
         let mut annotation_ids: Vec<u32> = Vec::new();
         for (i, flag) in annotation_flags.iter().enumerate() {
             if !*flag {

@@ -637,6 +637,7 @@ impl PreviewComposer {
             params.apply_in_place(&mut out);
         }
         self.blend_upper_layers(doc, &mut out, target, sx, sy, None, adjust);
+        doc.apply_display_color(&mut out);
         out
     }
 
@@ -763,6 +764,7 @@ impl PreviewComposer {
             };
             Self::blend_layer(&mut out, target, &stretched, ox, oy, drag_opacity, drag_blend);
         }
+        doc.apply_display_color(&mut out);
         out
     }
 
@@ -871,6 +873,7 @@ impl PreviewComposer {
             };
             Self::blend_layer(&mut out, target, &stretched, 0, 0, drag_opacity, drag_blend);
         }
+        doc.apply_display_color(&mut out);
         out
     }
 
@@ -963,6 +966,7 @@ impl PreviewComposer {
             };
             Self::blend_layer(&mut out, target, &src, ox, oy, drag_opacity, drag_blend);
         }
+        doc.apply_display_color(&mut out);
         out
     }
 }

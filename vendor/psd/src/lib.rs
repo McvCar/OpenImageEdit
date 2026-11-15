@@ -296,6 +296,14 @@ impl Psd {
     pub fn resources(&self) -> &Vec<ImageResource> {
         &self.image_resources_section.resources
     }
+
+    /// The embedded ICC profile (resource `1039`), if the file carries one.
+    pub fn icc_profile(&self) -> Option<&[u8]> {
+        self.resources().iter().find_map(|r| match r {
+            ImageResource::Raw(raw) if raw.resource_id() == 1039 => Some(raw.data()),
+            _ => None,
+        })
+    }
 }
 
 impl IntoRgba for Psd {

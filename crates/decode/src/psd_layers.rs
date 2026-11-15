@@ -126,6 +126,11 @@ pub struct PsdLayerSet {
     pub clipped: usize,
     /// Whether the file carries a flattened composite (stage 1 uses it).
     pub has_composite: bool,
+    /// 内嵌 ICC profile（图像资源 1039 的原始字节）。
+    ///
+    /// `decode` 路径在下面已经把图层位图转到 sRGB；`display` 路径把这个字节
+    /// 流交给 UI 建「文档空间 -> sRGB」变换，合成完成后再转。
+    pub icc_profile: Option<Vec<u8>>,
     /// Total bytes held by the layer bitmaps, for the memory budget probes.
     pub bytes: usize,
 }
@@ -1010,6 +1015,24 @@ fn build_layers<F: FnMut(usize, usize)>(
         degraded.extend(group_fx_notes);
     }
 
+    // ---- 内嵌 ICC -------------------------------------------------------
+    // `decode` 路径：图层在这里就转成 sRGB，之后层间混合在 sRGB 里进行。
+    // `display` 路径：只把 profile 原样交出去，合成完成后再转（贴近 PS 的
+    // 顺序）；`off` 路径不建任何变换。
+    let icc_profile = psd.icc_profile().map(|b| b.to_vec());
+    if let (Some(bytes), editcore::IccMode::Decode) =
+        (icc_profile.as_deref(), editcore::IccMode::from_env())
+    {
+        match editcore::IccTransform::new(bytes) {
+            Some(xform) => {
+                for layer in &mut layers {
+                    xform.apply(&mut layer.image);
+                }
+            }
+            None => degraded.push("内嵌 ICC 配置文件无法解析，已按文档色彩空间显示".into()),
+        }
+    }
+
     Ok(PsdLayerSet {
         layers,
         groups: group_list,
@@ -1020,6 +1043,7 @@ fn build_layers<F: FnMut(usize, usize)>(
         // Stage 1 always has the composite from `decode_psd_bytes`; if it
         // failed the file would not have been opened at all.
         has_composite: true,
+        icc_profile,
         bytes: total_bytes,
     })
 }

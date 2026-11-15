@@ -814,14 +814,15 @@ impl Session {
                     ));
                 }
                 let group_seeds = set.group_seeds();
-                (
-                    Document::from_psd_layers_with_groups(
-                        set.canvas,
-                        set.into_seeds(),
-                        group_seeds,
-                    ),
-                    Some(text),
-                )
+                let icc_profile = set.icc_profile.clone();
+                let mut doc = Document::from_psd_layers_with_groups(
+                    set.canvas,
+                    set.into_seeds(),
+                    group_seeds,
+                );
+                // 显示时转：图层保持文档空间，合成出口统一转 sRGB。
+                doc.set_icc_profile(icc_profile.as_deref());
+                (doc, Some(text))
             }
             _ => (Document::from_image(decoded.image), decoded.note.clone()),
         };

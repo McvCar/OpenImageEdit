@@ -355,6 +355,17 @@ pub fn decode_psd_bytes(bytes: &[u8], options: DecodeOptions) -> Result<Decoded,
     let image = RgbaImage::from_raw(width, height, rgba)
         .ok_or_else(|| DecodeError::Psd("合成图数据与画布尺寸不符".into()))?;
     let (image, downsampled_from) = apply_max_dimension(image, options.max_dimension);
+    let mut image = image;
+    // 预览路径（只有合并图、没有后续层间合成）：解码时转与显示时转等价。
+    // 真正需要区分的两条路径在 `psd_layers` / `Document` 里。
+    if editcore::IccMode::from_env() != editcore::IccMode::Off {
+        if let Some(xform) = psd
+            .icc_profile()
+            .and_then(editcore::IccTransform::new)
+        {
+            xform.apply(&mut image);
+        }
+    }
     Ok(Decoded {
         info: ImageInfo {
             format: SourceFormat::Psd,

@@ -32,6 +32,13 @@ pub struct Document {
     /// creation order ("1", "2", ...). Not part of snapshots on purpose, so
     /// names keep increasing across undo/redo.
     pub(crate) next_layer_seq: u32,
+    /// PSD 内嵌 ICC 的「文档色彩空间 -> sRGB」变换。
+    ///
+    /// 只有 `display` 路径才会设置（解码时转的图层已经是 sRGB，写回也不需要
+    /// 再转）；`flatten()` 在整幅合成完成后一次性用它转换，与 Photoshop
+    /// 「先在文档空间合成、最后转显示」的顺序一致。不进快照 / 历史：
+    /// 它描述的是文件本身，而不是某一步编辑。
+    pub icc: Option<SharedIcc>,
     pub(crate) history: History,
 }
 
@@ -321,6 +328,7 @@ impl Document {
             selection: None,
             edit_epoch: 0,
             next_layer_seq: 0,
+            icc: None,
             history: History::new(256),
         }
     }
@@ -387,6 +395,7 @@ impl Document {
             selection: None,
             edit_epoch: 0,
             next_layer_seq: 0,
+            icc: None,
             history: History::new(256),
         }
     }
@@ -1345,8 +1354,38 @@ impl Document {
         p
     }
 
-    /// 全幅合成：按 `layers` 顺序自底向上，位图按 offset + 不透明度混合，
-    /// 标记按不透明度栅格化到累积图。**顺序即 z 序** —— 标记不再天然置顶。
+    /// 全幅合成（**显示口径**）：先按 [`Document::flatten_in_doc_space`] 在
+    /// 文档空间合成，再按 `display` 路径转成 sRGB。没有内嵌 ICC / 开关关闭
+    /// 时与前者完全一致，不会多一次转换。
+    pub fn flatten(&self) -> RgbaImage {
+        let mut out = self.flatten_in_doc_space();
+        self.apply_display_color(&mut out);
+        out
+    }
+
+    /// 把一张合成图从文档空间转到显示空间（sRGB）。没有内嵌 ICC 时是空操作。
+    pub fn apply_display_color(&self, image: &mut RgbaImage) {
+        if let Some(icc) = &self.icc {
+            if let Ok(xform) = icc.lock() {
+                xform.apply(image);
+            }
+        }
+    }
+
+    /// 按 `IMAGEEDIT_PSD_ICC` 把 PSD 内嵌 profile 挂到文档上。
+    ///
+    /// 只有 `display` 路径会建变换：`decode` 路径的图层位图在解码时已经是
+    /// sRGB，这里再转就是双重转换；`off` 路径保持原样。
+    pub fn set_icc_profile(&mut self, profile: Option<&[u8]>) {
+        self.icc = match (IccMode::from_env(), profile) {
+            (IccMode::Display, Some(bytes)) => IccTransform::shared(bytes),
+            _ => None,
+        };
+    }
+
+    /// 全幅合成（**文档色彩空间**口径）：按 `layers` 顺序自底向上，位图按
+    /// offset + 不透明度混合，标记按不透明度栅格化到累积图。**顺序即 z 序**
+    /// —— 标记不再天然置顶。
     ///
     /// 两件 PSD 语义在这里落地：
     /// - **图层蒙版**：`alpha *= mask/255`（蒙版有自己的矩形）；
@@ -1355,7 +1394,10 @@ impl Document {
     /// 累积缓冲是 f32 直通 alpha，**整幅只在最后量化一次**。旧实现每叠一层
     /// 就 round 到 u8，这个文件平均每像素叠 33 层，累积漂移 1~2/255 —— 在
     /// 保真模式下就是肉眼可见的色差。
-    pub fn flatten(&self) -> RgbaImage {
+    ///
+    /// PSD 写回必须用这一份：文件里内嵌的 profile 是文档空间，写 sRGB 像素
+    /// 进去会让 PS 重开时整体偏色。
+    pub fn flatten_in_doc_space(&self) -> RgbaImage {
         let w = self.canvas.width;
         let h = self.canvas.height;
         if w == 0 || h == 0 {
