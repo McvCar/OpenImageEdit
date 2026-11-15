@@ -611,16 +611,32 @@ fn build_layers<F: FnMut(usize, usize)>(
                         opaque as f32 / total.max(1) as f32
                     );
                 }
-                // ---- 缓存过期裁剪（实验性，默认关）--------------------
-                // 形状层的显示 = 内容 ∩ 矢量路径，是「缓存过期」的修复方向
-                // （路径改过、缓存还是旧形状）。但实测这份设计稿里 PS 合并
-                // 图对两类层的行为相反：`矩形 670 拷贝`（按钮）按路径显示、
-                // `椭圆 623`（气泡尾巴超出椭圆路径）按缓存显示 —— psd-tools
-                // 的全局裁剪同样顾此失彼。净效果 MAE 5.37→6.44（倒退），
-                // 所以默认不裁；`IMAGEEDIT_PSD_VCLIP=1` 供单轴消融与排查。
-                if off("IMAGEEDIT_PSD_VCLIP") {
-                    if crate::psd_vector::clip_shape(&mut image, layer_offset, (cw as u32, ch as u32), vm)
-                    {
+                // ---- 缓存过期裁剪（仅当路径≈图层轮廓）-----------------
+                // 形状层的显示 = 内容 ∩ 矢量路径。这张稿子里有两类形状层，
+                // PS 合并图对它们的行为相反，必须分开对待：
+                //   · 路径就是图层轮廓（`矩形 559 拷贝`：缓存是直角矩形、
+                //     路径是圆角，PS 显示时圆角外被切掉）→ 按路径裁；
+                //   · 路径只是层内子区域（`椭圆 623` 的气泡尾巴画在椭圆
+                //     路径之外）→ 缓存才是正确内容，裁了会切掉尾巴。
+                // 判据：路径包围盒四边相对图层矩形内缩都不超过 2.5px。
+                // 旧的全局裁剪（psd-tools 同款）净 MAE 5.37→6.44，就是被
+                // 第二类层拖累的；这个判据把两者分开。
+                let path_is_outline = layer.layer_effects().is_none()
+                    && crate::psd_vector::path_bounds(vm, (cw as u32, ch as u32))
+                        .map(|b| {
+                            b[0] - x0 as f32 <= 2.5
+                                && b[1] - y0 as f32 <= 2.5
+                                && x1 as f32 - b[2] <= 2.5
+                                && y1 as f32 - b[3] <= 2.5
+                        })
+                        .unwrap_or(false);
+                if path_is_outline && !off("IMAGEEDIT_PSD_NO_VCLIP") {
+                    if crate::psd_vector::clip_shape(
+                        &mut image,
+                        layer_offset,
+                        (cw as u32, ch as u32),
+                        vm,
+                    ) {
                         vector_clipped += 1;
                     }
                 }

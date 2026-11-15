@@ -29,6 +29,36 @@ fn trace_fail(why: &str) {
     }
 }
 
+/// 路径点的坐标尺度：PS 原生写画布像素，本仓库的素材写 0..1 的比例。
+///
+/// 用一个常数缩放会把整张卡片画成一个像素的亮点，所以按数值范围判断：
+/// 全部点都在 ±4 以内就当作比例。
+fn scale_of(bounds: (f32, f32, f32, f32), canvas: (u32, u32)) -> (f32, f32) {
+    let normalized = [bounds.0, bounds.1, bounds.2, bounds.3]
+        .iter()
+        .all(|v| v.abs() <= 4.0);
+    if normalized {
+        (canvas.0 as f32, canvas.1 as f32)
+    } else {
+        (1.0, 1.0)
+    }
+}
+
+/// 路径包围盒换算到**画布坐标** `(x0, y0, x1, y1)`。
+///
+/// 裁剪决策要看「路径是不是就是图层轮廓」：路径包围盒和图层矩形比一下
+/// 就知道。`None` 表示路径不可用。
+pub fn path_bounds(mask: &VectorMask, canvas: (u32, u32)) -> Option<[f32; 4]> {
+    let (bx0, by0, bx1, by1) = mask.bounds()?;
+    let (sx, sy) = scale_of((bx0, by0, bx1, by1), canvas);
+    Some([
+        bx0.min(bx1) * sx,
+        by0.min(by1) * sy,
+        bx0.max(bx1) * sx,
+        by0.max(by1) * sy,
+    ])
+}
+
 /// 把 `mask` 的闭式子路径栅格化到**位图局部坐标**的覆盖率平面。
 ///
 /// 返回 `(cov, 路径包围盒@局部)`；`None` 表示路径不可用（空、坐标不是
@@ -39,6 +69,7 @@ fn shape_coverage(
     h: u32,
     offset: (i32, i32),
     canvas: (u32, u32),
+    shift: (f32, f32),
 ) -> Option<(Vec<f32>, [f32; 4])> {
     if w == 0 || h == 0 {
         trace_fail("empty-image");
@@ -48,13 +79,7 @@ fn shape_coverage(
         trace_fail("no-bounds");
         return None;
     };
-    // 尺度判断：PS 原生写像素，本仓库的素材写 0..1 的比例。
-    let normalized = [bx0, by0, bx1, by1].iter().all(|v| v.abs() <= 4.0);
-    let (sx, sy) = if normalized {
-        (canvas.0 as f32, canvas.1 as f32)
-    } else {
-        (1.0, 1.0)
-    };
+    let (sx, sy) = scale_of((bx0, by0, bx1, by1), canvas);
 
     let mut polys: Vec<Vec<(f32, f32)>> = Vec::new();
     for sp in &mask.subpaths {
@@ -66,10 +91,22 @@ fn shape_coverage(
         for i in 0..n {
             let a = sp.knots[i];
             let b = sp.knots[(i + 1) % n];
-            let p0 = (a.anchor.1 * sx - offset.0 as f32, a.anchor.0 * sy - offset.1 as f32);
-            let c1 = (a.leaving.1 * sx - offset.0 as f32, a.leaving.0 * sy - offset.1 as f32);
-            let c2 = (b.preceding.1 * sx - offset.0 as f32, b.preceding.0 * sy - offset.1 as f32);
-            let p3 = (b.anchor.1 * sx - offset.0 as f32, b.anchor.0 * sy - offset.1 as f32);
+            let p0 = (
+                a.anchor.1 * sx - offset.0 as f32 + shift.0,
+                a.anchor.0 * sy - offset.1 as f32 + shift.1,
+            );
+            let c1 = (
+                a.leaving.1 * sx - offset.0 as f32 + shift.0,
+                a.leaving.0 * sy - offset.1 as f32 + shift.1,
+            );
+            let c2 = (
+                b.preceding.1 * sx - offset.0 as f32 + shift.0,
+                b.preceding.0 * sy - offset.1 as f32 + shift.1,
+            );
+            let p3 = (
+                b.anchor.1 * sx - offset.0 as f32 + shift.0,
+                b.anchor.0 * sy - offset.1 as f32 + shift.1,
+            );
             let straight = (c1.0 - p0.0).abs() < 1e-4
                 && (c1.1 - p0.1).abs() < 1e-4
                 && (c2.0 - p3.0).abs() < 1e-4
@@ -123,7 +160,7 @@ pub fn fill_shape(
     fill: Option<&VectorFill>,
 ) -> bool {
     let (w, h) = image.dimensions();
-    let Some((cov, gb)) = shape_coverage(mask, w, h, offset, canvas) else {
+    let Some((cov, gb)) = shape_coverage(mask, w, h, offset, canvas, (0.0, 0.0)) else {
         return false;
     };
 
@@ -193,7 +230,7 @@ pub fn stroke_shape(
         return false;
     }
     let (w, h) = image.dimensions();
-    let Some((cov, gb)) = shape_coverage(mask, w, h, offset, canvas) else {
+    let Some((cov, gb)) = shape_coverage(mask, w, h, offset, canvas, (0.0, 0.0)) else {
         return false;
     };
     let half = stroke.width / 2.0;
@@ -251,7 +288,7 @@ pub fn path_alpha(
     mask: &VectorMask,
 ) -> Option<Vec<f32>> {
     let (w, h) = image.dimensions();
-    shape_coverage(mask, w, h, offset, canvas).map(|(cov, _)| cov)
+    shape_coverage(mask, w, h, offset, canvas, (0.0, 0.0)).map(|(cov, _)| cov)
 }
 
 /// 把位图裁到矢量路径内：`alpha *= cov`（PS 显示形状层 = 内容 ∩ 路径）。
@@ -267,7 +304,7 @@ pub fn clip_shape(
     mask: &VectorMask,
 ) -> bool {
     let (w, h) = image.dimensions();
-    let Some((cov, _gb)) = shape_coverage(mask, w, h, offset, canvas) else {
+    let Some((cov, _gb)) = shape_coverage(mask, w, h, offset, canvas, (0.0, 0.0)) else {
         return false;
     };
     let mut clipped = false;
