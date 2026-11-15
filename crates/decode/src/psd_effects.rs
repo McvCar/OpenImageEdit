@@ -588,6 +588,45 @@ thread_local! {
     static FX_COVER: std::cell::RefCell<Option<Vec<f32>>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Composite an effect that **only recolours the pixels already there**.
+///
+/// 内阴影/内发光在 Photoshop 里是被内容 alpha 剪辑的：它们换掉已有像素的颜色，
+/// 不新增不透明度。用 [`composite`]（source-over）画会把 alpha 叠上去 ——
+/// 17.6% 的阴影贴图配 3px 内描边被画成 32%，描边色与**页面背景**混合，
+/// 底部多压出一条暗带（实测该带 MAE 25.5，改后 21.0）。
+///
+/// 所以这里只按 `coverage × opacity` 的权重换色，alpha 原样保留。
+///
+/// 注意适用范围：颜色/渐变叠加是**实测**必须 source-over 的（改成换色后
+/// `(128,864)` 一带误差 +11，整体 3.329 -> 3.384），内描边同样（+0.03），
+/// 不要顺手统一过来。
+fn composite_inside(
+    out: &mut RgbaImage,
+    x: u32,
+    y: u32,
+    color: [u8; 3],
+    coverage: f32,
+    opacity: f32,
+    mode: editcore::BlendMode,
+) {
+    let t = (coverage.clamp(0.0, 1.0) * opacity.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    if t <= 0.002 {
+        return;
+    }
+    let w = out.width();
+    record_effect_coverage(x, y, w, t * 255.0);
+    let idx = ((y * w + x) * 4) as usize;
+    let data = out.as_mut();
+    if data[idx + 3] == 0 {
+        return;
+    }
+    let mut px = [data[idx], data[idx + 1], data[idx + 2], 255];
+    editcore::blend_pixel(&mut px, [color[0], color[1], color[2], 255], t, mode);
+    data[idx] = px[0];
+    data[idx + 1] = px[1];
+    data[idx + 2] = px[2];
+}
+
 fn record_effect_coverage(x: u32, y: u32, w: u32, alpha: f32) {
     let i = (y * w + x) as usize;
     let a = (alpha / 255.0).clamp(0.0, 1.0);
@@ -797,11 +836,16 @@ fn draw_inner_shadow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: &Lay
     for y in 0..h {
         for x in 0..w {
             let i = (y * w + x) as usize;
-            let cov = alpha[i] * blurred[i];
+            // 内阴影只画在内容里：`out` 在这里可能已经被投影/外描边扩过，
+            // 不能拿 out 的 alpha 当门槛（否则投影会被再染一遍）。
+            if alpha[i] <= INSIDE_EPS {
+                continue;
+            }
+            let cov = blurred[i];
             if cov <= 0.002 {
                 continue;
             }
-            composite(out, x, y, e.color, cov, e.opacity, mode);
+            composite_inside(out, x, y, e.color, cov, e.opacity, mode);
         }
     }
 }
@@ -826,11 +870,11 @@ fn draw_inner_glow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: &Layer
                 // the range (Photoshop 27.11).
                 t = 1.0 - t;
             }
-            let cov = alpha[i] * t;
+            let cov = t;
             if cov <= 0.002 {
                 continue;
             }
-            composite(out, x, y, e.color, cov, e.opacity, mode);
+            composite_inside(out, x, y, e.color, cov, e.opacity, mode);
         }
     }
 }
