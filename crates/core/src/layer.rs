@@ -27,6 +27,21 @@ pub fn next_group_id() -> GroupId {
     NEXT_GROUP_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// 挖空方式（PSD 的 `knko`）。
+///
+/// Photoshop 的「挖空」下拉框：浅挖空只挖掉**同一个组内**位于本层下方的
+/// 内容（洞里露出组下方的背景），深挖空连文档最底层一起挖掉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Knockout {
+    /// 未启用。
+    #[default]
+    None,
+    /// 浅挖空：只挖组内下层成员。
+    Shallow,
+    /// 深挖空：挖掉文档中所有位于本层下方的内容。
+    Deep,
+}
+
 /// 图层分组元数据。成员关系不单独存表，而是由每个 `Layer::group` 反查，
 /// 这样删层 / 撤销 / 替换整层时归属自动跟着走，不会出现成员表与图层栈
 /// 不一致的两份真值。
@@ -214,6 +229,8 @@ pub struct Layer {
     /// 混合颜色带（PSD 的 blending ranges + `lclr`）：按本层/下层的颜色范围
     /// 进一步遮挡本层，`None` = 全默认。
     pub blend_if: Option<BlendIf>,
+    /// 挖空（PSD 的 `knko`）：本层内容把下层挖掉后再绘制。
+    pub knockout: Knockout,
     /// 所属分组（`None` = 不属于任何组）。组只影响面板组织与批量显隐，
     /// 不改变 z 序、不参与合成。`duplicated()` 会继承它。
     pub group: Option<GroupId>,
@@ -257,6 +274,7 @@ impl Layer {
             clip_shape: None,
             style: None,
             blend_if: None,
+            knockout: Knockout::None,
             group: None,
             content: LayerContent::Raster(RasterLayer {
                 image,
@@ -338,6 +356,7 @@ impl Layer {
             clip_shape: None,
             style: None,
             blend_if: None,
+            knockout: Knockout::None,
             group: None,
             content: LayerContent::Mark(mark),
         }

@@ -38,8 +38,8 @@ pub use selection::{
 };
 pub use mark::{MarkKind, Mark};
 pub use layer::{
-    next_group_id, thumbnail_image, GroupId, Layer, LayerContent, LayerGroup, LayerId, LayerMask,
-    RasterLayer, StylePixels,
+    next_group_id, thumbnail_image, GroupId, Knockout, Layer, LayerContent, LayerGroup, LayerId,
+    LayerMask, RasterLayer, StylePixels,
 };
 pub use layer_ops::{AlignEdge, DistributeAxis};
 pub use layer_transform::{

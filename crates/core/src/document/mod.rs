@@ -164,6 +164,8 @@ pub struct PsdLayerSeed {
     pub style: Option<StylePixels>,
     /// 混合颜色带（PSD blending ranges + `lclr`），全默认 = `None`。
     pub blend_if: Option<BlendIf>,
+    /// 挖空（PSD `knko`），默认关闭。
+    pub knockout: Knockout,
 }
 
 /// One PSD folder ("layer group"). `layers` 里的成员通过 `PsdLayerSeed::group`
@@ -208,6 +210,7 @@ mod psd_assembly_tests {
             clip_shape: None,
             style: None,
             blend_if: None,
+            knockout: Knockout::None,
         }
     }
 
@@ -265,6 +268,90 @@ mod psd_assembly_tests {
             vec![group_seed(3, "组", BlendMode::Normal, 0.5, true)],
         );
         assert_eq!(doc.flatten().get_pixel(0, 0).0, [159, 159, 159, 255]);
+    }
+
+    /// 半透明挖空层：挖掉下层后，浅挖空会露出组下方的背景（不透明度仍是满的）。
+    #[test]
+    fn shallow_knockout_reveals_group_backdrop() {
+        let backdrop = seed("底", (0, 0), [255, 255, 255, 255], (1, 1), true, 1.0);
+        let make = |pass_through: bool| {
+            let mut red = seed("红", (0, 0), [255, 0, 0, 255], (1, 1), true, 1.0);
+            red.group = Some(7);
+            let mut blue = seed("蓝", (0, 0), [0, 0, 255, 128], (1, 1), true, 1.0);
+            blue.group = Some(7);
+            blue.knockout = Knockout::Shallow;
+            Document::from_psd_layers_with_groups(
+                (1, 1),
+                vec![backdrop.clone(), red, blue],
+                vec![group_seed(7, "组", BlendMode::Normal, 1.0, pass_through)],
+            )
+            .flatten()
+            .get_pixel(0, 0)
+            .0
+        };
+        // 隔离组与穿透组结果一致：组内红色被削掉一半，透出白底后的合成值。
+        for pass_through in [false, true] {
+            let got = make(pass_through);
+            for (i, want) in [127u8, 64, 191, 255].iter().enumerate() {
+                assert!(
+                    (got[i] as i32 - *want as i32).abs() <= 1,
+                    "pass_through={pass_through} 通道 {i}: got {got:?}"
+                );
+            }
+        }
+    }
+
+    /// 根层（不在任何组里）的浅挖空等价于挖掉文档下层：
+    /// 半透明挖空层下方不再垫着实底背景。
+    #[test]
+    fn root_shallow_knockout_clears_document_below() {
+        let make = |knockout: Knockout| {
+            let backdrop = seed("底", (0, 0), [255, 255, 255, 255], (1, 1), true, 1.0);
+            let mut blue = seed("蓝", (0, 0), [0, 0, 255, 128], (1, 1), true, 1.0);
+            blue.knockout = knockout;
+            Document::from_psd_layers_with_groups(
+                (1, 1),
+                vec![backdrop, blue],
+                Vec::new(),
+            )
+            .flatten()
+            .get_pixel(0, 0)
+            .0
+        };
+        assert_eq!(make(Knockout::None), [127, 127, 255, 255]);
+        let got = make(Knockout::Shallow);
+        for (i, want) in [85u8, 85, 255, 191].iter().enumerate() {
+            assert!(
+                (got[i] as i32 - *want as i32).abs() <= 1,
+                "通道 {i}: got {got:?}"
+            );
+        }
+    }
+
+    /// 深挖空连文档背景一起挖：结果不再是不透明的白底合成，
+    /// 而是留下与挖空覆盖率相应的透明。
+    #[test]
+    fn deep_knockout_removes_document_backdrop() {
+        let make = |knockout: Knockout| {
+            let backdrop = seed("底", (0, 0), [255, 255, 255, 255], (1, 1), true, 1.0);
+            let mut red = seed("红", (0, 0), [255, 0, 0, 255], (1, 1), true, 1.0);
+            red.group = Some(7);
+            let mut blue = seed("蓝", (0, 0), [0, 0, 255, 128], (1, 1), true, 1.0);
+            blue.group = Some(7);
+            blue.knockout = knockout;
+            Document::from_psd_layers_with_groups(
+                (1, 1),
+                vec![backdrop, red, blue],
+                vec![group_seed(7, "组", BlendMode::Normal, 1.0, false)],
+            )
+            .flatten()
+            .get_pixel(0, 0)
+            .0
+        };
+        let shallow = make(Knockout::Shallow);
+        assert_eq!(shallow[3], 255, "浅挖空只挖组内，背景仍是实底");
+        let deep = make(Knockout::Deep);
+        assert!(deep[3] < 240, "深挖空应把白底一起挖掉：{deep:?}");
     }
 
     /// 混合颜色带按本层颜色遮罩：白端 128 以上整片消失，其余照常。
@@ -515,6 +602,7 @@ impl Document {
             layer.clip_shape = seed.clip_shape;
             layer.style = seed.style;
             layer.blend_if = seed.blend_if;
+            layer.knockout = seed.knockout;
             layer.locked = false;
             layer.background = false;
             layer.group = seed.group.and_then(|gid| group_of.get(&gid).copied());
@@ -1545,7 +1633,7 @@ impl Document {
         // 剪贴基底层的 alpha 覆盖率（不含不透明度）。剪贴层逐像素乘上它；
         // 隐藏的基底覆盖率是 0，于是整条剪贴链一起消失 —— 与 PS 一致。
         let mut clip = vec![0f32; n];
-        self.composite_range(&self.layers, &mut acc, &mut clip, w, h, None);
+        self.composite_range(&self.layers, &mut acc, &mut clip, w, h, None, None);
         acc_to_image(&acc, w, h)
     }
 
@@ -1555,6 +1643,13 @@ impl Document {
     /// 与成员模式逐层直接叠加是两回事。遇到需要隔离的组（非穿透，或组不透明度
     /// < 100%）时，把它连续的成员递归合成到独立缓冲，再整体混合一次；穿透组
     /// 仍按原来的逐层叠加走，保证既有画面不变。
+    ///
+    /// `base` 是当前组起点处的累积背景，只有穿透组才给（浅挖空要把组内下层
+    /// 恢复成它）；隔离组与根层传 `None`，等价于「背景是透明」。
+    ///
+    /// 返回深挖空涉及的像素下标与保留系数：调用方在把本段结果混到自己的
+    /// 累积缓冲前，要先把这些像素按下层内容乘上保留系数 —— 深挖空要求连
+    /// 组外的背景一起挖掉。
     fn composite_range(
         &self,
         layers: &[Layer],
@@ -1563,27 +1658,60 @@ impl Document {
         w: u32,
         h: u32,
         inside: Option<GroupId>,
-    ) {
+        base: Option<&[[f32; 4]]>,
+    ) -> Vec<(usize, f32)> {
+        let mut deep: Vec<(usize, f32)> = Vec::new();
         let mut i = 0;
         while i < layers.len() {
             let layer = &layers[i];
             if let Some(gid) = layer.group {
                 if inside != Some(gid) {
                     if let Some(group) = self.groups.iter().find(|g| g.id == gid) {
+                        let end = self.group_run_end(layers, i, gid);
+                        let has_knockout =
+                            layers[i..end].iter().any(|l| l.knockout != Knockout::None);
                         if group.isolated() {
-                            let end = self.group_run_end(layers, i, gid);
                             let n = w as usize * h as usize;
                             let mut sub = vec![[0f32; 4]; n];
                             let mut sub_clip = vec![0f32; n];
-                            self.composite_range(
+                            let sub_deep = self.composite_range(
                                 &layers[i..end],
                                 &mut sub,
                                 &mut sub_clip,
                                 w,
                                 h,
                                 Some(gid),
+                                None,
                             );
+                            for &(p, keep) in &sub_deep {
+                                for c in 0..4 {
+                                    acc[p][c] *= keep;
+                                }
+                            }
                             blend_group(acc, &sub, group);
+                            deep.extend(sub_deep);
+                            i = end;
+                            continue;
+                        } else if has_knockout {
+                            // 穿透组的成员直接跟组下方的画面混合。要支持浅挖空
+                            // （只挖组内成员），必须先把组起点的背景复制一份，
+                            // 组内挖空时恢复它；否则分不清「组内下层」和
+                            // 「组外背景」。组里没有挖空层时仍走原来的逐层路径。
+                            let n = w as usize * h as usize;
+                            let base_snapshot = acc.to_vec();
+                            let mut sub = base_snapshot.clone();
+                            let mut sub_clip = vec![0f32; n];
+                            let sub_deep = self.composite_range(
+                                &layers[i..end],
+                                &mut sub,
+                                &mut sub_clip,
+                                w,
+                                h,
+                                Some(gid),
+                                Some(&base_snapshot),
+                            );
+                            acc.copy_from_slice(&sub);
+                            deep.extend(sub_deep);
                             i = end;
                             continue;
                         }
@@ -1607,7 +1735,9 @@ impl Document {
                     None
                 };
                 match &layer.content {
-                    LayerContent::Raster(r) => composite_raster(acc, w, h, r, layer, clip_alpha),
+                    LayerContent::Raster(r) => {
+                        composite_raster(acc, w, h, r, layer, clip_alpha, base, &mut deep)
+                    }
                     LayerContent::Mark(m) => {
                         // 标记不能先栅格化到空图：马赛克要采样**当前已合成**的
                         // 画面才能算出块平均。所以先把累积缓冲物化，再按旧语义
@@ -1643,6 +1773,7 @@ impl Document {
             }
             i += 1;
         }
+        deep
     }
 
     /// `gid` 组从 `start` 开始的一段连续成员（含嵌套组）。PSD 里组总是连续
@@ -1846,6 +1977,8 @@ fn composite_raster(
     r: &RasterLayer,
     layer: &Layer,
     clip: Option<&[f32]>,
+    base: Option<&[[f32; 4]]>,
+    deep: &mut Vec<(usize, f32)>,
 ) {
     if layer.opacity <= 0.0 {
         return;
@@ -1896,6 +2029,45 @@ fn composite_raster(
                     bf.source_factor([px[0], px[1], px[2]])
                 };
                 src[3] *= f;
+            }
+            // 挖空：先按本层覆盖率把下层挖掉，再正常绘制本层。
+            // 浅挖空只削弱当前组内的下层内容（穿透组用组起点背景做「地板」，
+            // 组外背景保持原样）；深挖空连组外背景一起削弱，并记下像素与
+            // 保留系数，由上层在混合前作用到自己的累积缓冲。
+            if layer.knockout != Knockout::None {
+                let cov = (src[3] * layer.opacity).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    let p = y as usize * w as usize + x as usize;
+                    let keep = 1.0 - cov;
+                    match layer.knockout {
+                        Knockout::Shallow => match base {
+                            // 组内下层 = 当前累积与组起点背景之差；只削弱这部分。
+                            Some(b) => {
+                                let bp = b[p];
+                                let cur = acc[p];
+                                acc[p] = [
+                                    bp[0] + (cur[0] - bp[0]) * keep,
+                                    bp[1] + (cur[1] - bp[1]) * keep,
+                                    bp[2] + (cur[2] - bp[2]) * keep,
+                                    bp[3] + (cur[3] - bp[3]) * keep,
+                                ];
+                            }
+                            // 隔离组 / 根层：当前缓冲就是「组内下层」，直接削弱。
+                            None => {
+                                for c in 0..4 {
+                                    acc[p][c] *= keep;
+                                }
+                            }
+                        },
+                        Knockout::Deep => {
+                            for c in 0..4 {
+                                acc[p][c] *= keep;
+                            }
+                            deep.push((p, keep));
+                        }
+                        Knockout::None => {}
+                    }
+                }
             }
             if src[3] <= 0.0 {
                 continue;

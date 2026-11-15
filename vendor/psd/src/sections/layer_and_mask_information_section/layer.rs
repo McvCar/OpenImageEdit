@@ -59,6 +59,8 @@ pub struct LayerProperties {
     /// `black_low / black_high / white_low / white_high`，顺序为
     /// 「合成源、合成目标，然后每个通道各一对」。全默认时为 `None`。
     pub(crate) blend_ranges: Option<Vec<[u8; 4]>>,
+    /// 挖空（`knko`）：图层内容挖掉下层的方式，`None` = 关。
+    pub(crate) knockout: Option<Knockout>,
 }
 
 /// Where a layer's mask lives, plus the "mask disabled" flag.
@@ -97,6 +99,19 @@ impl MaskRect {
     pub fn height(&self) -> u32 {
         (self.bottom - self.top + 1).max(0) as u32
     }
+}
+
+/// 挖空方式（`knko`）。
+///
+/// Photoshop 的「挖空」下拉框：浅挖空只挖掉**同一个组内**位于本层下方的
+/// 内容（洞里露出组下方的背景），深挖空连文档最底层一起挖掉。关掉时不存
+/// 这个键，读出来是 `None`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Knockout {
+    /// 浅挖空：只挖组内下层成员。
+    Shallow,
+    /// 深挖空：挖掉文档里所有位于本层下方的内容。
+    Deep,
 }
 
 /// Brightness/contrast adjustment layer settings (`brit`).
@@ -170,7 +185,13 @@ impl LayerProperties {
             vector_fill: layer_record.vector_fill.clone(),
             vector_stroke: layer_record.vector_stroke.clone(),
             blend_ranges: layer_record.blend_ranges.clone(),
+            knockout: layer_record.knockout,
         }
+    }
+
+    /// 挖空设置（`knko`），`None` = 未设置。
+    pub fn knockout(&self) -> Option<Knockout> {
+        self.knockout
     }
 
     /// 混合颜色带（Blend If）原始范围表，见 [`LayerProperties::blend_ranges`]。
@@ -605,6 +626,8 @@ pub struct LayerRecord {
     pub(super) vector_stroke: Option<crate::vector::VectorStroke>,
     /// 混合颜色带（Blend If）原始范围表，见 [`LayerProperties::blend_ranges`]。
     pub(super) blend_ranges: Option<Vec<[u8; 4]>>,
+    /// 挖空设置（`knko`）。
+    pub(super) knockout: Option<Knockout>,
 }
 
 impl LayerRecord {

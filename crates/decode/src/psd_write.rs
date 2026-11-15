@@ -83,6 +83,8 @@ struct PreparedLayer {
     mask: Option<PreparedMask>,
     /// 混合颜色带（Blend If）：全默认时 `None`，写回长度 0。
     blend_if: Option<editcore::BlendIf>,
+    /// 挖空（`knko`）：`None` = 关闭，不写这个键。
+    knockout: editcore::Knockout,
     /// 所属分组（写 PSD 时要按它插 `lsct` 分隔记录）。
     group: Option<editcore::GroupId>,
 }
@@ -205,6 +207,7 @@ fn prepare_layers(doc: &Document) -> Result<Vec<PreparedLayer>, crate::DecodeErr
                 })
             }),
             blend_if: layer.blend_if.clone(),
+            knockout: layer.knockout,
             group: layer.group,
         });
     }
@@ -280,6 +283,7 @@ fn write_layer_record(out: &mut Vec<u8>, l: &PreparedLayer) -> Result<(), crate:
         &l.name,
         l.mask.as_ref(),
         l.blend_if.as_ref(),
+        l.knockout,
         None,
     );
     Ok(())
@@ -312,6 +316,7 @@ fn write_divider_record(
         name,
         None,
         None,
+        editcore::Knockout::None,
         Some((section, blend)),
     );
 }
@@ -329,6 +334,7 @@ fn write_record(
     name: &str,
     mask: Option<&PreparedMask>,
     blend_if: Option<&editcore::BlendIf>,
+    knockout: editcore::Knockout,
     lsct: Option<(u32, &'static [u8; 4])>,
 ) {
     let (top, left, bottom, right) = rect;
@@ -425,6 +431,20 @@ fn write_record(
         push_u32(&mut extra, section);
         push_bytes(&mut extra, b"8BIM");
         push_bytes(&mut extra, blend);
+    }
+
+    // `8BIMknko`：挖空设置（4 字节：1 = 浅、2 = 深）。必须放在 Pascal 图层名
+    // 之后的「附加信息块」区；关掉时不写这个键，与 PS 的习惯一致。
+    let ko = match knockout {
+        editcore::Knockout::None => 0u32,
+        editcore::Knockout::Shallow => 1,
+        editcore::Knockout::Deep => 2,
+    };
+    if ko != 0 {
+        push_bytes(&mut extra, b"8BIM");
+        push_bytes(&mut extra, b"knko");
+        push_u32(&mut extra, 4);
+        push_u32(&mut extra, ko);
     }
 
     push_u32(out, extra.len() as u32); // extra data length
@@ -825,6 +845,7 @@ mod tests {
             clip_shape: None,
             style: None,
             blend_if: None,
+            knockout: editcore::Knockout::None,
         };
         let doc = Document::from_psd_layers_with_groups(
             (cw, ch),
@@ -872,6 +893,7 @@ mod tests {
             clip_shape: None,
             style: None,
             blend_if: None,
+            knockout: editcore::Knockout::None,
         };
         let mut doc = Document::from_psd_layers((4, 4), vec![seed]);
         let want = BlendIf {
@@ -899,6 +921,42 @@ mod tests {
         let set = crate::psd_layers::decode_psd_layers(&bytes, crate::DecodeOptions::default())
             .expect("decode_psd_layers");
         assert_eq!(set.layers[0].blend_if.as_ref(), Some(&want));
+    }
+
+    /// 2f) 挖空写回：`8BIMknko` 4 字节（1 浅 / 2 深），关闭时不写键，
+    /// 读回来必须一致。
+    #[test]
+    fn knockout_round_trip() {
+        use editcore::{BlendMode, Knockout, PsdLayerSeed};
+        let seed = PsdLayerSeed {
+            name: "挖".into(),
+            offset: (0, 0),
+            image: solid(4, 4, [90, 90, 90, 255]),
+            visible: true,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            group: None,
+            mask: None,
+            clipping: false,
+            clip_shape: None,
+            style: None,
+            blend_if: None,
+            knockout: Knockout::None,
+        };
+        for want in [Knockout::Shallow, Knockout::Deep] {
+            let mut doc = Document::from_psd_layers((4, 4), vec![seed.clone()]);
+            doc.layers[1].knockout = want;
+            let bytes = encode_psd(&doc, 90).expect("encode_psd");
+            let set =
+                crate::psd_layers::decode_psd_layers(&bytes, crate::DecodeOptions::default())
+                    .expect("decode_psd_layers");
+            assert_eq!(set.layers[0].knockout, want);
+        }
+        let doc = Document::from_psd_layers((4, 4), vec![seed]);
+        let bytes = encode_psd(&doc, 90).expect("encode_psd");
+        let set = crate::psd_layers::decode_psd_layers(&bytes, crate::DecodeOptions::default())
+            .expect("decode_psd_layers");
+        assert_eq!(set.layers[0].knockout, Knockout::None);
     }
 
     /// 2b) Adobe's layer-flags bit 1 is INVERTED (SET = hidden). Photoshop
@@ -974,6 +1032,7 @@ mod tests {
             clip_shape: None,
             style: None,
             blend_if: None,
+            knockout: editcore::Knockout::None,
         };
         let doc = Document::from_psd_layers((4, 4), vec![seed("上层"), seed("下层")]);
         assert_eq!(doc.layers.len(), 3, "background + 2 seeds");

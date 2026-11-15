@@ -167,8 +167,15 @@ impl PreviewComposer {
         // 需要隔离的组（非穿透 / 组不透明度 < 100%）只在 core 的合成里有语义，
         // 逐层预览没法表达「整组先合成再混合」。这类文件退回整幅 flatten 再
         // 降采样：慢一点，但保证预览与导出逐像素一致。实时调色仍走下面的
-        // 逐层路径（拖动期间的过渡态）。
-        if adjust.is_none() && doc.groups.iter().any(|g| g.isolated()) {
+        // 逐层路径（拖动期间的过渡态）。挖空同理：它会改写下层累积结果，
+        // 逐层叠加的预览也表达不了。
+        if adjust.is_none()
+            && (doc.groups.iter().any(|g| g.isolated())
+                || doc
+                    .layers
+                    .iter()
+                    .any(|l| l.knockout != editcore::Knockout::None))
+        {
             return resize_to(&doc.flatten(), target);
         }
         let Some((sx, sy)) = self.prepare(doc, target) else {

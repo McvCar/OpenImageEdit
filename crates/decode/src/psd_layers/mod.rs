@@ -73,6 +73,8 @@ pub struct PsdLayerData {
     pub style: Option<editcore::StylePixels>,
     /// 混合颜色带（PSD blending ranges + `lclr`），全默认 = `None`。
     pub blend_if: Option<editcore::BlendIf>,
+    /// 挖空（PSD `knko`），默认关闭。
+    pub knockout: editcore::Knockout,
 }
 
 /// 烘焙样式前的 alpha 平面（1 字节/像素，行优先）连同它自己的矩形。
@@ -203,6 +205,7 @@ impl PsdLayerSet {
                 clip_shape: l.clip_shape,
                 style: l.style,
                 blend_if: l.blend_if,
+                knockout: l.knockout,
             })
             .collect()
     }
@@ -387,6 +390,11 @@ fn build_layers<F: FnMut(usize, usize)>(
         // 混合颜色带（`lclr` 口径位 + 每组 4 字节的范围表）。全默认时丢掉，
         // 免得每层都挂一份不起作用的表。
         let blend_if = layer_blend_if(layer);
+        let knockout = match layer.knockout() {
+            Some(psd::Knockout::Shallow) => editcore::Knockout::Shallow,
+            Some(psd::Knockout::Deep) => editcore::Knockout::Deep,
+            None => editcore::Knockout::None,
+        };
         // 组不再摊平：整棵树由 `psd.groups()` 交出去（见函数末尾），这里
         // 只把「这层属于哪个组」记在层上，让面板能还原缩进与折叠。
         // A group's own visibility and opacity live on the folder record, not on
@@ -800,6 +808,7 @@ fn build_layers<F: FnMut(usize, usize)>(
             clip_shape,
             style,
             blend_if,
+            knockout,
         });
         clips.push(layer.is_clipping_mask());
         progress(step + 1, total);

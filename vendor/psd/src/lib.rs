@@ -26,7 +26,8 @@ pub use crate::sections::image_resources_section::{ImageResource, RawImageResour
 use crate::sections::image_resources_section::ImageResourcesSection;
 pub use crate::sections::image_resources_section::{DescriptorField, UnitFloatStructure};
 pub use crate::sections::layer_and_mask_information_section::layer::{
-    BlendMode, BrightnessContrast, HueSaturation, LayerChannels, MaskRect, PsdGroup, PsdLayer,
+    BlendMode, BrightnessContrast, HueSaturation, Knockout, LayerChannels, MaskRect, PsdGroup,
+    PsdLayer,
 };
 pub use vector::{
     VectorFill, VectorKnot, VectorMask, VectorOperation, VectorPattern, VectorStroke,

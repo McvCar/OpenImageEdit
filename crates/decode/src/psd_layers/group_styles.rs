@@ -152,6 +152,7 @@ pub(super) fn bake_group_style_layers(
                         clip_shape: None,
                         style: None,
                         blend_if: None,
+                        knockout: editcore::Knockout::None,
                     },
                 );
                 inserted += 1;
@@ -180,6 +181,7 @@ pub(super) fn bake_group_style_layers(
                         clip_shape: None,
                         style: None,
                         blend_if: None,
+                        knockout: editcore::Knockout::None,
                     },
                 );
                 inserted += 1;

@@ -6,8 +6,8 @@ use crate::psd_channel::PsdChannelKind;
 use crate::sections::image_data_section::ChannelBytes;
 use crate::sections::layer_and_mask_information_section::groups::Groups;
 use crate::sections::layer_and_mask_information_section::layer::{
-    BlendMode, BrightnessContrast, GroupDivider, HueSaturation, LayerChannels, LayerRecord,
-    MaskRect, PsdGroup, PsdLayer, PsdLayerError,
+    BlendMode, BrightnessContrast, GroupDivider, HueSaturation, Knockout, LayerChannels,
+    LayerRecord, MaskRect, PsdGroup, PsdLayer, PsdLayerError,
 };
 use crate::sections::layer_and_mask_information_section::layers::Layers;
 use crate::sections::PsdCursor;
@@ -26,6 +26,8 @@ const KEY_SECTION_DIVIDER_SETTING: &[u8; 4] = b"lsct";
 const KEY_BRIGHTNESS_CONTRAST: &[u8; 4] = b"brit";
 /// Key of `Hue/saturation (photoshop 6.0)`, "hue2"
 const KEY_HUE_SATURATION: &[u8; 4] = b"hue2";
+/// 挖空设置 `knko`：4 字节 u32，0 = 关、1 = 浅、2 = 深。
+const KEY_KNOCKOUT: &[u8; 4] = b"knko";
 
 /// Key of `Object-based effects layer info`, "lfx2" — layer styles.
 ///
@@ -562,6 +564,8 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
     let mut sheet_fill: Option<crate::vector::VectorFill> = None;
     // 形状描边与 fillEnabled（vst2）。
     let mut vector_stroke: Option<crate::vector::VectorStroke> = None;
+    // 挖空设置（knko）：0 = 关、1 = 浅、2 = 深，其他值当作关。
+    let mut knockout: Option<Knockout> = None;
     // There can be multiple additional layer information sections so we'll loop
     // until we stop seeing them.
     while cursor.peek_4() == SIGNATURE_EIGHT_BIM || cursor.peek_4() == SIGNATURE_EIGHT_B64 {
@@ -591,6 +595,19 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
                 if additional_layer_info_len >= 16 {
                     cursor.read_4();
                 }
+            }
+
+            // 挖空（`knko`）：4 字节，0 = 关、1 = 浅、2 = 深。
+            KEY_KNOCKOUT => {
+                let pos = cursor.position();
+                if additional_layer_info_len >= 4 {
+                    knockout = match cursor.read_u32() {
+                        1 => Some(Knockout::Shallow),
+                        2 => Some(Knockout::Deep),
+                        _ => None,
+                    };
+                }
+                cursor.seek(pos + additional_layer_info_len as u64);
             }
 
             // Brightness/contrast ("brit"): 2×i16 sliders + mean + lab flag.
@@ -718,6 +735,7 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
         blend_mode,
         divider_type,
         divider_blend_mode,
+        knockout,
         blend_ranges,
         brightness_contrast,
         hue_saturation,
