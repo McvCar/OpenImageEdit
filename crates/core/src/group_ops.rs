@@ -429,6 +429,7 @@ mod group_tests {
             style: None,
             blend_if: None,
             knockout: Knockout::None,
+            transparency_shapes: true,
         };
         // 底 -> 顶：底层无组，中层在「内层」组，顶层在「外层」组。
         let mut doc = Document::from_psd_layers_with_groups(

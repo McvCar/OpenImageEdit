@@ -231,6 +231,9 @@ pub struct Layer {
     pub blend_if: Option<BlendIf>,
     /// 挖空（PSD 的 `knko`）：本层内容把下层挖掉后再绘制。
     pub knockout: Knockout,
+    /// 透明形状图层（PSD 的 `tsly`，默认开）：关掉后 Layer Style 由图层
+    /// 蒙版驱动，没有蒙版时样式完全不显示。
+    pub transparency_shapes: bool,
     /// 所属分组（`None` = 不属于任何组）。组只影响面板组织与批量显隐，
     /// 不改变 z 序、不参与合成。`duplicated()` 会继承它。
     pub group: Option<GroupId>,
@@ -275,6 +278,7 @@ impl Layer {
             style: None,
             blend_if: None,
             knockout: Knockout::None,
+            transparency_shapes: true,
             group: None,
             content: LayerContent::Raster(RasterLayer {
                 image,
@@ -357,6 +361,7 @@ impl Layer {
             style: None,
             blend_if: None,
             knockout: Knockout::None,
+            transparency_shapes: true,
             group: None,
             content: LayerContent::Mark(mark),
         }

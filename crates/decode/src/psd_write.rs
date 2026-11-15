@@ -85,6 +85,8 @@ struct PreparedLayer {
     blend_if: Option<editcore::BlendIf>,
     /// 挖空（`knko`）：`None` = 关闭，不写这个键。
     knockout: editcore::Knockout,
+    /// 透明形状图层（`tsly`）：默认开，关掉时才写键。
+    transparency_shapes: bool,
     /// 所属分组（写 PSD 时要按它插 `lsct` 分隔记录）。
     group: Option<editcore::GroupId>,
 }
@@ -208,6 +210,7 @@ fn prepare_layers(doc: &Document) -> Result<Vec<PreparedLayer>, crate::DecodeErr
             }),
             blend_if: layer.blend_if.clone(),
             knockout: layer.knockout,
+            transparency_shapes: layer.transparency_shapes,
             group: layer.group,
         });
     }
@@ -284,6 +287,7 @@ fn write_layer_record(out: &mut Vec<u8>, l: &PreparedLayer) -> Result<(), crate:
         l.mask.as_ref(),
         l.blend_if.as_ref(),
         l.knockout,
+        l.transparency_shapes,
         None,
     );
     Ok(())
@@ -317,6 +321,7 @@ fn write_divider_record(
         None,
         None,
         editcore::Knockout::None,
+        true,
         Some((section, blend)),
     );
 }
@@ -335,6 +340,7 @@ fn write_record(
     mask: Option<&PreparedMask>,
     blend_if: Option<&editcore::BlendIf>,
     knockout: editcore::Knockout,
+    transparency_shapes: bool,
     lsct: Option<(u32, &'static [u8; 4])>,
 ) {
     let (top, left, bottom, right) = rect;
@@ -445,6 +451,15 @@ fn write_record(
         push_bytes(&mut extra, b"knko");
         push_u32(&mut extra, 4);
         push_u32(&mut extra, ko);
+    }
+
+    // `8BIMtsly`：透明形状图层，1 字节布尔 + 3 字节补位；默认开（PS 不写键），
+    // 只有关掉时才写 0。
+    if !transparency_shapes {
+        push_bytes(&mut extra, b"8BIM");
+        push_bytes(&mut extra, b"tsly");
+        push_u32(&mut extra, 4);
+        push_bytes(&mut extra, &[0, 0, 0, 0]);
     }
 
     push_u32(out, extra.len() as u32); // extra data length
@@ -846,6 +861,7 @@ mod tests {
             style: None,
             blend_if: None,
             knockout: editcore::Knockout::None,
+            transparency_shapes: true,
         };
         let doc = Document::from_psd_layers_with_groups(
             (cw, ch),
@@ -894,6 +910,7 @@ mod tests {
             style: None,
             blend_if: None,
             knockout: editcore::Knockout::None,
+            transparency_shapes: true,
         };
         let mut doc = Document::from_psd_layers((4, 4), vec![seed]);
         let want = BlendIf {
@@ -942,6 +959,7 @@ mod tests {
             style: None,
             blend_if: None,
             knockout: Knockout::None,
+            transparency_shapes: true,
         };
         for want in [Knockout::Shallow, Knockout::Deep] {
             let mut doc = Document::from_psd_layers((4, 4), vec![seed.clone()]);
@@ -957,6 +975,43 @@ mod tests {
         let set = crate::psd_layers::decode_psd_layers(&bytes, crate::DecodeOptions::default())
             .expect("decode_psd_layers");
         assert_eq!(set.layers[0].knockout, Knockout::None);
+    }
+
+    /// 2g) 透明形状图层写回：`8BIMtsly` 是 1 字节布尔 + 3 字节补位；默认开
+    /// 不写键，关掉时才写 0，读回来必须一致。
+    #[test]
+    fn transparency_shapes_round_trip() {
+        use editcore::{BlendMode, Knockout, PsdLayerSeed};
+        let seed = PsdLayerSeed {
+            name: "形".into(),
+            offset: (0, 0),
+            image: solid(4, 4, [30, 160, 60, 255]),
+            visible: true,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            group: None,
+            mask: None,
+            clipping: false,
+            clip_shape: None,
+            style: None,
+            blend_if: None,
+            knockout: Knockout::None,
+            transparency_shapes: true,
+        };
+        // 默认开：不写键，读回来仍是 true。
+        let doc = Document::from_psd_layers((4, 4), vec![seed.clone()]);
+        let bytes = encode_psd(&doc, 90).expect("encode_psd");
+        let set = crate::psd_layers::decode_psd_layers(&bytes, crate::DecodeOptions::default())
+            .expect("decode_psd_layers");
+        assert!(set.layers[0].transparency_shapes);
+
+        // 关掉：写 tsly=0，读回来是 false。
+        let mut doc = Document::from_psd_layers((4, 4), vec![seed]);
+        doc.layers[1].transparency_shapes = false;
+        let bytes = encode_psd(&doc, 90).expect("encode_psd");
+        let set = crate::psd_layers::decode_psd_layers(&bytes, crate::DecodeOptions::default())
+            .expect("decode_psd_layers");
+        assert!(!set.layers[0].transparency_shapes);
     }
 
     /// 2b) Adobe's layer-flags bit 1 is INVERTED (SET = hidden). Photoshop
@@ -1033,6 +1088,7 @@ mod tests {
             style: None,
             blend_if: None,
             knockout: editcore::Knockout::None,
+            transparency_shapes: true,
         };
         let doc = Document::from_psd_layers((4, 4), vec![seed("上层"), seed("下层")]);
         assert_eq!(doc.layers.len(), 3, "background + 2 seeds");

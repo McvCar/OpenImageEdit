@@ -28,6 +28,8 @@ const KEY_BRIGHTNESS_CONTRAST: &[u8; 4] = b"brit";
 const KEY_HUE_SATURATION: &[u8; 4] = b"hue2";
 /// 挖空设置 `knko`：4 字节 u32，0 = 关、1 = 浅、2 = 深。
 const KEY_KNOCKOUT: &[u8; 4] = b"knko";
+/// 透明形状图层 `tsly`：4 字节（1 字节布尔 + 3 字节补位）。
+const KEY_TRANSPARENCY_SHAPES: &[u8; 4] = b"tsly";
 
 /// Key of `Object-based effects layer info`, "lfx2" — layer styles.
 ///
@@ -566,6 +568,8 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
     let mut vector_stroke: Option<crate::vector::VectorStroke> = None;
     // 挖空设置（knko）：0 = 关、1 = 浅、2 = 深，其他值当作关。
     let mut knockout: Option<Knockout> = None;
+    // 透明形状图层（tsly）：默认开；只有关掉时 PS 才写这个键。
+    let mut transparency_shapes: Option<bool> = None;
     // There can be multiple additional layer information sections so we'll loop
     // until we stop seeing them.
     while cursor.peek_4() == SIGNATURE_EIGHT_BIM || cursor.peek_4() == SIGNATURE_EIGHT_B64 {
@@ -606,6 +610,15 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
                         2 => Some(Knockout::Deep),
                         _ => None,
                     };
+                }
+                cursor.seek(pos + additional_layer_info_len as u64);
+            }
+
+            // 透明形状图层（`tsly`）：1 字节布尔 + 3 字节补位。
+            KEY_TRANSPARENCY_SHAPES => {
+                let pos = cursor.position();
+                if additional_layer_info_len >= 1 {
+                    transparency_shapes = Some(cursor.read_u8() != 0);
                 }
                 cursor.seek(pos + additional_layer_info_len as u64);
             }
@@ -736,6 +749,7 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
         divider_type,
         divider_blend_mode,
         knockout,
+        transparency_shapes,
         blend_ranges,
         brightness_contrast,
         hue_saturation,

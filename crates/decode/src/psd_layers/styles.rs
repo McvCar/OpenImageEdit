@@ -62,6 +62,7 @@ pub(super) fn bake_layer_styles(
     image: RgbaImage,
     offset: (i32, i32),
     canvas: (i32, i32),
+    mask: Option<&editcore::LayerMask>,
     patterns: &crate::psd_pattern::PatternStore,
     no_styles: bool,
 ) -> LayerStyleBake {
@@ -83,7 +84,29 @@ pub(super) fn bake_layer_styles(
     let mut clip_shape = None;
     let mut style = None;
     let mut baked = false;
-    if let Some(effects) = layer.layer_effects().filter(|_| !no_styles) {
+    if let Some(effects) =
+        layer
+            .layer_effects()
+            .filter(|_| !no_styles && (layer.transparency_shapes() || mask.is_some()))
+    {
+        // 「透明形状图层」关掉（`tsly = 0`）后，PS 不再按图层透明度判断样式
+        // 的内外区域，而是按图层蒙版；没有蒙版时样式完全不显示（上面的
+        // filter 已跳过）。这里把蒙版覆盖率做成样式作用 alpha，坐标从图层
+        // 矩形映射回画布。
+        let mut tsly_alpha = None;
+        if !layer.transparency_shapes() {
+            if let Some(m) = mask {
+                let (iw, ih) = (image.width(), image.height());
+                let mut plane = vec![0.0f32; iw as usize * ih as usize];
+                for y in 0..ih {
+                    for x in 0..iw {
+                        plane[(y * iw + x) as usize] =
+                            m.coverage(offset.0 + x as i32, offset.1 + y as i32);
+                    }
+                }
+                tsly_alpha = Some(plane);
+            }
+        }
         // 诊断：`IMAGEEDIT_PSD_DUMP_FX=<图层名子串>` 打印解析到的样式参数。
         // 保真差异按块归因到某个图层后，用它确认「是解析错了还是画错了」。
         if let Ok(want) = std::env::var("IMAGEEDIT_PSD_DUMP_FX") {
@@ -142,7 +165,11 @@ pub(super) fn bake_layer_styles(
             &image,
             layer_offset,
             effects,
-            path_alpha.as_deref(),
+            if layer.transparency_shapes() {
+                path_alpha.as_deref()
+            } else {
+                tsly_alpha.as_deref()
+            },
             Some(patterns),
         ) {
             if let Some(pre) = pre_alpha.as_ref() {

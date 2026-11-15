@@ -61,6 +61,9 @@ pub struct LayerProperties {
     pub(crate) blend_ranges: Option<Vec<[u8; 4]>>,
     /// 挖空（`knko`）：图层内容挖掉下层的方式，`None` = 关。
     pub(crate) knockout: Option<Knockout>,
+    /// 透明形状图层（`tsly`）：`None` = 默认开；关掉时 Layer Style 按图层
+    /// 蒙版而不是图层透明度来作用。
+    pub(crate) transparency_shapes: Option<bool>,
 }
 
 /// Where a layer's mask lives, plus the "mask disabled" flag.
@@ -186,12 +189,19 @@ impl LayerProperties {
             vector_stroke: layer_record.vector_stroke.clone(),
             blend_ranges: layer_record.blend_ranges.clone(),
             knockout: layer_record.knockout,
+            transparency_shapes: layer_record.transparency_shapes,
         }
     }
 
     /// 挖空设置（`knko`），`None` = 未设置。
     pub fn knockout(&self) -> Option<Knockout> {
         self.knockout
+    }
+
+    /// 透明形状图层（`tsly`）：默认开。关掉后 Layer Style 由图层蒙版驱动，
+    /// 没有蒙版时图层样式完全不显示。
+    pub fn transparency_shapes(&self) -> bool {
+        self.transparency_shapes.unwrap_or(true)
     }
 
     /// 混合颜色带（Blend If）原始范围表，见 [`LayerProperties::blend_ranges`]。
@@ -628,6 +638,8 @@ pub struct LayerRecord {
     pub(super) blend_ranges: Option<Vec<[u8; 4]>>,
     /// 挖空设置（`knko`）。
     pub(super) knockout: Option<Knockout>,
+    /// 透明形状图层（`tsly`）。
+    pub(super) transparency_shapes: Option<bool>,
 }
 
 impl LayerRecord {

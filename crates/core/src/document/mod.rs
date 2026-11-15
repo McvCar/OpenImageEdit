@@ -166,6 +166,8 @@ pub struct PsdLayerSeed {
     pub blend_if: Option<BlendIf>,
     /// 挖空（PSD `knko`），默认关闭。
     pub knockout: Knockout,
+    /// 透明形状图层（PSD `tsly`），默认开。
+    pub transparency_shapes: bool,
 }
 
 /// One PSD folder ("layer group"). `layers` 里的成员通过 `PsdLayerSeed::group`
@@ -211,6 +213,7 @@ mod psd_assembly_tests {
             style: None,
             blend_if: None,
             knockout: Knockout::None,
+            transparency_shapes: true,
         }
     }
 
@@ -603,6 +606,7 @@ impl Document {
             layer.style = seed.style;
             layer.blend_if = seed.blend_if;
             layer.knockout = seed.knockout;
+            layer.transparency_shapes = seed.transparency_shapes;
             layer.locked = false;
             layer.background = false;
             layer.group = seed.group.and_then(|gid| group_of.get(&gid).copied());

@@ -75,6 +75,8 @@ pub struct PsdLayerData {
     pub blend_if: Option<editcore::BlendIf>,
     /// 挖空（PSD `knko`），默认关闭。
     pub knockout: editcore::Knockout,
+    /// 透明形状图层（PSD `tsly`），默认开。
+    pub transparency_shapes: bool,
 }
 
 /// 烘焙样式前的 alpha 平面（1 字节/像素，行优先）连同它自己的矩形。
@@ -206,6 +208,7 @@ impl PsdLayerSet {
                 style: l.style,
                 blend_if: l.blend_if,
                 knockout: l.knockout,
+                transparency_shapes: l.transparency_shapes,
             })
             .collect()
     }
@@ -774,6 +777,7 @@ fn build_layers<F: FnMut(usize, usize)>(
             image,
             layer_offset,
             (cw, ch),
+            mask.as_ref(),
             &patterns,
             no_styles,
         );
@@ -809,6 +813,7 @@ fn build_layers<F: FnMut(usize, usize)>(
             style,
             blend_if,
             knockout,
+            transparency_shapes: layer.transparency_shapes(),
         });
         clips.push(layer.is_clipping_mask());
         progress(step + 1, total);

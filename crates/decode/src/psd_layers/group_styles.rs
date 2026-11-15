@@ -153,6 +153,7 @@ pub(super) fn bake_group_style_layers(
                         style: None,
                         blend_if: None,
                         knockout: editcore::Knockout::None,
+                        transparency_shapes: true,
                     },
                 );
                 inserted += 1;
@@ -182,6 +183,7 @@ pub(super) fn bake_group_style_layers(
                         style: None,
                         blend_if: None,
                         knockout: editcore::Knockout::None,
+                        transparency_shapes: true,
                     },
                 );
                 inserted += 1;
