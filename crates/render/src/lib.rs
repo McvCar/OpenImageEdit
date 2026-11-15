@@ -298,6 +298,9 @@ pub struct PreviewComposer {
     /// 每个带烘焙样式、且可能当剪贴基底的层的「内容形状」覆盖率（预览尺度）。
     /// 与 `masks` 同一套缓存键与失效规则（`prepare()` 统一清空）。
     clip_shapes: Vec<Option<(i32, i32, u32, u32, Arc<Vec<u8>>)>>,
+    /// 每个带「内容之外样式笔迹」的层的预览尺度掩码（见 [`editcore::StylePixels`]）。
+    /// 与 `layers` 同一套缓存键（`(nw, nh)`），`prepare()` 统一清空。
+    styles: Vec<Option<(u32, u32, Arc<Vec<u8>>)>>,
     /// Scaled bitmap of the layer being live-resized (kept separate from
     /// `layers` so a cancelled gesture cannot poison the layer's cache).
     live: Option<CachedScaled>,
@@ -331,6 +334,7 @@ impl PreviewComposer {
             layers: Vec::new(),
             masks: Vec::new(),
             clip_shapes: Vec::new(),
+            styles: Vec::new(),
             live: None,
             live_flip: (false, false),
             rotate_small: None,
@@ -365,6 +369,7 @@ impl PreviewComposer {
             self.layers = vec![None; doc.layers.len()];
             self.masks = vec![None; doc.layers.len()];
             self.clip_shapes = vec![None; doc.layers.len()];
+            self.styles = vec![None; doc.layers.len()];
             self.live = None;
         }
         Some((
@@ -406,6 +411,7 @@ impl PreviewComposer {
                 bg.blend,
                 None,
                 mask_ref,
+                None,
             );
             return out;
         }
@@ -434,7 +440,7 @@ impl PreviewComposer {
             return img;
         }
         let mut out = RgbaImage::new(img.width(), img.height());
-        Self::blend_layer(&mut out, target, &img, 0, 0, bg.opacity, bg.blend, None, None);
+        Self::blend_layer(&mut out, target, &img, 0, 0, bg.opacity, bg.blend, None, None, None);
         out
     }
 
@@ -507,6 +513,18 @@ impl PreviewComposer {
                     let src = self.scaled_layer(li, &r.image, nw, nh);
                     let mask = self.masked_layer(li, layer, nw, nh);
                     let mask_ref = mask.as_deref().map(|m| (&m[..], nw));
+                    // 内容之外的样式笔迹：这些像素按样式自己的混合模式混合。
+                    let style = layer.style.as_ref().map(|s| {
+                        let scaled = self.scaled_style(
+                            li,
+                            &s.mask,
+                            (r.image.width(), r.image.height()),
+                            nw,
+                            nh,
+                        );
+                        (scaled, s.blend)
+                    });
+                    let style_ref = style.as_ref().map(|(m, b)| (&m[..], *b));
                     match adjust {
                         Some((AdjustTarget::Layer(index), params)) if index == li => {
                             let mut adjusted = (*src).clone();
@@ -521,6 +539,7 @@ impl PreviewComposer {
                                 layer.blend,
                                 clip_alpha,
                                 mask_ref,
+                                style_ref,
                             );
                         }
                         _ => Self::blend_layer(
@@ -533,6 +552,7 @@ impl PreviewComposer {
                             layer.blend,
                             clip_alpha,
                             mask_ref,
+                            style_ref,
                         ),
                     }
                 }
@@ -585,6 +605,8 @@ impl PreviewComposer {
     ///
     /// `clip` 是剪贴蒙版基线层的覆盖率（预览尺度，与 `out_buf` 同尺寸）；
     /// `mask` 是图层蒙版的覆盖率（**图层自己的矩形尺寸**，宽度一并传进来）。
+    /// `style` 是「内容之外的样式笔迹」掩码（图层矩形尺寸）连同样式自己的
+    /// 混合模式：那些像素改用它混合，见 [`editcore::StylePixels`]。
     /// 两者都是「src alpha 乘数」，先乘蒙版再乘剪贴 —— 与
     /// `Document::flatten_in_doc_space` 的 `composite_raster` 同序。
     /// 基底层 / 无剪贴层自己混合时对应参数传 `None`。
@@ -598,6 +620,7 @@ impl PreviewComposer {
         mode: editcore::BlendMode,
         clip: Option<&[u8]>,
         mask: Option<(&[u8], u32)>,
+        style: Option<(&[u8], editcore::BlendMode)>,
     ) {
         let nw = src.width() as i32;
         let nh = src.height() as i32;
@@ -609,7 +632,8 @@ impl PreviewComposer {
         let src_stride = nw as usize * 4;
         let src_buf: &[u8] = src.as_raw();
         let out_stride = target.width as usize * 4;
-        let normal = mode.is_normal();
+        // 有样式掩码时不能走 Normal 快路径：每个像素的模式可能不同。
+        let normal = mode.is_normal() && style.is_none();
         for ty in 0..target.height {
             let ly = ty as i64 - oy as i64;
             if ly < 0 || ly >= nh as i64 {
@@ -664,7 +688,13 @@ impl PreviewComposer {
                         let cov = c[ty as usize * target.width as usize + tx as usize] as u32;
                         px[3] = ((px[3] as u32 * cov + 127) / 255) as u8;
                     }
-                    editcore::blend_pixel(&mut dst, px, opacity, mode);
+                    let px_mode = match style {
+                        Some((s, smode)) if s[ly as usize * nw as usize + lx as usize] != 0 => {
+                            smode
+                        }
+                        _ => mode,
+                    };
+                    editcore::blend_pixel(&mut dst, px, opacity, px_mode);
                     orow[oo..oo + 4].copy_from_slice(&dst);
                 }
             }
@@ -681,9 +711,10 @@ impl PreviewComposer {
         mode: editcore::BlendMode,
         clip: Option<&[u8]>,
         mask: Option<(&[u8], u32)>,
+        style: Option<(&[u8], editcore::BlendMode)>,
     ) {
         let mut raw = std::mem::take(out).into_raw();
-        Self::blend(&mut raw, target, src, ox, oy, opacity, mode, clip, mask);
+        Self::blend(&mut raw, target, src, ox, oy, opacity, mode, clip, mask, style);
         *out = RgbaImage::from_raw(target.width, target.height, raw)
             .expect("preview buffer size preserved");
     }
@@ -972,6 +1003,32 @@ impl PreviewComposer {
         cov
     }
 
+    /// 「内容之外的样式笔迹」缩到预览尺度（单通道），按 `(w, h)` 缓存。
+    fn scaled_style(
+        &mut self,
+        li: usize,
+        mask: &[u8],
+        size: (u32, u32),
+        nw: u32,
+        nh: u32,
+    ) -> Arc<Vec<u8>> {
+        if let Some((cw, ch, cov)) = self.styles.get(li).cloned().flatten() {
+            if (cw, ch) == (nw, nh) {
+                return cov;
+            }
+        }
+        let mut plane = RgbaImage::from_pixel(size.0, size.1, image::Rgba([0, 0, 0, 0]));
+        for (dst, src) in plane.as_mut().chunks_exact_mut(4).zip(mask.iter()) {
+            dst[3] = *src;
+        }
+        let scaled = resize_to(&plane, Size::new(nw, nh));
+        let cov = Arc::new(scaled.pixels().map(|p| p.0[3]).collect::<Vec<u8>>());
+        if li < self.styles.len() {
+            self.styles[li] = Some((nw, nh, cov.clone()));
+        }
+        cov
+    }
+
     pub fn composite(&mut self, doc: &Document, target: Size) -> RgbaImage {
         self.composite_adjusted(doc, target, None)
     }
@@ -1124,7 +1181,7 @@ impl PreviewComposer {
                 }
                 _ => (*src).clone(),
             };
-            Self::blend_layer(&mut out, target, &stretched, ox, oy, drag_opacity, drag_blend, None, None);
+            Self::blend_layer(&mut out, target, &stretched, ox, oy, drag_opacity, drag_blend, None, None, None);
         }
         doc.apply_display_color(&mut out);
         out
@@ -1233,7 +1290,7 @@ impl PreviewComposer {
                 }
                 _ => active,
             };
-            Self::blend_layer(&mut out, target, &stretched, 0, 0, drag_opacity, drag_blend, None, None);
+            Self::blend_layer(&mut out, target, &stretched, 0, 0, drag_opacity, drag_blend, None, None, None);
         }
         doc.apply_display_color(&mut out);
         out
@@ -1326,7 +1383,7 @@ impl PreviewComposer {
                 }
                 _ => rotated,
             };
-            Self::blend_layer(&mut out, target, &src, ox, oy, drag_opacity, drag_blend, None, None);
+            Self::blend_layer(&mut out, target, &src, ox, oy, drag_opacity, drag_blend, None, None, None);
         }
         doc.apply_display_color(&mut out);
         out
@@ -1667,6 +1724,42 @@ mod tests {
         // 缩略预览同样只能落在内容形状里。
         let small = PreviewComposer::new().composite(&doc, Size::new(10, 10));
         assert_eq!(small.get_pixel(2, 2).0, [255, 0, 0, 255], "缩略预览里剪贴内容溢到描边");
+    }
+
+    /// 投影画在内容之外的部分要按样式自己的混合模式（PSD `Md  `）与下层混合。
+    ///
+    /// 回归对象：标题栏那条奶油色投影 `(255,231,200)`，PSD 里是 `Multiply`，
+    /// 压在黄色面板上应得 `(255,208,~100)`；把它当 Normal 盖上去会变成一条
+    /// 不透明奶油带。这里钉住预览与 flatten 两条路径都对。
+    #[test]
+    fn preview_blends_outside_style_pixels_with_the_effect_mode() {
+        let mut doc = Document::from_image(solid(8, 8, [255, 230, 130, 255]));
+        let mut bar = Layer::new("bar", solid(8, 8, [255, 231, 200, 255]));
+        bar.style = Some(editcore::StylePixels {
+            blend: editcore::BlendMode::Multiply,
+            mask: vec![255; 64],
+        });
+        doc.add_layer(bar).unwrap();
+
+        let preview = PreviewComposer::new().composite(&doc, doc.canvas);
+        let px = preview.get_pixel(3, 3).0;
+        assert!(
+            (px[1] as i32 - 208).abs() <= 2 && (px[2] as i32 - 100).abs() <= 3,
+            "样式像素没有按 Multiply 混合下层: {px:?}"
+        );
+        assert_eq!(
+            preview.as_raw(),
+            doc.flatten_in_doc_space().as_raw(),
+            "1:1 预览与 flatten 的样式混合结果不一致"
+        );
+
+        // 掩码为 0 的像素仍走图层混合模式（Normal）：保持投影色。
+        let mut plain = Layer::new("plain", solid(8, 8, [255, 231, 200, 255]));
+        plain.style = None;
+        let mut doc2 = Document::from_image(solid(8, 8, [255, 230, 130, 255]));
+        doc2.add_layer(plain).unwrap();
+        let out2 = PreviewComposer::new().composite(&doc2, doc2.canvas);
+        assert_eq!(out2.get_pixel(3, 3).0, [255, 231, 200, 255]);
     }
 
     #[test]

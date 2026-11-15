@@ -71,6 +71,12 @@ pub struct Baked {
     /// distinction; this plane puts it back. It is what stops a hue shift
     /// clipped to a button from repainting the button's own outline.
     pub effect_coverage: Vec<u8>,
+    /// 只记「背后」样式（投影 / 外发光）的覆盖率。
+    ///
+    /// 和 `effect_coverage` 的区别：内阴影 / 描边 / 叠加都在内容**之内**或
+    /// 贴着内容，烘焙时背景就是图层内容，混合已经正确；只有这一份是画在
+    /// 内容之外、需要合成阶段用样式自己的混合模式补的。
+    pub behind_coverage: Vec<u8>,
 }
 
 /// Diagnostic ablation: `IMAGEEDIT_FX_SKIP=stroke,gradient` removes whole
@@ -245,6 +251,8 @@ pub fn bake_with_alpha(
     // 从这里开始记「样式画上去的像素」。内容那一步直接写 `out`，不经过
     // `composite`，所以不会被记进来——正好是我们要的分界。
     FX_COVER.with(|c| *c.borrow_mut() = Some(vec![0.0f32; (w * h) as usize]));
+    FX_BEHIND.with(|c| *c.borrow_mut() = Some(vec![0.0f32; (w * h) as usize]));
+    FX_FRONT.with(|c| *c.borrow_mut() = Some(vec![0.0f32; (w * h) as usize]));
 
     // ---- layer alpha in the expanded coordinate system ------------------
     let mut alpha = vec![0.0f32; (w * h) as usize];
@@ -260,6 +268,9 @@ pub fn bake_with_alpha(
     }
 
     // ---- 1. behind the content: drop shadow, outer glow ------------------
+    // 这一段单独打个标记：它们画在内容**之外**，合成时要用样式自己的混合
+    // 模式与下层画面混合（见 `behind_blend`），不能和描边、叠加混为一谈。
+    FX_IS_BEHIND.with(|f| f.set(true));
     for e in &active {
         match e.kind {
             EffectKind::DropShadow => draw_drop_shadow(&mut out, w, h, &alpha, e),
@@ -267,7 +278,7 @@ pub fn bake_with_alpha(
             _ => {}
         }
     }
-
+    FX_IS_BEHIND.with(|f| f.set(false));
     // ---- 2. the content itself ------------------------------------------
     {
         let data = out.as_mut();
@@ -383,11 +394,27 @@ pub fn bake_with_alpha(
         .into_iter()
         .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
         .collect();
+    let behind_raw = FX_BEHIND.with(|c| c.borrow_mut().take()).unwrap_or_default();
+    let front = FX_FRONT.with(|c| c.borrow_mut().take()).unwrap_or_default();
+    let behind_coverage: Vec<u8> = behind_raw
+        .iter()
+        .zip(front.iter())
+        .map(|(b, f)| {
+            // 被后续样式（描边 / 叠加 / 内阴影）盖过的像素不算：露出来的
+            // 已经不是投影自己的颜色了。
+            if *f > 0.0 {
+                0
+            } else {
+                (b.clamp(0.0, 1.0) * 255.0).round() as u8
+            }
+        })
+        .collect();
     Some(Baked {
         image: out,
         offset: new_offset,
         notes,
         effect_coverage,
+        behind_coverage,
     })
 }
 
@@ -412,6 +439,9 @@ struct Padding {
 pub struct GroupBaked {
     pub behind: Option<RgbaImage>,
     pub front: Option<RgbaImage>,
+    /// `behind` 那份光栅自己的混合模式（见 [`behind_blend`]）：组的投影要按
+    /// 它和组**下方**的画面混合，不能当成 Normal 图层盖上去。
+    pub behind_blend: editcore::BlendMode,
     /// Canvas position of both rasters' top-left corner.
     pub offset: (i32, i32),
     pub notes: Vec<String>,
@@ -592,6 +622,7 @@ pub fn bake_group_effects(
     Some(GroupBaked {
         behind,
         front,
+        behind_blend: behind_blend(active.iter().copied()).unwrap_or(editcore::BlendMode::Normal),
         offset: new_offset,
         notes,
     })
@@ -641,6 +672,13 @@ thread_local! {
     /// 是为了不必给 8 个 `draw_*` 都加一个 out 参数——它们唯一共同的出口就是
     /// [`composite`]。`bake` 之外始终是 `None`，[`composite`] 于是零成本。
     static FX_COVER: std::cell::RefCell<Option<Vec<f32>>> = const { std::cell::RefCell::new(None) };
+    /// 同一时刻只记「背后」样式（投影 / 外发光）的那一份覆盖率。
+    static FX_BEHIND: std::cell::RefCell<Option<Vec<f32>>> = const { std::cell::RefCell::new(None) };
+    /// 记「非背后」样式（内阴影、叠加、描边、斜面）。这些画在投影之上，
+    /// 一个像素只要被它们碰过，露出来的颜色就不是投影自己的了。
+    static FX_FRONT: std::cell::RefCell<Option<Vec<f32>>> = const { std::cell::RefCell::new(None) };
+    /// 当前是否在画「背后」样式。
+    static FX_IS_BEHIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Composite an effect that **only recolours the pixels already there**.
@@ -741,6 +779,16 @@ fn record_effect_coverage(x: u32, y: u32, w: u32, alpha: f32) {
             }
         }
     });
+    let add = |cov: Option<&mut Vec<f32>>| {
+        if let Some(v) = cov.and_then(|c| c.get_mut(i)) {
+            *v = 1.0 - (1.0 - *v) * (1.0 - a);
+        }
+    };
+    if FX_IS_BEHIND.with(|f| f.get()) {
+        FX_BEHIND.with(|c| add(c.borrow_mut().as_mut()));
+    } else {
+        FX_FRONT.with(|c| add(c.borrow_mut().as_mut()));
+    }
 }
 
 /// Diagnostic: `IMAGEEDIT_FX_TRACE=x,y` prints every style composite at that
@@ -1246,6 +1294,37 @@ fn sample(src: &[f32], w: u32, h: u32, x: i32, y: i32) -> f32 {
 
 fn blend_of(mode: psd::BlendMode) -> editcore::BlendMode {
     crate::psd_layers::blend_of(mode)
+}
+
+/// 「背后」样式（投影 / 外发光）自己的混合模式（PSD 描述符 `Md  `）。
+///
+/// Photoshop 拿效果自己的混合模式把效果与**图层下方的画面**混合；烘焙把效果
+/// 画进图层位图后，那层位图里已经没有「下方」（背景是透明的），`Multiply`
+/// 于是退化成 `Normal` —— 标题栏的奶油色投影会把黄色面板盖成一条不透明的
+/// 奶油带，而不是把它压暗。合成阶段用这个模式把语义补回来。
+///
+/// 多个背后样式时取最后一个非 `Normal` 的（PS 的堆叠里后画的在上，且
+/// `Normal` 作者很少，非 Normal 才是要修的那类）。没有背后样式返回 `None`。
+pub fn behind_blend<'a>(
+    effects: impl IntoIterator<Item = &'a LayerEffect>,
+) -> Option<editcore::BlendMode> {
+    let mut mode = None;
+    for e in effects
+        .into_iter()
+        .filter(|e| e.enabled && !skip_kind(e.kind))
+    {
+        if !matches!(e.kind, EffectKind::DropShadow | EffectKind::OuterGlow) {
+            continue;
+        }
+        let m = blend_of(e.blend);
+        // Normal 只作为兜底：先记下来，后面遇到非 Normal 就覆盖它。
+        mode = Some(if m == editcore::BlendMode::Normal {
+            mode.unwrap_or(m)
+        } else {
+            m
+        });
+    }
+    mode
 }
 
 /// Photoshop's angle/distance pair as an image-space offset.

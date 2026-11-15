@@ -426,6 +426,7 @@ mod group_tests {
             mask: None,
             clipping: false,
             clip_shape: None,
+            style: None,
         };
         // 底 -> 顶：底层无组，中层在「内层」组，顶层在「外层」组。
         let mut doc = Document::from_psd_layers_with_groups(

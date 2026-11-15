@@ -160,6 +160,8 @@ pub struct PsdLayerSeed {
     /// 烘焙样式**之前**的内容 alpha；作为剪贴基底时限幅用它（见
     /// [`Layer::clip_shape`]）。`None` = 该层没有烘焙样式。
     pub clip_shape: Option<LayerMask>,
+    /// 烘焙样式画在内容之外的笔迹与它自己的混合模式（见 [`StylePixels`]）。
+    pub style: Option<StylePixels>,
 }
 
 /// One PSD folder ("layer group"). `layers` 里的成员通过 `PsdLayerSeed::group`
@@ -198,6 +200,7 @@ mod psd_assembly_tests {
             mask: None,
             clipping: false,
             clip_shape: None,
+            style: None,
         }
     }
 
@@ -410,6 +413,7 @@ impl Document {
             layer.mask = seed.mask;
             layer.clipping = seed.clipping;
             layer.clip_shape = seed.clip_shape;
+            layer.style = seed.style;
             layer.locked = false;
             layer.background = false;
             layer.group = seed.group.and_then(|gid| group_of.get(&gid).copied());
@@ -1677,13 +1681,47 @@ fn composite_raster(
             if src[3] <= 0.0 {
                 continue;
             }
+            // 内容之外的样式笔迹（投影 / 外发光）按样式自己的混合模式与
+            // 已合成的下层混合；像图层混合模式那样用会把它盖成不透明色带。
+            let style_px = match layer.style.as_ref() {
+                Some(s)
+                    if s.at(
+                        (x - r.offset.0) as u32,
+                        (y - r.offset.1) as u32,
+                        r.image.width(),
+                    ) =>
+                {
+                    Some(s.blend)
+                }
+                _ => None,
+            };
+            let mode = style_px.unwrap_or(layer.blend);
+            trace_flat(x, y, layer, src, mode, style_px.is_some());
             crate::blend::blend_pixel_f32(
                 &mut acc[y as usize * w as usize + x as usize],
                 src,
                 layer.opacity,
-                layer.blend,
+                mode,
             );
         }
     }
+}
+
+/// Diagnostic: `IMAGEEDIT_FLAT_TRACE=x,y` prints every layer that contributes
+/// to that canvas pixel in `flatten_in_doc_space`, with the mode actually used.
+fn trace_flat(x: i32, y: i32, layer: &Layer, src: [f32; 4], mode: BlendMode, styled: bool) {
+    static AT: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    let at = AT.get_or_init(|| {
+        let v = std::env::var("IMAGEEDIT_FLAT_TRACE").ok()?;
+        let mut it = v.split(',');
+        Some((it.next()?.trim().parse().ok()?, it.next()?.trim().parse().ok()?))
+    });
+    if *at != Some((x, y)) {
+        return;
+    }
+    eprintln!(
+        "flat-trace ({x},{y}) layer {:?} src {:?} opacity {} mode {:?} style_px {}",
+        layer.name, src, layer.opacity, mode, styled
+    );
 }
 

@@ -83,6 +83,33 @@ pub struct RasterLayer {
     pub transform: Option<LayerTransform>,
 }
 
+/// 烘焙样式的「背后」笔迹：投影 / 外发光画在图层内容之外的那部分。
+///
+/// Photoshop 里每个图层效果有自己的混合模式（描述符 `Md  `，投影常见
+/// `Multiply`），它作用在**效果色与图层下方的画面**之间。烘焙把效果画进
+/// 图层自己的位图，那里的背景是透明的，`Multiply` 退化成 `Normal` ——
+/// 标题栏那条奶油色投影本该把黄色面板压暗，实际却盖成一条不透明奶油带。
+///
+/// 内容之内的像素不受影响（那里的背景是图层内容，烘焙时混合已经正确）。
+/// 这个掩码只标出「不透明度完全来自样式」的像素，合成时改用样式的混合
+/// 模式与已合成的下层混合。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StylePixels {
+    /// 样式自己的混合模式（`LayerEffect::blend`）。
+    pub blend: BlendMode,
+    /// 与图层位图同尺寸、同 offset 的掩码；非 0 = 该像素来自样式。
+    pub mask: Vec<u8>,
+}
+
+impl StylePixels {
+    /// 图片坐标 `(x, y)` 处是否为样式笔迹。
+    pub fn at(&self, x: u32, y: u32, w: u32) -> bool {
+        self.mask
+            .get(y as usize * w as usize + x as usize)
+            .is_some_and(|v| *v != 0)
+    }
+}
+
 /// 图层内容：位图 or 矢量标记。
 ///
 /// 两者共享外层的「可见 / 锁定 / 不透明度 / 顺序 / 名字」，因此面板、批量
@@ -164,6 +191,9 @@ pub struct Layer {
     /// 铺到 8px 粉描边上）。导入时留下烘焙前的内容 alpha，两条合成路径都
     /// 用它；`None` = 该层没有烘焙样式，位图 alpha 就是内容。
     pub clip_shape: Option<LayerMask>,
+    /// 烘焙样式在内容之外的笔迹及其混合模式，`None` = 没有（或全是 Normal）。
+    /// 见 [`StylePixels`]。
+    pub style: Option<StylePixels>,
     /// 所属分组（`None` = 不属于任何组）。组只影响面板组织与批量显隐，
     /// 不改变 z 序、不参与合成。`duplicated()` 会继承它。
     pub group: Option<GroupId>,
@@ -205,6 +235,7 @@ impl Layer {
             mask: None,
             clipping: false,
             clip_shape: None,
+            style: None,
             group: None,
             content: LayerContent::Raster(RasterLayer {
                 image,
@@ -284,6 +315,7 @@ impl Layer {
             mask: None,
             clipping: false,
             clip_shape: None,
+            style: None,
             group: None,
             content: LayerContent::Mark(mark),
         }

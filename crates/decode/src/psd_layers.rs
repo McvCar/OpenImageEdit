@@ -52,6 +52,9 @@ pub struct PsdLayerData {
     /// 剪贴蒙版同样只认基底的内容：外描边 / 投影不算边界。拿烘焙后的 alpha
     /// 当边界，剪贴内容会铺到描边上（实测黄色斜纹越过圆角、压上 8px 粉描边）。
     pub clip_shape: Option<editcore::LayerMask>,
+    /// 烘焙样式画在**内容之外**的笔迹，连同样式自己的混合模式（PSD `Md  `）。
+    /// 那些像素在合成时要按样式模式与下层混合，见 [`editcore::StylePixels`]。
+    pub style: Option<editcore::StylePixels>,
 }
 
 /// 烘焙样式前的 alpha 平面（1 字节/像素，行优先）连同它自己的矩形。
@@ -102,6 +105,43 @@ impl ContentAlpha {
             size,
         }
     }
+}
+
+/// 「背后样式画在内容之外」的像素 + 样式自己的混合模式，交给合成阶段。
+///
+/// `coverage` 只含投影 / 外发光（`Baked::behind_coverage`）。再按内容 alpha
+/// 过滤一次：内容之内的投影是被内容盖住的（`knocks_out` 也已经把它清掉），
+/// 那里的背景是图层内容，烘焙时混合已经对了。
+fn style_plane(
+    content: &ContentAlpha,
+    offset: (i32, i32),
+    size: (u32, u32),
+    coverage: &[u8],
+    blend: editcore::BlendMode,
+) -> Option<editcore::StylePixels> {
+    let (w, h) = size;
+    if coverage.len() != (w as usize) * (h as usize) {
+        return None;
+    }
+    let mut mask = coverage.to_vec();
+    let mut any = false;
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let i = (y as u32 * w + x as u32) as usize;
+            if mask[i] == 0 {
+                continue;
+            }
+            if content.at(offset.0 + x, offset.1 + y) > 0.0 {
+                mask[i] = 0;
+            } else {
+                any = true;
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    Some(editcore::StylePixels { blend, mask })
 }
 
 /// One PSD folder. `parent` / `psd_id` 用 PSD 自己的编号，`PsdLayerData::group`
@@ -174,6 +214,7 @@ impl PsdLayerSet {
                 mask: l.mask,
                 clipping: l.clipping,
                 clip_shape: l.clip_shape,
+                style: l.style,
             })
             .collect()
     }
@@ -836,6 +877,7 @@ fn build_layers<F: FnMut(usize, usize)>(
         };
         let mut content_alpha = None;
         let mut clip_shape = None;
+        let mut style = None;
         if let Some(effects) = layer.layer_effects().filter(|_| !no_styles) {
             // 诊断：`IMAGEEDIT_PSD_DUMP_FX=<图层名子串>` 打印解析到的样式参数。
             // 保真差异按块归因到某个图层后，用它确认「是解析错了还是画错了」。
@@ -909,6 +951,37 @@ fn build_layers<F: FnMut(usize, usize)>(
                         baked.image.dimensions(),
                         &baked.effect_coverage,
                     ));
+                    // 内容之外的样式笔迹（投影 / 外发光）：烘焙把它们按 Normal
+                    // 画进了图层位图，背景是透明的，`Multiply` 退化成 Normal。
+                    // 记下这些像素与样式自己的混合模式，合成时改用它。
+                    if let Some(mode) = crate::psd_effects::behind_blend(effects) {
+                        style = style_plane(
+                            pre,
+                            baked.offset,
+                            baked.image.dimensions(),
+                            &baked.behind_coverage,
+                            mode,
+                        );
+                        if let (Some(s), Ok(want)) =
+                            (style.as_ref(), std::env::var("IMAGEEDIT_PSD_DUMP_STYLE"))
+                        {
+                            if want == "*" || layer.name().contains(&want) {
+                                let (w, h) = baked.image.dimensions();
+                                let n = s.mask.iter().filter(|v| **v != 0).count();
+                                println!(
+                                    "{{\"style\":\"{}\",\"blend\":\"{:?}\",\"px\":{},\
+                                     \"rect\":[{},{},{},{}]}}",
+                                    layer.name(),
+                                    s.blend,
+                                    n,
+                                    baked.offset.0,
+                                    baked.offset.1,
+                                    w,
+                                    h
+                                );
+                            }
+                        }
+                    }
                 }
                 image = baked.image;
                 layer_offset = baked.offset;
@@ -934,6 +1007,7 @@ fn build_layers<F: FnMut(usize, usize)>(
             clipping,
             content_alpha,
             clip_shape,
+            style,
         });
         clips.push(layer.is_clipping_mask());
         progress(step + 1, total);
@@ -1211,6 +1285,7 @@ fn bake_group_style_layers(
                         clipping: false,
                         content_alpha: None,
                         clip_shape: None,
+                        style: None,
                     },
                 );
                 inserted += 1;
@@ -1228,12 +1303,16 @@ fn bake_group_style_layers(
                         image: behind,
                         visible: group_visible,
                         opacity: 1.0,
-                        blend: editcore::BlendMode::Normal,
+                        // 组的投影带着它自己的混合模式（PSD `Md  `）：PS 里
+                        // 投影与组下方的画面混合，当成 Normal 图层盖上去会把
+                        // 下层染成投影色。
+                        blend: baked.behind_blend,
                         degraded: Vec::new(),
                         mask: None,
                         clipping: false,
                         content_alpha: None,
                         clip_shape: None,
+                        style: None,
                     },
                 );
                 inserted += 1;
