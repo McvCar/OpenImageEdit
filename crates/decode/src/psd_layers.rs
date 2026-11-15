@@ -1388,6 +1388,7 @@ fn map_blend_mode(mode: psd::BlendMode) -> Option<editcore::BlendMode> {
     use editcore::BlendMode as M;
     Some(match mode {
         psd::BlendMode::PassThrough | psd::BlendMode::Normal => M::Normal,
+        psd::BlendMode::Dissolve => M::Dissolve,
         psd::BlendMode::Multiply => M::Multiply,
         psd::BlendMode::Screen => M::Screen,
         psd::BlendMode::Overlay => M::Overlay,
@@ -1397,10 +1398,18 @@ fn map_blend_mode(mode: psd::BlendMode) -> Option<editcore::BlendMode> {
         psd::BlendMode::ColorBurn => M::ColorBurn,
         psd::BlendMode::LinearDodge => M::LinearDodge,
         psd::BlendMode::LinearBurn => M::LinearBurn,
+        psd::BlendMode::DarkerColor => M::DarkerColor,
+        psd::BlendMode::LighterColor => M::LighterColor,
         psd::BlendMode::SoftLight => M::SoftLight,
         psd::BlendMode::HardLight => M::HardLight,
+        psd::BlendMode::VividLight => M::VividLight,
+        psd::BlendMode::LinearLight => M::LinearLight,
+        psd::BlendMode::PinLight => M::PinLight,
+        psd::BlendMode::HardMix => M::HardMix,
         psd::BlendMode::Difference => M::Difference,
         psd::BlendMode::Exclusion => M::Exclusion,
+        psd::BlendMode::Subtract => M::Subtract,
+        psd::BlendMode::Divide => M::Divide,
         psd::BlendMode::Hue => M::Hue,
         psd::BlendMode::Saturation => M::Saturation,
         psd::BlendMode::Color => M::Color,
@@ -2309,6 +2318,27 @@ mod tests {
         let bytes = include_bytes!("../../../vendor/psd/tests/fixtures/green-chinese-layer-name-1x1.psd");
         let set = decode_psd_layers(bytes, DecodeOptions::default()).expect("parse");
         assert!(set.layers.iter().any(|l| l.name.chars().any(|c| c as u32 > 127)));
+    }
+
+    /// 新补齐的图层模式必须带着自己的模式进到 `PsdLayerData`，而不是被当成
+    /// Normal 悄悄降级（以前 `fsub`/`fdiv` 会走 `map_blend_mode` 的兜底）。
+    #[test]
+    fn extended_blend_modes_survive_decoding() {
+        let cases: [(&[u8], editcore::BlendMode); 2] = [
+            (
+                include_bytes!("../../../vendor/psd/tests/fixtures/blending/blue-red-1x1-subtract.psd"),
+                editcore::BlendMode::Subtract,
+            ),
+            (
+                include_bytes!("../../../vendor/psd/tests/fixtures/blending/blue-red-1x1-divide.psd"),
+                editcore::BlendMode::Divide,
+            ),
+        ];
+        for (bytes, want) in cases {
+            let set = decode_psd_layers(bytes, DecodeOptions::default()).expect("parse");
+            let top = set.layers.iter().find(|l| l.name == "Top Layer").expect("top layer");
+            assert_eq!(top.blend, want);
+        }
     }
 
     #[test]

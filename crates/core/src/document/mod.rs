@@ -1292,7 +1292,7 @@ impl Document {
                 continue;
             }
             let src = r.image.get_pixel(lx as u32, ly as u32).0;
-            blend_over_with(&mut out, src, layer.opacity, layer.blend);
+            blend_over_with(&mut out, src, layer.opacity, layer.blend, x, y);
         }
         image::Rgba(out)
     }
@@ -1507,16 +1507,29 @@ impl Document {
 /// 把 `src` 按 `opacity` 叠到 `out` 上（正常模式，与旧 `composite_pixel` 逐像素一致）。
 #[allow(dead_code)]
 pub(crate) fn blend_over(out: &mut [u8; 4], src: [u8; 4], opacity: f32) {
-    blend_over_with(out, src, opacity, BlendMode::Normal);
+    blend_over_with(out, src, opacity, BlendMode::Normal, 0, 0);
 }
 
 /// 带混合模式的版本：PSD 打开时带回的 `Multiply` / `Color` 等都走这里。
+/// `(x, y)` 是画布坐标，只有「溶解」需要它做抖动。
 pub(crate) fn blend_over_with(
     out: &mut [u8; 4],
     src: [u8; 4],
     opacity: f32,
     mode: BlendMode,
+    x: i32,
+    y: i32,
 ) {
+    if mode.is_dissolve() {
+        let keep = crate::blend::dissolve_hit(x, y, src[3] as f32 / 255.0 * opacity);
+        let (src, opacity) = if keep {
+            ([src[0], src[1], src[2], 255], 1.0)
+        } else {
+            ([0, 0, 0, 0], 0.0)
+        };
+        crate::blend::blend_pixel(out, src, opacity, BlendMode::Normal);
+        return;
+    }
     crate::blend::blend_pixel(out, src, opacity, mode);
 }
 
@@ -1697,10 +1710,21 @@ fn composite_raster(
             };
             let mode = style_px.unwrap_or(layer.blend);
             trace_flat(x, y, layer, src, mode, style_px.is_some());
+            // 溶解没有逐像素公式：按 `(x, y)` 抖动把 alpha 二值化，保留的像素
+            // 完全不透明，其余完全不画，再走 Normal。
+            let (src, opacity, mode) = if mode.is_dissolve() {
+                if crate::blend::dissolve_hit(x, y, src[3] * layer.opacity) {
+                    ([src[0], src[1], src[2], 1.0], 1.0, BlendMode::Normal)
+                } else {
+                    ([0.0; 4], 0.0, BlendMode::Normal)
+                }
+            } else {
+                (src, layer.opacity, mode)
+            };
             crate::blend::blend_pixel_f32(
                 &mut acc[y as usize * w as usize + x as usize],
                 src,
-                layer.opacity,
+                opacity,
                 mode,
             );
         }

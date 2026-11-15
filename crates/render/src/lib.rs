@@ -694,7 +694,19 @@ impl PreviewComposer {
                         }
                         _ => mode,
                     };
-                    editcore::blend_pixel(&mut dst, px, opacity, px_mode);
+                    // 溶解：按目标像素坐标抖动成 0/1，再走 Normal；1:1 预览下
+                    // `tx` 就是文档坐标，与 flatten 的抖动图案逐像素一致。
+                    let (px, op, px_mode) = if px_mode.is_dissolve() {
+                        let a = px[3] as f32 / 255.0 * opacity;
+                        if editcore::dissolve_hit(tx as i32, ty as i32, a) {
+                            ([px[0], px[1], px[2], 255], 1.0, editcore::BlendMode::Normal)
+                        } else {
+                            ([0, 0, 0, 0], 0.0, editcore::BlendMode::Normal)
+                        }
+                    } else {
+                        (px, opacity, px_mode)
+                    };
+                    editcore::blend_pixel(&mut dst, px, op, px_mode);
                     orow[oo..oo + 4].copy_from_slice(&dst);
                 }
             }
@@ -1760,6 +1772,27 @@ mod tests {
         doc2.add_layer(plain).unwrap();
         let out2 = PreviewComposer::new().composite(&doc2, doc2.canvas);
         assert_eq!(out2.get_pixel(3, 3).0, [255, 231, 200, 255]);
+    }
+
+    #[test]
+    fn preview_matches_flatten_for_dissolve() {
+        let mut doc = Document::from_image(solid(16, 16, [0, 0, 0, 255]));
+        let mut layer = Layer::new("diss", solid(16, 16, [255, 0, 0, 128]));
+        layer.blend = editcore::BlendMode::Dissolve;
+        doc.add_layer(layer).unwrap();
+
+        let flat = doc.flatten_in_doc_space();
+        let preview = PreviewComposer::new().composite(&doc, doc.canvas);
+        assert_eq!(
+            preview.as_raw(),
+            flat.as_raw(),
+            "1:1 预览的溶解抖动图案与 flatten 不一致"
+        );
+
+        let kept = flat.pixels().filter(|p| p.0[0] > 200 && p.0[3] == 255).count();
+        let partial = flat.pixels().filter(|p| p.0[3] == 128).count();
+        assert_eq!(partial, 0, "溶解不应留下半透明像素");
+        assert!((90..=166).contains(&kept), "保留像素数异常: {kept}");
     }
 
     #[test]

@@ -85,7 +85,7 @@ pub(crate) fn blend_image_at_mode(
                 continue;
             }
             let px = out.get_pixel_mut(x as u32, y as u32);
-            blend_over_with(&mut px.0, s, opacity, mode);
+            blend_over_with(&mut px.0, s, opacity, mode, x, y);
         }
     }
 }

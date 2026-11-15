@@ -15,6 +15,8 @@ pub enum BlendMode {
     /// Plain alpha compositing — the historical behaviour.
     #[default]
     Normal,
+    /// 溶解：按 alpha 做二值抖动，像素要么全有要么全无，需要坐标。
+    Dissolve,
     Multiply,
     Screen,
     Overlay,
@@ -24,10 +26,20 @@ pub enum BlendMode {
     ColorBurn,
     LinearDodge,
     LinearBurn,
+    /// 深色（`dkCl`）：整组取比较暗的那个颜色，不逐通道挑。
+    DarkerColor,
+    /// 浅色（`lgCl`）：整组取比较亮的那个颜色，不逐通道挑。
+    LighterColor,
     SoftLight,
     HardLight,
+    VividLight,
+    LinearLight,
+    PinLight,
+    HardMix,
     Difference,
     Exclusion,
+    Subtract,
+    Divide,
     Hue,
     Saturation,
     Color,
@@ -40,10 +52,16 @@ impl BlendMode {
         matches!(self, BlendMode::Normal)
     }
 
+    /// 溶解没有逐像素公式，要靠坐标抖动，调用方须先换成 [`BlendMode::Normal`]。
+    pub fn is_dissolve(self) -> bool {
+        matches!(self, BlendMode::Dissolve)
+    }
+
     /// Human-readable name, for the degradation list and diagnostics.
     pub fn label(self) -> &'static str {
         match self {
             BlendMode::Normal => "正常",
+            BlendMode::Dissolve => "溶解",
             BlendMode::Multiply => "正片叠底",
             BlendMode::Screen => "滤色",
             BlendMode::Overlay => "叠加",
@@ -53,16 +71,44 @@ impl BlendMode {
             BlendMode::ColorBurn => "颜色加深",
             BlendMode::LinearDodge => "线性减淡(添加)",
             BlendMode::LinearBurn => "线性加深",
+            BlendMode::DarkerColor => "深色",
+            BlendMode::LighterColor => "浅色",
             BlendMode::SoftLight => "柔光",
             BlendMode::HardLight => "强光",
+            BlendMode::VividLight => "亮光",
+            BlendMode::LinearLight => "线性光",
+            BlendMode::PinLight => "点光",
+            BlendMode::HardMix => "实色混合",
             BlendMode::Difference => "差值",
             BlendMode::Exclusion => "排除",
+            BlendMode::Subtract => "减去",
+            BlendMode::Divide => "划分",
             BlendMode::Hue => "色相",
             BlendMode::Saturation => "饱和度",
             BlendMode::Color => "颜色",
             BlendMode::Luminosity => "明度",
         }
     }
+}
+
+/// 溶解的二值阈值：`(x, y)` 决定这一格在 `alpha` 下是否显形。
+///
+/// Photoshop 用一张固定的噪声图决定哪些像素保留；这里用坐标哈希做确定性
+/// 噪声（同一份文档每次渲染结果一致），阈值是图层 alpha × 不透明度。返回
+/// `true` 表示该像素保留为完全不透明。
+pub fn dissolve_hit(x: i32, y: i32, alpha: f32) -> bool {
+    let a = alpha.clamp(0.0, 1.0);
+    if a >= 1.0 {
+        return true;
+    }
+    if a <= 0.0 {
+        return false;
+    }
+    let mut h = (x as u32).wrapping_mul(0x9E37_79B9) ^ (y as u32).wrapping_mul(0x85EB_CA6B);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2545_F491);
+    h ^= h >> 13;
+    (h & 0xFFFF) as f32 / 65536.0 < a
 }
 
 /// Composite `src` onto `out`, honouring `mode`.
@@ -180,10 +226,29 @@ pub(crate) fn blend_pixel_f32(out: &mut [f32; 4], src: [f32; 4], opacity: f32, m
 fn blend_rgb(mode: BlendMode, b: [f32; 3], s: [f32; 3]) -> [f32; 3] {
     match mode {
         BlendMode::Normal => s,
+        // 溶解由调用方先抖动成 Normal，走到这里说明没有坐标可用（效果烘焙），
+        // 按正常处理。
+        BlendMode::Dissolve => s,
         BlendMode::Hue => set_lum(set_sat(s, sat(b)), lum(b)),
         BlendMode::Saturation => set_lum(set_sat(b, sat(s)), lum(b)),
         BlendMode::Color => set_lum(s, lum(b)),
         BlendMode::Luminosity => set_lum(b, lum(s)),
+        // 深色 / 浅色不逐通道挑：比较两个颜色的明度后**整组**取一个，
+        // 所以逐通道算会把红蓝混出新色，Photoshop 里不会。
+        BlendMode::DarkerColor => {
+            if lum(s) < lum(b) {
+                s
+            } else {
+                b
+            }
+        }
+        BlendMode::LighterColor => {
+            if lum(s) > lum(b) {
+                s
+            } else {
+                b
+            }
+        }
         _ => {
             let mut out = [0.0f32; 3];
             for c in 0..3 {
@@ -197,34 +262,79 @@ fn blend_rgb(mode: BlendMode, b: [f32; 3], s: [f32; 3]) -> [f32; 3] {
 fn separable(mode: BlendMode, b: f32, s: f32) -> f32 {
     match mode {
         BlendMode::Normal => s,
+        BlendMode::Dissolve => s,
         BlendMode::Multiply => b * s,
         BlendMode::Screen => b + s - b * s,
         // Overlay is HardLight with the operands swapped.
         BlendMode::Overlay => hard_light(s, b),
         BlendMode::Darken => b.min(s),
         BlendMode::Lighten => b.max(s),
-        BlendMode::ColorDodge => {
-            if s >= 1.0 {
-                1.0
-            } else {
-                (b / (1.0 - s)).min(1.0)
-            }
-        }
-        BlendMode::ColorBurn => {
-            if s <= 0.0 {
-                0.0
-            } else {
-                1.0 - ((1.0 - b) / s).min(1.0)
-            }
-        }
+        BlendMode::ColorDodge => color_dodge(b, s),
+        BlendMode::ColorBurn => color_burn(b, s),
         BlendMode::LinearDodge => (b + s).min(1.0),
         BlendMode::LinearBurn => (b + s - 1.0).max(0.0),
         BlendMode::HardLight => hard_light(b, s),
         BlendMode::SoftLight => soft_light(b, s),
+        // 亮光：源色暗于 50% 用颜色加深（源色翻倍），亮于 50% 用颜色减淡。
+        BlendMode::VividLight => {
+            if s <= 0.5 {
+                color_burn(b, 2.0 * s)
+            } else {
+                color_dodge(b, 2.0 * (s - 0.5))
+            }
+        }
+        // 线性光：源色每增加 1 相当于线性减淡 2。
+        BlendMode::LinearLight => (b + 2.0 * s - 1.0).clamp(0.0, 1.0),
+        // 点光：源色暗于 50% 取变暗，亮于 50% 取变亮。
+        BlendMode::PinLight => {
+            if s <= 0.5 {
+                b.min(2.0 * s)
+            } else {
+                b.max(2.0 * s - 1.0)
+            }
+        }
+        // 实色混合：亮光的结果过 50% 阈值，只剩 0 / 1（等价 b + s >= 1）。
+        BlendMode::HardMix => {
+            if b + s >= 1.0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
         BlendMode::Difference => (b - s).abs(),
         BlendMode::Exclusion => b + s - 2.0 * b * s,
+        BlendMode::Subtract => (b - s).max(0.0),
+        // 划分：源色为 0 时按白色处理，避免除零。
+        BlendMode::Divide => {
+            if s <= 0.0 {
+                1.0
+            } else {
+                (b / s).min(1.0)
+            }
+        }
         // Handled by `blend_rgb`.
-        BlendMode::Hue | BlendMode::Saturation | BlendMode::Color | BlendMode::Luminosity => s,
+        BlendMode::DarkerColor
+        | BlendMode::LighterColor
+        | BlendMode::Hue
+        | BlendMode::Saturation
+        | BlendMode::Color
+        | BlendMode::Luminosity => s,
+    }
+}
+
+fn color_dodge(b: f32, s: f32) -> f32 {
+    if s >= 1.0 {
+        1.0
+    } else {
+        (b / (1.0 - s)).min(1.0)
+    }
+}
+
+fn color_burn(b: f32, s: f32) -> f32 {
+    if s <= 0.0 {
+        0.0
+    } else {
+        1.0 - ((1.0 - b) / s).min(1.0)
     }
 }
 
@@ -329,6 +439,49 @@ mod tests {
     fn linear_dodge_adds_and_clamps() {
         assert_eq!(over([100, 10, 0], [100, 10, 0], BlendMode::LinearDodge), [200, 20, 0]);
         assert_eq!(over([200, 0, 0], [200, 0, 0], BlendMode::LinearDodge), [255, 0, 0]);
+    }
+
+    /// 溶解：半透明区域按坐标抖动成二值，覆盖率约等于 alpha。
+    #[test]
+    fn dissolve_thresholds_partial_alpha_by_coordinate() {
+        assert!(dissolve_hit(0, 0, 1.0));
+        assert!(!dissolve_hit(0, 0, 0.0));
+        let kept = (0..64)
+            .flat_map(|y| (0..64).map(move |x| (x, y)))
+            .filter(|&(x, y)| dissolve_hit(x, y, 0.5))
+            .count();
+        assert!((1700..=2400).contains(&kept), "保留像素数异常: {kept}");
+        // 同一坐标必须稳定，否则每帧渲染都会闪。
+        assert_eq!(dissolve_hit(7, 9, 0.5), dissolve_hit(7, 9, 0.5));
+    }
+
+    /// 补齐的八个模式：期望值按 PDF/W3C 公式手算，和 Photoshop 的
+    /// `vLit` / `lLit` / `pLit` / `hMix` / `fsub` / `fdiv` / `dkCl` / `lgCl` 一致。
+    #[test]
+    fn extended_layer_modes_match_the_spec_formulas() {
+        // 亮光：源色 192(0.753) 走颜色减淡（2×(0.753-0.5)=0.506），
+        // 底 128(0.502) → 0.502/0.494 超过 1 → 白；源色 64(0.251) 走颜色加深，
+        // 底 200(0.784) → 1-min(1, 0.216/0.502) = 0.569 → 145。
+        assert_eq!(over([128, 128, 128], [192, 192, 192], BlendMode::VividLight), [255, 255, 255]);
+        assert_eq!(over([200, 200, 200], [64, 64, 64], BlendMode::VividLight), [145, 145, 145]);
+        // 线性光：b + 2s - 1。
+        assert_eq!(over([128, 128, 128], [192, 192, 192], BlendMode::LinearLight), [255, 255, 255]);
+        assert_eq!(over([128, 128, 128], [64, 64, 64], BlendMode::LinearLight), [1, 1, 1]);
+        // 点光：暗取 min(b, 2s)，亮取 max(b, 2s-1)。
+        assert_eq!(over([128, 128, 128], [64, 64, 64], BlendMode::PinLight), [128, 128, 128]);
+        assert_eq!(over([200, 200, 200], [192, 192, 192], BlendMode::PinLight), [200, 200, 200]);
+        // 实色混合：b + s >= 1 出白，否则出黑。
+        assert_eq!(over([100, 100, 100], [100, 100, 100], BlendMode::HardMix), [0, 0, 0]);
+        assert_eq!(over([200, 200, 200], [200, 200, 200], BlendMode::HardMix), [255, 255, 255]);
+        // 减去 / 划分。
+        assert_eq!(over([200, 60, 0], [50, 20, 90], BlendMode::Subtract), [150, 40, 0]);
+        assert_eq!(over([64, 128, 0], [128, 64, 0], BlendMode::Divide), [128, 255, 255]);
+        // 深色 / 浅色整组取色：底 (50,200,50) 明度 138.5，源灰 (100,100,100) 明度 100。
+        assert_eq!(
+            over([50, 200, 50], [100, 100, 100], BlendMode::DarkerColor),
+            [100, 100, 100]
+        );
+        assert_eq!(over([50, 200, 50], [100, 100, 100], BlendMode::LighterColor), [50, 200, 50]);
     }
 
     #[test]
