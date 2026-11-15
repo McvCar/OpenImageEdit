@@ -3,7 +3,7 @@ use std::sync::Arc;
 use image::imageops::FilterType;
 use image::RgbaImage;
 
-use editcore::{Adjust, AdjustTarget, Document, LayerContent, Rect, Size};
+use editcore::{Adjust, AdjustTarget, Document, Layer, LayerContent, Rect, Size};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Viewport {
@@ -382,7 +382,7 @@ impl PreviewComposer {
             let (ox, oy, nw, nh) =
                 Self::preview_dst(r.offset, (r.image.width(), r.image.height()), sx, sy);
             let src = self.scaled_layer(0, &r.image, nw, nh);
-            Self::blend_layer(&mut out, target, &src, ox, oy, bg.opacity, bg.blend);
+            Self::blend_layer(&mut out, target, &src, ox, oy, bg.opacity, bg.blend, None);
             return out;
         }
         let nw = ((doc.view.width as f64 * sx).round() as u32).max(1);
@@ -410,7 +410,7 @@ impl PreviewComposer {
             return img;
         }
         let mut out = RgbaImage::new(img.width(), img.height());
-        Self::blend_layer(&mut out, target, &img, 0, 0, bg.opacity, bg.blend);
+        Self::blend_layer(&mut out, target, &img, 0, 0, bg.opacity, bg.blend, None);
         out
     }
 
@@ -427,10 +427,30 @@ impl PreviewComposer {
         skip: Option<usize>,
         adjust: Option<(AdjustTarget, Adjust)>,
     ) {
+        // 剪贴蒙版基线覆盖率。只有「下一层是剪贴层」时才需要，避免每帧都为
+        // 整条图层的每一层重采样一遍覆盖率。
+        let mut clip: Option<Vec<u8>> = None;
         for (li, layer) in doc.layers.iter().enumerate().skip(1) {
+            if !layer.clipping {
+                let next_is_clip = doc
+                    .layers
+                    .get(li + 1)
+                    .map(|next| next.clipping)
+                    .unwrap_or(false);
+                clip = if next_is_clip {
+                    Some(self.clip_coverage(li, layer, target, sx, sy))
+                } else {
+                    None
+                };
+            }
             if !layer.visible || layer.opacity <= 0.0 || skip == Some(li) {
                 continue;
             }
+            let clip_alpha = if layer.clipping {
+                clip.as_deref()
+            } else {
+                None
+            };
             match &layer.content {
                 LayerContent::Mark(m) => {
                     if layer.opacity >= 0.999 {
@@ -473,6 +493,7 @@ impl PreviewComposer {
                                 oy,
                                 layer.opacity,
                                 layer.blend,
+                                clip_alpha,
                             );
                         }
                         _ => Self::blend_layer(
@@ -483,6 +504,7 @@ impl PreviewComposer {
                             oy,
                             layer.opacity,
                             layer.blend,
+                            clip_alpha,
                         ),
                     }
                 }
@@ -532,6 +554,10 @@ impl PreviewComposer {
     /// `opacity` at draw time. Row-slice fast path: whole rows are handed
     /// out as byte slices so the per-tick cost stays low even in debug
     /// builds.
+    ///
+    /// `clip` 是剪贴蒙版基线层的覆盖率（预览尺度，与 `out_buf` 同尺寸），
+    /// 作为 src alpha 的乘数 —— 与 `Document::flatten_in_doc_space` 的
+    /// `fill_clip_coverage` 同语义。基底层 / 无剪贴层自己混合时传 `None`。
     fn blend(
         out_buf: &mut [u8],
         target: Size,
@@ -540,6 +566,7 @@ impl PreviewComposer {
         oy: i32,
         opacity: f32,
         mode: editcore::BlendMode,
+        clip: Option<&[u8]>,
     ) {
         let nw = src.width() as i32;
         let nh = src.height() as i32;
@@ -565,7 +592,14 @@ impl PreviewComposer {
                 let so = lx as usize * 4;
                 let oo = tx as usize * 4;
                 if normal {
-                    let sa = srow[so + 3] as f32 / 255.0 * opacity;
+                    // 与 `composite_raster` + `blend_pixel_f32` 完全同序：
+                    // alpha = (a/255) × 剪贴，再乘图层不透明度。
+                    let mut alpha = srow[so + 3] as f32 / 255.0;
+                    if let Some(c) = clip {
+                        let ci = ty as usize * target.width as usize + tx as usize;
+                        alpha *= c[ci] as f32 / 255.0;
+                    }
+                    let sa = alpha * opacity;
                     if sa <= 0.0 {
                         continue;
                     }
@@ -582,12 +616,16 @@ impl PreviewComposer {
                         orow[oo + 2],
                         orow[oo + 3],
                     ];
-                    let px = [
+                    let mut px = [
                         srow[so],
                         srow[so + 1],
                         srow[so + 2],
                         srow[so + 3],
                     ];
+                    if let Some(c) = clip {
+                        let cov = c[ty as usize * target.width as usize + tx as usize] as u32;
+                        px[3] = ((px[3] as u32 * cov + 127) / 255) as u8;
+                    }
                     editcore::blend_pixel(&mut dst, px, opacity, mode);
                     orow[oo..oo + 4].copy_from_slice(&dst);
                 }
@@ -603,11 +641,68 @@ impl PreviewComposer {
         oy: i32,
         opacity: f32,
         mode: editcore::BlendMode,
+        clip: Option<&[u8]>,
     ) {
         let mut raw = std::mem::take(out).into_raw();
-        Self::blend(&mut raw, target, src, ox, oy, opacity, mode);
+        Self::blend(&mut raw, target, src, ox, oy, opacity, mode, clip);
         *out = RgbaImage::from_raw(target.width, target.height, raw)
             .expect("preview buffer size preserved");
+    }
+
+    /// 剪贴基线层的覆盖率（预览尺度 u8 alpha）。
+    ///
+    /// 与 `Document::flatten_in_doc_space` 里的 `fill_clip_coverage` 同语义：
+    /// 覆盖率 = 基底位图 alpha × 基底自己的图层蒙版；隐藏 / 全透明的基底给出
+    /// 全 0，于是整条剪贴链一起消失；基底只是「半透明」（opacity < 1）时覆盖
+    /// 率仍给满，不乘不透明度。
+    ///
+    /// 覆盖率必须落在**预览尺度**上：图层在预览里是缩小后混合的，如果拿文
+    /// 档尺度的覆盖率去索引就会错位，剪贴内容会跑到基线框外面。
+    fn clip_coverage(
+        &mut self,
+        li: usize,
+        layer: &Layer,
+        target: Size,
+        sx: f64,
+        sy: f64,
+    ) -> Vec<u8> {
+        let mut cov = vec![0u8; target.width as usize * target.height as usize];
+        if !layer.visible || layer.opacity <= 0.0 {
+            return cov;
+        }
+        let (src, ox, oy) = match &layer.content {
+            LayerContent::Raster(r) => {
+                let (ox, oy, nw, nh) =
+                    Self::preview_dst(r.offset, (r.image.width(), r.image.height()), sx, sy);
+                let src = self.scaled_layer(li, &r.image, nw, nh);
+                (src, ox, oy)
+            }
+            LayerContent::Mark(_) => {
+                let (plane, offset) = layer.plane();
+                let (ox, oy, nw, nh) =
+                    Self::preview_dst(offset, (plane.width(), plane.height()), sx, sy);
+                (Arc::new(resize_to(&plane, Size::new(nw, nh))), ox, oy)
+            }
+        };
+        let tw = target.width as i32;
+        let th = target.height as i32;
+        for ty in 0..src.height() as i32 {
+            let py = oy + ty;
+            if py < 0 || py >= th {
+                continue;
+            }
+            for tx in 0..src.width() as i32 {
+                let px = ox + tx;
+                if px < 0 || px >= tw {
+                    continue;
+                }
+                let a = src.get_pixel(tx as u32, ty as u32).0[3];
+                if a > 0 {
+                    cov[py as usize * tw as usize + px as usize] = a;
+                }
+            }
+        }
+        cov
     }
 
     pub fn composite(&mut self, doc: &Document, target: Size) -> RgbaImage {
@@ -762,7 +857,7 @@ impl PreviewComposer {
                 }
                 _ => (*src).clone(),
             };
-            Self::blend_layer(&mut out, target, &stretched, ox, oy, drag_opacity, drag_blend);
+            Self::blend_layer(&mut out, target, &stretched, ox, oy, drag_opacity, drag_blend, None);
         }
         doc.apply_display_color(&mut out);
         out
@@ -871,7 +966,7 @@ impl PreviewComposer {
                 }
                 _ => active,
             };
-            Self::blend_layer(&mut out, target, &stretched, 0, 0, drag_opacity, drag_blend);
+            Self::blend_layer(&mut out, target, &stretched, 0, 0, drag_opacity, drag_blend, None);
         }
         doc.apply_display_color(&mut out);
         out
@@ -964,7 +1059,7 @@ impl PreviewComposer {
                 }
                 _ => rotated,
             };
-            Self::blend_layer(&mut out, target, &src, ox, oy, drag_opacity, drag_blend);
+            Self::blend_layer(&mut out, target, &src, ox, oy, drag_opacity, drag_blend, None);
         }
         doc.apply_display_color(&mut out);
         out
@@ -1100,6 +1195,47 @@ mod tests {
             .unwrap();
         let rendered = render_for_viewport(&doc, Viewport::new(500, 500, Zoom::Fit));
         assert_eq!(rendered.dimensions(), (500, 250));
+    }
+
+    /// 剪贴蒙版必须在「预览合成」里生效。
+    ///
+    /// 回归对象：`PreviewComposer` 曾经只做逐层 alpha-over，完全不看
+    /// `Layer::clipping`，于是被剪贴的纹理层（PSD 里那些 151×268 的斜条纹
+    /// 智能对象）在窗口里整片铺到底，PS 合并图里却只出现在圆角按钮内 ——
+    /// 屏幕上就是一条刺眼的斜条纹带，而 `dump-flat`（走 flatten）看不出来。
+    #[test]
+    fn preview_respects_clipping_mask() {
+        let mut doc = Document::from_image(solid(40, 40, [255, 255, 255, 255]));
+        let mut base = Layer::new("base", solid(10, 10, [255, 0, 0, 255]));
+        base.set_offset((5, 5));
+        doc.add_layer(base).unwrap();
+        let mut clipped = Layer::new("clipped", solid(40, 40, [0, 0, 255, 255]));
+        clipped.clipping = true;
+        doc.add_layer(clipped).unwrap();
+
+        // 0.5 倍预览：基线红块占 (2,2)–(7,7)。
+        let out = PreviewComposer::new().composite(&doc, Size::new(20, 20));
+        assert_eq!(
+            out.get_pixel(0, 0).0,
+            [255, 255, 255, 255],
+            "剪贴层漏到基线框外"
+        );
+        assert_eq!(
+            out.get_pixel(19, 19).0,
+            [255, 255, 255, 255],
+            "剪贴层漏到基线框外"
+        );
+        let inside = out.get_pixel(5, 5).0;
+        assert!(
+            inside[2] > 200 && inside[0] < 60,
+            "框内应是剪贴层的蓝色，得到 {:?}",
+            inside
+        );
+
+        // 1:1 时预览必须与 flatten（保存/保真口径）逐像素一致。
+        let preview = PreviewComposer::new().composite(&doc, doc.canvas);
+        let flat = doc.flatten_in_doc_space();
+        assert_eq!(preview.as_raw(), flat.as_raw(), "预览与 flatten 的剪贴结果不一致");
     }
 
     #[test]
