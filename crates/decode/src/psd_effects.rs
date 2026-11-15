@@ -306,10 +306,10 @@ pub fn bake_with_alpha(
     for e in &active {
         match e.kind {
             EffectKind::InnerShadow => {
-                draw_inner_shadow(&mut out, w, h, &alpha, e);
+                draw_inner_shadow(&mut out, w, h, &alpha, e, None);
             }
             EffectKind::InnerGlow => {
-                draw_inner_glow(&mut out, w, h, &alpha, e);
+                draw_inner_glow(&mut out, w, h, &alpha, e, None);
             }
             _ => {}
         }
@@ -318,8 +318,10 @@ pub fn bake_with_alpha(
     // ---- 4. overlays, on top of the content ------------------------------
     for e in &active {
         match e.kind {
-            EffectKind::ColorOverlay => draw_color_overlay(&mut out, w, h, &alpha, e),
-            EffectKind::GradientOverlay => draw_gradient_overlay(&mut out, w, h, &alpha, bounds, e),
+            EffectKind::ColorOverlay => draw_color_overlay(&mut out, w, h, &alpha, e, None),
+            EffectKind::GradientOverlay => {
+                draw_gradient_overlay(&mut out, w, h, &alpha, bounds, e, None)
+            }
             EffectKind::PatternOverlay => {
                 notes.push("图层样式「图案叠加」暂不支持".into());
             }
@@ -379,7 +381,8 @@ struct Padding {
 /// the two rasters a group's effect stack produces:
 ///
 /// * `behind` — drop shadow / outer glow, drawn *below* the group's content;
-/// * `front` — the stroke ring, drawn *above* it.
+/// * `front` — inner shadow / inner glow / colour & gradient overlays / the
+///   stroke ring, drawn *above* it (Photoshop's stacking order).
 ///
 /// The group is a contiguous run of the layer stack, so inserting these as two
 /// extra raster layers inside that run composites exactly like Photoshop's
@@ -509,8 +512,31 @@ pub fn bake_group_effects(
         }
     }
 
-    // ---- front: the stroke ring ------------------------------------------
+    // ---- front: inner effects, overlays, then the stroke ------------------
+    // Photoshop's stack for a group is the same as for a layer: inner shadow /
+    // inner glow sit on the content, overlays above them, the stroke on top.
+    // Everything is painted source-over at `coverage × group alpha` because a
+    // fresh front raster has no dst alpha to "replace" (the same reason the
+    // group stroke needed this treatment).
     let mut front = empty();
+    for e in &active {
+        match e.kind {
+            EffectKind::InnerShadow => draw_inner_shadow(&mut front, w, h, &big, e, Some(&big)),
+            EffectKind::InnerGlow => draw_inner_glow(&mut front, w, h, &big, e, Some(&big)),
+            _ => {}
+        }
+    }
+    // Gradient overlays run across the group's ink, like the group stroke.
+    let bounds = alpha_bounds(&big, w, h);
+    for e in &active {
+        match e.kind {
+            EffectKind::ColorOverlay => draw_color_overlay(&mut front, w, h, &big, e, Some(&big)),
+            EffectKind::GradientOverlay => {
+                draw_gradient_overlay(&mut front, w, h, &big, bounds, e, Some(&big))
+            }
+            _ => {}
+        }
+    }
     let strokes: Vec<&&LayerEffect> = active.iter().filter(|e| e.kind == EffectKind::Stroke).collect();
     if !strokes.is_empty() {
         let need_in = strokes.iter().any(|e| e.stroke_position != StrokePosition::Outside);
@@ -519,19 +545,14 @@ pub fn bake_group_effects(
         let dout = if need_out { dist_outside(&big, w, h) } else { Vec::new() };
         // A group stroke's gradient (if any) runs across the group's ink, not
         // its bounding rectangle of member layers.
-        let bounds = alpha_bounds(&big, w, h);
         for e in &strokes {
             draw_stroke(&mut front, w, h, &big, &din, &dout, bounds, e, Some(&big));
         }
     }
     for e in &active {
         match e.kind {
-            EffectKind::InnerShadow | EffectKind::InnerGlow => {
-                notes.push("组样式「内阴影/内发光」暂不支持（组级）".into());
-            }
-            EffectKind::ColorOverlay | EffectKind::GradientOverlay | EffectKind::PatternOverlay
-            | EffectKind::BevelEmboss => {
-                notes.push("组样式「叠加/浮雕」暂不支持（组级）".into());
+            EffectKind::PatternOverlay | EffectKind::BevelEmboss => {
+                notes.push("组样式「图案叠加/斜面和浮雕」暂不支持（组级）".into());
             }
             _ => {}
         }
@@ -873,7 +894,14 @@ fn draw_stroke(
     }
 }
 
-fn draw_inner_shadow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: &LayerEffect) {
+fn draw_inner_shadow(
+    out: &mut RgbaImage,
+    w: u32,
+    h: u32,
+    alpha: &[f32],
+    e: &LayerEffect,
+    clip: Option<&[f32]>,
+) {
     let (dx, dy) = offset_vector(e.distance, e.angle);
     // The shadow is the *hole* (everything outside the shape) moved by the same
     // offset the light would push it, blurred, then clipped to the shape: that
@@ -897,12 +925,29 @@ fn draw_inner_shadow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: &Lay
             if cov <= 0.002 {
                 continue;
             }
-            composite_inside(out, x, y, e.color, cov, e.opacity, mode);
+            // 组级前景光栅从全透明开始，`composite_inside` 会因为 dst alpha=0
+            // 整块丢掉；组模式按组覆盖率画成新像素（与组描边同一策略）。
+            match clip {
+                Some(c) => {
+                    let cov = (cov * c[i]).clamp(0.0, 1.0);
+                    if cov > 0.002 {
+                        composite(out, x, y, e.color, cov, e.opacity, mode);
+                    }
+                }
+                None => composite_inside(out, x, y, e.color, cov, e.opacity, mode),
+            }
         }
     }
 }
 
-fn draw_inner_glow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: &LayerEffect) {
+fn draw_inner_glow(
+    out: &mut RgbaImage,
+    w: u32,
+    h: u32,
+    alpha: &[f32],
+    e: &LayerEffect,
+    clip: Option<&[f32]>,
+) {
     let inverse: Vec<f32> = alpha.iter().map(|a| 1.0 - a).collect();
     let (grow, soft) = spread_split(e.size, e.choke);
     let grown = dilate(&inverse, w, h, grow);
@@ -926,16 +971,35 @@ fn draw_inner_glow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: &Layer
             if cov <= 0.002 {
                 continue;
             }
-            composite_inside(out, x, y, e.color, cov, e.opacity, mode);
+            match clip {
+                Some(c) => {
+                    let cov = (cov * c[i]).clamp(0.0, 1.0);
+                    if cov > 0.002 {
+                        composite(out, x, y, e.color, cov, e.opacity, mode);
+                    }
+                }
+                None => composite_inside(out, x, y, e.color, cov, e.opacity, mode),
+            }
         }
     }
 }
 
-fn draw_color_overlay(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: &LayerEffect) {
+fn draw_color_overlay(
+    out: &mut RgbaImage,
+    w: u32,
+    h: u32,
+    alpha: &[f32],
+    e: &LayerEffect,
+    clip: Option<&[f32]>,
+) {
     let mode = blend_of(e.blend);
     for y in 0..h {
         for x in 0..w {
-            let cov = alpha[(y * w + x) as usize];
+            let i = (y * w + x) as usize;
+            let mut cov = alpha[i];
+            if let Some(c) = clip {
+                cov *= c[i];
+            }
             if cov <= 0.002 {
                 continue;
             }
@@ -951,6 +1015,7 @@ fn draw_gradient_overlay(
     alpha: &[f32],
     bbox: [f32; 4],
     e: &LayerEffect,
+    clip: Option<&[f32]>,
 ) {
     let Some(g) = e.gradient.as_ref() else {
         return;
@@ -958,7 +1023,11 @@ fn draw_gradient_overlay(
     let mode = blend_of(e.blend);
     for y in 0..h {
         for x in 0..w {
-            let cov = alpha[(y * w + x) as usize];
+            let i = (y * w + x) as usize;
+            let mut cov = alpha[i];
+            if let Some(c) = clip {
+                cov *= c[i];
+            }
             if cov <= 0.002 {
                 continue;
             }
@@ -1562,6 +1631,75 @@ mod tests {
         assert_eq!(px, [115, 115, 115, 255], "shadow below the shape");
         // Above the shape there is nothing.
         assert_eq!(behind.get_pixel(4 + 3, 1 + 3).0[3], 0);
+    }
+
+    /// 组级内阴影 / 内发光 / 颜色叠加 / 渐变叠加画在同一张前景光栅上。
+    /// 回归点：前景光栅从全透明开始，`composite_inside` 遇到 dst alpha = 0
+    /// 会把内阴影/内发光整块吃掉（组描边曾经就是这么消失的）。
+    #[test]
+    fn group_inner_effects_and_overlays_land_on_the_front_raster() {
+        let (w, h) = (12u32, 12u32);
+        let mut alpha = vec![0.0f32; (w * h) as usize];
+        for y in 3..9 {
+            for x in 3..9 {
+                alpha[(y * w + x) as usize] = 1.0;
+            }
+        }
+
+        let mut overlay = effect(EffectKind::ColorOverlay);
+        overlay.color = [200, 10, 10];
+        let baked = bake_group_effects(&alpha, (w, h), (0, 0), &[overlay]).expect("overlay");
+        let front = baked.front.as_ref().expect("overlay raster");
+        assert_eq!(front.get_pixel(4, 4).0, [200, 10, 10, 255]);
+        assert_eq!(front.get_pixel(0, 0).0[3], 0, "组外不应有叠加色");
+
+        let mut shadow = effect(EffectKind::InnerShadow);
+        shadow.color = [0, 0, 0];
+        shadow.distance = 2.0;
+        shadow.angle = 90.0;
+        let baked = bake_group_effects(&alpha, (w, h), (0, 0), &[shadow]).expect("inner shadow");
+        let front = baked.front.as_ref().expect("inner shadow raster");
+        assert!(
+            front.pixels().any(|p| p.0[3] > 0),
+            "内阴影不能整块消失"
+        );
+
+        let mut glow = effect(EffectKind::InnerGlow);
+        glow.color = [255, 255, 255];
+        glow.size = 2.0;
+        let baked = bake_group_effects(&alpha, (w, h), (0, 0), &[glow]).expect("inner glow");
+        let front = baked.front.as_ref().expect("inner glow raster");
+        assert!(front.pixels().any(|p| p.0[3] > 0), "内发光不能整块消失");
+
+        let mut grad = effect(EffectKind::GradientOverlay);
+        grad.gradient = Some(Gradient {
+            color_stops: vec![
+                psd::effects::ColorStop {
+                    location: 0.0,
+                    color: [0, 0, 0],
+                },
+                psd::effects::ColorStop {
+                    location: 1.0,
+                    color: [255, 255, 255],
+                },
+            ],
+            alpha_stops: vec![psd::effects::AlphaStop {
+                location: 0.0,
+                alpha: 1.0,
+            }],
+            kind: GradientKind::Linear,
+            angle: 0.0,
+            reverse: false,
+            align: true,
+            scale: 100.0,
+        });
+        let baked = bake_group_effects(&alpha, (w, h), (0, 0), &[grad]).expect("gradient");
+        let front = baked.front.as_ref().expect("gradient raster");
+        // 角度 0：渐变沿 x 从黑到白。
+        let left = front.get_pixel(3, 5).0[0] as i32;
+        let right = front.get_pixel(8, 5).0[0] as i32;
+        assert!(right > left + 100, "left {left} right {right}");
+        assert_eq!(front.get_pixel(0, 0).0[3], 0, "组外不应有渐变");
     }
 
     #[test]

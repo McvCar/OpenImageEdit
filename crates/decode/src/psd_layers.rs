@@ -976,7 +976,7 @@ fn build_layers<F: FnMut(usize, usize)>(
             bake_group_style_layers(&mut layers, groups, (cw as u32, ch as u32));
         if group_fx_count > 0 {
             degraded.push(format!(
-                "{group_fx_count} 个组的样式（投影/描边）已烘焙进独立图层"
+                "{group_fx_count} 个组的样式（投影/描边/内阴影/叠加）已烘焙进独立图层"
             ));
             // 插入的位图按实际尺寸重新计量（层循环只累加了原始层的字节）。
             total_bytes = layers
@@ -1010,8 +1010,9 @@ fn dedup(v: &mut Vec<String>) {
 }
 
 /// Bake the styles carried on **folder records** (`lfx2` on a group) into two
-/// extra raster layers: the shadow below the group's lowest member, the stroke
-/// above its highest one.
+/// extra raster layers: the shadow below the group's lowest member, the
+/// foreground effects (inner shadow / glow, overlays, stroke) above its
+/// highest one.
 ///
 /// Photoshop renders a group's styles once around the group's composite
 /// outline — one ring around every child, not one per child. The group is a
@@ -1143,7 +1144,7 @@ fn bake_group_style_layers(
                     PsdLayerData {
                         annotation: false,
                         group: Some(group.id()),
-                        name: format!("组「{}」描边(烘焙)", group.name()),
+                        name: format!("组「{}」样式(烘焙)", group.name()),
                         offset: baked.offset,
                         image: front,
                         visible: group_visible,
