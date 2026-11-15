@@ -39,6 +39,7 @@ const KEY_VECTOR_MASK: &[u8; 4] = b"vmsk";
 const KEY_VECTOR_MASK_ALT: &[u8; 4] = b"vsms";
 /// 形状图层的填充内容（纯色 / 渐变）。
 const KEY_VECTOR_STROKE_CONTENT: &[u8; 4] = b"vscg";
+const KEY_VECTOR_STROKE: &[u8; 4] = b"vstk";
 /// 形状填充的 sheet setting（`SoCo` 实色 / `GdFl` 渐变）。与 `vscg` 的分工：
 /// sheet setting 是**形状内部的填充**，`vscg` 是**矢量描边的内容** —— 实测
 /// `矩形 556 拷贝` 这类实心形状只有 `SoCo`，卡片描边层只有 `vscg`。
@@ -538,6 +539,8 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
     let mut vector_fill: Option<crate::vector::VectorFill> = None;
     // 形状填充的 sheet setting（SoCo / GdFl），优先于 vscg（描边内容）。
     let mut sheet_fill: Option<crate::vector::VectorFill> = None;
+    // 形状描边与 fillEnabled（vst2）。
+    let mut vector_stroke: Option<crate::vector::VectorStroke> = None;
     // There can be multiple additional layer information sections so we'll loop
     // until we stop seeing them.
     while cursor.peek_4() == SIGNATURE_EIGHT_BIM || cursor.peek_4() == SIGNATURE_EIGHT_B64 {
@@ -642,6 +645,22 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
                 cursor.seek(end as u64);
             }
 
+            // 形状描边（`vst2`）：除了描边本身，还带 `fillEnabled` —— 只描边
+            // 不填充的形状层不能拿 `vscg` 当填充画成实心色块。
+            KEY_VECTOR_STROKE => {
+                let start = cursor.position() as usize;
+                let len = additional_layer_info_len as usize;
+                let block = cursor
+                    .get_ref()
+                    .get(start..start.checked_add(len).unwrap_or(usize::MAX))
+                    .unwrap_or(&[]);
+                if let Some(s) = crate::vector::parse_vector_stroke(block) {
+                    vector_stroke = Some(s);
+                }
+                let end = start.saturating_add(len).min(cursor.get_ref().len());
+                cursor.seek(end as u64);
+            }
+
             KEY_SOLID_COLOR_SHEET | KEY_GRADIENT_SHEET => {
                 let start = cursor.position() as usize;
                 let len = additional_layer_info_len as usize;
@@ -681,7 +700,17 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
         mask_rect,
         vector_mask,
         // 形状内部的填充以 sheet setting（SoCo / GdFl）为准；没有 sheet
-        // setting 的层（卡片描边）退回 `vscg`。
-        vector_fill: sheet_fill.or(vector_fill),
+        // setting 的层（卡片描边）退回 `vscg`，但 `vst2.fillEnabled = false`
+        // 时必须留空 —— 否则只描边的形状会被整片涂成实心。
+        vector_fill: if vector_stroke
+            .as_ref()
+            .map(|s| !s.fill_enabled)
+            .unwrap_or(false)
+        {
+            None
+        } else {
+            sheet_fill.or(vector_fill)
+        },
+        vector_stroke,
     })
 }

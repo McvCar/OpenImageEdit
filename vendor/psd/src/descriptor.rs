@@ -42,6 +42,10 @@ pub enum DescriptorValue {
         type_id: [u8; 4],
         /// Value, e.g. `b"Mltp"`.
         value: [u8; 4],
+        /// Full value text (`strokeStyleAlignOutside` is longer than four
+        /// characters, and its first four are shared with the other
+        /// alignments, so the truncated key alone cannot tell them apart).
+        text: String,
     },
     /// `Objc` / `GlbO` / `type`
     Descriptor(Descriptor),
@@ -92,6 +96,15 @@ impl Descriptor {
     pub fn enum_value(&self, key: &[u8]) -> Option<[u8; 4]> {
         match self.get(key)? {
             DescriptorValue::Enum { value, .. } => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Full enum value text, for values longer than four characters (e.g.
+    /// `strokeStyleAlignOutside`).
+    pub fn enum_text(&self, key: &[u8]) -> Option<&str> {
+        match self.get(key)? {
+            DescriptorValue::Enum { text, .. } => Some(text.as_str()),
             _ => None,
         }
     }
@@ -223,6 +236,18 @@ pub fn parse_block2(bytes: &[u8]) -> Option<Descriptor> {
     parse_descriptor_body(&mut r)
 }
 
+/// Parse a plain descriptor block: **one** u32 version in front of the body.
+///
+/// `vstk` (`DescriptorBlock`, classID `strokeStyle`) uses this layout, while
+/// `lfx2` uses [`parse_block2`]'s two versions. Feeding a `vstk` payload to
+/// `parse_block2` makes the class id look like a version and the reader chases
+/// a bogus unicode-string length.
+pub fn parse_block(bytes: &[u8]) -> Option<Descriptor> {
+    let mut r = Reader::new(bytes);
+    let _version = r.u32()?;
+    parse_descriptor_body(&mut r)
+}
+
 fn dbg_on() -> bool {
     std::env::var_os("IMAGEEDIT_DEBUG_DESCRIPTOR").is_some()
 }
@@ -299,10 +324,17 @@ fn parse_value(r: &mut Reader, os_type: [u8; 4]) -> Option<DescriptorValue> {
         b"TEXT" => DescriptorValue::Text(r.unicode_string()?),
         // Both halves of an enum are length-prefixed keys (usually a zero
         // length followed by four characters).
-        b"enum" => DescriptorValue::Enum {
-            type_id: four(r.length_and_key()?),
-            value: four(r.length_and_key()?),
-        },
+        b"enum" => {
+            let type_id = r.length_and_key()?;
+            let value = r.length_and_key()?;
+            DescriptorValue::Enum {
+                type_id: four(type_id),
+                value: four(value.clone()),
+                text: String::from_utf8_lossy(&value)
+                    .trim_end_matches('\0')
+                    .to_string(),
+            }
+        }
         b"long" => DescriptorValue::Integer(r.i32()?),
         b"comp" => DescriptorValue::Double(r.i64()? as f64),
         b"bool" => DescriptorValue::Bool(r.u8()? != 0),

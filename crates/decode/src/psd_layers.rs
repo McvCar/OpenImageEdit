@@ -354,6 +354,7 @@ fn build_layers<F: FnMut(usize, usize)>(
     let mut clipped_layers = 0usize;
     let mut vector_filled = 0usize;
     let mut vector_clipped = 0usize;
+    let mut vector_stroked = 0usize;
     let groups = psd.groups();
     let mut inherited_hidden = false;
     // 诊断开关：把某一项特性关掉再合成，用 `dump-flat` 与 PS 合并图比对，
@@ -525,6 +526,31 @@ fn build_layers<F: FnMut(usize, usize)>(
         let mut image = image;
         let mut layer_offset = (x0, y0);
 
+        // ---- 形状矢量描边的扩边 ---------------------------------------
+        // 外描边 / 居中描边会落在路径之外，而形状层的通道位图止于路径
+        // 包围盒 —— 不留这圈边，描边外半圈会被直接裁掉。
+        if !off("IMAGEEDIT_PSD_NO_VECTOR") {
+            if let Some(st) = layer.stroke_style() {
+                if st.enabled && st.width > 0.0 {
+                    let reach = match st.align {
+                        psd::VectorStrokeAlign::Outside => st.width.ceil() as i32 + 1,
+                        psd::VectorStrokeAlign::Center => (st.width / 2.0).ceil() as i32 + 1,
+                        psd::VectorStrokeAlign::Inside => 0,
+                    };
+                    if reach > 0 {
+                        let mut padded = image::RgbaImage::new(
+                            image.width() + 2 * reach as u32,
+                            image.height() + 2 * reach as u32,
+                        );
+                        image::imageops::overlay(&mut padded, &image, reach as i64, reach as i64);
+                        image = padded;
+                        layer_offset.0 -= reach;
+                        layer_offset.1 -= reach;
+                    }
+                }
+            }
+        }
+
         // ---- 形状图层的矢量填充（`vmsk` / `vscg`）------------------------
         // 形状层的像素由 PS 按矢量路径实时生成。两类洞都要补：① 通道完全
         // 为空的层（实测目标稿 5 张卡片的渐变描边整圈丢失）；② 缓存接近
@@ -596,6 +622,43 @@ fn build_layers<F: FnMut(usize, usize)>(
                     if crate::psd_vector::clip_shape(&mut image, layer_offset, (cw as u32, ch as u32), vm)
                     {
                         vector_clipped += 1;
+                    }
+                }
+                // ---- 矢量描边（`vstk`）---------------------------------
+                // 只补**通道全空**的层。有缓存内容的层，描边已经在像素里了
+                // （PS 把形状的实时渲染烘焙进了通道）；再按路径画一遍会多出
+                // 一条带 —— 实测 `矩形 13`（全画布细边框）路径的内沿比缓存
+                // 靠内 1.5px，右内边多画了一列纯红，整幅 MAE 因此 +0.41。
+                if !off("IMAGEEDIT_PSD_NO_VSTROKE") && empty {
+                    if let Some(st) = layer.stroke_style() {
+                        let painted = crate::psd_vector::stroke_shape(
+                            &mut image,
+                            layer_offset,
+                            (cw as u32, ch as u32),
+                            vm,
+                            st,
+                        );
+                        if painted {
+                            vector_stroked += 1;
+                        }
+                        if std::env::var_os("IMAGEEDIT_PSD_VSTROKE_TRACE").is_some() {
+                            println!(
+                                "{{\"phase\":\"decode\",\"event\":\"vstroke\",\"name\":\"{}\",\
+                                 \"off\":[{},{}],\"size\":[{},{}],\"w\":{},\"align\":{:?},\
+                                 \"op\":{},\"solid\":{:?},\"grad\":{},\"painted\":{}}}",
+                                layer.name(),
+                                layer_offset.0,
+                                layer_offset.1,
+                                image.width(),
+                                image.height(),
+                                st.width,
+                                st.align,
+                                st.opacity,
+                                st.fill.solid,
+                                st.fill.gradient.is_some(),
+                                painted
+                            );
+                        }
                     }
                 }
             }
@@ -773,7 +836,36 @@ fn build_layers<F: FnMut(usize, usize)>(
                 }
             }
             crate::psd_effects::set_trace_label(layer.name());
-            if let Some(baked) = crate::psd_effects::bake(&image, layer_offset, effects) {
+            // 只描边的形状（`fillEnabled = false`）位图是空的，但 PS 仍然按
+            // **矢量路径**给它描边、加内阴影 —— 样式的作用 alpha 要取路径
+            // 覆盖率，不能取空像素，否则整圈的样式都会消失。
+            //
+            // 但**带描边**的形状不能这么做：它真正可见的内容是那圈描边
+            // （`stroke_shape` 已经画进位图），路径覆盖率会把整个内部都算成
+            // 内容 —— 实测 `矩形 13`（全画布细边框）的内阴影/颜色叠加因此
+            // 铺满整个内区，MAE 从 3.98 涨到 5.44。
+            let has_visible_stroke = layer
+                .stroke_style()
+                .map(|s| s.enabled && s.width > 0.0)
+                .unwrap_or(false);
+            let path_alpha = if layer.vector_fill().is_none() && !has_visible_stroke {
+                layer.vector_mask().and_then(|vm| {
+                    crate::psd_vector::path_alpha(
+                        &image,
+                        layer_offset,
+                        (cw as u32, ch as u32),
+                        vm,
+                    )
+                })
+            } else {
+                None
+            };
+            if let Some(baked) = crate::psd_effects::bake_with_alpha(
+                &image,
+                layer_offset,
+                effects,
+                path_alpha.as_deref(),
+            ) {
                 if let Some(pre) = pre_alpha.as_ref() {
                     content_alpha = Some(ContentAlpha::from_baked(
                         pre,
@@ -834,6 +926,11 @@ fn build_layers<F: FnMut(usize, usize)>(
     if vector_clipped > 0 {
         degraded.push(format!(
             "{vector_clipped} 个形状图层按矢量路径重新裁剪（通道缓存与路径不一致）"
+        ));
+    }
+    if vector_stroked > 0 {
+        degraded.push(format!(
+            "{vector_stroked} 个形状图层的描边按矢量路径栅格化（vstk，含只描边不填充的层）"
         ));
     }
     // ---- 文件夹树（PSD 的组，不再摊平）---------------------------------

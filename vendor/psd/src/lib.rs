@@ -28,7 +28,7 @@ pub use crate::sections::image_resources_section::{DescriptorField, UnitFloatStr
 pub use crate::sections::layer_and_mask_information_section::layer::{
     BlendMode, BrightnessContrast, HueSaturation, LayerChannels, MaskRect, PsdGroup, PsdLayer,
 };
-pub use vector::{VectorFill, VectorKnot, VectorMask, VectorSubpath};
+pub use vector::{VectorFill, VectorKnot, VectorMask, VectorStroke, VectorStrokeAlign, VectorSubpath};
 use crate::sections::layer_and_mask_information_section::LayerAndMaskInformationSection;
 use crate::sections::MajorSections;
 

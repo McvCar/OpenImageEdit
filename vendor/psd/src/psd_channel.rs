@@ -373,6 +373,7 @@ mod tests {
             mask_rect: None,
             vector_mask: None,
             vector_fill: None,
+            vector_stroke: None,
         };
 
         let layer = PsdLayer {

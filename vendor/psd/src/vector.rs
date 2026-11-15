@@ -168,6 +168,90 @@ pub fn parse_vector_mask(bytes: &[u8]) -> Option<VectorMask> {
     Some(mask)
 }
 
+/// 形状图层描边的对齐方式（`strokeStyleLineAlignment`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorStrokeAlign {
+    /// 描边完全落在路径内侧。
+    Inside,
+    /// 以路径为轴，内外各一半。
+    Center,
+    /// 描边完全落在路径外侧。
+    Outside,
+}
+
+/// 形状图层的矢量描边（`vstk`）。
+///
+/// 有 29 个形状层是**只描边不填充**的（`fillEnabled = false`）：它们的可见
+/// 内容就是这一圈描边，通道里什么都没有。只按 `vscg` 填色会把它们画成实心
+/// 色块，反而盖住下面的剪贴纹理。
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorStroke {
+    /// `strokeEnabled`：描边是否显示。
+    pub enabled: bool,
+    /// `vstk` 的 `fillEnabled`：为 `false` 时路径内部完全透明。
+    pub fill_enabled: bool,
+    /// 描边宽度（画布像素）。
+    pub width: f32,
+    /// 描边相对路径的对齐方式。
+    pub align: VectorStrokeAlign,
+    /// `strokeStyleOpacity`，0..1。
+    pub opacity: f32,
+    /// 描边内容（`strokeStyleContent`）：纯色或渐变。
+    pub fill: VectorFill,
+}
+
+/// 解析 `vstk` 的负载。负载是一整个 DescriptorBlock（classID `strokeStyle`），
+/// 只有一个 u32 版本，比 `lfx2` 少一个 data version。
+pub fn parse_vector_stroke(bytes: &[u8]) -> Option<VectorStroke> {
+    let desc = descriptor::parse_block(bytes)?;
+    let width = desc.number(b"strokeStyleLineWidth").unwrap_or(0.0) as f32;
+    let align = match desc.enum_text(b"strokeStyleLineAlignment") {
+        Some("strokeStyleAlignInside") => VectorStrokeAlign::Inside,
+        Some("strokeStyleAlignOutside") => VectorStrokeAlign::Outside,
+        _ => VectorStrokeAlign::Center,
+    };
+    let mut fill = VectorFill::default();
+    if let Some(content) = desc.descriptor(b"strokeStyleContent") {
+        fill = fill_from_descriptor(content);
+    }
+    if fill.solid.is_none() && fill.gradient.is_none() {
+        fill = fill_from_descriptor(&desc);
+    }
+    Some(VectorStroke {
+        enabled: desc.boolean(b"strokeEnabled").unwrap_or(false),
+        fill_enabled: desc.boolean(b"fillEnabled").unwrap_or(true),
+        width,
+        align,
+        opacity: (desc.number(b"strokeStyleOpacity").unwrap_or(100.0) as f32 / 100.0)
+            .clamp(0.0, 1.0),
+        fill,
+    })
+}
+
+/// 描述符里的填充内容：`SoCo` / `GdFl` 包一层，或者直接是 `Clr ` / `Grad`。
+fn fill_from_descriptor(desc: &descriptor::Descriptor) -> VectorFill {
+    let mut fill = VectorFill::default();
+    if let Some(soco) = desc.descriptor(b"SoCo") {
+        fill.solid = soco.descriptor(b"Clr ").and_then(rgb_from);
+    }
+    if fill.solid.is_none() {
+        if let Some(clr) = desc.descriptor(b"Clr ") {
+            fill.solid = rgb_from(clr);
+        }
+    }
+    if let Some(gdfl) = desc.descriptor(b"GdFl") {
+        if let Some(g) = gdfl.descriptor(b"Grad") {
+            fill.gradient = Some(crate::effects::gradient_from_descriptor(&gdfl, g));
+        }
+    }
+    if fill.gradient.is_none() {
+        if let Some(g) = desc.descriptor(b"Grad") {
+            fill.gradient = Some(crate::effects::gradient_from_descriptor(desc, g));
+        }
+    }
+    fill
+}
+
 /// 解析形状填充的 sheet setting（`SoCo` / `GdFl`）：负载 = u32 版本（实测
 /// 16）+ 描述符本体，比 `vscg` 少一层 key 头。`SoCo` 的实色在 `Clr `，
 /// `GdFl` 的渐变在 `Grad` 子描述符里 —— 与 `vscg` 内层结构一致。

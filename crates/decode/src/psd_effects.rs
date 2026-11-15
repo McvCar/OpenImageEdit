@@ -122,6 +122,21 @@ fn legacy(axis: &str) -> bool {
 /// corner; effects that paint outside the layer (shadow, outside stroke) grow
 /// the bitmap and push the offset accordingly.
 pub fn bake(image: &RgbaImage, offset: (i32, i32), effects: &[LayerEffect]) -> Option<Baked> {
+    bake_with_alpha(image, offset, effects, None)
+}
+
+/// Like [`bake`], but the alpha that drives the styles can come from the shape's
+/// vector path instead of the bitmap.
+///
+/// A shape layer can have `fillEnabled = false`: its pixels are empty, yet
+/// Photoshop still rings it with a stroke and shades it with inner shadows. The
+/// styles are computed from the path, not from the (absent) fill.
+pub fn bake_with_alpha(
+    image: &RgbaImage,
+    offset: (i32, i32),
+    effects: &[LayerEffect],
+    alpha_override: Option<&[f32]>,
+) -> Option<Baked> {
     let active: Vec<&LayerEffect> = effects
         .iter()
         .filter(|e| e.enabled && !skip_kind(e.kind))
@@ -167,6 +182,27 @@ pub fn bake(image: &RgbaImage, offset: (i32, i32), effects: &[LayerEffect]) -> O
                 pad.top = pad.top.max(reach);
                 pad.bottom = pad.bottom.max(reach);
             }
+            // Inner effects read the *inverse* mask (the world outside the
+            // shape), so they can only fall off correctly when that world is
+            // part of the bitmap. A shape layer's bitmap ends exactly at its
+            // bounding box, which left no transparent border to blur: the glow
+            // and the shadow vanished along every straight edge and only
+            // survived in the corners.
+            EffectKind::InnerShadow => {
+                let (dx, dy) = offset_vector(e.distance, e.angle);
+                let reach = blur_margin(e.size) + dx.abs().max(dy.abs());
+                pad.left = pad.left.max(reach);
+                pad.right = pad.right.max(reach);
+                pad.top = pad.top.max(reach);
+                pad.bottom = pad.bottom.max(reach);
+            }
+            EffectKind::InnerGlow => {
+                let reach = blur_margin(e.size);
+                pad.left = pad.left.max(reach);
+                pad.right = pad.right.max(reach);
+                pad.top = pad.top.max(reach);
+                pad.bottom = pad.bottom.max(reach);
+            }
             _ => {}
         }
     }
@@ -197,7 +233,10 @@ pub fn bake(image: &RgbaImage, offset: (i32, i32), effects: &[LayerEffect]) -> O
     let mut alpha = vec![0.0f32; (w * h) as usize];
     for y in 0..ih {
         for x in 0..iw {
-            let a = image.get_pixel(x, y).0[3] as f32 / 255.0;
+            let a = match alpha_override {
+                Some(o) => o[(y * iw + x) as usize],
+                None => image.get_pixel(x, y).0[3] as f32 / 255.0,
+            };
             let (tx, ty) = ((x as i64 + ox) as u32, (y as i64 + oy) as u32);
             alpha[(ty * w + tx) as usize] = a;
         }
@@ -390,6 +429,27 @@ pub fn bake_group_effects(
                     StrokePosition::Center => (e.size / 2.0).ceil() as i32 + 2,
                     StrokePosition::Inside => 0,
                 };
+                pad.left = pad.left.max(reach);
+                pad.right = pad.right.max(reach);
+                pad.top = pad.top.max(reach);
+                pad.bottom = pad.bottom.max(reach);
+            }
+            // Inner effects read the *inverse* mask (the world outside the
+            // shape), so they can only fall off correctly when that world is
+            // part of the bitmap. A shape layer's bitmap ends exactly at its
+            // bounding box, which left no transparent border to blur: the glow
+            // and the shadow vanished along every straight edge and only
+            // survived in the corners.
+            EffectKind::InnerShadow => {
+                let (dx, dy) = offset_vector(e.distance, e.angle);
+                let reach = blur_margin(e.size) + dx.abs().max(dy.abs());
+                pad.left = pad.left.max(reach);
+                pad.right = pad.right.max(reach);
+                pad.top = pad.top.max(reach);
+                pad.bottom = pad.bottom.max(reach);
+            }
+            EffectKind::InnerGlow => {
+                let reach = blur_margin(e.size);
                 pad.left = pad.left.max(reach);
                 pad.right = pad.right.max(reach);
                 pad.top = pad.top.max(reach);
@@ -618,6 +678,66 @@ fn draw_outer_glow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: &Layer
     }
 }
 
+/// Ring coverage of a shape, given its per-pixel coverage.
+///
+/// `out_half` / `in_half` are the band widths outside / inside the contour, so a
+/// 2 px outside stroke is `(2.0, 0.0)` and a 1 px centre stroke `(0.5, 0.5)`.
+///
+/// `dist_*` measure from the **pixel centre** to the contour, which sits half a
+/// pixel outside a fully opaque border pixel's centre. A band of `size` px is
+/// therefore `size + 0.5 - d` wide as seen from the centre; measuring from the
+/// centre without that half pixel made every 1 px ring half transparent at the
+/// edge and shaved the last row off thicker rings.
+pub fn ring_coverage(alpha: &[f32], w: u32, h: u32, out_half: f32, in_half: f32) -> Vec<f32> {
+    let dist_in = if in_half > 0.0 {
+        dist_inside(alpha, w, h)
+    } else {
+        Vec::new()
+    };
+    let dist_out = if out_half > 0.0 {
+        dist_outside(alpha, w, h)
+    } else {
+        Vec::new()
+    };
+    ring_coverage_from_fields(alpha, w, h, &dist_in, &dist_out, out_half, in_half)
+}
+
+fn ring_coverage_from_fields(
+    alpha: &[f32],
+    w: u32,
+    h: u32,
+    dist_in: &[f32],
+    dist_out: &[f32],
+    out_half: f32,
+    in_half: f32,
+) -> Vec<f32> {
+    const CONTOUR_HALF: f32 = 0.5;
+    let mut cov = vec![0.0f32; alpha.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) as usize;
+            let a = alpha[i];
+            let mut c = 0.0f32;
+            // The inside half of the band lies over the content, so it takes the
+            // content's alpha.
+            if in_half > 0.0 && a > INSIDE_EPS {
+                let d = dist_in.get(i).copied().unwrap_or(0.0).max(0.0);
+                c = (in_half + CONTOUR_HALF - d).clamp(0.0, 1.0) * a;
+            }
+            // The outside half follows the contour, which runs *through* an
+            // antialiased border pixel: only its uncovered share is outside.
+            if out_half > 0.0 && a < 1.0 - INSIDE_EPS {
+                let d = dist_out.get(i).copied().unwrap_or(0.0).max(0.0);
+                let band = (out_half + CONTOUR_HALF - d).clamp(0.0, 1.0);
+                let share = if a <= INSIDE_EPS { 1.0 } else { 1.0 - a };
+                c = c.max(band * share);
+            }
+            cov[i] = c;
+        }
+    }
+    cov
+}
+
 fn draw_stroke(
     out: &mut RgbaImage,
     w: u32,
@@ -638,25 +758,10 @@ fn draw_stroke(
         StrokePosition::Inside => (0.0, size),
         StrokePosition::Center => (size / 2.0, size / 2.0),
     };
+    let cov_map = ring_coverage_from_fields(alpha, w, h, dist_in, dist_out, out_half, in_half);
     for y in 0..h {
         for x in 0..w {
-            let i = (y * w + x) as usize;
-            let a = alpha[i];
-            let mut cov = 0.0f32;
-            // The inside half of the band lies over the content, so it takes the
-            // content's alpha.
-            if in_half > 0.0 && a > INSIDE_EPS {
-                let d = dist_in.get(i).copied().unwrap_or(0.0).max(0.0);
-                cov = (in_half - d).clamp(0.0, 1.0) * a;
-            }
-            // The outside half follows the contour, which runs *through* an
-            // antialiased border pixel: only its uncovered share is outside.
-            if out_half > 0.0 && a < 1.0 - INSIDE_EPS {
-                let d = dist_out.get(i).copied().unwrap_or(0.0).max(0.0);
-                let band = (out_half - d).clamp(0.0, 1.0);
-                let share = if a <= INSIDE_EPS { 1.0 } else { 1.0 - a };
-                cov = cov.max(band * share);
-            }
+            let cov = cov_map[(y * w + x) as usize];
             if cov <= 0.002 {
                 continue;
             }
@@ -1609,6 +1714,159 @@ pub(crate) fn parse_layer_effects_for_debug(bytes: &[u8]) -> Option<Vec<psd::eff
 
 #[cfg(test)]
 mod debug_probe {
+    /// Diagnostic: parse every `vstk` block in a file and report what the
+    /// shape-stroke reader accepts.
+    ///
+    /// ```text
+    /// set IMAGEEDIT_INSPECT_PSD=<file.psd>
+    /// cargo test -p imageedit-decode debug_vstk -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn debug_vstk() {
+        let Ok(path) = std::env::var("IMAGEEDIT_INSPECT_PSD") else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read");
+        let (mut blocks, mut parsed) = (0, 0);
+        let mut i = 0usize;
+        while let Some(off) = find(&bytes[i..], b"vstk") {
+            let at = i + off;
+            i = at + 4;
+            let Some(len_bytes) = bytes.get(at + 4..at + 8) else { break };
+            let len = u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+            let Some(block) = bytes.get(at + 8..at + 8 + len) else { continue };
+            blocks += 1;
+            match psd::vector::parse_vector_stroke(block) {
+                Some(s) => {
+                    parsed += 1;
+                    if parsed <= 4 {
+                        println!(
+                            "ok fill_enabled={} stroke_enabled={} width={} align={:?} opacity={} solid={:?} grad={}",
+                            s.fill_enabled, s.enabled, s.width, s.align, s.opacity, s.fill.solid, s.fill.gradient.is_some()
+                        );
+                    }
+                }
+                None => {
+                    if blocks <= 4 {
+                        println!("fail head={:?}", &block[..block.len().min(20)]);
+                    }
+                }
+            }
+        }
+        println!("vstk blocks {blocks} parsed {parsed}");
+    }
+
+    /// Diagnostic: dump the contour (`Trns`) sub-descriptors of every `lfx2`
+    /// block, so the renderer can be written against the shapes the target
+    /// file actually carries.
+    ///
+    /// ```text
+    /// set IMAGEEDIT_INSPECT_PSD=<file.psd>
+    /// cargo test -p imageedit-decode debug_lfx2_contours -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn debug_lfx2_contours() {
+        use psd::descriptor::{parse_block2, Descriptor, DescriptorValue};
+        let Ok(path) = std::env::var("IMAGEEDIT_INSPECT_PSD") else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read");
+        let (mut blocks, mut effects, mut with_contour, mut non_linear) = (0, 0, 0, 0);
+        let mut shapes: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut printed = 0;
+        let mut i = 0usize;
+        while let Some(off) = find(&bytes[i..], b"lfx2") {
+            let at = i + off;
+            i = at + 4;
+            let Some(len_bytes) = bytes.get(at + 4..at + 8) else { break };
+            let len = u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+            let Some(block) = bytes.get(at + 8..at + 8 + len) else { continue };
+            let Some(root) = parse_block2(block) else { continue };
+            blocks += 1;
+            for (key, value) in &root.items {
+                let DescriptorValue::Descriptor(d) = value else { continue };
+                effects += 1;
+                let key_s = String::from_utf8_lossy(key).to_string();
+                if seen_keys.insert(key_s.clone()) {
+                    println!(
+                        "keys on {}: {:?}",
+                        key_s,
+                        d.items
+                            .iter()
+                            .map(|(k, v)| {
+                                let t = match v {
+                                    DescriptorValue::Descriptor(_) => "Objc",
+                                    DescriptorValue::List(_) => "VlLs",
+                                    DescriptorValue::Unit { .. } => "UntF",
+                                    DescriptorValue::Double(_) => "doub",
+                                    DescriptorValue::Integer(_) => "long",
+                                    DescriptorValue::Bool(_) => "bool",
+                                    DescriptorValue::Text(_) => "TEXT",
+                                    DescriptorValue::Enum { .. } => "enum",
+                                    DescriptorValue::Opaque => "opaque",
+                                };
+                                format!("{}:{t}", String::from_utf8_lossy(k))
+                            })
+                            .collect::<Vec<_>>()
+                    );
+                }
+                let contour = d
+                    .get(b"TrnS")
+                    .or_else(|| d.get(b"Trns"))
+                    .and_then(|v| match v {
+                        DescriptorValue::Descriptor(c) => Some(c),
+                        _ => None,
+                    });
+                let Some(c) = contour else { continue };
+                with_contour += 1;
+                let pts = contour_points(c);
+                if pts.len() > 2 || pts.iter().any(|(x, y)| (x - y).abs() > 0.02) {
+                    non_linear += 1;
+                }
+                let key_s = format!(
+                    "{}/{} pts={}",
+                    String::from_utf8_lossy(key),
+                    String::from_utf8_lossy(&c.class_id),
+                    pts.len()
+                );
+                *shapes.entry(key_s).or_insert(0) += 1;
+                if printed < 6 && (pts.len() > 2 || pts.iter().any(|(x, y)| (x - y).abs() > 0.02)) {
+                    printed += 1;
+                    println!(
+                        "contour on {} children {:?} pts {:?}",
+                        String::from_utf8_lossy(key),
+                        c.items.iter().map(|(k, _)| String::from_utf8_lossy(k).to_string()).collect::<Vec<_>>(),
+                        pts
+                    );
+                }
+            }
+        }
+        println!("lfx2 blocks {blocks} effects {effects} with-contour {with_contour} non-linear {non_linear}");
+        let mut list: Vec<_> = shapes.into_iter().collect();
+        list.sort_by(|a, b| b.1.cmp(&a.1));
+        for (k, v) in list {
+            println!("{v:>5}  {k}");
+        }
+        let _ = (parse_block2 as fn(&[u8]) -> Option<Descriptor>, &mut printed);
+    }
+
+    /// Normalised (x, y) control points of a contour descriptor (`Crv ` list of
+    /// `Hrzn` / `Vrtc` pairs; Photoshop's plane is 0..255 with y down).
+    fn contour_points(c: &psd::descriptor::Descriptor) -> Vec<(f32, f32)> {
+        use psd::descriptor::DescriptorValue;
+        let mut out = Vec::new();
+        let Some(list) = c.list(b"Crv ") else { return out };
+        for item in list {
+            let DescriptorValue::Descriptor(p) = item else { continue };
+            let (Some(x), Some(y)) = (p.number(b"Hrzn"), p.number(b"Vrtc")) else { continue };
+            out.push((x as f32, y as f32));
+        }
+        out
+    }
+
     /// Diagnostic: parse every `lfx2` block in a file and report how many the
     /// descriptor reader accepts.
     ///

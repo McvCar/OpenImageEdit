@@ -53,6 +53,8 @@ pub struct LayerProperties {
     pub(crate) vector_mask: Option<crate::vector::VectorMask>,
     /// 形状图层的填充内容（`vscg`）：纯色或渐变。
     pub(crate) vector_fill: Option<crate::vector::VectorFill>,
+    /// 形状图层的描边与填充开关（`vst2`）。
+    pub(crate) vector_stroke: Option<crate::vector::VectorStroke>,
 }
 
 /// Where a layer's mask lives, plus the "mask disabled" flag.
@@ -162,6 +164,7 @@ impl LayerProperties {
             mask_rect: layer_record.mask_rect,
             vector_mask: layer_record.vector_mask.clone(),
             vector_fill: layer_record.vector_fill.clone(),
+            vector_stroke: layer_record.vector_stroke.clone(),
         }
     }
 
@@ -202,6 +205,11 @@ impl LayerProperties {
     /// 形状图层的填充（`vscg`）。纯色 / 渐变 / 两者都没有（只有描边）。
     pub fn vector_fill(&self) -> Option<&crate::vector::VectorFill> {
         self.vector_fill.as_ref()
+    }
+
+    /// 形状图层的描边与填充开关（`vst2`）。
+    pub fn stroke_style(&self) -> Option<&crate::vector::VectorStroke> {
+        self.vector_stroke.as_ref()
     }
 
     /// Get the name of the layer
@@ -573,6 +581,8 @@ pub struct LayerRecord {
     pub(super) vector_mask: Option<crate::vector::VectorMask>,
     /// 形状填充（`vscg`）
     pub(super) vector_fill: Option<crate::vector::VectorFill>,
+    /// 形状描边与填充开关（`vst2`）
+    pub(super) vector_stroke: Option<crate::vector::VectorStroke>,
 }
 
 impl LayerRecord {

@@ -11,7 +11,7 @@
 //! 一个像素的亮点，所以按数值范围判断：全部点都在 ±4 以内就当作比例。
 
 use image::RgbaImage;
-use psd::{VectorFill, VectorMask};
+use psd::{VectorFill, VectorMask, VectorStroke, VectorStrokeAlign};
 
 /// 每条贝塞尔曲线切成多少段。形状层通常只有 4~16 个节点，24 段足以让
 /// 圆角在 4 倍超采样下看不出折线。
@@ -175,6 +175,83 @@ pub fn fill_shape(
         }
     }
     painted
+}
+
+/// 把形状的矢量描边（`vstk`）画到 `image` 上。
+///
+/// 29 个形状层是「只描边不填充」的（`fillEnabled = false`）：通道里一片
+/// 空白，可见内容就是这一圈描边。按 `vscg` 填色会把它们画成实心色块（实测
+/// `矩形 670` 因此盖住了下面剪贴的金色祥云纹理）。
+pub fn stroke_shape(
+    image: &mut RgbaImage,
+    offset: (i32, i32),
+    canvas: (u32, u32),
+    mask: &VectorMask,
+    stroke: &VectorStroke,
+) -> bool {
+    if !stroke.enabled || stroke.width <= 0.0 {
+        return false;
+    }
+    let (w, h) = image.dimensions();
+    let Some((cov, gb)) = shape_coverage(mask, w, h, offset, canvas) else {
+        return false;
+    };
+    let half = stroke.width / 2.0;
+    let (out_half, in_half) = match stroke.align {
+        VectorStrokeAlign::Outside => (stroke.width, 0.0),
+        VectorStrokeAlign::Center => (half, half),
+        VectorStrokeAlign::Inside => (0.0, stroke.width),
+    };
+    let ring = crate::psd_effects::ring_coverage(&cov, w, h, out_half, in_half);
+    let solid = stroke.fill.solid;
+    let gradient = stroke.fill.gradient.as_ref();
+    let mut painted = false;
+    for y in 0..h {
+        for x in 0..w {
+            let c = ring[(y * w + x) as usize];
+            if c <= 0.002 {
+                continue;
+            }
+            let (color, ga) = match (solid, gradient) {
+                (Some(c), _) => (c, 1.0),
+                (None, Some(g)) => {
+                    let t = crate::psd_effects::gradient_t(x as f32, y as f32, gb, g);
+                    g.sample(t)
+                }
+                (None, None) => ([0, 0, 0], 1.0),
+            };
+            let a = (c.clamp(0.0, 1.0) * ga.clamp(0.0, 1.0) * stroke.opacity) * 255.0;
+            let a = a.round().clamp(0.0, 255.0) as u8;
+            if a == 0 {
+                continue;
+            }
+            let px = image.get_pixel_mut(x, y);
+            let src_a = a as f32 / 255.0;
+            let inv = 1.0 - src_a;
+            for k in 0..3 {
+                px.0[k] = (color[k] as f32 * src_a + px.0[k] as f32 * inv).round() as u8;
+            }
+            px.0[3] = ((src_a + px.0[3] as f32 / 255.0 * inv) * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            painted = true;
+        }
+    }
+    painted
+}
+
+/// 形状路径在图层位图坐标系里的覆盖率（0..1，长度 `w * h`）。
+///
+/// 形状层的通道像素是空的（或过期的），图层样式要按矢量路径计算：Photoshop
+/// 对 `fillEnabled = false` 的形状照样描边、加内阴影，依据就是这条路径。
+pub fn path_alpha(
+    image: &RgbaImage,
+    offset: (i32, i32),
+    canvas: (u32, u32),
+    mask: &VectorMask,
+) -> Option<Vec<f32>> {
+    let (w, h) = image.dimensions();
+    shape_coverage(mask, w, h, offset, canvas).map(|(cov, _)| cov)
 }
 
 /// 把位图裁到矢量路径内：`alpha *= cov`（PS 显示形状层 = 内容 ∩ 路径）。
