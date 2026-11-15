@@ -3,7 +3,7 @@ use std::sync::Arc;
 use image::imageops::FilterType;
 use image::RgbaImage;
 
-use editcore::{Adjust, AdjustTarget, Document, Layer, LayerContent, Rect, Size};
+use editcore::{Adjust, AdjustTarget, Document, Layer, LayerContent, LayerMask, Rect, Size};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Viewport {
@@ -292,6 +292,9 @@ pub struct PreviewComposer {
     target: (u32, u32),
     base: Option<CachedScaled>,
     layers: Vec<Option<CachedScaled>>,
+    /// 每个有图层蒙版的层的预览尺度覆盖率（乘数），按 (ox, oy, w, h) 缓存。
+    /// 蒙版编辑同样走 `edit_epoch`，`prepare()` 里统一清空。
+    masks: Vec<Option<(i32, i32, u32, u32, Arc<Vec<u8>>)>>,
     /// Scaled bitmap of the layer being live-resized (kept separate from
     /// `layers` so a cancelled gesture cannot poison the layer's cache).
     live: Option<CachedScaled>,
@@ -323,6 +326,7 @@ impl PreviewComposer {
             target: (0, 0),
             base: None,
             layers: Vec::new(),
+            masks: Vec::new(),
             live: None,
             live_flip: (false, false),
             rotate_small: None,
@@ -355,6 +359,7 @@ impl PreviewComposer {
             self.target = (target.width, target.height);
             self.base = None;
             self.layers = vec![None; doc.layers.len()];
+            self.masks = vec![None; doc.layers.len()];
             self.live = None;
         }
         Some((
@@ -377,12 +382,26 @@ impl PreviewComposer {
             return RgbaImage::new(target.width, target.height);
         };
         let aligned = r.offset.0 == -doc.view.x && r.offset.1 == -doc.view.y;
-        if !aligned {
+        // 背景层带蒙版时不能走「整幅裁剪重采样」的快路径（快路径不做蒙版
+        // 合成），退回普通图层路径。
+        if !aligned || bg.mask.is_some() {
             let mut out = RgbaImage::new(target.width, target.height);
             let (ox, oy, nw, nh) =
                 Self::preview_dst(r.offset, (r.image.width(), r.image.height()), sx, sy);
             let src = self.scaled_layer(0, &r.image, nw, nh);
-            Self::blend_layer(&mut out, target, &src, ox, oy, bg.opacity, bg.blend, None);
+            let mask = self.masked_layer(0, bg, nw, nh);
+            let mask_ref = mask.as_deref().map(|m| (&m[..], nw));
+            Self::blend_layer(
+                &mut out,
+                target,
+                &src,
+                ox,
+                oy,
+                bg.opacity,
+                bg.blend,
+                None,
+                mask_ref,
+            );
             return out;
         }
         let nw = ((doc.view.width as f64 * sx).round() as u32).max(1);
@@ -410,7 +429,7 @@ impl PreviewComposer {
             return img;
         }
         let mut out = RgbaImage::new(img.width(), img.height());
-        Self::blend_layer(&mut out, target, &img, 0, 0, bg.opacity, bg.blend, None);
+        Self::blend_layer(&mut out, target, &img, 0, 0, bg.opacity, bg.blend, None, None);
         out
     }
 
@@ -481,6 +500,8 @@ impl PreviewComposer {
                     let (ox, oy, nw, nh) =
                         Self::preview_dst(r.offset, (r.image.width(), r.image.height()), sx, sy);
                     let src = self.scaled_layer(li, &r.image, nw, nh);
+                    let mask = self.masked_layer(li, layer, nw, nh);
+                    let mask_ref = mask.as_deref().map(|m| (&m[..], nw));
                     match adjust {
                         Some((AdjustTarget::Layer(index), params)) if index == li => {
                             let mut adjusted = (*src).clone();
@@ -494,6 +515,7 @@ impl PreviewComposer {
                                 layer.opacity,
                                 layer.blend,
                                 clip_alpha,
+                                mask_ref,
                             );
                         }
                         _ => Self::blend_layer(
@@ -505,6 +527,7 @@ impl PreviewComposer {
                             layer.opacity,
                             layer.blend,
                             clip_alpha,
+                            mask_ref,
                         ),
                     }
                 }
@@ -555,9 +578,11 @@ impl PreviewComposer {
     /// out as byte slices so the per-tick cost stays low even in debug
     /// builds.
     ///
-    /// `clip` 是剪贴蒙版基线层的覆盖率（预览尺度，与 `out_buf` 同尺寸），
-    /// 作为 src alpha 的乘数 —— 与 `Document::flatten_in_doc_space` 的
-    /// `fill_clip_coverage` 同语义。基底层 / 无剪贴层自己混合时传 `None`。
+    /// `clip` 是剪贴蒙版基线层的覆盖率（预览尺度，与 `out_buf` 同尺寸）；
+    /// `mask` 是图层蒙版的覆盖率（**图层自己的矩形尺寸**，宽度一并传进来）。
+    /// 两者都是「src alpha 乘数」，先乘蒙版再乘剪贴 —— 与
+    /// `Document::flatten_in_doc_space` 的 `composite_raster` 同序。
+    /// 基底层 / 无剪贴层自己混合时对应参数传 `None`。
     fn blend(
         out_buf: &mut [u8],
         target: Size,
@@ -567,6 +592,7 @@ impl PreviewComposer {
         opacity: f32,
         mode: editcore::BlendMode,
         clip: Option<&[u8]>,
+        mask: Option<(&[u8], u32)>,
     ) {
         let nw = src.width() as i32;
         let nh = src.height() as i32;
@@ -593,8 +619,11 @@ impl PreviewComposer {
                 let oo = tx as usize * 4;
                 if normal {
                     // 与 `composite_raster` + `blend_pixel_f32` 完全同序：
-                    // alpha = (a/255) × 剪贴，再乘图层不透明度。
+                    // alpha = (a/255 × 蒙版) × 剪贴，再乘图层不透明度。
                     let mut alpha = srow[so + 3] as f32 / 255.0;
+                    if let Some((m, mw)) = mask {
+                        alpha *= m[ly as usize * mw as usize + lx as usize] as f32 / 255.0;
+                    }
                     if let Some(c) = clip {
                         let ci = ty as usize * target.width as usize + tx as usize;
                         alpha *= c[ci] as f32 / 255.0;
@@ -622,6 +651,10 @@ impl PreviewComposer {
                         srow[so + 2],
                         srow[so + 3],
                     ];
+                    if let Some((m, mw)) = mask {
+                        let mcov = m[ly as usize * mw as usize + lx as usize] as u32;
+                        px[3] = ((px[3] as u32 * mcov + 127) / 255) as u8;
+                    }
                     if let Some(c) = clip {
                         let cov = c[ty as usize * target.width as usize + tx as usize] as u32;
                         px[3] = ((px[3] as u32 * cov + 127) / 255) as u8;
@@ -642,11 +675,123 @@ impl PreviewComposer {
         opacity: f32,
         mode: editcore::BlendMode,
         clip: Option<&[u8]>,
+        mask: Option<(&[u8], u32)>,
     ) {
         let mut raw = std::mem::take(out).into_raw();
-        Self::blend(&mut raw, target, src, ox, oy, opacity, mode, clip);
+        Self::blend(&mut raw, target, src, ox, oy, opacity, mode, clip, mask);
         *out = RgbaImage::from_raw(target.width, target.height, raw)
             .expect("preview buffer size preserved");
+    }
+
+    /// 蒙版在画布区间 `[x0, x1) × [y0, y1)` 上的平均覆盖率（u8）。
+    ///
+    /// 区间端点向外取整后逐像素取**字节**平均（不是取采样点），与位图的降
+    /// 采样口径一致：`downscale_box` 的一个输出像素正好覆盖源图同一段区间，
+    /// 蒙版按同一段区间取平均才不会在缩略图上「透出/多挡」半行。
+    ///
+    /// 缩放比恰好为 1 时区间里只有一个像素，结果逐字节等于
+    /// `mask.coverage()` 的 u8 值，1:1 预览才能和 flatten 逐字节一致。
+    fn mask_cov_range(mask: &LayerMask, x0: f64, x1: f64, y0: f64, y1: f64) -> u8 {
+        let cx0 = x0.floor() as i32;
+        let cx1 = (x1.ceil() as i32).max(cx0 + 1);
+        let cy0 = y0.floor() as i32;
+        let cy1 = (y1.ceil() as i32).max(cy0 + 1);
+        let mut sum = 0u64;
+        let mut n = 0u64;
+        for y in cy0..cy1 {
+            for x in cx0..cx1 {
+                let lx = x - mask.offset.0;
+                let ly = y - mask.offset.1;
+                let v = if lx < 0
+                    || ly < 0
+                    || lx >= mask.image.width() as i32
+                    || ly >= mask.image.height() as i32
+                {
+                    mask.default
+                } else {
+                    mask.image.get_pixel(lx as u32, ly as u32).0[0]
+                };
+                sum += v as u64;
+                n += 1;
+            }
+        }
+        ((sum + n / 2) / n.max(1)) as u8
+    }
+
+    /// 一层位图在预览尺度上的蒙版覆盖率数组（长度 = `nw * nh`）。
+    ///
+    /// 输出像素 `(tx, ty)` 覆盖源图局部区间 `[tx*sw/nw, (tx+1)*sw/nw)`，
+    /// 加图层 offset 后交给 [`Self::mask_cov_range`] —— 与 `resize_to` 对同一
+    /// 层位图做的区间平均严格对应，缩小时不会因 `preview_dst` 的 floor/ceil
+    /// 而错位。
+    fn mask_cov_for_rect(
+        mask: &LayerMask,
+        offset: (i32, i32),
+        sw: u32,
+        sh: u32,
+        nw: u32,
+        nh: u32,
+    ) -> Vec<u8> {
+        let mut cov = vec![255u8; nw as usize * nh as usize];
+        if nw == 0 || nh == 0 {
+            return cov;
+        }
+        let rx = sw as f64 / nw as f64;
+        let ry = sh as f64 / nh as f64;
+        for ty in 0..nh {
+            let y0 = offset.1 as f64 + ty as f64 * ry;
+            let y1 = offset.1 as f64 + (ty as f64 + 1.0) * ry;
+            for tx in 0..nw {
+                let x0 = offset.0 as f64 + tx as f64 * rx;
+                let x1 = offset.0 as f64 + (tx as f64 + 1.0) * rx;
+                cov[ty as usize * nw as usize + tx as usize] =
+                    Self::mask_cov_range(mask, x0, x1, y0, y1);
+            }
+        }
+        cov
+    }
+
+    /// 图层蒙版在预览尺度上的 alpha 乘数（长度 = 该图层缩放后的像素数）。
+    ///
+    /// 每帧为每个有蒙版的图层重算一次是整块 O(像素) 的活，所以按
+    /// `(offset.x, offset.y, nw, nh)` 缓存到 `self.masks[li]`：拖动只改
+    /// offset 时缓存失效一次，纯重绘（offset / 尺寸都没变）直接命中；换
+    /// epoch / 换预览尺寸由 `prepare()` 统一清空。全 255（蒙版没有真正遮挡）
+    /// 时返回 `None`，让热路径不付任何逐像素代价。
+    ///
+    /// 矢量标记不在这里处理：`flatten_in_doc_space` 的 Mark 分支不应用蒙版，
+    /// 预览保持同一语义。
+    fn masked_layer(&mut self, li: usize, layer: &Layer, nw: u32, nh: u32) -> Option<Arc<Vec<u8>>> {
+        let Some(mask) = layer.mask.as_ref() else {
+            return None;
+        };
+        let Some(r) = layer.raster() else {
+            return None;
+        };
+        if let Some((cx, cy, cw, ch, cov)) = self.masks.get(li).cloned().flatten() {
+            if cx == r.offset.0 && cy == r.offset.1 && cw == nw && ch == nh {
+                return Some(cov);
+            }
+        }
+        let cov = Self::mask_cov_for_rect(
+            mask,
+            r.offset,
+            r.image.width(),
+            r.image.height(),
+            nw,
+            nh,
+        );
+        if cov.iter().all(|&c| c == 255) {
+            if li < self.masks.len() {
+                self.masks[li] = None;
+            }
+            return None;
+        }
+        let arc = Arc::new(cov);
+        if li < self.masks.len() {
+            self.masks[li] = Some((r.offset.0, r.offset.1, nw, nh, arc.clone()));
+        }
+        Some(arc)
     }
 
     /// 剪贴基线层的覆盖率（预览尺度 u8 alpha）。
@@ -670,20 +815,38 @@ impl PreviewComposer {
         if !layer.visible || layer.opacity <= 0.0 {
             return cov;
         }
-        let (src, ox, oy) = match &layer.content {
+        let (src, ox, oy, mcov) = match &layer.content {
             LayerContent::Raster(r) => {
                 let (ox, oy, nw, nh) =
                     Self::preview_dst(r.offset, (r.image.width(), r.image.height()), sx, sy);
                 let src = self.scaled_layer(li, &r.image, nw, nh);
-                (src, ox, oy)
+                let mcov = self.masked_layer(li, layer, nw, nh);
+                (src, ox, oy, mcov)
             }
             LayerContent::Mark(_) => {
                 let (plane, offset) = layer.plane();
                 let (ox, oy, nw, nh) =
                     Self::preview_dst(offset, (plane.width(), plane.height()), sx, sy);
-                (Arc::new(resize_to(&plane, Size::new(nw, nh))), ox, oy)
+                // 与 `fill_clip_coverage` 一样，标记基底也要乘自己的蒙版。
+                let mcov = layer.mask.as_ref().map(|mask| {
+                    Arc::new(Self::mask_cov_for_rect(
+                        mask,
+                        offset,
+                        plane.width(),
+                        plane.height(),
+                        nw,
+                        nh,
+                    ))
+                });
+                (
+                    Arc::new(resize_to(&plane, Size::new(nw, nh))),
+                    ox,
+                    oy,
+                    mcov,
+                )
             }
         };
+        let mw = src.width();
         let tw = target.width as i32;
         let th = target.height as i32;
         for ty in 0..src.height() as i32 {
@@ -696,7 +859,13 @@ impl PreviewComposer {
                 if px < 0 || px >= tw {
                     continue;
                 }
-                let a = src.get_pixel(tx as u32, ty as u32).0[3];
+                let mut a = src.get_pixel(tx as u32, ty as u32).0[3];
+                if a > 0 {
+                    if let Some(m) = mcov.as_deref() {
+                        let m = m[ty as usize * mw as usize + tx as usize] as u32;
+                        a = ((a as u32 * m + 127) / 255) as u8;
+                    }
+                }
                 if a > 0 {
                     cov[py as usize * tw as usize + px as usize] = a;
                 }
@@ -857,7 +1026,7 @@ impl PreviewComposer {
                 }
                 _ => (*src).clone(),
             };
-            Self::blend_layer(&mut out, target, &stretched, ox, oy, drag_opacity, drag_blend, None);
+            Self::blend_layer(&mut out, target, &stretched, ox, oy, drag_opacity, drag_blend, None, None);
         }
         doc.apply_display_color(&mut out);
         out
@@ -966,7 +1135,7 @@ impl PreviewComposer {
                 }
                 _ => active,
             };
-            Self::blend_layer(&mut out, target, &stretched, 0, 0, drag_opacity, drag_blend, None);
+            Self::blend_layer(&mut out, target, &stretched, 0, 0, drag_opacity, drag_blend, None, None);
         }
         doc.apply_display_color(&mut out);
         out
@@ -1059,7 +1228,7 @@ impl PreviewComposer {
                 }
                 _ => rotated,
             };
-            Self::blend_layer(&mut out, target, &src, ox, oy, drag_opacity, drag_blend, None);
+            Self::blend_layer(&mut out, target, &src, ox, oy, drag_opacity, drag_blend, None, None);
         }
         doc.apply_display_color(&mut out);
         out
@@ -1236,6 +1405,126 @@ mod tests {
         let preview = PreviewComposer::new().composite(&doc, doc.canvas);
         let flat = doc.flatten_in_doc_space();
         assert_eq!(preview.as_raw(), flat.as_raw(), "预览与 flatten 的剪贴结果不一致");
+    }
+
+    /// 图层蒙版必须在「预览合成」里生效，且 1:1 时与 flatten 逐字节一致。
+    ///
+    /// 回归对象：`PreviewComposer` 曾经完全不看 `Layer::mask`，带蒙版的层在
+    /// 预览里是「蒙版透明处仍然整块可见」；而保存 / 保真走
+    /// `flatten_in_doc_space`，于是窗口与导出图对不上。
+    ///
+    /// 蒙版取 0 / 64 / 128 / 192 / 255 五档分数值：只要预览的覆盖率换算写错
+    /// 一个字节（例如把 `coverage()` 的 f32 直接截断成 0/1），逐字节断言就会
+    /// 失败。
+    #[test]
+    fn preview_matches_flatten_with_layer_mask_at_actual_size() {
+        use image::{GrayImage, Luma};
+        let mut doc = Document::from_image(solid(16, 8, [250, 250, 250, 255]));
+        let mut layer = Layer::new("masked", solid(16, 8, [200, 30, 40, 255]));
+        let mut mask = GrayImage::new(16, 8);
+        for y in 0..8u32 {
+            for x in 0..16u32 {
+                mask.put_pixel(
+                    x,
+                    y,
+                    Luma([match x % 5 {
+                        0 => 0,
+                        1 => 64,
+                        2 => 128,
+                        3 => 192,
+                        _ => 255,
+                    }]),
+                );
+            }
+        }
+        layer.mask = Some(LayerMask::new(mask, (0, 0)));
+        doc.add_layer(layer).unwrap();
+
+        let preview = PreviewComposer::new().composite(&doc, doc.canvas);
+        let flat = doc.flatten_in_doc_space();
+        assert_eq!(
+            preview.as_raw(),
+            flat.as_raw(),
+            "1:1 预览与 flatten_in_doc_space 不一致（蒙版）"
+        );
+
+        // 钉住「蒙版确实乘进了 alpha」：0 处完全露出底图，255 处完全是本层。
+        assert_eq!(preview.get_pixel(0, 0).0, [250, 250, 250, 255]);
+        assert_eq!(preview.get_pixel(4, 0).0, [200, 30, 40, 255]);
+        // 128 处应是严格按 alpha=128/255 的正片叠底结果。
+        let half = preview.get_pixel(2, 0).0;
+        assert_eq!(half, [225, 140, 145, 255], "蒙版半遮的混合结果不对");
+    }
+
+    /// 蒙版覆盖率按**预览像素覆盖的画布区间**取平均，而不是点采样。
+    ///
+    /// 3×1 的层在 2×1 预览里，第一个预览像素覆盖画布 x 0..1.5：蒙版是
+    /// [0, 255, 255]，正确结果是一半覆盖（128/255），不是 0 或 255。
+    #[test]
+    fn preview_mask_coverage_follows_preview_scale() {
+        use image::{GrayImage, Luma};
+        let mut doc = Document::from_image(solid(3, 1, [255, 255, 255, 255]));
+        let mut layer = Layer::new("masked", solid(3, 1, [0, 0, 0, 255]));
+        let mut mask = GrayImage::new(3, 1);
+        mask.put_pixel(0, 0, Luma([0]));
+        mask.put_pixel(1, 0, Luma([255]));
+        mask.put_pixel(2, 0, Luma([255]));
+        layer.mask = Some(LayerMask::new(mask, (0, 0)));
+        doc.add_layer(layer).unwrap();
+
+        let out = PreviewComposer::new().composite(&doc, Size::new(2, 1));
+        assert_eq!(out.get_pixel(1, 0).0, [0, 0, 0, 255], "右格应被完全遮住");
+        let edge = out.get_pixel(0, 0).0;
+        assert_eq!(edge[3], 255);
+        assert_eq!(edge[0], 127, "半覆盖的预览像素应混成中灰，得到 {:?}", edge);
+    }
+
+    /// 蒙版与剪贴同时存在时：先乘蒙版、再乘剪贴覆盖率。
+    ///
+    /// 基底红块自己带蒙版（右半遮住），上面压一层剪贴蓝层。正确结果：
+    /// - 基底可见处 → 蓝（剪贴层）；
+    /// - 基底被蒙版遮住处 → 白底（剪贴层跟着消失，而不是漏出蓝）；
+    /// - 基底矩形外 → 白底。
+    /// 若顺序反过来（先剪贴再蒙版），右侧会错误地留下蓝色。
+    #[test]
+    fn preview_applies_mask_before_clip() {
+        use image::{GrayImage, Luma};
+        let mut doc = Document::from_image(solid(8, 8, [255, 255, 255, 255]));
+        let mut base = Layer::new("base", solid(6, 6, [255, 0, 0, 255]));
+        base.set_offset((1, 1));
+        let mut mask = GrayImage::new(6, 6);
+        for y in 0..6u32 {
+            for x in 0..6u32 {
+                mask.put_pixel(x, y, Luma([if x < 3 { 255 } else { 0 }]));
+            }
+        }
+        base.mask = Some(LayerMask::new(mask, (1, 1)));
+        doc.add_layer(base).unwrap();
+        let mut clipped = Layer::new("clipped", solid(8, 8, [0, 0, 255, 255]));
+        clipped.clipping = true;
+        doc.add_layer(clipped).unwrap();
+
+        let out = PreviewComposer::new().composite(&doc, doc.canvas);
+        assert_eq!(
+            out.get_pixel(2, 2).0,
+            [0, 0, 255, 255],
+            "基底可见处应显示剪贴层"
+        );
+        assert_eq!(
+            out.get_pixel(5, 2).0,
+            [255, 255, 255, 255],
+            "基底被蒙版遮住，剪贴层必须一起消失"
+        );
+        assert_eq!(
+            out.get_pixel(0, 0).0,
+            [255, 255, 255, 255],
+            "基底矩形外应露出白底"
+        );
+        assert_eq!(
+            out.as_raw(),
+            doc.flatten_in_doc_space().as_raw(),
+            "1:1 预览与 flatten 的蒙版 + 剪贴叠加结果不一致"
+        );
     }
 
     #[test]
