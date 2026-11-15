@@ -374,6 +374,9 @@ mod tests {
             vector_mask: None,
             vector_fill: None,
             vector_stroke: None,
+            blend_ranges: None,
+            knockout: None,
+            transparency_shapes: None,
         };
 
         let layer = PsdLayer {

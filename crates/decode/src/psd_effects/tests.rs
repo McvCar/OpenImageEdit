@@ -28,6 +28,7 @@ fn effect(kind: EffectKind) -> LayerEffect {
         stroke_position: StrokePosition::Outside,
         stroke_fill: StrokeFill::Color,
         gradient: None,
+        contour: None,
         knocks_out: true,
         glow_source: GlowSource::Edge,
         pattern: None,
@@ -305,6 +306,38 @@ fn noise_speckles_the_effect_matte() {
     );
     let again = bake(&img, (0, 0), &[noisy]).expect("noisy shadow again");
     assert_eq!(grain.image.as_raw(), again.image.as_raw(), "颗粒必须确定");
+}
+
+/// 等高线（`TrnS`）重映射投影的柔和边缘：把 0.5 以下压到 0，遮罩总量下降。
+/// 恒等曲线（(0,0)→(1,1)）必须和「没有曲线」完全一致。
+#[test]
+fn contour_remaps_the_shadow_matte() {
+    let img = layer(16, 16, [255, 255, 255, 255], 4);
+    let mut e = effect(EffectKind::DropShadow);
+    e.size = 4.0;
+    e.distance = 2.0;
+    e.opacity = 1.0;
+    let clean = bake(&img, (0, 0), &[e.clone()]).expect("clean shadow");
+    let sum = |b: &Baked| b.behind_coverage.iter().map(|&v| v as u32).sum::<u32>();
+    let clean_sum = sum(&clean);
+
+    let mut identity = e.clone();
+    identity.contour = Some(psd::effects::Contour {
+        points: vec![(0.0, 0.0), (1.0, 1.0)],
+    });
+    let same = bake(&img, (0, 0), &[identity]).expect("identity contour");
+    assert_eq!(clean.image.as_raw(), same.image.as_raw(), "直线等高线是恒等映射");
+
+    e.contour = Some(psd::effects::Contour {
+        points: vec![(0.0, 0.0), (0.5, 0.0), (1.0, 1.0)],
+    });
+    let shaped = bake(&img, (0, 0), &[e]).expect("contoured shadow");
+    let shaped_sum = sum(&shaped);
+    assert!(shaped_sum > 0, "等高线不能让投影整块消失");
+    assert!(
+        shaped_sum < clean_sum,
+        "等高线压低柔和边缘: clean {clean_sum} shaped {shaped_sum}"
+    );
 }
 
 #[test]

@@ -85,6 +85,37 @@ pub enum GradientKind {
     Diamond,
 }
 
+/// 效果等高线（`TrnS`，PS 里的「透明度形状」；斜面/浮雕用它的「光泽等高线」）。
+///
+/// 把效果自己的遮罩覆盖率按曲线重新映射。Photoshop 默认的曲线是
+/// (0,0) → (255,255) 的直线，等价于恒等映射，所以只保留真正弯过的曲线，
+/// 渲染端在绝大多数图层上不必逐像素查表。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Contour {
+    /// 归一化控制点（0..1），按 x 递增。
+    pub points: Vec<(f32, f32)>,
+}
+
+impl Contour {
+    /// 在 `t`（0..1）处线性插值；两端之外取端点值。
+    pub fn eval(&self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        let first = self.points[0];
+        if t <= first.0 {
+            return first.1;
+        }
+        for pair in self.points.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if t <= b.0 {
+                let span = (b.0 - a.0).max(1e-5);
+                let k = (t - a.0) / span;
+                return (a.1 + (b.1 - a.1) * k).clamp(0.0, 1.0);
+            }
+        }
+        self.points[self.points.len() - 1].1
+    }
+}
+
 /// One colour stop, location normalised to 0..1.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColorStop {
@@ -231,6 +262,8 @@ pub struct LayerEffect {
     pub stroke_fill: StrokeFill,
     /// Stroke / gradient overlay ramp.
     pub gradient: Option<Gradient>,
+    /// `TrnS` 等高线：重映射效果遮罩的覆盖率（None = 恒等）。
+    pub contour: Option<Contour>,
     /// `layerConceals`: the layer knocks the shadow out of itself.
     pub knocks_out: bool,
     /// Inner glow only.
@@ -280,6 +313,7 @@ impl LayerEffect {
             stroke_position: StrokePosition::Outside,
             stroke_fill: StrokeFill::Color,
             gradient: None,
+            contour: None,
             pattern: None,
             pattern_phase: (0.0, 0.0),
             knocks_out: true,
@@ -451,6 +485,38 @@ fn kind_for_key(key: &[u8], legacy: bool) -> Option<(EffectKind, bool)> {
     }
 }
 
+/// 读 `TrnS` 等高线。默认直线 (0,0) → (255,255) 返回 `None`：它是恒等
+/// 映射，渲染端不必为它逐像素查表。
+fn parse_contour(c: &Descriptor) -> Option<Contour> {
+    let mut points = Vec::new();
+    for item in c.list(b"Crv ")? {
+        let DescriptorValue::Descriptor(p) = item else {
+            continue;
+        };
+        let (Some(x), Some(y)) = (p.number(b"Hrzn"), p.number(b"Vrtc")) else {
+            continue;
+        };
+        points.push((
+            (x as f32 / 255.0).clamp(0.0, 1.0),
+            (y as f32 / 255.0).clamp(0.0, 1.0),
+        ));
+    }
+    if points.len() < 2 {
+        return None;
+    }
+    points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let identity = points.len() == 2
+        && points[0].0.abs() < 1e-3
+        && points[0].1.abs() < 1e-3
+        && (points[1].0 - 1.0).abs() < 1e-3
+        && (points[1].1 - 1.0).abs() < 1e-3;
+    if identity {
+        None
+    } else {
+        Some(Contour { points })
+    }
+}
+
 fn parse_effect(kind: EffectKind, d: &Descriptor) -> LayerEffect {
     let mut e = LayerEffect::new(kind);
     if let Some(v) = d.boolean(b"enab") {
@@ -493,6 +559,10 @@ fn parse_effect(kind: EffectKind, d: &Descriptor) -> LayerEffect {
     // `Nose`：效果噪声百分比（投影 / 内阴影 / 外发光 / 内发光）。
     if let Some(v) = d.number(b"Nose") {
         e.noise = (v as f32).clamp(0.0, 100.0);
+    }
+    // `TrnS`：效果等高线（投影/发光的透明度形状；斜面的光泽等高线）。
+    if let Some(c) = d.descriptor(b"TrnS") {
+        e.contour = parse_contour(c);
     }
     if let Some(v) = d.boolean(b"layerConceals") {
         e.knocks_out = v;
@@ -720,6 +790,19 @@ fn blend_from_enum(v: &[u8; 4]) -> BlendMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 等高线求值：分段线性、两端夹紧。
+    #[test]
+    fn contour_eval_interpolates_and_clamps() {
+        let c = Contour {
+            points: vec![(0.0, 0.0), (0.5, 0.75), (1.0, 1.0)],
+        };
+        assert!((c.eval(0.25) - 0.375).abs() < 1e-6);
+        assert!((c.eval(0.5) - 0.75).abs() < 1e-6);
+        assert!((c.eval(0.75) - 0.875).abs() < 1e-6);
+        assert_eq!(c.eval(-1.0), 0.0);
+        assert_eq!(c.eval(2.0), 1.0);
+    }
 
     fn push_u32(v: &mut Vec<u8>, n: u32) {
         v.extend_from_slice(&n.to_be_bytes());

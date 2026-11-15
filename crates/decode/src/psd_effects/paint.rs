@@ -226,6 +226,17 @@ pub(super) fn noise_factor(x: u32, y: u32, noise: f32) -> f32 {
     1.0 - amount * r
 }
 
+/// 效果等高线（`TrnS`）：把效果遮罩的覆盖率按曲线重映射。
+///
+/// 没有曲线时原样返回（解析阶段已把默认直线归成 `None`），所以绝大多数
+/// 图层的效果路径不受影响。斜面/浮雕用它当光泽等高线，重映射的是受光量。
+pub(super) fn contour_value(e: &LayerEffect, t: f32) -> f32 {
+    match e.contour.as_ref() {
+        Some(c) => c.eval(t),
+        None => t,
+    }
+}
+
 pub(super) fn draw_drop_shadow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: &LayerEffect) {
     let (dx, dy) = offset_vector(e.distance, e.angle);
     let shifted = shift_mask(alpha, w, h, dx, dy, 0.0);
@@ -238,7 +249,7 @@ pub(super) fn draw_drop_shadow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32
     for y in 0..h {
         for x in 0..w {
             let i = (y * w + x) as usize;
-            let mut cov = blurred[i];
+            let mut cov = contour_value(e, blurred[i]);
             if e.knocks_out {
                 cov *= 1.0 - alpha[i];
             }
@@ -261,7 +272,7 @@ pub(super) fn draw_outer_glow(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32]
     let mode = blend_of(e.blend);
     for y in 0..h {
         for x in 0..w {
-            let cov = (blurred[(y * w + x) as usize] * 2.0).min(1.0)
+            let cov = contour_value(e, (blurred[(y * w + x) as usize] * 2.0).min(1.0))
                 * noise_factor(x, y, e.noise);
             if cov <= 0.002 {
                 continue;
@@ -442,7 +453,7 @@ pub(super) fn draw_inner_shadow(
             if alpha[i] <= INSIDE_EPS {
                 continue;
             }
-            let cov = blurred[i] * noise_factor(x, y, e.noise);
+            let cov = contour_value(e, blurred[i]) * noise_factor(x, y, e.noise);
             if cov <= 0.002 {
                 continue;
             }
@@ -488,7 +499,7 @@ pub(super) fn draw_inner_glow(
                 // the range (Photoshop 27.11).
                 t = 1.0 - t;
             }
-            let cov = t * noise_factor(x, y, e.noise);
+            let cov = contour_value(e, t) * noise_factor(x, y, e.noise);
             if cov <= 0.002 {
                 continue;
             }
@@ -666,7 +677,7 @@ pub(super) fn draw_bevel(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: 
                 psd::BevelStyle::Outer => 1.0 - alpha[i],
                 _ => 1.0,
             };
-            let cov = edge * side * shade.abs().min(1.0);
+            let cov = edge * side * contour_value(e, shade.abs().min(1.0));
             if cov <= 0.002 {
                 continue;
             }
