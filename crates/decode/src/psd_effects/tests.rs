@@ -600,3 +600,44 @@ fn bevel_direction_flips_the_shading() {
     };
     assert!(at(6, 6) < at(33, 33), "凹凸翻转后右下反而更亮");
 }
+
+/// 根 `Scl `（图层样式 Scale 滑块）：只放大几何量，百分比/颜色/渐变不动。
+#[test]
+fn layer_style_scale_multiplies_geometry_only() {
+    let mut shadow = effect(EffectKind::DropShadow);
+    shadow.distance = 4.0;
+    shadow.size = 8.0;
+    shadow.opacity = 0.5;
+    let mut stroke = effect(EffectKind::Stroke);
+    stroke.size = 2.0;
+    let mut bevel = effect(EffectKind::BevelEmboss);
+    bevel.size = 5.0;
+    bevel.soften = 3.0;
+    let mut pattern = effect(EffectKind::PatternOverlay);
+    pattern.pattern = Some(psd::VectorPattern {
+        id: "p".into(),
+        name: "P".into(),
+        scale: 50.0,
+        angle: 0.0,
+        align: true,
+    });
+    let gradient = effect(EffectKind::GradientOverlay);
+    let mut all = vec![shadow, stroke, bevel, pattern, gradient];
+
+    psd::effects::apply_effect_scale(&mut all, 200.0);
+    assert_eq!(all[0].distance, 8.0);
+    assert_eq!(all[0].size, 16.0);
+    assert_eq!(all[0].opacity, 0.5);
+    assert_eq!(all[1].size, 4.0);
+    assert_eq!(all[2].size, 10.0);
+    assert_eq!(all[2].soften, 6.0);
+    assert_eq!(all[3].pattern.as_ref().unwrap().scale, 100.0);
+
+    // 100 % 是恒等，逐字段不变。
+    let mut same = vec![effect(EffectKind::DropShadow)];
+    same[0].distance = 4.0;
+    same[0].size = 8.0;
+    psd::effects::apply_effect_scale(&mut same, 100.0);
+    assert_eq!(same[0].distance, 4.0);
+    assert_eq!(same[0].size, 8.0);
+}

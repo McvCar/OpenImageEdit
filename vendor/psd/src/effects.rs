@@ -331,6 +331,48 @@ impl LayerEffect {
             soften: 0.0,
         }
     }
+
+    /// 乘上「图层样式缩放」（根描述符的 `Scl `）。只动几何量，百分比与颜色
+    /// 不动；图案铺贴比例也要跟着变（纹理图案同理）。
+    fn scale_by(&mut self, k: f32) {
+        match self.kind {
+            // 投影/内阴影：偏移与模糊半径。
+            EffectKind::DropShadow | EffectKind::InnerShadow => {
+                self.distance *= k;
+                self.size *= k;
+            }
+            // 发光只有模糊半径；描边只有宽度。
+            EffectKind::OuterGlow | EffectKind::InnerGlow | EffectKind::Stroke => {
+                self.size *= k;
+            }
+            // 斜面的大小与柔化。
+            EffectKind::BevelEmboss => {
+                self.size *= k;
+                self.soften *= k;
+            }
+            // 颜色/渐变叠加：换色与渐变本身不随缩放变化。
+            _ => {}
+        }
+        if let Some(p) = &mut self.pattern {
+            // Photoshop 图案缩放范围是 1..1000 %。
+            p.scale = (p.scale * k).clamp(1.0, 1000.0);
+        }
+    }
+}
+
+/// 应用图层样式缩放（`lfx2` / `lfxs` / `lmfx` 根描述符的 `Scl `，单位 `#Prc`）。
+///
+/// Photoshop 把「图层样式」对话框的 Scale 滑块单独记在根上，而各效果里仍是
+/// 作者填的原始数值：200 % 的投影应当画成两倍偏移/模糊，而重新打开对话框时
+/// 数值仍是原值、滑块仍是 200 %。`100`（缺省）是恒等，0 或非法值忽略。
+pub fn apply_effect_scale(effects: &mut [LayerEffect], percent: f32) {
+    let k = percent / 100.0;
+    if !k.is_finite() || k <= 0.0 || (k - 1.0).abs() < 1e-6 {
+        return;
+    }
+    for e in effects {
+        e.scale_by(k);
+    }
 }
 
 /// Parse the payload of an `lfx2` / `lmfx` / `lfxs` additional-layer-info block.
@@ -365,6 +407,8 @@ pub fn parse_layer_effects(bytes: &[u8]) -> Option<Vec<LayerEffect>> {
             out.push(parse_effect(kind, desc));
         }
     }
+    // 根上的 `Scl ` 是「图层样式」对话框的 Scale 滑块（`#Prc`，缺省 100）。
+    apply_effect_scale(&mut out, root.number(b"Scl ").unwrap_or(100.0) as f32);
     Some(out)
 }
 
