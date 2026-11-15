@@ -178,6 +178,30 @@ fn lerp_u8(a: u8, b: u8, k: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * k).round().clamp(0.0, 255.0) as u8
 }
 
+/// Bevel/emboss style (`bvlS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BevelStyle {
+    /// `InrB` — the bevel is carved into the content.
+    #[default]
+    Inner,
+    /// `OtrB` — the bevel grows outside the content.
+    Outer,
+    /// `Embs` — both sides of the edge are shaded.
+    Emboss,
+    /// `PlEb` / `PlWg` — pillow emboss.
+    Pillow,
+}
+
+/// Bevel/emboss direction (`bvlD`): raised or pressed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BevelDirection {
+    /// `In  ` — raised (default).
+    #[default]
+    Up,
+    /// `Out ` — pressed in.
+    Down,
+}
+
 /// One enabled (or disabled) layer style.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayerEffect {
@@ -209,6 +233,33 @@ pub struct LayerEffect {
     pub knocks_out: bool,
     /// Inner glow only.
     pub glow_source: GlowSource,
+    /// Pattern overlay / pattern stroke reference (`Ptrn` + `Scl ` / `Angl`).
+    pub pattern: Option<crate::vector::VectorPattern>,
+    /// `phase` → `Hrzn` / `Vrtc` pattern origin offset in pixels.
+    pub pattern_phase: (f32, f32),
+    // ---- bevel / emboss (`ebbl`) ------------------------------------
+    /// `hglC`.
+    pub highlight_color: [u8; 3],
+    /// `hglO` percent, normalised to 0..1.
+    pub highlight_opacity: f32,
+    /// `hglM`.
+    pub highlight_blend: BlendMode,
+    /// `sdwC`.
+    pub shadow_color: [u8; 3],
+    /// `sdwO` percent, normalised to 0..1.
+    pub shadow_opacity: f32,
+    /// `sdwM`.
+    pub shadow_blend: BlendMode,
+    /// `bvlS`.
+    pub bevel_style: BevelStyle,
+    /// `bvlD`.
+    pub bevel_direction: BevelDirection,
+    /// `Lald` in degrees above the horizon.
+    pub altitude: f32,
+    /// `srgR` percent (depth).
+    pub depth: f32,
+    /// `Sftn` in pixels.
+    pub soften: f32,
 }
 
 impl LayerEffect {
@@ -226,8 +277,21 @@ impl LayerEffect {
             stroke_position: StrokePosition::Outside,
             stroke_fill: StrokeFill::Color,
             gradient: None,
+            pattern: None,
+            pattern_phase: (0.0, 0.0),
             knocks_out: true,
             glow_source: GlowSource::Edge,
+            highlight_color: [255, 255, 255],
+            highlight_opacity: 0.75,
+            highlight_blend: BlendMode::Screen,
+            shadow_color: [0, 0, 0],
+            shadow_opacity: 0.75,
+            shadow_blend: BlendMode::Multiply,
+            bevel_style: BevelStyle::Inner,
+            bevel_direction: BevelDirection::Up,
+            altitude: 30.0,
+            depth: 100.0,
+            soften: 0.0,
         }
     }
 }
@@ -453,6 +517,59 @@ fn parse_effect(kind: EffectKind, d: &Descriptor) -> LayerEffect {
     }
     if let Some(g) = d.descriptor(b"Grad") {
         e.gradient = Some(parse_gradient(g, d));
+    }
+    // ---- 图案叠加 ----------------------------------------------------
+    // `Ptrn` 是图案引用；`Scl ` / `Angl` / `Algn` / `phase` 直接挂在效果上。
+    if d.descriptor(b"Ptrn").is_some() {
+        e.pattern = Some(crate::vector::pattern_from_descriptor(d));
+    }
+    if let Some(phase) = d.descriptor(b"phase") {
+        let h = phase.number(b"Hrzn").unwrap_or(0.0) as f32;
+        let v = phase.number(b"Vrtc").unwrap_or(0.0) as f32;
+        e.pattern_phase = (h, v);
+    }
+    // ---- 斜面和浮雕 --------------------------------------------------
+    if let Some(c) = d.descriptor(b"hglC") {
+        e.highlight_color = rgb_from(&c);
+    }
+    if let Some(v) = d.number(b"hglO") {
+        e.highlight_opacity = (v / 100.0).clamp(0.0, 1.0) as f32;
+    }
+    if let Some(v) = d.enum_value(b"hglM") {
+        e.highlight_blend = blend_from_enum(&v);
+    }
+    if let Some(c) = d.descriptor(b"sdwC") {
+        e.shadow_color = rgb_from(&c);
+    }
+    if let Some(v) = d.number(b"sdwO") {
+        e.shadow_opacity = (v / 100.0).clamp(0.0, 1.0) as f32;
+    }
+    if let Some(v) = d.enum_value(b"sdwM") {
+        e.shadow_blend = blend_from_enum(&v);
+    }
+    if let Some(v) = d.enum_value(b"bvlS") {
+        e.bevel_style = match &v {
+            b"OtrB" => BevelStyle::Outer,
+            b"Embs" => BevelStyle::Emboss,
+            b"PlEb" | b"PlWg" => BevelStyle::Pillow,
+            _ => BevelStyle::Inner,
+        };
+    }
+    if let Some(v) = d.enum_value(b"bvlD") {
+        e.bevel_direction = if &v == b"Out " {
+            BevelDirection::Down
+        } else {
+            BevelDirection::Up
+        };
+    }
+    if let Some(v) = d.number(b"Lald") {
+        e.altitude = v as f32;
+    }
+    if let Some(v) = d.number(b"srgR") {
+        e.depth = v as f32;
+    }
+    if let Some(v) = d.number(b"Sftn") {
+        e.soften = v as f32;
     }
     e
 }

@@ -46,7 +46,10 @@ pub mod descriptor;
 pub mod effects;
 pub mod vector;
 
-pub use effects::{EffectKind, Gradient, GradientKind, LayerEffect, StrokeFill, StrokePosition};
+pub use effects::{
+    BevelDirection, BevelStyle, EffectKind, Gradient, GradientKind, LayerEffect, StrokeFill,
+    StrokePosition,
+};
 
 /// An list of errors returned when processing PSD file.
 ///

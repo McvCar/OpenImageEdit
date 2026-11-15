@@ -129,7 +129,7 @@ fn legacy(axis: &str) -> bool {
 /// corner; effects that paint outside the layer (shadow, outside stroke) grow
 /// the bitmap and push the offset accordingly.
 pub fn bake(image: &RgbaImage, offset: (i32, i32), effects: &[LayerEffect]) -> Option<Baked> {
-    bake_with_alpha(image, offset, effects, None)
+    bake_with_alpha(image, offset, effects, None, None)
 }
 
 /// Like [`bake`], but the alpha that drives the styles can come from the shape's
@@ -143,6 +143,7 @@ pub fn bake_with_alpha(
     offset: (i32, i32),
     effects: &[LayerEffect],
     alpha_override: Option<&[f32]>,
+    patterns: Option<&crate::psd_pattern::PatternStore>,
 ) -> Option<Baked> {
     let active: Vec<&LayerEffect> = effects
         .iter()
@@ -205,6 +206,15 @@ pub fn bake_with_alpha(
             }
             EffectKind::InnerGlow => {
                 let reach = blur_margin(e.size);
+                pad.left = pad.left.max(reach);
+                pad.right = pad.right.max(reach);
+                pad.top = pad.top.max(reach);
+                pad.bottom = pad.bottom.max(reach);
+            }
+            // 斜面/浮雕按 alpha 的模糊梯度算光照；图层边缘外侧要有透明
+            // 缓冲，否则直边上的坡度为 0，斜面会整条消失。
+            EffectKind::BevelEmboss => {
+                let reach = blur_margin(e.size + e.soften);
                 pad.left = pad.left.max(reach);
                 pad.right = pad.right.max(reach);
                 pad.top = pad.top.max(reach);
@@ -323,10 +333,22 @@ pub fn bake_with_alpha(
                 draw_gradient_overlay(&mut out, w, h, &alpha, bounds, e, None)
             }
             EffectKind::PatternOverlay => {
-                notes.push("图层样式「图案叠加」暂不支持".into());
+                if !draw_pattern_overlay(
+                    &mut out,
+                    w,
+                    h,
+                    &alpha,
+                    offset,
+                    ox,
+                    oy,
+                    e,
+                    patterns,
+                ) {
+                    notes.push("图层样式「图案叠加」缺少图案像素".into());
+                }
             }
             EffectKind::BevelEmboss => {
-                notes.push("图层样式「斜面和浮雕」暂不支持".into());
+                draw_bevel(&mut out, w, h, &alpha, e);
             }
             _ => {}
         }
@@ -1041,6 +1063,139 @@ fn draw_gradient_overlay(
     }
 }
 
+/// 图案叠加：把图案平铺进图层内容。
+///
+/// 返回 `false` 表示有样式但文件里没有对应图案像素（或缺少图案引用），
+/// 调用方据此记一条降级说明；画面保持原样，不拿白色/纯色冒充图案。
+fn draw_pattern_overlay(
+    out: &mut RgbaImage,
+    w: u32,
+    h: u32,
+    alpha: &[f32],
+    offset: (i32, i32),
+    ox: i64,
+    oy: i64,
+    e: &LayerEffect,
+    patterns: Option<&crate::psd_pattern::PatternStore>,
+) -> bool {
+    let Some(r) = e.pattern.as_ref() else {
+        return false;
+    };
+    let Some(store) = patterns else {
+        return false;
+    };
+    let Some(mut paint) = store.paint(r) else {
+        return false;
+    };
+    paint.phase = e.pattern_phase;
+    // `Algn`：图案原点跟随图层左上角；否则用文档原点。
+    let anchor = if r.align {
+        (offset.0 as f32, offset.1 as f32)
+    } else {
+        (0.0, 0.0)
+    };
+    let mode = blend_of(e.blend);
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) as usize;
+            let cov = alpha[i];
+            if cov <= 0.002 {
+                continue;
+            }
+            let cx = x as f32 - ox as f32 + offset.0 as f32;
+            let cy = y as f32 - oy as f32 + offset.1 as f32;
+            let px = paint.sample(cx, cy, anchor);
+            let pa = px[3] as f32 / 255.0;
+            if pa <= 0.002 {
+                continue;
+            }
+            composite(
+                out,
+                x,
+                y,
+                [px[0], px[1], px[2]],
+                cov,
+                e.opacity * pa,
+                mode,
+            );
+        }
+    }
+    true
+}
+
+/// 斜面 / 浮雕：按内容 alpha 的模糊梯度模拟一个受光表面。
+///
+/// Photoshop 的斜面本质是「边缘坡度 × 光照方向」：先按 Size 模糊 alpha
+/// 得到高度场，边缘处的梯度就是朝外的法线；法线与光源方向的点积为正的
+/// 一侧打高光（`hglC` / `hglM` / `hglO`），为负的一侧压暗影（`sdwC` /
+/// `sdwM` / `sdwO`）。`depth`（`srgR`）放大坡度，`bvlD` 翻转凹凸。
+fn draw_bevel(out: &mut RgbaImage, w: u32, h: u32, alpha: &[f32], e: &LayerEffect) {
+    // 高度场：Size 决定斜面宽度，Sftn 再柔化一层。
+    let radius = (((e.size + e.soften) * 0.5).ceil() as i32).max(1);
+    let height = box_blur(alpha, w, h, radius);
+    let rad = e.angle.to_radians();
+    // 指向光源的方向（图像坐标，y 向下）。PS 角度逆时针、y 向上，
+    // 所以同一角度下「指向光源」= (cos, -sin)。
+    let (lx, ly) = (rad.cos(), -rad.sin());
+    let sign = match e.bevel_direction {
+        psd::BevelDirection::Up => 1.0,
+        psd::BevelDirection::Down => -1.0,
+    };
+    let depth = (e.depth / 100.0).clamp(0.0, 4.0);
+    let hi = blend_of(e.highlight_blend);
+    let sh = blend_of(e.shadow_blend);
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) as usize;
+            let gx = sample(&height, w, h, x as i32 + 1, y as i32)
+                - sample(&height, w, h, x as i32 - 1, y as i32);
+            let gy = sample(&height, w, h, x as i32, y as i32 + 1)
+                - sample(&height, w, h, x as i32, y as i32 - 1);
+            let len = (gx * gx + gy * gy).sqrt();
+            if len <= 1e-4 {
+                continue;
+            }
+            // 朝外法线 = -梯度 / 长度。
+            let shade = (-gx * lx - gy * ly) / len * sign * depth;
+            if shade.abs() <= 0.002 {
+                continue;
+            }
+            // 坡度带：边缘处 b*(1-b) 最大，深处和远处都衰减到 0。
+            let edge = (height[i] * (1.0 - height[i]) * 4.0).clamp(0.0, 1.0);
+            let side = match e.bevel_style {
+                psd::BevelStyle::Inner => alpha[i],
+                psd::BevelStyle::Outer => 1.0 - alpha[i],
+                _ => 1.0,
+            };
+            let cov = edge * side * shade.abs().min(1.0);
+            if cov <= 0.002 {
+                continue;
+            }
+            if shade > 0.0 {
+                composite(
+                    out,
+                    x,
+                    y,
+                    e.highlight_color,
+                    cov,
+                    e.highlight_opacity,
+                    hi,
+                );
+            } else {
+                composite(out, x, y, e.shadow_color, cov, e.shadow_opacity, sh);
+            }
+        }
+    }
+}
+
+/// 越界取 0（高度场在图层外没有内容）。
+fn sample(src: &[f32], w: u32, h: u32, x: i32, y: i32) -> f32 {
+    if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+        return 0.0;
+    }
+    src[(y as u32 * w + x as u32) as usize]
+}
+
 fn blend_of(mode: psd::BlendMode) -> editcore::BlendMode {
     crate::psd_layers::blend_of(mode)
 }
@@ -1556,6 +1711,19 @@ mod tests {
             gradient: None,
             knocks_out: true,
             glow_source: GlowSource::Edge,
+            pattern: None,
+            pattern_phase: (0.0, 0.0),
+            highlight_color: [255, 255, 255],
+            highlight_opacity: 0.75,
+            highlight_blend: psd::BlendMode::Screen,
+            shadow_color: [0, 0, 0],
+            shadow_opacity: 0.75,
+            shadow_blend: psd::BlendMode::Multiply,
+            bevel_style: psd::BevelStyle::Inner,
+            bevel_direction: psd::BevelDirection::Up,
+            altitude: 30.0,
+            depth: 100.0,
+            soften: 0.0,
         }
     }
 
@@ -1937,6 +2105,104 @@ mod tests {
         let dark = baked.image.get_pixel(5, 11).0[0];
         assert!(bright > 240, "top right is already white: {bright}");
         assert!(dark < 15, "bottom left stays black: {dark}");
+    }
+
+    /// 图案叠加按图案像素平铺，而不是退回纯色。
+    #[test]
+    fn pattern_overlay_tiles_the_pattern() {
+        let img = layer(8, 8, [128, 128, 128, 255], 0);
+        let mut e = effect(EffectKind::PatternOverlay);
+        e.pattern = Some(psd::VectorPattern {
+            id: "p1".into(),
+            name: "P".into(),
+            scale: 100.0,
+            angle: 0.0,
+            align: true,
+        });
+        e.opacity = 1.0;
+        let store = crate::psd_pattern::PatternStore {
+            tiles: vec![crate::psd_pattern::PatternTile {
+                id: "p1".into(),
+                name: "P".into(),
+                image: RgbaImage::from_raw(2, 1, vec![255, 0, 0, 255, 0, 255, 0, 255]).unwrap(),
+            }],
+        };
+        let baked = crate::psd_effects::bake_with_alpha(&img, (0, 0), &[e], None, Some(&store))
+            .expect("baked");
+        assert_eq!(baked.image.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(baked.image.get_pixel(1, 0).0, [0, 255, 0, 255]);
+        assert_eq!(baked.image.get_pixel(2, 0).0, [255, 0, 0, 255]);
+    }
+
+    /// 没有图案像素时保持原样，并记一条降级说明。
+    #[test]
+    fn pattern_overlay_without_pixels_is_a_no_op() {
+        let img = layer(8, 8, [128, 128, 128, 255], 0);
+        let mut e = effect(EffectKind::PatternOverlay);
+        e.pattern = Some(psd::VectorPattern {
+            id: "missing".into(),
+            name: "missing".into(),
+            scale: 100.0,
+            angle: 0.0,
+            align: true,
+        });
+        let baked = crate::psd_effects::bake_with_alpha(
+            &img,
+            (0, 0),
+            &[e],
+            None,
+            Some(&crate::psd_pattern::PatternStore::default()),
+        )
+        .expect("baked");
+        assert_eq!(baked.image.get_pixel(4, 4).0, [128, 128, 128, 255]);
+        assert!(baked.notes.iter().any(|n| n.contains("图案叠加")));
+    }
+
+    /// 斜面：光从左上来时，左上边缘提亮、右下边缘压暗。
+    #[test]
+    fn bevel_lights_the_side_facing_the_light() {
+        let img = layer(40, 40, [128, 128, 128, 255], 5);
+        let mut e = effect(EffectKind::BevelEmboss);
+        e.size = 4.0;
+        e.depth = 100.0;
+        e.angle = 135.0;
+        e.highlight_color = [255, 255, 255];
+        e.shadow_color = [0, 0, 0];
+        e.highlight_opacity = 1.0;
+        e.shadow_opacity = 1.0;
+        let baked = bake(&img, (0, 0), &[e]).expect("baked");
+        let at = |x: i32, y: i32| {
+            let px = (x - baked.offset.0) as u32;
+            let py = (y - baked.offset.1) as u32;
+            baked.image.get_pixel(px, py).0[0] as i32
+        };
+        let lit = at(6, 6);
+        let middle = at(20, 20);
+        let dark = at(33, 33);
+        assert!(lit > middle + 20, "左上应提亮: lit={lit} mid={middle}");
+        assert!(dark < middle - 20, "右下应压暗: dark={dark} mid={middle}");
+    }
+
+    /// `bvlD = Down` 把凹凸翻过来：同一光向下左上变暗、右下变亮。
+    #[test]
+    fn bevel_direction_flips_the_shading() {
+        let img = layer(40, 40, [128, 128, 128, 255], 5);
+        let mut e = effect(EffectKind::BevelEmboss);
+        e.size = 4.0;
+        e.depth = 100.0;
+        e.angle = 135.0;
+        e.bevel_direction = psd::BevelDirection::Down;
+        e.highlight_color = [255, 255, 255];
+        e.shadow_color = [0, 0, 0];
+        e.highlight_opacity = 1.0;
+        e.shadow_opacity = 1.0;
+        let baked = bake(&img, (0, 0), &[e]).expect("baked");
+        let at = |x: i32, y: i32| {
+            let px = (x - baked.offset.0) as u32;
+            let py = (y - baked.offset.1) as u32;
+            baked.image.get_pixel(px, py).0[0] as i32
+        };
+        assert!(at(6, 6) < at(33, 33), "凹凸翻转后右下反而更亮");
     }
 }
 

@@ -884,6 +884,7 @@ fn build_layers<F: FnMut(usize, usize)>(
                 layer_offset,
                 effects,
                 path_alpha.as_deref(),
+                Some(&patterns),
             ) {
                 if let Some(pre) = pre_alpha.as_ref() {
                     content_alpha = Some(ContentAlpha::from_baked(
