@@ -393,24 +393,18 @@ fn set_lum(c: [f32; 3], l: f32) -> [f32; 3] {
 
 fn set_sat(c: [f32; 3], s: f32) -> [f32; 3] {
     // Order the three components, stretch the extremes to 0 / s, then put the
-    // values back where they came from.
+    // values back where they came from. `res` is indexed by channel; writing
+    // the rank-ordered values into it and remapping afterwards scrambles any
+    // colour whose channels are not already ascending (pure green became blue).
     let mut idx = [0usize, 1, 2];
     idx.sort_by(|a, b| c[*a].partial_cmp(&c[*b]).unwrap_or(std::cmp::Ordering::Equal));
     let (lo, mid, hi) = (idx[0], idx[1], idx[2]);
-    let mut out = [0.0f32; 3];
     let (cmin, cmid, cmax) = (c[lo], c[mid], c[hi]);
-    if cmax > cmin {
-        out[mid] = (cmid - cmin) * s / (cmax - cmin);
-        out[hi] = s;
-    } else {
-        out[mid] = 0.0;
-        out[hi] = 0.0;
-    }
-    out[lo] = 0.0;
     let mut res = [0.0f32; 3];
-    res[lo] = out[0];
-    res[mid] = out[1];
-    res[hi] = out[2];
+    if cmax > cmin {
+        res[mid] = (cmid - cmin) * s / (cmax - cmin);
+        res[hi] = s;
+    }
     res
 }
 
@@ -670,6 +664,25 @@ mod tests {
             [100, 100, 100]
         );
         assert_eq!(over([50, 200, 50], [100, 100, 100], BlendMode::LighterColor), [50, 200, 50]);
+    }
+
+    /// 其余分离 / 非分离模式：同样按 W3C 公式手算（Overlay 是 HardLight
+    /// 交换操作数，柔光用 pegtop，色相 / 饱和度 / 颜色 / 明度走 SetLum/SetSat）。
+    #[test]
+    fn remaining_layer_modes_match_the_spec_formulas() {
+        assert_eq!(over([64, 64, 64], [192, 192, 192], BlendMode::Overlay), [96, 96, 96]);
+        assert_eq!(over([64, 64, 64], [64, 64, 64], BlendMode::SoftLight), [40, 40, 40]);
+        assert_eq!(over([64, 64, 64], [64, 192, 192], BlendMode::HardLight), [32, 161, 161]);
+        assert_eq!(over([200, 60, 30], [50, 20, 90], BlendMode::Difference), [150, 40, 60]);
+        assert_eq!(over([64, 192, 128], [192, 64, 64], BlendMode::Exclusion), [160, 160, 128]);
+        // 色相：取源色相 + 底色饱和度 / 明度；红底上放绿 → 绿相、红亮度。
+        assert_eq!(over([255, 0, 0], [0, 255, 0], BlendMode::Hue), [0, 130, 0]);
+        // 饱和度：红底取源的饱和度（灰 = 0）→ 灰；保持底色明度。
+        assert_eq!(over([255, 0, 0], [128, 128, 128], BlendMode::Saturation), [77, 77, 77]);
+        // 颜色：取源色 + 底色明度。绿色底放红色 → 红相、绿明度。
+        assert_eq!(over([0, 255, 0], [255, 0, 0], BlendMode::Color), [255, 106, 106]);
+        // 明度：取底色 + 源明度。绿色底放红色 → 绿相、红明度。
+        assert_eq!(over([0, 255, 0], [255, 0, 0], BlendMode::Luminosity), [0, 130, 0]);
     }
 
     #[test]
