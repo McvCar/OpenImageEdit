@@ -75,10 +75,30 @@ struct PreparedLayer {
     name: String,
     opacity: u8,
     visible: bool,
+    /// 剪贴蒙版（PSD 的 clipping 字节：0 = 基底，1 = 剪贴到下层）。
+    clipping: bool,
     blend: editcore::BlendMode,
     planes: [Vec<u8>; 4],
+    /// 图层蒙版（`-2` 通道 + 它自己的矩形）。
+    mask: Option<PreparedMask>,
     /// 所属分组（写 PSD 时要按它插 `lsct` 分隔记录）。
     group: Option<editcore::GroupId>,
+}
+
+/// 图层蒙版的落盘数据。
+///
+/// PSD 的蒙版通道按**蒙版自己的矩形**压缩，和图层矩形无关；蒙版矩形写的是
+/// 右下**边界**（right = left + 宽），vendored 解析器读的时候会减 1 换算成
+/// 「最后一个像素」，与图层矩形同一约定。
+struct PreparedMask {
+    top: i32,
+    left: i32,
+    bottom: i32,
+    right: i32,
+    /// 蒙版矩形外的取值（PS 只存 0 / 255）。
+    default: u8,
+    /// 灰度平面，行优先，长度 = 宽 × 高。
+    plane: Vec<u8>,
 }
 
 /// 一条 PSD 层记录：真图层，或者分组的分隔记录（文件夹行 / 组底边界）。
@@ -153,8 +173,25 @@ fn prepare_layers(doc: &Document) -> Result<Vec<PreparedLayer>, crate::DecodeErr
             name: layer.name.clone(),
             opacity: (layer.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
             visible: layer.visible,
+            clipping: layer.clipping,
             blend: layer.blend,
             planes,
+            // 蒙版按它自己的矩形原样写：模型里的蒙版已经裁剪到画布范围，
+            // 矩形外默认色（`default`）也要一起保留，否则重开会藏掉内容。
+            mask: layer.mask.as_ref().and_then(|m| {
+                let (mw, mh) = m.image.dimensions();
+                if mw == 0 || mh == 0 {
+                    return None;
+                }
+                Some(PreparedMask {
+                    top: m.offset.1,
+                    left: m.offset.0,
+                    bottom: m.offset.1 + mh as i32, // boundary (parser subtracts one)
+                    right: m.offset.0 + mw as i32,  // boundary (parser subtracts one)
+                    default: m.default,
+                    plane: m.image.as_raw().clone(),
+                })
+            }),
             group: layer.group,
         });
     }
@@ -211,6 +248,7 @@ fn write_layer_record(out: &mut Vec<u8>, l: &PreparedLayer) -> Result<(), crate:
         channel_len as u32,
         blend_key(l.blend),
         l.opacity,
+        l.clipping,
         // Adobe's layer flags bit 1 is INVERTED: SET means HIDDEN. Photoshop
         // writes bit 3 (`1 for Photoshop 5.0 and later`) on visible layers and
         // never sets bit 1 unless the layer is hidden. Writing the vendor
@@ -218,6 +256,7 @@ fn write_layer_record(out: &mut Vec<u8>, l: &PreparedLayer) -> Result<(), crate:
         // hidden in Photoshop / Krita / GIMP.
         if l.visible { 8 } else { 8 | 2 },
         &l.name,
+        l.mask.as_ref(),
         None,
     );
     Ok(())
@@ -235,13 +274,15 @@ fn write_divider_record(out: &mut Vec<u8>, name: &str, section: u32) {
         2, // 空通道：只有 2 字节压缩标记
         b"norm",
         255,
+        false,
         8,
         name,
+        None,
         Some(section),
     );
 }
 
-/// 单条记录的公共写手（图层与分隔记录只差 `lsct`）。
+/// 单条记录的公共写手（图层与分隔记录只差 `lsct` / 蒙版 / 剪贴位）。
 #[allow(clippy::too_many_arguments)]
 fn write_record(
     out: &mut Vec<u8>,
@@ -249,8 +290,10 @@ fn write_record(
     channel_len: u32,
     blend: &[u8; 4],
     opacity: u8,
+    clipping: bool,
     flags: u8,
     name: &str,
+    mask: Option<&PreparedMask>,
     lsct: Option<u32>,
 ) {
     let (top, left, bottom, right) = rect;
@@ -258,21 +301,43 @@ fn write_record(
     push_i32(out, left);
     push_i32(out, bottom); // exclusive (parser subtracts one)
     push_i32(out, right);  // exclusive (parser subtracts one)
-    push_u16(out, 4);      // R, G, B, TransparencyMask
-    for id in [0i16, 1, 2, -1] {
+    // 有蒙版时多声明一条 `-2` 通道；它的长度按**蒙版矩形**（而不是图层矩形）算。
+    let mut channels: Vec<(i16, u32)> = vec![
+        (0, channel_len),
+        (1, channel_len),
+        (2, channel_len),
+        (-1, channel_len),
+    ];
+    if let Some(m) = mask {
+        channels.push((-2, 2 + m.plane.len() as u32));
+    }
+    push_u16(out, channels.len() as u16);
+    for (id, len) in channels {
         push_i16(out, id);
-        push_u32(out, channel_len);
+        push_u32(out, len);
     }
     push_bytes(out, b"8BIM");
     push_bytes(out, blend);
     push_u8(out, opacity); // 0 = transparent, 255 = opaque
-    push_u8(out, 0);       // clipping: base
+    push_u8(out, if clipping { 1 } else { 0 }); // 0 = base, 1 = clipping
     push_u8(out, flags);
     push_u8(out, 0); // filler
 
     // ---- extra data ----
     let mut extra = Vec::new();
-    push_u32(&mut extra, 0); // layer mask data length
+    // 图层蒙版数据块：20 字节 = 矩形(16) + 默认色(1) + 标志(1) + 补位(2)。
+    // 长度为 0 表示「没有蒙版」。
+    push_u32(&mut extra, if mask.is_some() { 20 } else { 0 });
+    if let Some(m) = mask {
+        push_i32(&mut extra, m.top);
+        push_i32(&mut extra, m.left);
+        // 与图层矩形一样存右下**边界**；解析端会减 1 换成最后一个像素。
+        push_i32(&mut extra, m.bottom);
+        push_i32(&mut extra, m.right);
+        push_u8(&mut extra, m.default);
+        push_u8(&mut extra, 0); // flags: bit1=0 -> 蒙版启用
+        push_zeros(&mut extra, 2);
+    }
     push_u32(&mut extra, 0); // layer blending ranges length
     let ascii = ascii_placeholder(name);
     push_u8(&mut extra, ascii.len() as u8);
@@ -452,6 +517,11 @@ pub fn encode_psd(doc: &Document, _quality: u8) -> Result<Vec<u8>, crate::Decode
                 for plane in &l.planes {
                     push_u16(&mut layer_info, 0); // compression = RAW
                     push_bytes(&mut layer_info, plane);
+                }
+                // 蒙版通道（`-2`）的数据跟在 RGBA 之后，按声明的顺序。
+                if let Some(m) = &l.mask {
+                    push_u16(&mut layer_info, 0);
+                    push_bytes(&mut layer_info, &m.plane);
                 }
             }
             PsdRecord::Divider { .. } => {
@@ -709,6 +779,38 @@ mod tests {
         let set2 = crate::decode_psd_layers(&bytes2, crate::DecodeOptions::default())
             .expect("second decode");
         assert_eq!(set2.layers.len(), 2, "second generation must not grow");
+    }
+
+    /// 2e) 图层蒙版（`-2` 通道，含自己的矩形与矩形外默认色）与剪贴位必须
+    /// 写回 PSD —— 保存后重开不能丢。
+    #[test]
+    fn mask_and_clipping_roundtrip() {
+        use editcore::LayerMask;
+        use image::{GrayImage, Luma};
+
+        let mut doc = Document::from_image(solid(8, 6, [10, 20, 30, 255]));
+        let mask_px: Vec<u8> = vec![0, 64, 128, 255];
+        let mask = GrayImage::from_fn(2, 2, |x, y| Luma([mask_px[(y * 2 + x) as usize]]));
+        let mut top = Layer::new("蒙版层", solid(4, 3, [200, 10, 10, 255]));
+        top.set_offset((3, 2));
+        top.clipping = true;
+        // 蒙版矩形比图层小，矩形外按 255 显示：两个信息都必须原样写回。
+        top.mask = Some(LayerMask::with_default(mask, (1, 1), 255));
+        doc.layers.push(top);
+
+        let bytes = encode_psd(&doc, 90).expect("encode_psd");
+        let set = crate::psd_layers::decode_psd_layers(&bytes, crate::DecodeOptions::default())
+            .expect("decode_psd_layers");
+        assert_eq!(set.layers.len(), 2, "背景 + 蒙版层");
+        let got = &set.layers[1];
+        assert!(got.clipping, "剪贴位没写回");
+        let m = got.mask.as_ref().expect("图层蒙版没写回");
+        assert_eq!(m.offset, (1, 1), "蒙版矩形偏移");
+        assert_eq!(m.default, 255, "蒙版矩形外默认色");
+        assert_eq!(m.image.dimensions(), (2, 2), "蒙版按自己的矩形写");
+        assert_eq!(m.image.as_raw(), &mask_px, "蒙版像素");
+        assert_eq!(set.masked, 1);
+        assert_eq!(set.clipped, 1);
     }
 
     /// 3) Extreme small canvas: a 1x1 document.

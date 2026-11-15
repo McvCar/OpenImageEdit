@@ -107,7 +107,11 @@ def parse_psd(path):
         extra_len = u32(b, o)
         o += 4
         extra_end = o + extra_len
-        o += 4 + u32(b, o)                 # layer mask data
+        mask_len = u32(b, o)
+        mask_rect = None
+        if mask_len >= 20:
+            mask_rect = struct.unpack_from(">iiii", b, o + 4)
+        o += 4 + mask_len                  # layer mask data
         o += 4 + u32(b, o)                 # blending ranges
         nlen = b[o]
         o += 1
@@ -130,10 +134,12 @@ def parse_psd(path):
             "name": name,
             "rect": (top, left, bottom, right),
             "opacity": opacity,
+            "clipping": clipping,
             "flags": flags,
             "visible": (flags & 2) == 0,   # Adobe: bit 1 SET = HIDDEN
             "blend": blend,
             "channels": channels,
+            "mask_rect": mask_rect,
         })
     return {
         "width": width, "height": height, "depth": depth, "mode": mode,
@@ -249,11 +255,21 @@ def phase_raw():
     elif toggled["visible"]:
         problems.append("编辑后的隐藏状态没写回（flags=%d）" % toggled["flags"])
     # Every declared channel length must include the 2-byte compression marker.
+    # 蒙版通道（`-2`）按**蒙版自己的矩形**存，不是图层矩形，长度单独算。
     for l in info["layers"]:
         w = l["rect"][3] - l["rect"][1]
         h = l["rect"][2] - l["rect"][0]
         for cid, clen in l["channels"]:
-            if clen != 2 + w * h:
+            if cid == -2:
+                r = l["mask_rect"]
+                if r is None:
+                    problems.append("%s 声明了蒙版通道但没有蒙版矩形" % l["name"])
+                    continue
+                mw, mh = r[3] - r[1], r[2] - r[0]
+                if clen != 2 + mw * mh:
+                    problems.append("%s 蒙版通道长度 %d != 2+%d*%d"
+                                    % (l["name"], clen, mw, mh))
+            elif clen != 2 + w * h:
                 problems.append("%s 通道长度 %d != 2+%d*%d"
                                 % (l["name"], clen, w, h))
                 break

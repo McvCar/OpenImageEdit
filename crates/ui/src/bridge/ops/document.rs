@@ -371,11 +371,11 @@ impl qobject::Bridge {
                     job.path.display()
                 )
             };
-            // 蒙版 / 剪贴还没写进 PSD（P0 只做了读与合成）。不说清楚的话，
-            // 用户下次打开会发现蒙版没了 —— 那才是真正的数据丢失。
+            // 蒙版 / 剪贴现在会真正写进 PSD（`-2` 通道 + clipping 位），
+            // 这里只如实报数量，不再提示「未写回」。
             if masks > 0 || clips > 0 {
                 text.push_str(&format!(
-                    "；{masks} 个图层蒙版、{clips} 个剪贴层暂未写回 PSD"
+                    "；已保留 {masks} 个图层蒙版、{clips} 个剪贴层"
                 ));
             }
             self.as_mut().set_status(QString::from(text.as_str()));

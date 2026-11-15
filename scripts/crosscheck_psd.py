@@ -18,7 +18,11 @@ B 档的读写都建立在 vendored `psd` crate 之上，而**同一个错误的
             逐层比对名称 / 显隐 / 不透明度。验证「我们读别人的文件没错」。
 
 用法：
-    python scripts/crosscheck_psd.py [--only written|vendor|all]
+    python scripts/crosscheck_psd.py [--only written|structure|vendor|all]
+
+  written   : 本程序写一份 PSD 再让 psd-tools 读（层属性 / 合成图）。
+  structure : 剪贴位与图层蒙版写回（独立构造的样本 + 第三方读取确认）。
+  vendor    : 20 份第三方 fixture，本程序读 vs psd-tools 读。
 
 依赖 psd-tools：`pip install psd-tools`。缺失时打印 SKIP 并返回 0
 （不让没有该依赖的机器误判为回归）。
@@ -29,6 +33,7 @@ import glob
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -39,6 +44,8 @@ from probe_layer_panel import EXE, pump  # noqa: E402
 
 OUT_DIR = os.path.join(ROOT, "tmp", "psd-cross")
 FIXTURE = os.path.join(ROOT, "tmp", "psd-fixtures", "small-layers.psd")
+CLIP_FIXTURE = os.path.join(
+    ROOT, "vendor", "psd", "tests", "fixtures", "green-clipping-10x10.psd")
 VENDOR_GLOB = os.path.join(ROOT, "vendor", "psd", "tests", "fixtures", "**", "*.psd")
 
 HOOKS = (
@@ -184,6 +191,103 @@ def phase_written():
     return problems
 
 
+def be(fmt, *vals):
+    return struct.pack(">" + fmt, *vals)
+
+
+def make_mask_fixture(path):
+    """生成一份带图层蒙版的 8-bit RGB PSD（本脚本独立构造，不经过任何 Rust 代码）。
+
+    蒙版矩形比画布小（3x3 @ (2,1)），矩形外默认色 255 —— 这两项写回后都必须
+    原样保留：矩形错位会让蒙版整体偏移，默认色丢了会把从没遮掉的内容藏起来。
+    """
+    w = h = 6
+    mask = [0, 64, 128, 10, 90, 180, 255, 220, 5]
+    planes = [
+        (0, bytes([30] * (w * h))),
+        (1, bytes([200] * (w * h))),
+        (2, bytes([60] * (w * h))),
+        (-1, bytes([255] * (w * h))),
+        (-2, bytes(mask)),
+    ]
+    rec = be("iiii", 0, 0, h, w) + be("H", len(planes))
+    for cid, data in planes:
+        rec += be("h", cid) + be("I", 2 + len(data))
+    rec += b"8BIMnorm" + be("BBBB", 255, 0, 8, 0)
+    # 蒙版块：矩形存右下**边界**（宽 = right-left），默认色，标志，补位。
+    extra = be("I", 20) + be("iiii", 1, 2, 4, 5) + b"\xff\x00\x00\x00"
+    extra += be("I", 0)  # blending ranges
+    name = b"mask layer"
+    extra += bytes([len(name)]) + name
+    extra += b"\x00" * ((4 - (1 + len(name)) % 4) % 4)
+    rec += be("I", len(extra)) + extra
+    blob = b"".join(be("H", 0) + data for _, data in planes)
+    info = be("h", 1) + rec + blob
+    if len(info) % 2:
+        info += b"\x00"
+    section = be("I", len(info)) + info + be("I", 0)
+    out = b"8BPS" + be("H", 1) + b"\x00" * 6 + be("H", 4)
+    out += be("I", h) + be("I", w) + be("H", 8) + be("H", 3)
+    out += be("I", 0) + be("I", 0)
+    out += be("I", len(section)) + section
+    out += be("H", 0)  # 合并图：raw planar
+    for ch in range(4):
+        out += bytes([255 if ch == 3 else 0] * (w * h))
+    with open(path, "wb") as fp:
+        fp.write(out)
+
+
+def phase_structure():
+    """蒙版 / 剪贴写回：本程序保存，psd-tools 独立确认结构还在。"""
+    print("--- structure: 蒙版 / 剪贴写回（第三方读） ---", flush=True)
+    from psd_tools import PSDImage
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    problems = []
+
+    # 1) 剪贴位：源文件里哪些层是剪贴层，保存后必须一一对应。
+    clip = os.path.join(OUT_DIR, "clipping.psd")
+    shutil.copyfile(CLIP_FIXTURE, clip)
+    want = [bool(l.clipping) for l in PSDImage.open(CLIP_FIXTURE).descendants()]
+    lines = run_script(clip, "layers-dump;save", timeout=40.0)
+    if not any('"event":"saved"' in l for l in lines):
+        problems.append("剪贴样本写回没有 saved 事件")
+    got = [bool(l.clipping) for l in PSDImage.open(clip).descendants()]
+    if got != want:
+        problems.append("剪贴位写回不一致：%s != %s" % (got, want))
+    else:
+        print("  剪贴位 %s（%d 层）" % (got, len(got)))
+
+    # 2) 蒙版：矩形 / 矩形外默认色 / 像素必须原样往返。
+    src = os.path.join(OUT_DIR, "mask-src.psd")
+    dst = os.path.join(OUT_DIR, "mask-saved.psd")
+    make_mask_fixture(src)
+    shutil.copyfile(src, dst)
+    lines = run_script(dst, "layers-dump;save", timeout=40.0)
+    if not any('"event":"saved"' in l for l in lines):
+        problems.append("蒙版样本写回没有 saved 事件")
+    layers = list(PSDImage.open(dst).descendants())
+    if len(layers) != 1:
+        problems.append("蒙版样本保存后层数 %d != 1" % len(layers))
+    else:
+        mask = layers[0].mask
+        if mask is None:
+            problems.append("图层蒙版保存后丢失（psd-tools mask=None）")
+        else:
+            # psd-tools 的 bbox 是 (left, top, right, bottom)，右下为边界。
+            if tuple(mask.bbox) != (2, 1, 5, 4):
+                problems.append("蒙版矩形 %s != (2, 1, 5, 4)" % (mask.bbox,))
+            if mask.background_color != 255:
+                problems.append("蒙版矩形外默认色 %s != 255"
+                                % mask.background_color)
+            px = list(mask.topil().convert("L").tobytes())
+            if px != [0, 64, 128, 10, 90, 180, 255, 220, 5]:
+                problems.append("蒙版像素 %s 不一致" % (px,))
+            print("  蒙版 bbox=%s bg=%s 像素=%s"
+                  % (tuple(mask.bbox), mask.background_color, px))
+    return problems
+
+
 def phase_vendor():
     """第三方 fixture：本程序读 vs psd-tools 读。"""
     print("--- vendor: 第三方 fixture 双向对照 ---", flush=True)
@@ -237,7 +341,8 @@ def phase_vendor():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", choices=["written", "vendor", "all"], default="all")
+    ap.add_argument("--only", choices=["written", "structure", "vendor", "all"],
+                    default="all")
     args = ap.parse_args()
 
     try:
@@ -253,6 +358,8 @@ def main():
     problems = []
     if args.only in ("written", "all"):
         problems += ["written: " + p for p in phase_written()]
+    if args.only in ("structure", "all"):
+        problems += ["structure: " + p for p in phase_structure()]
     if args.only in ("vendor", "all"):
         problems += ["vendor: " + p for p in phase_vendor()]
 

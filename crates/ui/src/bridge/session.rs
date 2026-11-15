@@ -54,9 +54,11 @@ pub(in crate::bridge) struct Session {
     /// be "Saved As" a new PSD (a fresh layered file from their flat pixels).
     pub(in crate::bridge) psd_layered: bool,
     /// True when the layer stack lost structure that a PSD write-back cannot
-    /// represent (groups flattened, masks / clipping dropped, non-Normal
-    /// blend modes, layers clipped to the canvas or skipped). Ctrl+S asks for
-    /// confirmation once instead of baking those losses into the source file.
+    /// represent (baked styles / adjustment layers, non-Normal blend modes,
+    /// layers clipped to the canvas or skipped). Groups, masks and clipping
+    /// ARE written back now, so they no longer set this flag on their own.
+    /// Ctrl+S asks for confirmation once instead of baking those losses into
+    /// the source file.
     pub(in crate::bridge) psd_lossy: bool,
     /// Decoder hint shown in the status bar (e.g. PSD flattened preview).
     pub(in crate::bridge) note: Option<String>,
