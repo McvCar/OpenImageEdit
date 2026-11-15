@@ -67,21 +67,33 @@ impl BlendMode {
 
 /// Composite `src` onto `out`, honouring `mode`.
 ///
-/// `out` is straight-alpha RGBA in 0..=255, same convention as the rest of the
-/// compositor: colours are accumulated the way `blend_over` always did, and the
-/// blend function is only consulted where the backdrop actually has coverage —
-/// a `Multiply` layer over transparent pixels still pastes its own colour.
+/// `out` and `src` are **straight-alpha** RGBA (0..=255) — the convention the
+/// whole compositor, the preview renderer and the PSD writer use.
+///
+/// The honest Porter-Duff form is used instead of a plain lerp:
+///
+/// ```text
+/// ao = as + ab * (1 - as)
+/// co = as * (1 - ab) * Cs + as * ab * B(Cb, Cs) + (1 - as) * ab * Cb
+/// Co = co / ao
+/// ```
+///
+/// Without the final division the buffer accumulates *premultiplied* colour on
+/// a semi-transparent backdrop, so a 50 % white layer over transparency came out
+/// mid-grey, and every anti-aliased edge in a PSD with a transparent canvas was
+/// darker than Photoshop's. The blend function is only consulted where the
+/// backdrop has coverage: a `Multiply` layer over transparent pixels still
+/// pastes its own colour.
 pub fn blend_pixel(out: &mut [u8; 4], src: [u8; 4], opacity: f32, mode: BlendMode) {
     let a = (src[3] as f32 / 255.0) * opacity;
     if a <= 0.0 {
         return;
     }
-    // Fast path: identical to the pre-blend-mode implementation, bit for bit.
+    let ab = out[3] as f32 / 255.0;
     if mode.is_normal() {
         blend_normal(out, src, a);
         return;
     }
-    let ab = out[3] as f32 / 255.0;
     let cb = [
         out[0] as f32 / 255.0,
         out[1] as f32 / 255.0,
@@ -94,29 +106,45 @@ pub fn blend_pixel(out: &mut [u8; 4], src: [u8; 4], opacity: f32, mode: BlendMod
     ];
     let mixed = blend_rgb(mode, cb, cs);
     let inv = 1.0 - a;
+    let ao = a + ab * inv;
+    if ao <= 0.0 {
+        *out = [0, 0, 0, 0];
+        return;
+    }
     for c in 0..3 {
         // Where the backdrop is transparent there is nothing to blend with, so
         // the source keeps its own colour.
         let eff = cs[c] * (1.0 - ab) + mixed[c] * ab;
-        out[c] = ((eff * a + cb[c] * inv) * 255.0).round().clamp(0.0, 255.0) as u8;
+        let co = eff * a + cb[c] * ab * inv;
+        out[c] = ((co / ao) * 255.0).round().clamp(0.0, 255.0) as u8;
     }
-    out[3] = ((a + ab * inv) * 255.0).round().clamp(0.0, 255.0) as u8;
+    out[3] = (ao * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
 pub(crate) fn blend_normal(out: &mut [u8; 4], src: [u8; 4], a: f32) {
+    let ab = out[3] as f32 / 255.0;
     let inv = 1.0 - a;
-    for c in 0..3 {
-        out[c] = (src[c] as f32 * a + out[c] as f32 * inv).round() as u8;
+    let ao = a + ab * inv;
+    if ao <= 0.0 {
+        *out = [0, 0, 0, 0];
+        return;
     }
-    out[3] = ((a + out[3] as f32 / 255.0 * inv) * 255.0).round() as u8;
+    // 直通 alpha 下的 over：先按预乘写，再除掉合成 alpha，否则半透明背景
+    // 会把累积值当成直通色继续往下叠（越叠越暗）。
+    for c in 0..3 {
+        let co = src[c] as f32 * a + out[c] as f32 * ab * inv;
+        out[c] = (co / ao).round().clamp(0.0, 255.0) as u8;
+    }
+    out[3] = (ao * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
 /// `blend_pixel` 的浮点版本，用于整幅合成。
 ///
-/// 输出缓冲是**直通 alpha 的 f32**（0..=1），颜色分量也是 0..=1。公式与
-/// `blend_pixel` 逐项一致，唯一区别是中间结果不再每层 round 到 u8 —— 一张
-/// 有几十层堆叠的 PSD 每层都舍入一次会累积 1~2/255 的系统性偏移，保真模式
-/// 下这就是可见的色差。
+/// 输出缓冲是**预乘 alpha 的 f32**（0..=1）：不透明画布上预乘与直通等价，
+/// 但半透明画布上只有预乘才能把「已叠上去的颜色」和「覆盖率」分开累积。
+/// 量化成 8 位图时由调用方一次性除掉 alpha（`acc_to_image`），中途不 round ——
+/// 一张有几十层堆叠的 PSD 每层都舍入一次会累积 1~2/255 的系统性偏移，保真
+/// 模式下这就是可见的色差。
 pub(crate) fn blend_pixel_f32(out: &mut [f32; 4], src: [f32; 4], opacity: f32, mode: BlendMode) {
     let a = src[3] * opacity;
     if a <= 0.0 {
@@ -131,14 +159,19 @@ pub(crate) fn blend_pixel_f32(out: &mut [f32; 4], src: [f32; 4], opacity: f32, m
         return;
     }
     let ab = out[3];
-    let cb = [out[0], out[1], out[2]];
+    // 混合函数要的是直通色，缓冲里存的是预乘色：ab<1 时先还原一次。
+    let cb = if ab > 0.0 {
+        [out[0] / ab, out[1] / ab, out[2] / ab]
+    } else {
+        [0.0; 3]
+    };
     let cs = [src[0], src[1], src[2]];
     let mixed = blend_rgb(mode, cb, cs);
     let inv = 1.0 - a;
     for c in 0..3 {
         // 背景透明处没有可混合的颜色，源色自己保留（与 u8 版一致）。
         let eff = cs[c] * (1.0 - ab) + mixed[c] * ab;
-        out[c] = eff * a + cb[c] * inv;
+        out[c] = eff * a + out[c] * inv;
     }
     out[3] = a + ab * inv;
 }
@@ -322,5 +355,42 @@ mod tests {
         let mut out = [128u8, 128, 128, 255];
         blend_pixel(&mut out, [0, 255, 0, 255], 0.5, BlendMode::Multiply);
         assert_eq!(&out[..3], &[64, 128, 64]);
+    }
+
+    #[test]
+    fn half_opacity_layer_over_transparency_keeps_its_colour() {
+        // 透明画布上 50% 的白色：Photoshop 存的是 (255,255,255,128)，不是
+        // 预乘后的 (128,128,128,128)。旧实现把累积值当直通色，这里会得到灰色，
+        // 于是所有「透明底 + 半透明贴图」的稿子整片偏暗。
+        let mut out = [0u8, 0, 0, 0];
+        blend_pixel(&mut out, [255, 255, 255, 255], 0.5, BlendMode::Normal);
+        assert_eq!(out, [255, 255, 255, 128]);
+    }
+
+    #[test]
+    fn second_half_opacity_layer_keeps_straight_alpha() {
+        // 两层 50%：合成 alpha = 0.75，颜色仍是纯白（叠加不改变颜色本身）。
+        let mut out = [0u8, 0, 0, 0];
+        blend_pixel(&mut out, [255, 255, 255, 255], 0.5, BlendMode::Normal);
+        blend_pixel(&mut out, [255, 255, 255, 255], 0.5, BlendMode::Normal);
+        assert_eq!(out, [255, 255, 255, 192]);
+    }
+
+    #[test]
+    fn blend_on_half_transparent_backdrop_uses_straight_colours() {
+        // 半透明背景 (10,200,30,α128) 上叠 50% 的 (200,100,50)，按
+        // Porter-Duff（ab≈0.502, as=0.5, Multiply）：
+        //   ao = 0.751 → 192
+        //   Co = (72, 126, 29)
+        // 旧实现把背景当直通色、又不除 ao，会得到明显偏暗的 (52,60,6)。
+        let mut out = [10u8, 200, 30, 128];
+        blend_pixel(&mut out, [200, 100, 50, 255], 0.5, BlendMode::Multiply);
+        assert_eq!(out[3], 192);
+        assert!(
+            (out[0] as i32 - 72).abs() <= 1
+                && (out[1] as i32 - 126).abs() <= 1
+                && (out[2] as i32 - 29).abs() <= 1,
+            "got {out:?}"
+        );
     }
 }

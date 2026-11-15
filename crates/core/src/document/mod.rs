@@ -1449,28 +1449,43 @@ fn blend_raster_into(out: &mut RgbaImage, r: &RasterLayer, opacity: f32, mode: B
 }
 
 /// 把 f32 累积缓冲量化成一张 8 位图（整幅唯一的一次量化）。
+///
+/// 缓冲里存的是**预乘**色，输出的 8 位图是**直通** alpha（全工程、PSD 写回、
+/// 缩略图都按直通读）。少了这一步除法，半透明画布的整幅画面会按覆盖率变暗：
+/// alpha=152 的纯白会被写成 (152,152,152)，bg.psd 这类「透明底 + 半透明贴图」
+/// 的稿子整片偏暗（实测 MAE 13.66，除法之后 0.20）。
 fn acc_to_image(acc: &[[f32; 4]], w: u32, h: u32) -> RgbaImage {
     let mut out = RgbaImage::new(w, h);
     for (px, v) in out.pixels_mut().zip(acc.iter()) {
+        let a = v[3];
+        let (r, g, b) = if a > 0.0 {
+            (v[0] / a, v[1] / a, v[2] / a)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
         px.0 = [
-            (v[0] * 255.0).round().clamp(0.0, 255.0) as u8,
-            (v[1] * 255.0).round().clamp(0.0, 255.0) as u8,
-            (v[2] * 255.0).round().clamp(0.0, 255.0) as u8,
-            (v[3] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (r * 255.0).round().clamp(0.0, 255.0) as u8,
+            (g * 255.0).round().clamp(0.0, 255.0) as u8,
+            (b * 255.0).round().clamp(0.0, 255.0) as u8,
+            (a * 255.0).round().clamp(0.0, 255.0) as u8,
         ];
     }
     out
 }
 
 /// 把一张 8 位图写回 f32 累积缓冲（标记直绘之后用）。
+///
+/// 输入是直通 alpha 的 8 位图（标记栅格化 / 蒙版绘制都在直通空间工作），
+/// 缓冲则按预乘保存，所以这里乘回 alpha。
 fn store_image(acc: &mut [[f32; 4]], img: &RgbaImage) {
     for (v, px) in acc.iter_mut().zip(img.pixels()) {
         let p = px.0;
+        let a = p[3] as f32 / 255.0;
         *v = [
-            p[0] as f32 / 255.0,
-            p[1] as f32 / 255.0,
-            p[2] as f32 / 255.0,
-            p[3] as f32 / 255.0,
+            p[0] as f32 / 255.0 * a,
+            p[1] as f32 / 255.0 * a,
+            p[2] as f32 / 255.0 * a,
+            a,
         ];
     }
 }

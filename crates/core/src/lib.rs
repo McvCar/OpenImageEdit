@@ -1017,6 +1017,27 @@ mod tests {
         assert_eq!(flat.get_pixel(0, 0).0, [0, 0, 0, 255]);
     }
 
+    /// 透明画布上 50% 的图层：整幅合成必须是**直通**色 + 128 的 alpha。
+    ///
+    /// 累积缓冲是预乘的，量化时必须除掉 alpha；否则半透明贴图会按覆盖率
+    /// 变暗——bg.psd 那类「透明底 + 半透明素材」的稿子整片偏暗（与合并图
+    /// 的 MAE 从 13.66 降到 0.20）。
+    #[test]
+    fn flatten_keeps_straight_alpha_on_transparent_canvas() {
+        let mut doc = Document::from_image(RgbaImage::new(8, 8));
+        let mut layer = Layer::new(
+            "半透明",
+            RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255])),
+        );
+        layer.set_offset((2, 2));
+        layer.opacity = 0.5;
+        doc.add_layer(layer).unwrap();
+        let flat = doc.flatten();
+        assert_eq!(flat.get_pixel(3, 3).0, [255, 255, 255, 128]);
+        // 图层之外仍是全透明，颜色清零而不是留着预乘残值。
+        assert_eq!(flat.get_pixel(0, 0).0, [0, 0, 0, 0]);
+    }
+
     fn rect_mark(fill: bool) -> Mark {
         let mut m = Mark::new(MarkKind::Rect);
         m.rect = (2.0, 2.0, 10.0, 8.0);
