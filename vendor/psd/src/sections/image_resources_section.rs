@@ -4,12 +4,15 @@ use std::ops::Range;
 use thiserror::Error;
 
 pub use crate::sections::image_resources_section::image_resource::ImageResource;
+pub use crate::sections::image_resources_section::image_resource::RawImageResource;
 use crate::sections::image_resources_section::image_resource::SlicesImageResource;
 use crate::sections::PsdCursor;
 
 const EXPECTED_RESOURCE_BLOCK_SIGNATURE: [u8; 4] = [56, 66, 73, 77];
 const EXPECTED_DESCRIPTOR_VERSION: u32 = 16;
 const RESOURCE_SLICES_INFO: i16 = 1050;
+/// Pattern resources: `2491` (Patt), `2492` (Pat2), `2493` (Pat3).
+const RESOURCE_PATTERNS: std::ops::RangeInclusive<i16> = 2491..=2493;
 
 mod image_resource;
 
@@ -56,6 +59,16 @@ impl ImageResourcesSection {
                     )
                     .map_err(ImageResourcesSectionError::InvalidResource)?;
                     resources.push(ImageResource::Slices(slices_image_resource));
+                }
+                // 图案（Patt/Pat2/Pat3）留给解码器：通道要按 PackBits 解压，
+                // 与图层通道同一套逻辑。
+                _ if RESOURCE_PATTERNS.contains(&rid) => {
+                    let data = cursor.get_ref()[block.data_range].to_vec();
+                    resources.push(ImageResource::Raw(RawImageResource {
+                        resource_id: rid,
+                        name: block.name,
+                        data,
+                    }));
                 }
                 _ => {}
             }

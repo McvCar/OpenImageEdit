@@ -12,6 +12,7 @@ pub use psd_layers::{
     decode_psd_layers, decode_psd_layers_with_progress, PsdLayerData, PsdLayerSet,
 };
 
+mod psd_pattern;
 mod psd_vector;
 
 mod psd_write;

@@ -11,7 +11,7 @@
 //! 一个像素的亮点，所以按数值范围判断：全部点都在 ±4 以内就当作比例。
 
 use image::RgbaImage;
-use psd::{VectorFill, VectorMask, VectorStroke, VectorStrokeAlign};
+use psd::{VectorFill, VectorMask, VectorOperation, VectorStroke, VectorStrokeAlign};
 
 /// 每条贝塞尔曲线切成多少段。形状层通常只有 4~16 个节点，24 段足以让
 /// 圆角在 4 倍超采样下看不出折线。
@@ -59,7 +59,15 @@ pub fn path_bounds(mask: &VectorMask, canvas: (u32, u32)) -> Option<[f32; 4]> {
     ])
 }
 
-/// 把 `mask` 的闭式子路径栅格化到**位图局部坐标**的覆盖率平面。
+/// 把 `mask` 的子路径栅格化到**位图局部坐标**的覆盖率平面。
+///
+/// `include_open` 决定开放子路径是否参与：填充 / 裁剪按 Photoshop 的
+/// 「填充路径会自动闭合」语义参与（隐式补一条直线闭合边），描边则不参与
+/// （开放路径没有闭合边，画上去会多一条本不存在的龙套线）。
+///
+/// 每条子路径的 `operation` 按 PS 的路径运算合成：并集 / 差集 / 交集 /
+/// 异或。异或就是 even-odd 的效果，但不是全局开关 —— PSD 把这个选择
+/// 存在每条子路径的长度记录里。
 ///
 /// 返回 `(cov, 路径包围盒@局部)`；`None` 表示路径不可用（空、坐标不是
 /// 有限数、完全落在位图外），调用方据此保持原样。
@@ -70,6 +78,7 @@ fn shape_coverage(
     offset: (i32, i32),
     canvas: (u32, u32),
     shift: (f32, f32),
+    include_open: bool,
 ) -> Option<(Vec<f32>, [f32; 4])> {
     if w == 0 || h == 0 {
         trace_fail("empty-image");
@@ -81,14 +90,20 @@ fn shape_coverage(
     };
     let (sx, sy) = scale_of((bx0, by0, bx1, by1), canvas);
 
-    let mut polys: Vec<Vec<(f32, f32)>> = Vec::new();
+    let mut polys: Vec<(Vec<(f32, f32)>, VectorOperation)> = Vec::new();
     for sp in &mask.subpaths {
-        if !sp.closed || sp.knots.len() < 2 {
+        if sp.knots.len() < 2 {
+            continue;
+        }
+        // 描边不补闭合边；填充 / 裁剪按 PS 语义隐式闭合。
+        if !sp.closed && !include_open {
             continue;
         }
         let mut poly = Vec::with_capacity(sp.knots.len() * 8);
         let n = sp.knots.len();
-        for i in 0..n {
+        // 闭合路径最后一段回到起点；开放路径只走到最后一个节点。
+        let segs = if sp.closed { n } else { n - 1 };
+        for i in 0..segs {
             let a = sp.knots[i];
             let b = sp.knots[(i + 1) % n];
             let p0 = (
@@ -119,8 +134,16 @@ fn shape_coverage(
                 poly.push(bezier(p0, c1, c2, p3, t));
             }
         }
+        // 开放路径补上最后一个锚点；闭合边由扫描线隐式补成直线。
+        if !sp.closed {
+            let a = sp.knots[n - 1].anchor;
+            poly.push((
+                a.1 * sx - offset.0 as f32 + shift.0,
+                a.0 * sy - offset.1 as f32 + shift.1,
+            ));
+        }
         if poly.len() >= 3 {
-            polys.push(poly);
+            polys.push((poly, sp.operation));
         }
     }
     if polys.is_empty() {
@@ -138,14 +161,65 @@ fn shape_coverage(
         return None;
     }
 
-    let mut cov = vec![0f32; (w * h) as usize];
-    rasterize(&polys, &mut cov, w, h, py0, py1);
+    let n = (w * h) as usize;
+    // 初始填充规则：PS 允许「从所有像素开始」再由子路径扣除。
+    let mut cov = if mask.initial_fill {
+        vec![1f32; n]
+    } else {
+        vec![0f32; n]
+    };
+    let mut tmp = vec![0f32; n];
+    for (poly, op) in &polys {
+        let mut rx0 = f32::INFINITY;
+        let mut ry0 = f32::INFINITY;
+        let mut rx1 = f32::NEG_INFINITY;
+        let mut ry1 = f32::NEG_INFINITY;
+        for (x, y) in poly {
+            rx0 = rx0.min(*x);
+            ry0 = ry0.min(*y);
+            rx1 = rx1.max(*x);
+            ry1 = ry1.max(*y);
+        }
+        let rx0 = rx0.max(0.0);
+        let ry0 = ry0.max(0.0);
+        let rx1 = rx1.min(w as f32);
+        let ry1 = ry1.min(h as f32);
+        if rx1 <= rx0 || ry1 <= ry0 {
+            continue;
+        }
+        // 只清 / 只扫本子路径覆盖的行。
+        let row0 = ry0.floor() as usize;
+        let row1 = (ry1.ceil() as usize).min(h as usize);
+        for y in row0..row1 {
+            tmp[y * w as usize..(y + 1) * w as usize].fill(0.0);
+        }
+        rasterize(std::slice::from_ref(poly), &mut tmp, w, h, ry0, ry1);
+        combine(&mut cov, &tmp, *op, w, row0, row1);
+    }
     if mask.invert {
         for v in cov.iter_mut() {
             *v = 1.0 - *v;
         }
     }
     Some((cov, [px0, py0, px1, py1]))
+}
+
+/// 把一条子路径的覆盖率按 PS 路径运算合进总区域。
+fn combine(dst: &mut [f32], src: &[f32], op: VectorOperation, w: u32, row0: usize, row1: usize) {
+    let w = w as usize;
+    for y in row0..row1 {
+        for x in 0..w {
+            let i = y * w + x;
+            let a = dst[i].clamp(0.0, 1.0);
+            let b = src[i].clamp(0.0, 1.0);
+            dst[i] = match op {
+                VectorOperation::Union => a + b - a * b,
+                VectorOperation::Subtract => a * (1.0 - b),
+                VectorOperation::Intersect => a * b,
+                VectorOperation::Xor => a + b - 2.0 * a * b,
+            };
+        }
+    }
 }
 
 /// 把形状画到 `image` 上（`offset` 是这张位图左上角的画布坐标）。
@@ -158,17 +232,26 @@ pub fn fill_shape(
     canvas: (u32, u32),
     mask: &VectorMask,
     fill: Option<&VectorFill>,
+    patterns: Option<&crate::psd_pattern::PatternStore>,
 ) -> bool {
     let (w, h) = image.dimensions();
-    let Some((cov, gb)) = shape_coverage(mask, w, h, offset, canvas, (0.0, 0.0)) else {
+    let Some((cov, gb)) = shape_coverage(mask, w, h, offset, canvas, (0.0, 0.0), true) else {
         return false;
     };
 
     // 填充色：纯色优先，其次渐变（按路径包围盒做基准，与 PS 一致），
-    // 都没有就当作纯白 —— 无填充的形状在 PS 里也只显示描边，这里由
-    // 后续描边样式覆盖，不会漏出白色。
+    // 再次图案；都没有就当作纯白 —— 无填充的形状在 PS 里也只显示描边，
+    // 这里由后续描边样式覆盖，不会漏出白色。
     let solid = fill.and_then(|f| f.solid);
     let gradient = fill.and_then(|f| f.gradient.as_ref());
+    let pattern = fill
+        .and_then(|f| f.pattern.as_ref())
+        .and_then(|r| patterns.and_then(|s| s.paint(r)));
+    // 图案原点：与图层对齐时用路径包围盒左上角，否则用文档原点。
+    let (anchor_x, anchor_y) = match fill.and_then(|f| f.pattern.as_ref()) {
+        Some(r) if r.align => (gb[0] + offset.0 as f32, gb[1] + offset.1 as f32),
+        _ => (0.0, 0.0),
+    };
     let mut painted = false;
     for y in 0..h {
         for x in 0..w {
@@ -182,7 +265,22 @@ pub fn fill_shape(
                     let t = crate::psd_effects::gradient_t(x as f32, y as f32, gb, g);
                     g.sample(t)
                 }
-                (None, None) => ([255, 255, 255], 1.0),
+                (None, None) => {
+                    if let Some(p) = pattern {
+                        let px = p.sample(
+                            x as f32 + offset.0 as f32,
+                            y as f32 + offset.1 as f32,
+                            (anchor_x, anchor_y),
+                        );
+                        ([px[0], px[1], px[2]], px[3] as f32 / 255.0)
+                    } else {
+                        // 有图案引用但文件里没有像素：不画，别拿白色冒充。
+                        if fill.and_then(|f| f.pattern.as_ref()).is_some() {
+                            continue;
+                        }
+                        ([255, 255, 255], 1.0)
+                    }
+                }
             };
             let a = (c.clamp(0.0, 1.0) * ga.clamp(0.0, 1.0) * 255.0).round() as u8;
             if a == 0 {
@@ -230,7 +328,7 @@ pub fn stroke_shape(
         return false;
     }
     let (w, h) = image.dimensions();
-    let Some((cov, gb)) = shape_coverage(mask, w, h, offset, canvas, (0.0, 0.0)) else {
+    let Some((cov, gb)) = shape_coverage(mask, w, h, offset, canvas, (0.0, 0.0), false) else {
         return false;
     };
     let half = stroke.width / 2.0;
@@ -288,7 +386,7 @@ pub fn path_alpha(
     mask: &VectorMask,
 ) -> Option<Vec<f32>> {
     let (w, h) = image.dimensions();
-    shape_coverage(mask, w, h, offset, canvas, (0.0, 0.0)).map(|(cov, _)| cov)
+    shape_coverage(mask, w, h, offset, canvas, (0.0, 0.0), true).map(|(cov, _)| cov)
 }
 
 /// 把位图裁到矢量路径内：`alpha *= cov`（PS 显示形状层 = 内容 ∩ 路径）。
@@ -304,7 +402,7 @@ pub fn clip_shape(
     mask: &VectorMask,
 ) -> bool {
     let (w, h) = image.dimensions();
-    let Some((cov, _gb)) = shape_coverage(mask, w, h, offset, canvas, (0.0, 0.0)) else {
+    let Some((cov, _gb)) = shape_coverage(mask, w, h, offset, canvas, (0.0, 0.0), true) else {
         return false;
     };
     let mut clipped = false;
@@ -423,14 +521,11 @@ mod tests {
         };
         VectorMask {
             invert: false,
+            initial_fill: false,
             subpaths: vec![psd::VectorSubpath {
                 closed: true,
-                knots: vec![
-                    k(y0, x0),
-                    k(y0, x1),
-                    k(y1, x1),
-                    k(y1, x0),
-                ],
+                operation: VectorOperation::Union,
+                knots: vec![k(y0, x0), k(y0, x1), k(y1, x1), k(y1, x0)],
             }],
         }
     }
@@ -440,7 +535,7 @@ mod tests {
     fn normalized_paths_scale_to_the_canvas() {
         let mut img = RgbaImage::new(20, 20);
         let mask = square(0.25, 0.25, 0.75, 0.75);
-        assert!(fill_shape(&mut img, (0, 0), (20, 20), &mask, None));
+        assert!(fill_shape(&mut img, (0, 0), (20, 20), &mask, None, None));
         assert_eq!(img.get_pixel(10, 10).0[3], 255, "中间必须被填满");
         assert_eq!(img.get_pixel(1, 1).0[3], 0, "角落在形状外");
         assert_eq!(img.get_pixel(5, 10).0[3], 255, "左边界已进入形状");
@@ -451,7 +546,7 @@ mod tests {
     fn pixel_paths_are_used_as_is() {
         let mut img = RgbaImage::new(40, 40);
         let mask = square(10.0, 10.0, 30.0, 30.0);
-        assert!(fill_shape(&mut img, (0, 0), (40, 40), &mask, None));
+        assert!(fill_shape(&mut img, (0, 0), (40, 40), &mask, None, None));
         assert_eq!(img.get_pixel(20, 20).0[3], 255);
         assert_eq!(img.get_pixel(2, 2).0[3], 0);
         assert_eq!(img.get_pixel(35, 35).0[3], 0);
@@ -463,7 +558,7 @@ mod tests {
     fn offset_shifts_the_shape_into_local_coordinates() {
         let mut img = RgbaImage::new(20, 20);
         let mask = square(0.5, 0.5, 1.0, 1.0);
-        assert!(fill_shape(&mut img, (10, 10), (20, 20), &mask, None));
+        assert!(fill_shape(&mut img, (10, 10), (20, 20), &mask, None, None));
         assert_eq!(img.get_pixel(5, 5).0[3], 255, "画布 (15,15) 在形状内");
         assert_eq!(img.get_pixel(9, 9).0[3], 255, "画布 (19,19) 仍在形状内");
         assert_eq!(img.get_pixel(15, 15).0[3], 0, "画布 (25,25) 在形状外");
@@ -477,8 +572,144 @@ mod tests {
         let fill = VectorFill {
             solid: Some([12, 200, 90]),
             gradient: None,
+            pattern: None,
         };
-        assert!(fill_shape(&mut img, (0, 0), (8, 8), &mask, Some(&fill)));
+        assert!(fill_shape(
+            &mut img,
+            (0, 0),
+            (8, 8),
+            &mask,
+            Some(&fill),
+            None
+        ));
         assert_eq!(img.get_pixel(4, 4).0, [12, 200, 90, 255]);
+    }
+
+    /// 开放子路径填充时按 PS 语义隐式闭合（「填充路径会自动闭合」）。
+    #[test]
+    fn open_subpath_is_closed_for_filling() {
+        let mut img = RgbaImage::new(100, 100);
+        let k = |y: f32, x: f32| VectorKnot {
+            preceding: (y, x),
+            anchor: (y, x),
+            leaving: (y, x),
+        };
+        let mask = VectorMask {
+            invert: false,
+            initial_fill: false,
+            subpaths: vec![psd::VectorSubpath {
+                closed: false,
+                operation: VectorOperation::Union,
+                knots: vec![k(10.0, 10.0), k(10.0, 90.0), k(90.0, 90.0)],
+            }],
+        };
+        assert!(fill_shape(&mut img, (0, 0), (100, 100), &mask, None, None));
+        assert_eq!(img.get_pixel(70, 30).0[3], 255, "三角形内部被填满");
+        assert_eq!(img.get_pixel(20, 70).0[3], 0, "斜边外侧不填");
+    }
+
+    /// 第二条子路径的 `Xor` 就是 even-odd：重叠区被扣除。
+    #[test]
+    fn xor_operation_punches_the_overlap() {
+        let mut img = RgbaImage::new(100, 100);
+        let k = |y: f32, x: f32| VectorKnot {
+            preceding: (y, x),
+            anchor: (y, x),
+            leaving: (y, x),
+        };
+        let sq = |x0: f32, y0: f32, x1: f32, y1: f32, op| psd::VectorSubpath {
+            closed: true,
+            operation: op,
+            knots: vec![k(y0, x0), k(y0, x1), k(y1, x1), k(y1, x0)],
+        };
+        let mask = VectorMask {
+            invert: false,
+            initial_fill: false,
+            subpaths: vec![
+                sq(0.0, 0.0, 60.0, 60.0, VectorOperation::Union),
+                sq(40.0, 40.0, 100.0, 100.0, VectorOperation::Xor),
+            ],
+        };
+        assert!(fill_shape(&mut img, (0, 0), (100, 100), &mask, None, None));
+        assert_eq!(img.get_pixel(20, 20).0[3], 255, "只在第一条内");
+        assert_eq!(img.get_pixel(50, 50).0[3], 0, "重叠区按奇偶规则扣除");
+        assert_eq!(img.get_pixel(80, 80).0[3], 255, "只在第二条内");
+    }
+
+    /// `Subtract` 挖洞：画中画的图标靠这个操作，而不是绕向。
+    #[test]
+    fn subtract_operation_cuts_a_hole() {
+        let mut img = RgbaImage::new(100, 100);
+        let k = |y: f32, x: f32| VectorKnot {
+            preceding: (y, x),
+            anchor: (y, x),
+            leaving: (y, x),
+        };
+        let sq = |x0: f32, y0: f32, x1: f32, y1: f32, op| psd::VectorSubpath {
+            closed: true,
+            operation: op,
+            knots: vec![k(y0, x0), k(y0, x1), k(y1, x1), k(y1, x0)],
+        };
+        let mask = VectorMask {
+            invert: false,
+            initial_fill: false,
+            subpaths: vec![
+                sq(0.0, 0.0, 100.0, 100.0, VectorOperation::Union),
+                sq(30.0, 30.0, 70.0, 70.0, VectorOperation::Subtract),
+            ],
+        };
+        assert!(fill_shape(&mut img, (0, 0), (100, 100), &mask, None, None));
+        assert_eq!(img.get_pixel(10, 10).0[3], 255);
+        assert_eq!(img.get_pixel(50, 50).0[3], 0, "中间被挖空");
+    }
+
+    /// 图案填充按 ID 取像素并平铺。
+    #[test]
+    fn pattern_fill_tiles_the_pattern() {
+        let mut img = RgbaImage::new(4, 4);
+        let k = |y: f32, x: f32| VectorKnot {
+            preceding: (y, x),
+            anchor: (y, x),
+            leaving: (y, x),
+        };
+        let mask = VectorMask {
+            invert: false,
+            initial_fill: false,
+            subpaths: vec![psd::VectorSubpath {
+                closed: true,
+                operation: VectorOperation::Union,
+                knots: vec![k(0.0, 0.0), k(0.0, 1.0), k(1.0, 1.0), k(1.0, 0.0)],
+            }],
+        };
+        let tile = RgbaImage::from_raw(2, 1, vec![255, 0, 0, 255, 0, 255, 0, 255]).unwrap();
+        let store = crate::psd_pattern::PatternStore {
+            tiles: vec![crate::psd_pattern::PatternTile {
+                id: "p1".into(),
+                name: "P".into(),
+                image: tile,
+            }],
+        };
+        let fill = VectorFill {
+            solid: None,
+            gradient: None,
+            pattern: Some(psd::VectorPattern {
+                id: "p1".into(),
+                name: "P".into(),
+                scale: 100.0,
+                angle: 0.0,
+                align: false,
+            }),
+        };
+        assert!(fill_shape(
+            &mut img,
+            (0, 0),
+            (4, 4),
+            &mask,
+            Some(&fill),
+            Some(&store)
+        ));
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(img.get_pixel(1, 0).0, [0, 255, 0, 255]);
+        assert_eq!(img.get_pixel(2, 0).0, [255, 0, 0, 255], "图案平铺");
     }
 }

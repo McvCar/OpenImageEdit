@@ -22,13 +22,16 @@ pub use crate::psd_channel::{PsdChannelCompression, PsdChannelKind};
 pub use crate::sections::file_header_section::{ColorMode, PsdDepth};
 pub use crate::sections::image_data_section::ChannelBytes;
 use crate::sections::image_data_section::ImageDataSection;
-pub use crate::sections::image_resources_section::ImageResource;
+pub use crate::sections::image_resources_section::{ImageResource, RawImageResource};
 use crate::sections::image_resources_section::ImageResourcesSection;
 pub use crate::sections::image_resources_section::{DescriptorField, UnitFloatStructure};
 pub use crate::sections::layer_and_mask_information_section::layer::{
     BlendMode, BrightnessContrast, HueSaturation, LayerChannels, MaskRect, PsdGroup, PsdLayer,
 };
-pub use vector::{VectorFill, VectorKnot, VectorMask, VectorStroke, VectorStrokeAlign, VectorSubpath};
+pub use vector::{
+    VectorFill, VectorKnot, VectorMask, VectorOperation, VectorPattern, VectorStroke,
+    VectorStrokeAlign, VectorSubpath,
+};
 use crate::sections::layer_and_mask_information_section::LayerAndMaskInformationSection;
 use crate::sections::MajorSections;
 

@@ -38,11 +38,42 @@ pub struct VectorKnot {
     pub leaving: (f32, f32),
 }
 
-/// 一条子路径。闭合子路径组成填充区域，开放子路径只对描边有意义。
+/// 子路径的组合方式（Photoshop 形状的「路径操作」）。
+///
+/// 长度记录里紧跟节点数的 `int16` 就是这个值；它决定多条子路径如何合成
+/// 一个填充区域，**不是**全局的 even-odd 开关。目标稿所有子路径都是
+/// `Union`，孔洞类图标会用 `Subtract` 或相反绕向表达。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VectorOperation {
+    /// `0` — 异或（扣除重叠部分，等价于 even-odd）。
+    Xor,
+    /// `1` — 并集（默认）。
+    #[default]
+    Union,
+    /// `2` — 差集（从已有区域里挖掉这条）。
+    Subtract,
+    /// `3` — 交集（只保留与已有区域重叠的部分）。
+    Intersect,
+}
+
+impl VectorOperation {
+    fn from_raw(raw: i16) -> Self {
+        match raw {
+            0 => VectorOperation::Xor,
+            2 => VectorOperation::Subtract,
+            3 => VectorOperation::Intersect,
+            _ => VectorOperation::Union,
+        }
+    }
+}
+
+/// 一条子路径。闭合子路径组成填充区域，开放子路径填充时按 PS 语义隐式闭合。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct VectorSubpath {
-    /// `true` = 闭合（参与填充），`false` = 开放（只影响描边）。
+    /// `true` = 闭合，`false` = 开放（描边不补闭合边，填充仍隐式闭合）。
     pub closed: bool,
+    /// 与已有区域的组合方式。
+    pub operation: VectorOperation,
     /// 节点序列，首尾自动相连（闭合时）。
     pub knots: Vec<VectorKnot>,
 }
@@ -52,7 +83,11 @@ pub struct VectorSubpath {
 pub struct VectorMask {
     /// Photoshop 的「反相」勾选。
     pub invert: bool,
-    /// 轮廓，通常是 1 条；图标可能是多条（各自的孔洞靠环绕方向表达）。
+    /// 初始填充规则记录（selector 8）：`true` 表示从「全部像素已填充」开始。
+    ///
+    /// 见 `InitialFillRule`：值 1 表示填充从所有像素开始，随后由子路径扣除。
+    pub initial_fill: bool,
+    /// 轮廓，通常是 1 条；图标可能是多条（各自的孔洞靠 operation 表达）。
     pub subpaths: Vec<VectorSubpath>,
 }
 
@@ -79,15 +114,35 @@ impl VectorMask {
     }
 }
 
-/// 形状图层的填充（`vscg`）：纯色或渐变。
+/// 形状填充引用的图案（`PtFl`）。
 ///
-/// 两者可能都不存在 —— 那时 PS 里就是无填充的形状，只有描边。
+/// 描述符里只有图案 ID / 名称与铺贴参数，**像素本身**在图像资源
+/// `PATTERNS1`（id 2491）里，由解码器按 ID 关联。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VectorPattern {
+    /// `Ptrn` → `Idnt`：图案 ID（空表示文件里没写）。
+    pub id: String,
+    /// `Ptrn` → `Nm  `：图案名称（UI 里看到的名字）。
+    pub name: String,
+    /// `Scl ` 百分比，100 = 原始尺寸。
+    pub scale: f32,
+    /// `Angl` 角度（度）。
+    pub angle: f32,
+    /// `Algn`：图案是否与图层对齐。
+    pub align: bool,
+}
+
+/// 形状图层的填充（`vscg`）：纯色、渐变或图案。
+///
+/// 三者可能都不存在 —— 那时 PS 里就是无填充的形状，只有描边。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct VectorFill {
     /// 纯色填充（`SoCo`）。
     pub solid: Option<[u8; 3]>,
     /// 渐变填充（`GdFl`），几何在体里（角度、类型、色标）。
     pub gradient: Option<Gradient>,
+    /// 图案填充（`PtFl`）。
+    pub pattern: Option<VectorPattern>,
 }
 
 /// 解析 `vmsk` / `vsms` 的负载。结构不对就返回 `None`，绝不 panic：
@@ -103,6 +158,7 @@ pub fn parse_vector_mask(bytes: &[u8]) -> Option<VectorMask> {
     let flags = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
     let mut mask = VectorMask {
         invert: flags & 1 != 0,
+        initial_fill: false,
         subpaths: Vec::new(),
     };
     let mut i = 8usize;
@@ -113,17 +169,21 @@ pub fn parse_vector_mask(bytes: &[u8]) -> Option<VectorMask> {
         let selector = u16::from_be_bytes([bytes[i], bytes[i + 1]]);
         i += 2;
         match selector {
-            // 闭合 / 开放子路径的长度记录：节点数 + 22 字节附加数据。
+            // 闭合 / 开放子路径的长度记录：节点数 + 组合方式 + 20 字节附加数据。
             0 | 3 => {
                 if i + 24 > bytes.len() {
                     break;
                 }
                 let count = u16::from_be_bytes([bytes[i], bytes[i + 1]]) as usize;
+                // 负载 = 节点数(u16) + operation(int16) + 20 字节。
+                let operation =
+                    VectorOperation::from_raw(i16::from_be_bytes([bytes[i + 2], bytes[i + 3]]));
                 i += 24;
                 closed = selector == 0;
                 remaining = count.min(4096);
                 mask.subpaths.push(VectorSubpath {
                     closed,
+                    operation,
                     knots: Vec::with_capacity(remaining),
                 });
             }
@@ -151,10 +211,19 @@ pub fn parse_vector_mask(bytes: &[u8]) -> Option<VectorMask> {
                 }
                 let _ = closed;
             }
-            // 填充规则 / 剪贴板 / 初始填充规则：负载都是固定的 24 字节
-            // （规范里含 2 字节子类型；selector 已经单独读过，这里整段跳过，
-            //  少读 2 字节会让后面整段错位 —— 曾因此一条路径都读不出来）。
-            6 | 7 | 8 => {
+            // 填充规则 / 剪贴板：负载固定 24 字节。selector 6 是空记录，
+            // 7 是剪贴板矩形，两者都不影响填充区域。
+            6 | 7 => {
+                i += 24;
+            }
+            // 初始填充规则（selector 8）：u16 值 + 22 字节保留。值 1 表示
+            // 填充从「所有像素」开始，随后由子路径按 operation 扣除。
+            8 => {
+                if i + 24 > bytes.len() {
+                    break;
+                }
+                mask.initial_fill =
+                    u16::from_be_bytes([bytes[i], bytes[i + 1]]) & 1 != 0;
                 i += 24;
             }
             // 未知 selector：结构已经不可信，停在这里比乱读安全。
@@ -214,7 +283,7 @@ pub fn parse_vector_stroke(bytes: &[u8]) -> Option<VectorStroke> {
     if let Some(content) = desc.descriptor(b"strokeStyleContent") {
         fill = fill_from_descriptor(content);
     }
-    if fill.solid.is_none() && fill.gradient.is_none() {
+    if fill.solid.is_none() && fill.gradient.is_none() && fill.pattern.is_none() {
         fill = fill_from_descriptor(&desc);
     }
     Some(VectorStroke {
@@ -228,7 +297,8 @@ pub fn parse_vector_stroke(bytes: &[u8]) -> Option<VectorStroke> {
     })
 }
 
-/// 描述符里的填充内容：`SoCo` / `GdFl` 包一层，或者直接是 `Clr ` / `Grad`。
+/// 描述符里的填充内容：`SoCo` / `GdFl` / `PtFl` 包一层，或者直接是
+/// `Clr ` / `Grad` / `Ptrn`。
 fn fill_from_descriptor(desc: &descriptor::Descriptor) -> VectorFill {
     let mut fill = VectorFill::default();
     if let Some(soco) = desc.descriptor(b"SoCo") {
@@ -249,7 +319,37 @@ fn fill_from_descriptor(desc: &descriptor::Descriptor) -> VectorFill {
             fill.gradient = Some(crate::effects::gradient_from_descriptor(desc, g));
         }
     }
+    if let Some(ptfl) = desc.descriptor(b"PtFl") {
+        fill.pattern = Some(pattern_from_descriptor(ptfl));
+    }
     fill
+}
+
+/// 从 `PtFl` 描述符读图案引用与铺贴参数。
+pub(crate) fn pattern_from_descriptor(d: &descriptor::Descriptor) -> VectorPattern {
+    let mut p = VectorPattern {
+        scale: 100.0,
+        angle: 0.0,
+        align: true,
+        ..Default::default()
+    };
+    let ptrn = d.descriptor(b"Ptrn").unwrap_or(d);
+    if let Some(id) = ptrn.text(b"Idnt") {
+        p.id = id.to_string();
+    }
+    if let Some(name) = ptrn.text(b"Nm  ") {
+        p.name = name.to_string();
+    }
+    if let Some(v) = d.number(b"Scl ") {
+        p.scale = v as f32;
+    }
+    if let Some(v) = d.number(b"Angl") {
+        p.angle = v as f32;
+    }
+    if let Some(v) = d.boolean(b"Algn") {
+        p.align = v;
+    }
+    p
 }
 
 /// 解析形状填充的 sheet setting（`SoCo` / `GdFl`）：负载 = u32 版本（实测
@@ -269,7 +369,10 @@ pub fn parse_sheet_fill(bytes: &[u8]) -> Option<VectorFill> {
             fill.gradient = Some(crate::effects::gradient_from_descriptor(&desc, g));
         }
     }
-    if fill.solid.is_none() && fill.gradient.is_none() {
+    if let Some(ptfl) = desc.descriptor(b"PtFl") {
+        fill.pattern = Some(pattern_from_descriptor(ptfl));
+    }
+    if fill.solid.is_none() && fill.gradient.is_none() && fill.pattern.is_none() {
         return None;
     }
     Some(fill)
@@ -290,15 +393,20 @@ pub fn parse_vector_fill(bytes: &[u8]) -> Option<VectorFill> {
             fill.gradient = Some(crate::effects::gradient_from_descriptor(&gdfl, g));
         }
     }
-    if fill.solid.is_none() && fill.gradient.is_none() {
-        // 少数文件把填充直接放在描述符本身（没有 SoCo/GdFl 包一层）。
+    if let Some(ptfl) = desc.descriptor(b"PtFl") {
+        fill.pattern = Some(pattern_from_descriptor(ptfl));
+    }
+    if fill.solid.is_none() && fill.gradient.is_none() && fill.pattern.is_none() {
+        // 少数文件把填充直接放在描述符本身（没有 SoCo/GdFl/PtFl 包一层）。
         if let Some(g) = desc.descriptor(b"Grad") {
             fill.gradient = Some(crate::effects::gradient_from_descriptor(&desc, g));
         } else if let Some(soco) = desc.descriptor(b"Clr ") {
             fill.solid = rgb_from(soco);
+        } else if let Some(ptrn) = desc.descriptor(b"Ptrn") {
+            fill.pattern = Some(pattern_from_descriptor(ptrn));
         }
     }
-    if fill.solid.is_none() && fill.gradient.is_none() {
+    if fill.solid.is_none() && fill.gradient.is_none() && fill.pattern.is_none() {
         return None;
     }
     Some(fill)

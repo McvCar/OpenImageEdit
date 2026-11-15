@@ -356,6 +356,8 @@ fn build_layers<F: FnMut(usize, usize)>(
     let mut vector_clipped = 0usize;
     let mut vector_stroked = 0usize;
     let groups = psd.groups();
+    // 图案资源（`Patt` / `Pat2` / `Pat3`）：形状填充按图案 ID 取像素。
+    let patterns = crate::psd_pattern::PatternStore::from_resources(psd.resources());
     let mut inherited_hidden = false;
     // 诊断开关：把某一项特性关掉再合成，用 `dump-flat` 与 PS 合并图比对，
     // 就能量出「这一项到底贡献了多少误差」。只在排查时用，平时全开。
@@ -586,6 +588,7 @@ fn build_layers<F: FnMut(usize, usize)>(
                         (cw as u32, ch as u32),
                         vm,
                         layer.vector_fill(),
+                        Some(&patterns),
                     )
                 {
                     vector_filled += 1;
@@ -1649,7 +1652,7 @@ fn decode_mask(
     ))
 }
 
-fn unpack_packbits(data: &[u8], expected: usize) -> Vec<u8> {
+pub(crate) fn unpack_packbits(data: &[u8], expected: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(expected);
     let mut i = 0usize;
     while i < data.len() && out.len() < expected {
