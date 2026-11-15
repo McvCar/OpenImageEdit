@@ -476,6 +476,7 @@ dependencies = [
 name = "imageedit-decode"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "image",
  "imageedit-core",
  "lcms2",
@@ -676,6 +677,7 @@ dependencies = [
 name = "psd"
 version = "0.3.5"
 dependencies = [
+ "flate2",
  "thiserror 1.0.69",
 ]
 

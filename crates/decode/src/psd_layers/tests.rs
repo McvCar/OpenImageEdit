@@ -100,6 +100,169 @@ fn make_psd(w: u32, h: u32, layers: &[TestLayer]) -> Vec<u8> {
     out
 }
 
+/// 16 位版本：图层通道与合并图都写成裸 16 位（每样本两字节），用于验证
+/// 降级路径。输入仍是 8 位 RGBA，按 `v * 257` 扩展。
+fn make_psd_16(w: u32, h: u32, layers: &[TestLayer]) -> Vec<u8> {
+    let mut records = Vec::new();
+    let mut channels = Vec::new();
+    for layer in layers.iter() {
+        let n = (layer.w * layer.h) as usize;
+        let mut data = Vec::new();
+        for c in 0..4 {
+            push_u16(&mut data, 0); // raw
+            for i in 0..n {
+                push_u16(&mut data, layer.rgba[i * 4 + c] as u16 * 257);
+            }
+        }
+        let mut rec = Vec::new();
+        push_i32(&mut rec, layer.top);
+        push_i32(&mut rec, layer.left);
+        push_i32(&mut rec, layer.top + layer.h as i32);
+        push_i32(&mut rec, layer.left + layer.w as i32);
+        push_u16(&mut rec, 4);
+        for id in [0i16, 1, 2, -1] {
+            push_i16(&mut rec, id);
+            push_u32(&mut rec, (2 + 2 * n) as u32);
+        }
+        rec.extend_from_slice(b"8BIMnorm");
+        rec.push(layer.opacity);
+        rec.push(0);
+        rec.push(if layer.visible { 8 } else { 8 | 2 });
+        rec.push(0);
+        let mut extra = Vec::new();
+        push_u32(&mut extra, 0);
+        push_u32(&mut extra, 0);
+        let name = layer.name.as_bytes();
+        extra.push(name.len() as u8);
+        extra.extend_from_slice(name);
+        pad4(&mut extra);
+        push_u32(&mut rec, extra.len() as u32);
+        rec.extend_from_slice(&extra);
+        records.extend_from_slice(&rec);
+        channels.extend_from_slice(&data);
+    }
+    let mut info = Vec::new();
+    push_u32(&mut info, (2 + records.len() + channels.len()) as u32);
+    push_i16(&mut info, layers.len() as i16);
+    info.extend_from_slice(&records);
+    info.extend_from_slice(&channels);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"8BPS");
+    push_u16(&mut out, 1);
+    out.extend_from_slice(&[0; 6]);
+    push_u16(&mut out, 4);
+    push_u32(&mut out, h);
+    push_u32(&mut out, w);
+    push_u16(&mut out, 16); // depth
+    push_u16(&mut out, 3);
+    push_u32(&mut out, 0);
+    push_u32(&mut out, 0);
+    push_u32(&mut out, (info.len() + 4) as u32);
+    out.extend_from_slice(&info);
+    push_u32(&mut out, 0);
+    push_u16(&mut out, 0); // raw merged image
+    for c in 0..4 {
+        for _ in 0..w * h {
+            push_u16(&mut out, (c * 40 + 17) as u16 * 257);
+        }
+    }
+    out
+}
+
+/// 32 位 + ZIP 图层通道（可带预测）。
+///
+/// 图层矩形沿用本仓库测试的约定：右下角存的是边界（`right = left + w`），
+/// vendor 解析时会把右下角减一，展开宽度正好是 `w`。
+fn make_psd_zip32(w: u32, h: u32, layer: &TestLayer, prediction: bool) -> Vec<u8> {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let (lw, lh) = (layer.w as usize, layer.h as usize);
+    let encode = |plane: Vec<f32>, rows: usize, cols: usize| -> Vec<u8> {
+        let mut raw = Vec::with_capacity(rows * cols * 4);
+        for v in plane {
+            raw.extend_from_slice(&v.to_be_bytes());
+        }
+        if prediction {
+            for row in raw.chunks_mut(cols * 4) {
+                for i in (4..row.len()).rev() {
+                    row[i] = row[i].wrapping_sub(row[i - 4]);
+                }
+            }
+        }
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&raw).unwrap();
+        enc.finish().unwrap()
+    };
+
+    let mut data = Vec::new();
+    let mut lens = Vec::new();
+    for c in 0..4 {
+        let plane: Vec<f32> = (0..lh * lw)
+            .map(|i| layer.rgba[i * 4 + c] as f32 / 255.0)
+            .collect();
+        let z = encode(plane, lh, lw);
+        push_u16(&mut data, if prediction { 3 } else { 2 });
+        data.extend_from_slice(&z);
+        lens.push((2 + z.len()) as u32);
+    }
+
+    let mut rec = Vec::new();
+    push_i32(&mut rec, layer.top);
+    push_i32(&mut rec, layer.left);
+    push_i32(&mut rec, layer.top + layer.h as i32);
+    push_i32(&mut rec, layer.left + layer.w as i32);
+    push_u16(&mut rec, 4);
+    for (id, len) in [0i16, 1, 2, -1].iter().zip(lens.iter()) {
+        push_i16(&mut rec, *id);
+        push_u32(&mut rec, *len);
+    }
+    rec.extend_from_slice(b"8BIMnorm");
+    rec.push(layer.opacity);
+    rec.push(0);
+    rec.push(if layer.visible { 8 } else { 8 | 2 });
+    rec.push(0);
+    let mut extra = Vec::new();
+    push_u32(&mut extra, 0);
+    push_u32(&mut extra, 0);
+    let name = layer.name.as_bytes();
+    extra.push(name.len() as u8);
+    extra.extend_from_slice(name);
+    pad4(&mut extra);
+    push_u32(&mut rec, extra.len() as u32);
+    rec.extend_from_slice(&extra);
+
+    let mut info = Vec::new();
+    push_u32(&mut info, (2 + rec.len() + data.len()) as u32);
+    push_i16(&mut info, 1);
+    info.extend_from_slice(&rec);
+    info.extend_from_slice(&data);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"8BPS");
+    push_u16(&mut out, 1);
+    out.extend_from_slice(&[0; 6]);
+    push_u16(&mut out, 4);
+    push_u32(&mut out, h);
+    push_u32(&mut out, w);
+    push_u16(&mut out, 32); // depth
+    push_u16(&mut out, 3);
+    push_u32(&mut out, 0);
+    push_u32(&mut out, 0);
+    push_u32(&mut out, (info.len() + 4) as u32);
+    out.extend_from_slice(&info);
+    push_u32(&mut out, 0);
+    push_u16(&mut out, if prediction { 3 } else { 2 });
+    for c in 0..4 {
+        let plane: Vec<f32> = (0..w * h)
+            .map(|_| (c * 40 + 17) as f32 / 255.0)
+            .collect();
+        out.extend_from_slice(&encode(plane, h as usize, w as usize));
+    }
+    out
+}
+
 fn solid(w: u32, h: u32, color: [u8; 4]) -> Vec<u8> {
     let mut v = Vec::with_capacity((w * h * 4) as usize);
     for _ in 0..w * h {
@@ -150,6 +313,76 @@ fn parses_layers_with_attributes_and_pixels() {
     assert!((set.layers[1].opacity - 128.0 / 255.0).abs() < 1e-6);
     assert_eq!(set.layers[1].image.get_pixel(0, 0), &Rgba([200, 100, 50, 128]));
     assert_eq!(set.bytes, (4 * 3 + 3 * 2) * 4);
+}
+
+#[test]
+fn sixteen_bit_layers_are_downgraded_to_8bit() {
+    let bytes = make_psd_16(
+        5,
+        4,
+        &[TestLayer {
+            name: "s16",
+            top: 1,
+            left: 2,
+            w: 2,
+            h: 2,
+            rgba: solid(2, 2, [200, 100, 50, 128]),
+            opacity: 255,
+            visible: true,
+        }],
+    );
+    let set = decode_psd_layers(&bytes, DecodeOptions::default()).expect("16-bit layers");
+    assert!(
+        set.degraded.iter().any(|n| n.contains("16 位")),
+        "{:?}",
+        set.degraded
+    );
+    assert_eq!(set.layers.len(), 1);
+    assert_eq!(
+        set.layers[0].image.get_pixel(0, 0),
+        &Rgba([200, 100, 50, 128])
+    );
+}
+
+#[test]
+fn thirtytwo_bit_zip_layers_decode_with_prediction() {
+    let layer = TestLayer {
+        name: "f32",
+        top: 1,
+        left: 1,
+        w: 3,
+        h: 2,
+        rgba: (0..3 * 2 * 4).map(|i| (i as u8) * 9).collect(),
+        opacity: 255,
+        visible: true,
+    };
+    for prediction in [false, true] {
+        let bytes = make_psd_zip32(5, 4, &layer, prediction);
+        let set = decode_psd_layers(&bytes, DecodeOptions::default()).expect("32-bit layers");
+        assert!(
+            set.degraded.iter().any(|n| n.contains("32 位")),
+            "{:?}",
+            set.degraded
+        );
+        assert_eq!(set.layers.len(), 1);
+        let image = &set.layers[0].image;
+        assert_eq!(image.dimensions(), (3, 2), "prediction {prediction}");
+        for y in 0..2 {
+            for x in 0..3 {
+                let i = ((y * 3 + x) * 4) as usize;
+                assert_eq!(
+                    image.get_pixel(x, y).0,
+                    [
+                        layer.rgba[i],
+                        layer.rgba[i + 1],
+                        layer.rgba[i + 2],
+                        layer.rgba[i + 3]
+                    ],
+                    "prediction {prediction} at ({x},{y})"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -311,17 +544,11 @@ fn vendored_fixtures_parse_without_panicking() {
         });
         match result {
             Err(_) => problems.push(format!("{name}: PANIC")),
-            Ok(Err(e)) => {
-                // 16-bit files are deliberately refused as layered
-                // documents (§7 degradation contract).
-                if *name != "one-channel" {
-                    problems.push(format!("{name}: {e}"));
-                }
-            }
+            Ok(Err(e)) => problems.push(format!("{name}: {e}")),
             Ok(Ok(set)) => {
                 // Flat fixtures (no Layer & Mask section) legitimately
                 // report zero layers; the caller keeps the composite.
-                let flat_ok = matches!(*name, "non-utf8-name" | "odd-pascal");
+                let flat_ok = matches!(*name, "non-utf8-name" | "odd-pascal" | "one-channel");
                 if set.layer_count() < 1 && !flat_ok {
                     problems.push(format!("{name}: no layers"));
                 }

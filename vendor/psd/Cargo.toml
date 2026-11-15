@@ -31,5 +31,8 @@ repository = "https://github.com/chinedufn/psd"
 [dependencies.thiserror]
 version = "1"
 
+[dependencies.flate2]
+version = "1"
+
 [dev-dependencies.anyhow]
 version = "1"

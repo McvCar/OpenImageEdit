@@ -112,12 +112,14 @@ impl Psd {
             major_sections.layer_and_mask,
             psd_width,
             psd_height,
+            file_header_section.depth,
         )
         .map_err(PsdError::LayerError)?;
 
         let image_data_section = ImageDataSection::from_bytes(
             major_sections.image_data,
             file_header_section.depth,
+            psd_width,
             psd_height,
             channel_count,
         )

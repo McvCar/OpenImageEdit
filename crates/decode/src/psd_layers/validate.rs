@@ -1,7 +1,10 @@
 use crate::{DecodeError, DecodeOptions};
 
 /// Mirror the header checks of `decode_psd_bytes` without touching it.
-pub(super) fn check_header(bytes: &[u8], options: DecodeOptions) -> Result<(u32, u32, u16), DecodeError> {
+pub(super) fn check_header(
+    bytes: &[u8],
+    options: DecodeOptions,
+) -> Result<(u32, u32, u16, u16), DecodeError> {
     let (width, height, depth, mode) = crate::psd_header(bytes).ok_or(DecodeError::UnsupportedFormat)?;
     let channels = bytes
         .get(12..14)
@@ -10,9 +13,9 @@ pub(super) fn check_header(bytes: &[u8], options: DecodeOptions) -> Result<(u32,
     if width == 0 || height == 0 {
         return Err(DecodeError::Psd("画布尺寸为 0".into()));
     }
-    if depth != 8 {
+    if !matches!(depth, 8 | 16 | 32) {
         return Err(DecodeError::Psd(format!(
-            "仅支持 8 位/通道（此文件为 {depth} 位），无法加载分层"
+            "仅支持 8/16/32 位/通道（此文件为 {depth} 位），无法加载分层"
         )));
     }
     if !matches!(mode, 1 | 3) {
@@ -39,7 +42,7 @@ pub(super) fn check_header(bytes: &[u8], options: DecodeOptions) -> Result<(u32,
             ));
         }
     }
-    Ok((width, height, channels))
+    Ok((width, height, channels, depth))
 }
 
 /// Pre-validate the layer&mask section down to per-record / per-channel
@@ -196,11 +199,12 @@ pub(super) fn validate_psd_layer_records(bytes: &[u8]) -> Result<Vec<String>, De
                 if l.saturating_sub(2) < rows * 2 && cid >= -1 {
                     short_channels += 1;
                 }
-            } else if compression > 1 {
+            } else if compression > 3 {
                 return Err(DecodeError::Psd(format!(
                     "压缩方式 {compression} 不受支持，无法加载分层"
                 )));
             }
+            // 2/3 是 ZIP（可带预测），没有行长度表；数据损坏由解压阶段报错。
             p = end;
         }
     }

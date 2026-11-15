@@ -318,9 +318,9 @@ pub fn decode_psd_bytes(bytes: &[u8], options: DecodeOptions) -> Result<Decoded,
     if width == 0 || height == 0 {
         return Err(DecodeError::Psd("画布尺寸为 0".into()));
     }
-    if depth != 8 {
+    if !matches!(depth, 8 | 16 | 32) {
         return Err(DecodeError::Psd(format!(
-            "仅支持 8 位/通道（此文件为 {depth} 位），请先在 Photoshop 中转换为 8 位"
+            "仅支持 8/16/32 位/通道（此文件为 {depth} 位），请先在 Photoshop 中转换"
         )));
     }
     if !matches!(mode, 1 | 3) {
@@ -339,7 +339,7 @@ pub fn decode_psd_bytes(bytes: &[u8], options: DecodeOptions) -> Result<Decoded,
             });
         }
     }
-    validate_psd_sections(bytes, width, height, channels)?;
+    validate_psd_sections(bytes, width, height, channels, depth)?;
     // The vendored psd fork fixes the known panics, but the crate is riddled
     // with unchecked slices — treat any residual panic as a decode error.
     // (Release builds with panic="unwind" for exactly this.)
@@ -375,7 +375,13 @@ pub fn decode_psd_bytes(bytes: &[u8], options: DecodeOptions) -> Result<Decoded,
         image,
         frame_count: 1,
         downsampled_from,
-        note: Some("PSD 预览：图层已合并，请另存为 PNG 等格式导出".into()),
+        note: Some(if depth == 8 {
+            "PSD 预览：图层已合并，请另存为 PNG 等格式导出".into()
+        } else {
+            format!(
+                "PSD 为 {depth} 位/通道，已降级为 8 位显示；图层已合并，请另存为 PNG 等格式导出"
+            )
+        }),
     })
 }
 
@@ -388,6 +394,7 @@ fn validate_psd_sections(
     width: u32,
     height: u32,
     channels: u16,
+    depth: u16,
 ) -> Result<(), DecodeError> {
     if channels == 0 || channels > 56 {
         return Err(DecodeError::Psd(format!("通道数异常：{channels}")));
@@ -422,10 +429,11 @@ fn validate_psd_sections(
     let data = off + 2;
     let pixels = width as usize * height as usize;
     let chans = channels as usize;
+    let bytes_per_sample = (depth as usize / 8).max(1);
     match compression {
         0 => {
-            // Raw planar: exactly channels * pixels bytes are read.
-            if bytes.len().saturating_sub(data) < chans * pixels {
+            // Raw planar: exactly channels * pixels * bytes/sample are read.
+            if bytes.len().saturating_sub(data) < chans * pixels * bytes_per_sample {
                 return Err(DecodeError::Psd("原始通道数据不足，文件已损坏".into()));
             }
         }
@@ -447,9 +455,12 @@ fn validate_psd_sections(
                 }
             }
         }
+        // 2 = ZIP，3 = ZIP + 预测。解压后的长度由解压器校验，损坏会在
+        // `inflate_zlib` 里变成 `InvalidZipData`。
+        2 | 3 => {}
         other => {
             return Err(DecodeError::Psd(format!(
-                "压缩方式 {other} 不受支持（仅 RAW / RLE），请另存为兼容性 PSD"
+                "压缩方式 {other} 不受支持（仅 RAW / RLE / ZIP），请另存为兼容性 PSD"
             )));
         }
     }
@@ -812,18 +823,159 @@ mod tests {
         }
     }
 
-    #[test]
-    fn psd_rejects_16bit_and_cmyk_with_clear_errors() {
-        let (w, h) = (4u32, 4u32);
-        let mut pixels = vec![[0u8; 3]; (w * h) as usize];
-        let mut depth16 = minimal_rgb_psd(w, h, &pixels);
-        depth16[22] = 0;
-        depth16[23] = 16; // depth field
-        assert!(matches!(
-            decode_bytes(&depth16, DecodeOptions::default()),
-            Err(DecodeError::Psd(_))
-        ));
+    /// 16 位版本：每个样本两字节（大端）。
+    fn minimal_rgb_psd_16(width: u32, height: u32, pixels: &[[u16; 3]]) -> Vec<u8> {
+        let mut psd = Vec::new();
+        psd.extend_from_slice(b"8BPS");
+        psd.extend_from_slice(&1u16.to_be_bytes());
+        psd.extend_from_slice(&[0u8; 6]);
+        psd.extend_from_slice(&3u16.to_be_bytes());
+        psd.extend_from_slice(&height.to_be_bytes());
+        psd.extend_from_slice(&width.to_be_bytes());
+        psd.extend_from_slice(&16u16.to_be_bytes()); // depth
+        psd.extend_from_slice(&3u16.to_be_bytes());
+        psd.extend_from_slice(&0u32.to_be_bytes());
+        psd.extend_from_slice(&0u32.to_be_bytes());
+        psd.extend_from_slice(&0u32.to_be_bytes());
+        psd.extend_from_slice(&0u16.to_be_bytes());
+        for plane in 0..3 {
+            for px in pixels {
+                psd.extend_from_slice(&px[plane].to_be_bytes());
+            }
+        }
+        psd
+    }
 
+    #[test]
+    fn psd_decodes_16bit_by_scaling_to_8bit() {
+        // Photoshop 的 8→16 位扩展是 `v * 257`，降级必须能无损还原。
+        let (w, h) = (4u32, 4u32);
+        let pixels: Vec<[u16; 3]> = (0..w * h)
+            .map(|i| {
+                let v = (i as u16 * 17) % 256;
+                [v * 257, 0x8000, 0]
+            })
+            .collect();
+        let bytes = minimal_rgb_psd_16(w, h, &pixels);
+        let decoded = decode_bytes(&bytes, DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.image.dimensions(), (w, h));
+        for (i, px) in pixels.iter().enumerate() {
+            let got = decoded.image.get_pixel((i as u32) % w, (i as u32) / w).0;
+            assert_eq!(got, [(px[0] / 257) as u8, 128, 0, 255], "pixel {i}");
+        }
+        let note = decoded.note.unwrap();
+        assert!(note.contains("16 位"), "{note}");
+    }
+
+    #[test]
+    fn psd_decodes_rle_16bit_by_decompressing_first() {
+        // RLE 压缩的是 16 位字节流；必须先解压再取 8 位，不能把压缩流当样本。
+        let (w, h) = (4u32, 1u32);
+        let mut psd = minimal_rgb_psd_16(w, h, &vec![[0u16; 3]; (w * h) as usize]);
+        // 把图像数据区改成 RLE：压缩标志 + 行长度表 + 三条扫描线。
+        psd.truncate(psd.len() - 2 - (w * h * 3 * 2) as usize);
+        psd.extend_from_slice(&1u16.to_be_bytes());
+        let scanline: Vec<u8> = {
+            // 16 位样本是 2 字节，字面量头覆盖 2*w 个字节。
+            let mut v = vec![(w as i16 * 2 - 1) as i8 as u8];
+            for _ in 0..w {
+                v.extend_from_slice(&0x8080u16.to_be_bytes());
+            }
+            v
+        };
+        for _ in 0..3 * h {
+            psd.extend_from_slice(&(scanline.len() as u16).to_be_bytes());
+        }
+        for _ in 0..3 {
+            psd.extend_from_slice(&scanline);
+        }
+        let decoded = decode_bytes(&psd, DecodeOptions::default()).unwrap();
+        for px in decoded.image.pixels() {
+            assert_eq!(px.0, [128, 128, 128, 255]);
+        }
+    }
+
+    /// ZIP 压缩的 RGB PSD（`depth` 为 16/32），`prediction` 控制是否按
+    /// PSD 的逐行差分预测编码。每条通道是一条独立的 zlib 流。
+    fn zip_rgb_psd(
+        width: u32,
+        height: u32,
+        depth: u16,
+        prediction: bool,
+        pixels: &[[f32; 3]],
+    ) -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let bytes_per_sample = (depth / 8) as usize;
+        let mut psd = Vec::new();
+        psd.extend_from_slice(b"8BPS");
+        psd.extend_from_slice(&1u16.to_be_bytes());
+        psd.extend_from_slice(&[0u8; 6]);
+        psd.extend_from_slice(&3u16.to_be_bytes());
+        psd.extend_from_slice(&height.to_be_bytes());
+        psd.extend_from_slice(&width.to_be_bytes());
+        psd.extend_from_slice(&depth.to_be_bytes());
+        psd.extend_from_slice(&3u16.to_be_bytes());
+        psd.extend_from_slice(&0u32.to_be_bytes());
+        psd.extend_from_slice(&0u32.to_be_bytes());
+        psd.extend_from_slice(&0u32.to_be_bytes());
+        psd.extend_from_slice(&(if prediction { 3u16 } else { 2u16 }).to_be_bytes());
+        for plane in 0..3 {
+            let mut raw = Vec::new();
+            for row in 0..height {
+                let mut line = Vec::new();
+                for col in 0..width {
+                    let v = pixels[(row * width + col) as usize][plane];
+                    if depth == 16 {
+                        let v = (v * 65535.0).round() as u16;
+                        line.extend_from_slice(&v.to_be_bytes());
+                    } else {
+                        line.extend_from_slice(&v.to_be_bytes());
+                    }
+                }
+                if prediction {
+                    // 编码是解码的逆运算：从行尾往前做差。
+                    for i in (bytes_per_sample..line.len()).rev() {
+                        line[i] = line[i].wrapping_sub(line[i - bytes_per_sample]);
+                    }
+                }
+                raw.extend_from_slice(&line);
+            }
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(&raw).unwrap();
+            psd.extend_from_slice(&enc.finish().unwrap());
+        }
+        psd
+    }
+
+    #[test]
+    fn psd_decodes_zip_channels_with_and_without_prediction() {
+        let pixels = [
+            [0.25f32, 1.0, 0.0],
+            [0.5, 0.0, 1.0],
+            [1.0, 0.5, 0.25],
+            [0.0, 0.0, 0.0],
+        ];
+        for (depth, prediction) in [(32u16, false), (32, true), (16, true)] {
+            let bytes = zip_rgb_psd(4, 1, depth, prediction, &pixels);
+            let decoded = decode_bytes(&bytes, DecodeOptions::default()).unwrap();
+            let expect = [[64, 255, 0, 255], [128, 0, 255, 255], [255, 128, 64, 255], [0, 0, 0, 255]];
+            for (i, e) in expect.iter().enumerate() {
+                assert_eq!(
+                    decoded.image.get_pixel(i as u32, 0).0,
+                    *e,
+                    "depth {depth} prediction {prediction} pixel {i}"
+                );
+            }
+            assert!(decoded.note.unwrap().contains("位/通道"));
+        }
+    }
+
+    #[test]
+    fn psd_rejects_cmyk_with_clear_error() {
+        let (w, h) = (4u32, 4u32);
+        let pixels = vec![[0u8; 3]; (w * h) as usize];
         let mut cmyk = minimal_rgb_psd(w, h, &pixels);
         cmyk[24] = 0;
         cmyk[25] = 4; // color mode: CMYK

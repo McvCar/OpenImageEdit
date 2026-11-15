@@ -419,6 +419,8 @@ pub enum PsdLayerError {
     UnknownBlendingMode { mode: [u8; 4] },
     #[error("{compression} is an invalid layer channel compression. Must be 0, 1, 2 or 3")]
     InvalidCompression { compression: u16 },
+    #[error("Layer channel ZIP data is corrupt or truncated")]
+    CorruptZip,
 }
 
 impl PsdLayer {
@@ -646,6 +648,11 @@ impl LayerRecord {
     /// The height of this layer record
     pub fn height(&self) -> i32 {
         (self.bottom - self.top) + 1
+    }
+
+    /// The width of this layer record
+    pub fn width(&self) -> i32 {
+        (self.right - self.left) + 1
     }
 }
 

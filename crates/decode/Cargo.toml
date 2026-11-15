@@ -18,3 +18,5 @@ psd = "0.3.5"
 # 写回测试要现造一个非 sRGB 的 profile（gamma 1.0）才能区分「文档空间」
 # 和「显示空间」的像素。
 lcms2 = { workspace = true }
+# 32 位 PSD 的 ZIP 通道需要现场压缩，才能构造测试样例。
+flate2 = "1"

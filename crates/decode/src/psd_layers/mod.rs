@@ -247,9 +247,15 @@ pub fn decode_psd_layers_with_progress<F>(
 where
     F: FnMut(usize, usize),
 {
-    let (width, height, channels) = check_header(bytes, options)?;
-    crate::validate_psd_sections(bytes, width, height, channels)?;
-    let file_notes = validate_psd_layer_records(bytes)?;
+    let (width, height, channels, depth) = check_header(bytes, options)?;
+    crate::validate_psd_sections(bytes, width, height, channels, depth)?;
+    let mut file_notes = validate_psd_layer_records(bytes)?;
+    if depth != 8 {
+        file_notes.insert(
+            0,
+            format!("{depth} 位/通道已降级为 8 位，像素精度按 8 位保存"),
+        );
+    }
 
     // The vendored parser still has unchecked slices. Everything it touches
     // (including our own channel expansion) stays inside catch_unwind (C5).

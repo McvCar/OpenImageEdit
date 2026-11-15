@@ -197,7 +197,7 @@ pub trait IntoRgba {
 }
 
 /// Rle decompress a channel
-fn rle_decompress(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn rle_decompress(bytes: &[u8]) -> Vec<u8> {
     let mut cursor = PsdCursor::new(&bytes[..]);
 
     let mut decompressed = vec![];

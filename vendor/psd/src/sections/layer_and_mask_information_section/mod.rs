@@ -3,7 +3,9 @@ use std::ops::Range;
 
 use crate::psd_channel::PsdChannelCompression;
 use crate::psd_channel::PsdChannelKind;
-use crate::sections::image_data_section::ChannelBytes;
+use crate::sections::image_data_section::{
+    inflate_zlib, to_eight_bit, undo_prediction, ChannelBytes,
+};
 use crate::sections::layer_and_mask_information_section::groups::Groups;
 use crate::sections::layer_and_mask_information_section::layer::{
     BlendMode, BrightnessContrast, GroupDivider, HueSaturation, Knockout, LayerChannels,
@@ -11,6 +13,7 @@ use crate::sections::layer_and_mask_information_section::layer::{
 };
 use crate::sections::layer_and_mask_information_section::layers::Layers;
 use crate::sections::PsdCursor;
+use crate::PsdDepth;
 
 /// One of the possible additional layer block signatures
 const SIGNATURE_EIGHT_BIM: [u8; 4] = [56, 66, 73, 77];
@@ -112,6 +115,7 @@ impl LayerAndMaskInformationSection {
         bytes: &[u8],
         psd_width: u32,
         psd_height: u32,
+        depth: PsdDepth,
     ) -> Result<LayerAndMaskInformationSection, PsdLayerError> {
         let mut cursor = PsdCursor::new(bytes);
 
@@ -150,7 +154,7 @@ impl LayerAndMaskInformationSection {
         // PSD and make sure that we're handling this case properly.
         let layer_count: u16 = layer_count.abs() as u16;
         let (group_count, layer_records) =
-            LayerAndMaskInformationSection::read_layer_records(&mut cursor, layer_count)?;
+            LayerAndMaskInformationSection::read_layer_records(&mut cursor, layer_count, depth)?;
 
         LayerAndMaskInformationSection::decode_layers(
             layer_records,
@@ -245,6 +249,7 @@ impl LayerAndMaskInformationSection {
     fn read_layer_records(
         cursor: &mut PsdCursor,
         layer_count: u16,
+        depth: PsdDepth,
     ) -> Result<(usize, Vec<(LayerRecord, LayerChannels)>), PsdLayerError> {
         let mut groups_count = 0;
 
@@ -269,6 +274,7 @@ impl LayerAndMaskInformationSection {
                 cursor,
                 &layer_record.channel_data_lengths,
                 &layer_record,
+                depth,
             )?;
 
             result.push((layer_record, channels));
@@ -307,6 +313,7 @@ fn read_layer_channels(
     cursor: &mut PsdCursor,
     channel_data_lengths: &Vec<(PsdChannelKind, u32)>,
     layer_record: &LayerRecord,
+    depth: PsdDepth,
 ) -> Result<LayerChannels, PsdLayerError> {
     let capacity = channel_data_lengths.len();
     let mut channels = HashMap::with_capacity(capacity);
@@ -323,6 +330,16 @@ fn read_layer_channels(
                     .unwrap_or(0)
             }
             _ => layer_record.height().max(0) as usize,
+        };
+        // 通道矩形宽度：ZIP 预测按行还原时要用（蒙版矩形可能小于图层）。
+        let columns = match channel_kind {
+            PsdChannelKind::UserSuppliedLayerMask | PsdChannelKind::RealUserSuppliedLayerMask => {
+                layer_record
+                    .mask_rect
+                    .map(|m| m.width() as usize)
+                    .unwrap_or(0)
+            }
+            _ => layer_record.width().max(0) as usize,
         };
         let compression = cursor.read_u16();
         let compression = PsdChannelCompression::new(compression)
@@ -356,16 +373,25 @@ fn read_layer_channels(
                     ChannelBytes::RleCompressed(Vec::new())
                 }
             }
-            // Zip compression is unsupported; degrade to a parse error instead of
-            // panicking (a panic aborts the host process under panic=abort).
-            _ => {
-                return Err(PsdLayerError::InvalidCompression {
-                    compression: compression as u16,
-                })
+            // ZIP（含预测）：先解压，再按行撤销预测，最后统一降到 8 位。
+            PsdChannelCompression::ZipWithoutPrediction
+            | PsdChannelCompression::ZipWithPrediction => {
+                let bytes_per_sample = match depth {
+                    PsdDepth::Sixteen => 2usize,
+                    PsdDepth::ThirtyTwo => 4usize,
+                    _ => 1usize,
+                };
+                let row_len = columns * bytes_per_sample;
+                let (mut plane, _) = inflate_zlib(channel_data, row_len * scanlines)
+                    .ok_or(PsdLayerError::CorruptZip)?;
+                if compression == PsdChannelCompression::ZipWithPrediction {
+                    undo_prediction(&mut plane, row_len, bytes_per_sample);
+                }
+                ChannelBytes::RawData(plane)
             }
         };
 
-        channels.insert(*channel_kind, channel_bytes);
+        channels.insert(*channel_kind, to_eight_bit(channel_bytes, depth));
     }
 
     Ok(channels)
