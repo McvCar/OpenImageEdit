@@ -750,18 +750,42 @@ fn ring_coverage_from_fields(
     out_half: f32,
     in_half: f32,
 ) -> Vec<f32> {
+    let (out_band, in_band) = stroke_bands(alpha, w, h, dist_in, dist_out, out_half, in_half);
+    out_band
+        .iter()
+        .zip(in_band.iter())
+        .zip(alpha.iter())
+        .map(|((o, i), a)| o.max(i * a))
+        .collect()
+}
+
+/// 描边环的「外半边」与「内半边」覆盖率，两个半边分开返回。
+///
+/// 外半边是**新增**像素（画到内容之外），内半边只**换掉**内容颜色：内阴影
+/// 已经踩过这个坑 —— 17.6% 的阴影贴图配 3px 内描边，若把内半边也按 source-over
+/// 叠加，alpha 会从 0.176 涨到 0.32，描边色与页面背景混成一条暗带。
+/// 所以内半边返回的是「带宽本身」（不含内容 alpha的），由调用方用
+/// [`composite_inside`] 换色。
+fn stroke_bands(
+    alpha: &[f32],
+    w: u32,
+    h: u32,
+    dist_in: &[f32],
+    dist_out: &[f32],
+    out_half: f32,
+    in_half: f32,
+) -> (Vec<f32>, Vec<f32>) {
     const CONTOUR_HALF: f32 = 0.5;
-    let mut cov = vec![0.0f32; alpha.len()];
+    let mut out_band = vec![0.0f32; alpha.len()];
+    let mut in_band = vec![0.0f32; alpha.len()];
     for y in 0..h {
         for x in 0..w {
             let i = (y * w + x) as usize;
             let a = alpha[i];
-            let mut c = 0.0f32;
-            // The inside half of the band lies over the content, so it takes the
-            // content's alpha.
+            // The inside half of the band lies over the content.
             if in_half > 0.0 && a > INSIDE_EPS {
                 let d = dist_in.get(i).copied().unwrap_or(0.0).max(0.0);
-                c = (in_half + CONTOUR_HALF - d).clamp(0.0, 1.0) * a;
+                in_band[i] = (in_half + CONTOUR_HALF - d).clamp(0.0, 1.0);
             }
             // The outside half follows the contour, which runs *through* an
             // antialiased border pixel: only its uncovered share is outside.
@@ -769,12 +793,11 @@ fn ring_coverage_from_fields(
                 let d = dist_out.get(i).copied().unwrap_or(0.0).max(0.0);
                 let band = (out_half + CONTOUR_HALF - d).clamp(0.0, 1.0);
                 let share = if a <= INSIDE_EPS { 1.0 } else { 1.0 - a };
-                c = c.max(band * share);
+                out_band[i] = band * share;
             }
-            cov[i] = c;
         }
     }
-    cov
+    (out_band, in_band)
 }
 
 fn draw_stroke(
@@ -797,13 +820,11 @@ fn draw_stroke(
         StrokePosition::Inside => (0.0, size),
         StrokePosition::Center => (size / 2.0, size / 2.0),
     };
-    let cov_map = ring_coverage_from_fields(alpha, w, h, dist_in, dist_out, out_half, in_half);
+    let (cov_out, cov_in) =
+        stroke_bands(alpha, w, h, dist_in, dist_out, out_half, in_half);
     for y in 0..h {
         for x in 0..w {
-            let cov = cov_map[(y * w + x) as usize];
-            if cov <= 0.002 {
-                continue;
-            }
+            let i = (y * w + x) as usize;
             let (color, mut a) = match gradient {
                 Some(g) => {
                     let t = gradient_t(x as f32, y as f32, bounds, g);
@@ -816,7 +837,12 @@ fn draw_stroke(
             if a <= 0.002 {
                 continue;
             }
-            composite(out, x, y, color, cov, a, mode);
+            if cov_out[i] > 0.002 {
+                composite(out, x, y, color, cov_out[i], a, mode);
+            }
+            if cov_in[i] > 0.002 {
+                composite_inside(out, x, y, color, cov_in[i], a, mode);
+            }
         }
     }
 }
