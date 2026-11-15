@@ -790,6 +790,7 @@ mod tests {
             group: None,
             mask: None,
             clipping: false,
+            clip_shape: None,
         };
         let doc = Document::from_psd_layers((4, 4), vec![seed("上层"), seed("下层")]);
         assert_eq!(doc.layers.len(), 3, "background + 2 seeds");

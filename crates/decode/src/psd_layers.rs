@@ -47,6 +47,11 @@ pub struct PsdLayerData {
     /// 描边会被一起改色（实测把 #4a0621 的描边刷成洋红）。
     /// 只有带样式的层才需要，没有样式时是 `None`（不占内存）。
     pub content_alpha: Option<ContentAlpha>,
+    /// 同一份「内容」alpha，换成剪贴基底要的覆盖率平面。
+    ///
+    /// 剪贴蒙版同样只认基底的内容：外描边 / 投影不算边界。拿烘焙后的 alpha
+    /// 当边界，剪贴内容会铺到描边上（实测黄色斜纹越过圆角、压上 8px 粉描边）。
+    pub clip_shape: Option<editcore::LayerMask>,
 }
 
 /// 烘焙样式前的 alpha 平面（1 字节/像素，行优先）连同它自己的矩形。
@@ -168,6 +173,7 @@ impl PsdLayerSet {
                 group: l.group,
                 mask: l.mask,
                 clipping: l.clipping,
+                clip_shape: l.clip_shape,
             })
             .collect()
     }
@@ -829,6 +835,7 @@ fn build_layers<F: FnMut(usize, usize)>(
             None
         };
         let mut content_alpha = None;
+        let mut clip_shape = None;
         if let Some(effects) = layer.layer_effects().filter(|_| !no_styles) {
             // 诊断：`IMAGEEDIT_PSD_DUMP_FX=<图层名子串>` 打印解析到的样式参数。
             // 保真差异按块归因到某个图层后，用它确认「是解析错了还是画错了」。
@@ -892,6 +899,10 @@ fn build_layers<F: FnMut(usize, usize)>(
                 Some(&patterns),
             ) {
                 if let Some(pre) = pre_alpha.as_ref() {
+                    // 剪贴基底用的边界：烘焙前的原始内容 alpha（样式一点都
+                    // 不算），不是 `content_alpha` 那份「扣掉样式笔迹」的平面。
+                    clip_shape = GrayImage::from_raw(pre.size.0, pre.size.1, pre.alpha.clone())
+                        .map(|img| editcore::LayerMask::new(img, pre.offset));
                     content_alpha = Some(ContentAlpha::from_baked(
                         pre,
                         baked.offset,
@@ -922,6 +933,7 @@ fn build_layers<F: FnMut(usize, usize)>(
             mask,
             clipping,
             content_alpha,
+            clip_shape,
         });
         clips.push(layer.is_clipping_mask());
         progress(step + 1, total);
@@ -1198,6 +1210,7 @@ fn bake_group_style_layers(
                         mask: None,
                         clipping: false,
                         content_alpha: None,
+                        clip_shape: None,
                     },
                 );
                 inserted += 1;
@@ -1220,6 +1233,7 @@ fn bake_group_style_layers(
                         mask: None,
                         clipping: false,
                         content_alpha: None,
+                        clip_shape: None,
                     },
                 );
                 inserted += 1;

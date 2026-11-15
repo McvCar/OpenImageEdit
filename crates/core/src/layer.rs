@@ -156,6 +156,14 @@ pub struct Layer {
     ///
     /// 一组连续的剪贴层共享同一个基底层（PSD 里「剪贴蒙版」的语义）。
     pub clipping: bool,
+    /// 本层作为剪贴基底时，剪贴层该按哪个形状限幅（画布坐标覆盖率）。
+    ///
+    /// Photoshop 的剪贴蒙版以基底的**内容**为边界：外描边 / 投影这些图层
+    /// 样式画出来的像素不算内容。烘焙把内容和样式合成一张位图后，直接拿
+    /// 位图 alpha 当边界，剪贴内容就会压到描边上（实测黄色斜纹越过圆角、
+    /// 铺到 8px 粉描边上）。导入时留下烘焙前的内容 alpha，两条合成路径都
+    /// 用它；`None` = 该层没有烘焙样式，位图 alpha 就是内容。
+    pub clip_shape: Option<LayerMask>,
     /// 所属分组（`None` = 不属于任何组）。组只影响面板组织与批量显隐，
     /// 不改变 z 序、不参与合成。`duplicated()` 会继承它。
     pub group: Option<GroupId>,
@@ -196,6 +204,7 @@ impl Layer {
             blend: BlendMode::Normal,
             mask: None,
             clipping: false,
+            clip_shape: None,
             group: None,
             content: LayerContent::Raster(RasterLayer {
                 image,
@@ -274,6 +283,7 @@ impl Layer {
             blend: BlendMode::Normal,
             mask: None,
             clipping: false,
+            clip_shape: None,
             group: None,
             content: LayerContent::Mark(mark),
         }

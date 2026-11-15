@@ -295,6 +295,9 @@ pub struct PreviewComposer {
     /// 每个有图层蒙版的层的预览尺度覆盖率（乘数），按 (ox, oy, w, h) 缓存。
     /// 蒙版编辑同样走 `edit_epoch`，`prepare()` 里统一清空。
     masks: Vec<Option<(i32, i32, u32, u32, Arc<Vec<u8>>)>>,
+    /// 每个带烘焙样式、且可能当剪贴基底的层的「内容形状」覆盖率（预览尺度）。
+    /// 与 `masks` 同一套缓存键与失效规则（`prepare()` 统一清空）。
+    clip_shapes: Vec<Option<(i32, i32, u32, u32, Arc<Vec<u8>>)>>,
     /// Scaled bitmap of the layer being live-resized (kept separate from
     /// `layers` so a cancelled gesture cannot poison the layer's cache).
     live: Option<CachedScaled>,
@@ -327,6 +330,7 @@ impl PreviewComposer {
             base: None,
             layers: Vec::new(),
             masks: Vec::new(),
+            clip_shapes: Vec::new(),
             live: None,
             live_flip: (false, false),
             rotate_small: None,
@@ -360,6 +364,7 @@ impl PreviewComposer {
             self.base = None;
             self.layers = vec![None; doc.layers.len()];
             self.masks = vec![None; doc.layers.len()];
+            self.clip_shapes = vec![None; doc.layers.len()];
             self.live = None;
         }
         Some((
@@ -811,10 +816,16 @@ impl PreviewComposer {
         sx: f64,
         sy: f64,
     ) -> Vec<u8> {
-        let mut cov = vec![0u8; target.width as usize * target.height as usize];
         if !layer.visible || layer.opacity <= 0.0 {
-            return cov;
+            return vec![0u8; target.width as usize * target.height as usize];
         }
+        // 基底带烘焙样式时，边界取它的**内容**形状：样式额外画出来的外描边 /
+        // 投影不算内容，否则剪贴内容会铺到描边上（与 flatten 侧
+        // `fill_clip_coverage` 同口径）。
+        if let Some(shape) = layer.clip_shape.as_ref() {
+            return self.clip_shape_coverage(li, layer, shape, target, sx, sy);
+        }
+        let mut cov = vec![0u8; target.width as usize * target.height as usize];
         let (src, ox, oy, mcov) = match &layer.content {
             LayerContent::Raster(r) => {
                 let (ox, oy, nw, nh) =
@@ -870,6 +881,93 @@ impl PreviewComposer {
                     cov[py as usize * tw as usize + px as usize] = a;
                 }
             }
+        }
+        cov
+    }
+
+    /// 剪贴基底的「内容形状」在预览尺度上的覆盖率。
+    ///
+    /// 与 [`Self::clip_coverage`] 的位图路径同语义（同样的预览矩形、同样的
+    /// 蒙版顺序），只是边界换成烘焙样式**之前**的内容 alpha。形状的
+    /// 区间平均借 `resize_to` 走同一条降采样路径，缩小时两者的边缘口径一致。
+    fn clip_shape_coverage(
+        &mut self,
+        li: usize,
+        layer: &Layer,
+        shape: &LayerMask,
+        target: Size,
+        sx: f64,
+        sy: f64,
+    ) -> Vec<u8> {
+        let mut cov = vec![0u8; target.width as usize * target.height as usize];
+        let (sw, sh) = shape.image.dimensions();
+        let (ox, oy, nw, nh) = Self::preview_dst(shape.offset, (sw, sh), sx, sy);
+        let scaled = self.scaled_clip_shape(li, shape, nw, nh);
+        let mcov = layer
+            .mask
+            .as_ref()
+            .map(|m| Self::mask_cov_for_rect(m, shape.offset, sw, sh, nw, nh));
+        let tw = target.width as i32;
+        let th = target.height as i32;
+        for ty in 0..nh as i32 {
+            let py = oy + ty;
+            if py < 0 || py >= th {
+                continue;
+            }
+            for tx in 0..nw as i32 {
+                let px = ox + tx;
+                if px < 0 || px >= tw {
+                    continue;
+                }
+                let i = ty as usize * nw as usize + tx as usize;
+                let a = scaled[i];
+                if a == 0 {
+                    continue;
+                }
+                let a = match mcov.as_deref() {
+                    Some(m) => ((a as u32 * m[i] as u32 + 127) / 255) as u8,
+                    None => a,
+                };
+                if a > 0 {
+                    cov[py as usize * tw as usize + px as usize] = a;
+                }
+            }
+        }
+        cov
+    }
+
+    /// 内容形状缩到预览尺度（单通道 alpha），按 `(offset, w, h)` 缓存。
+    ///
+    /// 单通道借用 RGBA 的重采样路径：alpha 的区间平均与同尺寸位图完全同
+    /// 口径，1:1 时逐字节不变（预览与 flatten 才能逐字节对上）。
+    fn scaled_clip_shape(
+        &mut self,
+        li: usize,
+        shape: &LayerMask,
+        nw: u32,
+        nh: u32,
+    ) -> Arc<Vec<u8>> {
+        let key = (shape.offset.0, shape.offset.1, nw, nh);
+        if let Some((cx, cy, cw, ch, cov)) = self.clip_shapes.get(li).cloned().flatten() {
+            if (cx, cy, cw, ch) == key {
+                return cov;
+            }
+        }
+        let (sw, sh) = shape.image.dimensions();
+        let mut plane = RgbaImage::from_pixel(sw, sh, image::Rgba([0, 0, 0, 0]));
+        for (dst, src) in plane.pixels_mut().zip(shape.image.pixels()) {
+            dst.0[3] = src.0[0];
+        }
+        let scaled = resize_to(&plane, Size::new(nw, nh));
+        let cov = Arc::new(scaled.pixels().map(|p| p.0[3]).collect::<Vec<u8>>());
+        if li < self.clip_shapes.len() {
+            self.clip_shapes[li] = Some((
+                shape.offset.0,
+                shape.offset.1,
+                nw,
+                nh,
+                cov.clone(),
+            ));
         }
         cov
     }
@@ -1525,6 +1623,50 @@ mod tests {
             doc.flatten_in_doc_space().as_raw(),
             "1:1 预览与 flatten 的蒙版 + 剪贴叠加结果不一致"
         );
+    }
+
+    /// 剪贴基底带烘焙样式时，预览的边界必须取基底的「内容」形状。
+    ///
+    /// 回归对象：`矩形 5` 有 8px Outside 描边，烘焙后位图 alpha 比填充大一圈；
+    /// 剪贴的斜纹层按位图 alpha 限幅，于是花纹越过圆角、压到粉色描边上
+    /// （PS 里描边是硬边界）。这里钉住两件事：1:1 预览与 flatten 逐字节一致，
+    /// 且放大的描边带里一点剪贴内容都不能有。
+    #[test]
+    fn preview_clip_base_uses_content_shape_not_baked_effects() {
+        use image::{GrayImage, Luma};
+        let mut doc = Document::from_image(solid(20, 20, [255, 255, 255, 255]));
+        // 基底：12×12 全不透明（= 内容 + 烘焙描边），内容形状只有中间 6×6。
+        let mut base = Layer::new("base", solid(12, 12, [255, 0, 0, 255]));
+        base.set_offset((4, 4));
+        let mut shape = GrayImage::new(12, 12);
+        for y in 3..9u32 {
+            for x in 3..9u32 {
+                shape.put_pixel(x, y, Luma([255]));
+            }
+        }
+        base.clip_shape = Some(LayerMask::new(shape, (4, 4)));
+        doc.add_layer(base).unwrap();
+        let mut clipped = Layer::new("clipped", solid(20, 20, [0, 0, 255, 255]));
+        clipped.clipping = true;
+        doc.add_layer(clipped).unwrap();
+
+        // 描边带（内容形状之外、烘焙位图之内）必须是基底的红色，不能是蓝色。
+        let preview = PreviewComposer::new().composite(&doc, doc.canvas);
+        assert_eq!(
+            preview.get_pixel(4, 4).0,
+            [255, 0, 0, 255],
+            "描边带里漏进了剪贴内容"
+        );
+        assert_eq!(preview.get_pixel(7, 7).0, [0, 0, 255, 255], "内容形状内应是剪贴层");
+        assert_eq!(
+            preview.as_raw(),
+            doc.flatten_in_doc_space().as_raw(),
+            "1:1 预览与 flatten 的剪贴基线不一致（内容形状）"
+        );
+
+        // 缩略预览同样只能落在内容形状里。
+        let small = PreviewComposer::new().composite(&doc, Size::new(10, 10));
+        assert_eq!(small.get_pixel(2, 2).0, [255, 0, 0, 255], "缩略预览里剪贴内容溢到描边");
     }
 
     #[test]

@@ -157,6 +157,9 @@ pub struct PsdLayerSeed {
     pub mask: Option<LayerMask>,
     /// 该层是剪贴蒙版（只在下层基底的不透明区域内可见）。
     pub clipping: bool,
+    /// 烘焙样式**之前**的内容 alpha；作为剪贴基底时限幅用它（见
+    /// [`Layer::clip_shape`]）。`None` = 该层没有烘焙样式。
+    pub clip_shape: Option<LayerMask>,
 }
 
 /// One PSD folder ("layer group"). `layers` 里的成员通过 `PsdLayerSeed::group`
@@ -174,7 +177,7 @@ pub struct PsdGroupSeed {
 #[cfg(test)]
 mod psd_assembly_tests {
     use super::*;
-    use image::Rgba;
+    use image::{GrayImage, Luma, Rgba};
 
     fn seed(
         name: &str,
@@ -194,6 +197,7 @@ mod psd_assembly_tests {
             group: None,
             mask: None,
             clipping: false,
+            clip_shape: None,
         }
     }
 
@@ -270,6 +274,33 @@ mod psd_assembly_tests {
         let flat = doc.flatten();
         assert_eq!(flat.get_pixel(0, 0).0, [255, 0, 0, 255], "基底内应显示剪贴层");
         assert_eq!(flat.get_pixel(3, 0).0[3], 0, "基底外剪贴层必须不可见");
+    }
+
+    /// 基底带烘焙样式时，剪贴边界取「内容」形状，不取被样式撑大的位图 alpha。
+    ///
+    /// PS 的剪贴蒙版只认基底的内容：外描边 / 投影不算边界。烘焙后的位图
+    /// alpha 包含描边，拿它当边界剪贴内容就会铺到描边上。
+    #[test]
+    fn clip_base_boundary_uses_content_shape_not_baked_effects() {
+        // 基底位图 4×4 全不透明（= 内容 + 烘焙出来的描边），内容形状只有中间 2×2。
+        let mut base = seed("base", (0, 0), [0, 0, 0, 255], (4, 4), true, 1.0);
+        let mut shape = GrayImage::new(4, 4);
+        for y in 1..3u32 {
+            for x in 1..3u32 {
+                shape.put_pixel(x, y, Luma([255]));
+            }
+        }
+        base.clip_shape = Some(LayerMask::new(shape, (0, 0)));
+        let mut top = seed("clip", (0, 0), [255, 0, 0, 255], (4, 4), true, 1.0);
+        top.clipping = true;
+        let doc = Document::from_psd_layers((4, 4), vec![base, top]);
+        let flat = doc.flatten();
+        assert_eq!(flat.get_pixel(1, 1).0, [255, 0, 0, 255], "内容内应显示剪贴层");
+        assert_eq!(
+            flat.get_pixel(0, 0).0,
+            [0, 0, 0, 255],
+            "描边带（内容形状之外）不能铺剪贴层"
+        );
     }
 
     /// 基底被隐藏时，整条剪贴链跟着消失（PS 语义）。
@@ -378,6 +409,7 @@ impl Document {
             layer.blend = seed.blend;
             layer.mask = seed.mask;
             layer.clipping = seed.clipping;
+            layer.clip_shape = seed.clip_shape;
             layer.locked = false;
             layer.background = false;
             layer.group = seed.group.and_then(|gid| group_of.get(&gid).copied());
@@ -1539,6 +1571,29 @@ fn store_image(acc: &mut [[f32; 4]], img: &RgbaImage) {
 /// 否则上一条剪贴链会错误地沿用更下面那层的覆盖率。
 fn fill_clip_coverage(out: &mut [f32], w: u32, h: u32, layer: &Layer) {
     out.fill(0.0);
+    // 基底带烘焙样式时，剪贴边界取它的**内容**形状（样式画出来的外描边 /
+    // 投影不算内容）。拿烘焙后的位图 alpha 当边界会把剪贴内容铺到描边上。
+    if let Some(shape) = layer.clip_shape.as_ref() {
+        let x0 = shape.offset.0.max(0);
+        let y0 = shape.offset.1.max(0);
+        let x1 = (shape.offset.0 + shape.image.width() as i32).min(w as i32);
+        let y1 = (shape.offset.1 + shape.image.height() as i32).min(h as i32);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let mut cov = shape.coverage(x, y);
+                if cov <= 0.0 {
+                    continue;
+                }
+                if let Some(m) = layer.mask.as_ref() {
+                    cov *= m.coverage(x, y);
+                }
+                if cov > 0.0 {
+                    out[y as usize * w as usize + x as usize] = cov;
+                }
+            }
+        }
+        return;
+    }
     match &layer.content {
         LayerContent::Raster(r) => {
             write_coverage(out, w, h, &r.image, r.offset, layer.mask.as_ref())
