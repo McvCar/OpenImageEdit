@@ -109,6 +109,11 @@ impl IccTransform {
     }
 
     /// 原地把整幅 RGBA 从文档空间转到 sRGB。alpha 原样复制。
+    ///
+    /// 只转**直通 alpha 的颜色**。PSD 合并图里存的是「白底预乘」的 RGB，
+    /// 解预乘之后才是颜色；先转色再解预乘会让同一个颜色随 alpha 漂移
+    /// （psd-tools 的 `topil(apply_icc=True)` 就是这个顺序，半透明边缘因此
+    /// 对不上），那不是色彩管理，只是存储约定的算术残留。
     pub fn apply(&self, image: &mut RgbaImage) {
         let buf: &mut [u8] = image;
         self.xform.transform_in_place(buf);
@@ -119,6 +124,38 @@ impl IccTransform {
 mod tests {
     use super::*;
     use image::Rgba;
+
+    /// 一个与 sRGB 明显不同的 RGB profile（gamma 可调），用来让转换真的
+    /// 改变像素，而不是被 sRGB 恒等掩盖。
+    fn gamma_profile(gamma: f64) -> Vec<u8> {
+        let white = lcms2::CIExyY {
+            x: 0.3127,
+            y: 0.3290,
+            Y: 1.0,
+        };
+        let primaries = lcms2::CIExyYTRIPLE {
+            Red: lcms2::CIExyY {
+                x: 0.64,
+                y: 0.33,
+                Y: 1.0,
+            },
+            Green: lcms2::CIExyY {
+                x: 0.30,
+                y: 0.60,
+                Y: 1.0,
+            },
+            Blue: lcms2::CIExyY {
+                x: 0.15,
+                y: 0.06,
+                Y: 1.0,
+            },
+        };
+        let trc = lcms2::ToneCurve::new(gamma);
+        lcms2::Profile::new_rgb(&white, &primaries, &[&trc, &trc, &trc])
+            .expect("RGB profile")
+            .icc()
+            .expect("serialize profile")
+    }
 
     #[test]
     fn no_profile_means_no_transform() {
@@ -148,5 +185,58 @@ mod tests {
             }
             assert_eq!(a.0[3], b.0[3], "alpha must be copied through");
         }
+    }
+
+    /// 半透明像素的转色口径：颜色与 alpha 无关。
+    ///
+    /// Photoshop 在文档空间合成，alpha 只是覆盖率；同一个颜色不该因为
+    /// 不透明度不同而被转成不同颜色。
+    #[test]
+    fn semi_transparent_color_is_alpha_independent() {
+        let xform = IccTransform::new(&gamma_profile(1.0)).expect("profile");
+        let mut out = Vec::new();
+        for a in [1u8, 5, 64, 128, 254] {
+            let mut img = RgbaImage::from_pixel(1, 1, Rgba([40, 120, 200, a]));
+            xform.apply(&mut img);
+            let px = img.get_pixel(0, 0).0;
+            assert_eq!(px[3], a, "alpha must survive the transform");
+            out.push([px[0], px[1], px[2]]);
+        }
+        assert!(
+            out.windows(2).all(|w| w[0] == w[1]),
+            "same colour, different alpha must convert identically: {out:?}"
+        );
+    }
+
+    /// 反例：psd-tools 的 `apply_icc=True` 先把「白底预乘」的合并图转色，
+    /// 再解预乘 —— 同一个颜色会随 alpha 漂移。这个测试把那个顺序钉死为
+    /// 「不等于我们的结果」，防止以后为了对齐参考数值而悄悄改成它。
+    #[test]
+    fn matte_first_conversion_is_not_what_we_do() {
+        let xform = IccTransform::new(&gamma_profile(1.0)).expect("profile");
+        let (c, a) = ([40u8, 120, 200], 64u8);
+
+        let mut ours = RgbaImage::from_pixel(1, 1, Rgba([c[0], c[1], c[2], a]));
+        xform.apply(&mut ours);
+        let ours = ours.get_pixel(0, 0).0;
+
+        // 白底预乘 -> 转色 -> 解预乘（PSD 合并图的存储约定）。
+        let f = a as f32 / 255.0;
+        let matte: Vec<u8> = c
+            .iter()
+            .map(|&x| (f * x as f32 + (1.0 - f) * 255.0).round() as u8)
+            .collect();
+        let mut m = RgbaImage::from_pixel(1, 1, Rgba([matte[0], matte[1], matte[2], 255]));
+        xform.apply(&mut m);
+        let converted = m.get_pixel(0, 0).0;
+        let unmatte: Vec<u8> = (0..3)
+            .map(|i| {
+                ((converted[i] as f32 + a as f32 - 255.0) * 255.0 / a as f32)
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            })
+            .collect();
+
+        assert_ne!(&unmatte[..], &ours[..3]);
     }
 }
