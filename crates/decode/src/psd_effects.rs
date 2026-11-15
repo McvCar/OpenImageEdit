@@ -19,11 +19,18 @@
 //! Rendering order follows Photoshop's own stack (bottom to top):
 //!
 //! ```text
-//! drop shadow / outer glow   (behind the content)
+//! drop shadow / outer glow           (behind the content)
 //! layer content
-//! stroke, inner shadow, inner glow   (clipped to the content)
+//! inner shadow, inner glow           (inside the content)
 //! colour / gradient overlay          (over the content)
+//! stroke                             (over everything, overlays included)
 //! ```
+//!
+//! The stroke really is last: an inside stroke on an icon that also carries a
+//! colour overlay is the *stroke* you see in Photoshop, not the overlay colour.
+//! Drawing it before the overlays (which is what this file used to do) leaves
+//! the ring completely hidden under the overlay whenever the overlay is opaque —
+//! the "red X" icons lost their dark red outline that way.
 //!
 //! Geometry follows Photoshop, not convenience, because a style baked *slightly*
 //! wrong is worse than one baked coarsely — it moves hundreds of layers' pixels
@@ -270,7 +277,7 @@ pub fn bake_with_alpha(
         }
     }
 
-    // ---- 3. inside the content: stroke, inner shadow, inner glow --------
+    // ---- 3. inside the content: inner shadow, inner glow -----------------
     // Overlays and the gradient stroke are laid out over the *layer's* bounds (a
     // style with `Algn` covers the layer rect, not the ink), so that is the frame
     // they run across.
@@ -298,9 +305,6 @@ pub fn bake_with_alpha(
 
     for e in &active {
         match e.kind {
-            EffectKind::Stroke => {
-                draw_stroke(&mut out, w, h, &alpha, &dist_in, &dist_out, bounds, e);
-            }
             EffectKind::InnerShadow => {
                 draw_inner_shadow(&mut out, w, h, &alpha, e);
             }
@@ -311,7 +315,7 @@ pub fn bake_with_alpha(
         }
     }
 
-    // ---- 4. overlays, on top ---------------------------------------------
+    // ---- 4. overlays, on top of the content ------------------------------
     for e in &active {
         match e.kind {
             EffectKind::ColorOverlay => draw_color_overlay(&mut out, w, h, &alpha, e),
@@ -324,6 +328,14 @@ pub fn bake_with_alpha(
             }
             _ => {}
         }
+    }
+
+    // ---- 5. the stroke, last --------------------------------------------
+    // Photoshop stacks the stroke above the overlays: a 3 px inside stroke on an
+    // icon that also has a colour overlay stays visible in the file, so it has to
+    // stay visible here. Painting it in step 3 buried it under an opaque overlay.
+    for e in &strokes {
+        draw_stroke(&mut out, w, h, &alpha, &dist_in, &dist_out, bounds, e, None);
     }
 
     let new_offset = (offset.0 - pad.left, offset.1 - pad.top);
@@ -509,7 +521,7 @@ pub fn bake_group_effects(
         // its bounding rectangle of member layers.
         let bounds = alpha_bounds(&big, w, h);
         for e in &strokes {
-            draw_stroke(&mut front, w, h, &big, &din, &dout, bounds, e);
+            draw_stroke(&mut front, w, h, &big, &din, &dout, bounds, e, Some(&big));
         }
     }
     for e in &active {
@@ -809,6 +821,7 @@ fn draw_stroke(
     dist_out: &[f32],
     bounds: [f32; 4],
     e: &LayerEffect,
+    clip: Option<&[f32]>,
 ) {
     let size = e.size.max(0.5);
     let mode = blend_of(e.blend);
@@ -841,7 +854,20 @@ fn draw_stroke(
                 composite(out, x, y, color, cov_out[i], a, mode);
             }
             if cov_in[i] > 0.002 {
-                composite_inside(out, x, y, color, cov_in[i], a, mode);
+                match clip {
+                    // 组样式：`front` 是一张全新的透明光栅，插在组内容**上方**，
+                    // 里面没有内容可换色。`composite_inside` 撞到 dst alpha = 0
+                    // 就直接返回，内描边于是整条消失（绿勾 3px 内描边就是这么丢的）。
+                    // 这里按组覆盖率把描边画成新像素：source-over 之后，若组内容
+                    // 原本不透明，结果正好是 PS 的「描边盖在内容上」。
+                    Some(c) => {
+                        let cov = (cov_in[i] * c[i]).clamp(0.0, 1.0);
+                        if cov > 0.002 {
+                            composite(out, x, y, color, cov, a, mode);
+                        }
+                    }
+                    None => composite_inside(out, x, y, color, cov_in[i], a, mode),
+                }
             }
         }
     }
