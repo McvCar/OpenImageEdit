@@ -652,9 +652,11 @@ thread_local! {
 ///
 /// 所以这里只按 `coverage × opacity` 的权重换色，alpha 原样保留。
 ///
-/// 注意适用范围：颜色/渐变叠加是**实测**必须 source-over 的（改成换色后
-/// `(128,864)` 一带误差 +11，整体 3.329 -> 3.384），内描边同样（+0.03），
-/// 不要顺手统一过来。
+/// 注意适用范围：渐变叠加**实测**是 source-over 的（改成换色后 `(128,864)`
+/// 一带误差 +11，整体 3.329 -> 3.384），内描边同样（+0.03），不要顺手统一
+/// 过来。颜色叠加另有自己的 [`composite_fill`]：那次 A/B 里换色用的是
+/// `coverage × opacity` 当权重，软边像素只换了一半颜色，所以测出来“不如
+/// source-over”，见那里的说明。
 fn composite_inside(
     out: &mut RgbaImage,
     x: u32,
@@ -680,6 +682,52 @@ fn composite_inside(
     data[idx] = px[0];
     data[idx + 1] = px[1];
     data[idx + 2] = px[2];
+}
+
+/// 颜色叠加：Photoshop 是把叠加色**填满图层的形状**，不透明度由图层自己的
+/// alpha 决定，叠加本身不往上加 alpha。
+///
+/// [`composite`]（source-over）在这里是错的：它的不透明度权重取了
+/// `coverage × opacity`，而颜色叠加的 coverage 就是图层 alpha。于是
+///   * 半透明内容 + 白色叠加 → 先按预乘算出 `255 × a` 的灰，而不是白；
+///   * alpha 还被叠成 `a + a(1-a)`，比内容本身更实。
+/// 「增加时间」横幅里那条半透明白斜纹层（图层 84，内容 alpha≈0.4）就是这样
+/// 被烘成 65% 的灰纱罩：黄色斜纹发橄榄、粉色描边变灰、整块横幅发暗，全是
+/// 它盖出来的。逐像素对照见
+/// `color_overlay_does_not_premultiply_semi_transparent_content`。
+///
+/// 正确语义：按 `opacity`（叠加自身的不透明度，渐变再乘色标 alpha）与已有
+/// 内容混合，alpha 原样保留。完全没有内容的像素（组烘焙的 behind/front
+/// 缓冲）没有可换的色，直接写叠加色、alpha = `coverage × opacity`。
+fn composite_fill(
+    out: &mut RgbaImage,
+    x: u32,
+    y: u32,
+    color: [u8; 3],
+    coverage: f32,
+    opacity: f32,
+    mode: editcore::BlendMode,
+) {
+    let cov = coverage.clamp(0.0, 1.0);
+    let t = opacity.clamp(0.0, 1.0);
+    if cov <= 0.002 || t <= 0.002 {
+        return;
+    }
+    let w = out.width();
+    record_effect_coverage(x, y, w, cov * t * 255.0);
+    let idx = ((y * w + x) * 4) as usize;
+    let data = out.as_mut();
+    if data[idx + 3] == 0 {
+        data[idx] = color[0];
+        data[idx + 1] = color[1];
+        data[idx + 2] = color[2];
+        data[idx + 3] = (cov * t * 255.0).round().clamp(0.0, 255.0) as u8;
+        return;
+    }
+    // 已有内容：只换色，alpha 不动。
+    let mut px = [data[idx], data[idx + 1], data[idx + 2], 255];
+    editcore::blend_pixel(&mut px, [color[0], color[1], color[2], 255], t, mode);
+    data[idx..idx + 3].copy_from_slice(&px[..3]);
 }
 
 fn record_effect_coverage(x: u32, y: u32, w: u32, alpha: f32) {
@@ -1025,7 +1073,7 @@ fn draw_color_overlay(
             if cov <= 0.002 {
                 continue;
             }
-            composite(out, x, y, e.color, cov, e.opacity, mode);
+            composite_fill(out, x, y, e.color, cov, e.opacity, mode);
         }
     }
 }
@@ -1735,6 +1783,25 @@ mod tests {
         disabled.enabled = false;
         let img = layer(8, 8, [10, 20, 30, 255], 2);
         assert!(bake(&img, (0, 0), &[disabled]).is_none());
+    }
+
+    /// 颜色叠加是「换色」：半透明内容 + 白色叠加后 RGB 必须**是白**，alpha
+    /// 保持内容自己的值。
+    ///
+    /// source-over 会把颜色按 alpha 预乘（白 100% 叠到 40% 内容上成 65% 灰），
+    /// 还把 alpha 叠成 `a + a(1-a)`。PSD 里半透明白斜纹层（「增加时间」横幅的
+    /// 图层 84）就是这样变成灰纱罩的。
+    #[test]
+    fn color_overlay_does_not_premultiply_semi_transparent_content() {
+        let img = layer(8, 8, [12, 34, 56, 102], 2);
+        let mut e = effect(EffectKind::ColorOverlay);
+        e.color = [255, 255, 255];
+        let baked = bake(&img, (0, 0), &[e]).expect("color overlay bakes");
+        let p = baked.image.get_pixel(4, 4).0;
+        assert_eq!([p[0], p[1], p[2]], [255, 255, 255], "叠加色原样写进 RGB");
+        assert_eq!(p[3], 102, "alpha 由内容决定，叠加不往上加");
+        // 没有内容的像素仍然什么都没有。
+        assert_eq!(baked.image.get_pixel(0, 0).0[3], 0);
     }
 
     /// A group's stroke is one ring around the group's joint alpha, on a
