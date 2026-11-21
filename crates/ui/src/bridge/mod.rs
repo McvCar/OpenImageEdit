@@ -806,6 +806,11 @@ pub mod qobject {
         #[qinvokable]
         fn set_group_visible(self: Pin<&mut Self>, group_id: i32, visible: bool);
 
+        /// 把整组拖进另一组（target_id=0 表示移回顶层）。parent 改动 +
+        /// 子树显隐随环境切换，进撤销栈。
+        #[qinvokable]
+        fn move_group_to_group(self: Pin<&mut Self>, group_id: i32, target_id: i32);
+
         #[qinvokable]
         fn set_group_locked(self: Pin<&mut Self>, group_id: i32, locked: bool);
 

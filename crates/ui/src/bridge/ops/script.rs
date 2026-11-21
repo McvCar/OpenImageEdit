@@ -1437,6 +1437,14 @@ impl qobject::Bridge {
                     let on = it.next().map(|p| p.trim() != "0").unwrap_or(false);
                     self.as_mut().set_group_visible(id, on);
                 }
+                // `group-move:1,2` —— 组 1 移进组 2；target=0 移回顶层。
+                other if other.starts_with("group-move:") => {
+                    let body = other.trim_start_matches("group-move:");
+                    let mut it = body.split(',');
+                    let id: i32 = it.next().and_then(|p| p.trim().parse().ok()).unwrap_or(0);
+                    let t: i32 = it.next().and_then(|p| p.trim().parse().ok()).unwrap_or(0);
+                    self.as_mut().move_group_to_group(id, t);
+                }
                 // `group-select:1`
                 other if other.starts_with("group-select:") => {
                     let id: i32 = other

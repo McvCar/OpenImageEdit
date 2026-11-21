@@ -1220,8 +1220,8 @@ Item {
                         }
 
                         onPositionChanged: (mouse) => {
-                            if (!pressed || layerRow.locked || layerRow.isBase
-                                || layerRow.isGroup)
+                            // 组行也允许拖动（拖进别的组 / 拖回顶层）。
+                            if (!pressed || layerRow.locked || layerRow.isBase)
                                 return
                             if (!reordering && Math.abs(mouse.y - pressY) > 6) {
                                 reordering = true
@@ -1254,18 +1254,29 @@ Item {
                         onReleased: (mouse) => {
                             if (mouse.button === Qt.RightButton)
                                 return
+                            const draggedGroup = layerRow.row && layerRow.isGroup
+                                                 ? layerRow.row.gid : 0
                             if (reordering && toPos >= 0) {
                                 const target = host.layerPanelList[toPos]
-                                const from = layerRow.row ? layerRow.row.i : -1
-                                const fromGroup = layerRow.row ? (layerRow.row.g || 0) : 0
-                                if (from > 0 && toGroup >= 0 && toGroup !== fromGroup) {
-                                    // 跨组移动：只改 Layer::group，不改 z 序 / 像素。
-                                    bridge.move_layer_to_group(from, toGroup)
-                                } else if (toPos !== fromPos && target && target.i >= 0) {
-                                    // 同组内 / 顶层排序：显示行混了组标题，用真实 i。
-                                    const to = target.i
-                                    if (from > 0 && to > 0 && to !== from)
-                                        bridge.reorder_layer(from, to)
+                                if (draggedGroup > 0) {
+                                    // 组拖动：拖到组标题行 = 进该组（嵌套），
+                                    // 拖到顶层行 / 组外 = 移回顶层。防环由
+                                    // bridge 校验（移进自己的子树会被拒绝）。
+                                    if (toGroup !== draggedGroup)
+                                        bridge.move_group_to_group(draggedGroup,
+                                                                   Math.max(toGroup, 0))
+                                } else {
+                                    const from = layerRow.row ? layerRow.row.i : -1
+                                    const fromGroup = layerRow.row ? (layerRow.row.g || 0) : 0
+                                    if (from > 0 && toGroup >= 0 && toGroup !== fromGroup) {
+                                        // 跨组移动：只改 Layer::group，不改 z 序 / 像素。
+                                        bridge.move_layer_to_group(from, toGroup)
+                                    } else if (toPos !== fromPos && target && target.i >= 0) {
+                                        // 同组内 / 顶层排序：显示行混了组标题，用真实 i。
+                                        const to = target.i
+                                        if (from > 0 && to > 0 && to !== from)
+                                            bridge.reorder_layer(from, to)
+                                    }
                                 }
                             } else if (!reordering && layerRow.row && !layerRow.isBase
                                        && (!layerRow.locked || layerRow.isGroup)) {
@@ -1340,24 +1351,82 @@ Item {
         // 滚动条：只在滚动 / 拖拽期间短暂出现，停手 900ms 后淡出。
         // Qt 的 Flickable 默认不画滚动条，长列表（100+ 层）时用户不知道
         // 还能往下滚；常驻又占地方，所以用「滚动时才显示」。
-        Rectangle {
-            id: listScrollBar
+        // 右缘 14px 是热区：可拖 thumb、可点 track 跳转（用户反馈：
+        // 滚动条不能只是个指示灯，得有正常滚动条的手感）。
+        Item {
+            id: scrollHot
             z: 12
             anchors.right: parent.right
-            anchors.rightMargin: 2
             anchors.top: parent.top
-            width: 4
-            radius: 2
-            height: Math.max(24,
-                listArea.height * listArea.height
-                / Math.max(listArea.contentHeight, 1))
-            y: listArea.contentHeight > listArea.height
-               ? listArea.contentY / (listArea.contentHeight - listArea.height)
-                 * (listArea.height - height) : 0
-            color: "#6fa8dc"
-            opacity: layerPanel.scrollBarVisible ? 0.85 : 0
+            anchors.bottom: parent.bottom
+            width: 10
             visible: listArea.contentHeight > listArea.height + 1
-            Behavior on opacity { NumberAnimation { duration: 180 } }
+
+            function ensureVisible() {
+                layerPanel.scrollBarVisible = true
+                scrollBarHide.restart()
+            }
+
+            Rectangle {
+                id: listScrollBar
+                anchors.right: parent.right
+                anchors.rightMargin: 2
+                anchors.top: parent.top
+                width: 4
+                radius: 2
+                height: Math.max(24,
+                    listArea.height * listArea.height
+                    / Math.max(listArea.contentHeight, 1))
+                y: listArea.contentHeight > listArea.height
+                   ? listArea.contentY / (listArea.contentHeight - listArea.height)
+                     * (listArea.height - height) : 0
+                color: scrollMa.containsMouse || scrollMa.pressed
+                       ? "#8ec7ff" : "#6fa8dc"
+                opacity: layerPanel.scrollBarVisible ? 0.85 : 0
+                Behavior on opacity { NumberAnimation { duration: 180 } }
+            }
+
+            MouseArea {
+                id: scrollMa
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                property real grabOffset: 0
+
+                function dragTo(newThumbY) {
+                    const maxY = listArea.contentHeight - listArea.height
+                    const track = listArea.height - listScrollBar.height
+                    if (track <= 0 || maxY <= 0)
+                        return
+                    listArea.contentY = Math.max(0,
+                        Math.min(maxY, newThumbY / track * maxY))
+                }
+
+                onPressed: (mouse) => {
+                    // 命中 thumb → 按下点相对 thumb 顶的偏移；点在 track
+                    // 其它位置 → thumb 中心跳到点击处再拖。
+                    const thumbY = listScrollBar.y
+                    if (mouse.y >= thumbY && mouse.y <= thumbY + listScrollBar.height)
+                        grabOffset = mouse.y - thumbY
+                    else
+                        grabOffset = listScrollBar.height / 2
+                    listArea.interactive = false
+                    dragTo(mouse.y - grabOffset)
+                    scrollHot.ensureVisible()
+                }
+                onPositionChanged: (mouse) => {
+                    if (pressed)
+                        dragTo(mouse.y - grabOffset)
+                }
+                onReleased: {
+                    scrollBarHide.restart()
+                    listArea.interactive = true
+                }
+                onCanceled: {
+                    scrollBarHide.restart()
+                    listArea.interactive = true
+                }
+            }
         }
         Timer {
             id: scrollBarHide

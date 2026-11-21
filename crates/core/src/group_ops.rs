@@ -297,6 +297,110 @@ impl Document {
         self.execute(EditOp::Batch(ops))
     }
 
+    /// 把整个分组（连同其子组）移进另一组（`target=Some`）或移回顶层
+    /// （`target=None`）。只改 `Group::parent` 这一份元数据 —— 成员的
+    /// `Layer.group` 都指向自己的直属组，不用动；z 序也保持原样（与
+    /// 单层 `set_layer_group` 同语义：编组 / 归组不改变画面布局）。
+    ///
+    /// 渲染状态随环境切换：
+    /// * 移进隐藏环境（目标链上有隐藏组）：子树里所有可见成员跟着隐藏
+    ///   （`SetVisible`），与「拖层进隐藏组」行为一致；
+    /// * 移出隐藏环境：按原链最近隐藏组的 `hidden_snapshot` 恢复成员
+    ///   自身意愿（不在快照里 = 想显示），与单层移出的还原逻辑相同。
+    /// 两侧都是隔离组（不透明度 / 混合 / 非穿透）时画面也要变，bridge
+    /// 侧统一 `refresh_preview` 兜住。
+    pub fn move_group_to_group(
+        &mut self,
+        gid: GroupId,
+        target: Option<GroupId>,
+    ) -> Result<(), EditError> {
+        if self.find_group(gid).is_none() {
+            return Err(EditError::GroupNotFound(gid));
+        }
+        if let Some(tid) = target {
+            if self.find_group(tid).is_none() {
+                return Err(EditError::GroupNotFound(tid));
+            }
+        }
+        // 防环：目标链上出现自己 = 把组塞进它自己的子树，parent 会成环。
+        {
+            let mut next = target;
+            let mut guard = 0;
+            while let Some(id) = next {
+                guard += 1;
+                if guard > 64 {
+                    break;
+                }
+                if id == gid {
+                    return Err(EditError::GroupCycle(gid));
+                }
+                next = self.find_group(id).and_then(|g| g.parent);
+            }
+        }
+        // 「环境」= 组自己的祖先链（不含 gid 自身）：gid 自己的显隐是用户
+        // 设置的独立属性，移动组不改它的眼睛状态。
+        let from_flags = self
+            .find_group(gid)
+            .and_then(|g| g.parent)
+            .map(|pid| self.group_state_flags(Some(pid)))
+            .unwrap_or_default();
+        let to_flags = self.group_state_flags(target);
+        // ★from 必须在改 parent 之前取：from/to 相同的 SetGroups 会让撤销
+        // 「恢复」到改后状态（单测抓出来过）。
+        let from_groups = self.groups.clone();
+        {
+            let group = self
+                .groups
+                .iter_mut()
+                .find(|g| g.id == gid)
+                .expect("group existence checked above");
+            if group.parent == target {
+                return Ok(()); // 已经在那个组里，无事可做
+            }
+            group.parent = target;
+        }
+        let mut ops = vec![EditOp::SetGroups {
+            from: from_groups.clone(),
+            to: self.groups.clone(),
+        }];
+        // 显隐随环境切换（成员显隐见 doc 注释；显隐单独成 op，撤销/重做
+        // 时 Batch 顺序 apply、逆序回滚，与组 parent 变化保持一致）。
+        let members = self.group_subtree_layers(gid);
+        if to_flags.hidden && !from_flags.hidden {
+            for &i in &members {
+                if self.layers[i].visible {
+                    ops.push(EditOp::SetVisible {
+                        index: i,
+                        from: true,
+                        to: false,
+                    });
+                }
+            }
+        } else if !to_flags.hidden && from_flags.hidden {
+            let snapshot = from_flags
+                .hidden_group
+                .and_then(|hgid| self.find_group(hgid))
+                .map(|g| g.hidden_snapshot.clone())
+                .unwrap_or_default();
+            for &i in &members {
+                let layer = &self.layers[i];
+                let restore = snapshot
+                    .iter()
+                    .find(|(id, _)| *id == layer.id)
+                    .map(|(_, v)| *v)
+                    .unwrap_or(true);
+                if layer.visible != restore {
+                    ops.push(EditOp::SetVisible {
+                        index: i,
+                        from: layer.visible,
+                        to: restore,
+                    });
+                }
+            }
+        }
+        self.execute(EditOp::Batch(ops))
+    }
+
     /// 组混合模式 / 不透明度 / 穿透：三项都改变合成结果，走统一历史。
     pub fn set_group_blend(&mut self, gid: GroupId, blend: BlendMode) -> Result<(), EditError> {
         let from = self
@@ -633,6 +737,54 @@ mod group_tests {
 
         doc.redo().unwrap();
         assert_eq!(doc.group_members(gid), vec![1, 3]);
+    }
+
+    #[test]
+    fn move_group_to_group_nests_rejects_cycles_and_syncs_visibility() {
+        let mut doc = doc_with_layers(4);
+        let g1 = doc.group_layers(&[1, 2], None).unwrap();
+        let g2 = doc.group_layers(&[3, 4], None).unwrap();
+        assert_eq!(doc.find_group(g2).unwrap().parent, None);
+
+        // 嵌套：组 2 进组 1。成员直属组不变，z 序不变。
+        doc.move_group_to_group(g2, Some(g1)).unwrap();
+        assert_eq!(doc.find_group(g2).unwrap().parent, Some(g1));
+        assert_eq!(doc.layers[3].group, Some(g2));
+        assert_eq!(doc.layers[4].group, Some(g2));
+
+        // 防环：组 1 不能移进自己的后代组 2。
+        assert_eq!(
+            doc.move_group_to_group(g1, Some(g2)),
+            Err(EditError::GroupCycle(g1))
+        );
+        assert_eq!(doc.find_group(g1).unwrap().parent, None);
+
+        // 显隐同步：隐藏外层组 1 → 嵌套成员（层 3/4）一起隐藏；显示时还原。
+        doc.set_group_visible(g1, false).unwrap();
+        assert!(!doc.layers[1].visible && !doc.layers[3].visible);
+        doc.set_group_visible(g1, true).unwrap();
+        assert!(doc.layers[1].visible && doc.layers[3].visible);
+
+        // 移回顶层 + 撤销/重做走 parent。
+        doc.move_group_to_group(g2, None).unwrap();
+        assert_eq!(doc.find_group(g2).unwrap().parent, None);
+        doc.undo().unwrap();
+        assert_eq!(doc.find_group(g2).unwrap().parent, Some(g1));
+        doc.redo().unwrap();
+        assert_eq!(doc.find_group(g2).unwrap().parent, None);
+    }
+
+    #[test]
+    fn move_group_into_hidden_group_hides_subtree_members() {
+        let mut doc = doc_with_layers(4);
+        let g1 = doc.group_layers(&[1, 2], None).unwrap();
+        let g2 = doc.group_layers(&[3, 4], None).unwrap();
+        doc.set_group_visible(g1, false).unwrap(); // 组 1 隐藏（记 snapshot）
+        doc.move_group_to_group(g2, Some(g1)).unwrap();
+        // 移进隐藏组：可见成员跟着隐藏；组 1 再显示时按 snapshot 恢复。
+        assert!(!doc.layers[3].visible && !doc.layers[4].visible);
+        doc.set_group_visible(g1, true).unwrap();
+        assert!(doc.layers[3].visible && doc.layers[4].visible);
     }
 
     #[test]

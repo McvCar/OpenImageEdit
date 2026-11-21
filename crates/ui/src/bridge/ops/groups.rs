@@ -368,6 +368,42 @@ impl qobject::Bridge {
         );
     }
 
+    /// 把整组拖进另一组（target_id=0 → 移回顶层）。parent 改动 + 子树
+    /// 显隐随环境切换（core 里与单层 set_layer_group 同语义），走撤销栈。
+    /// 组环境（隔离 / 不透明度 / 隐藏）任何一侧都可能改变合成，统一
+    /// refresh_preview 兜住，不做「轻量刷新」判断。
+    pub fn move_group_to_group(mut self: Pin<&mut Self>, group_id: i32, target_id: i32) {
+        if !self.group_edit_allowed() || group_id <= 0 || target_id < 0 || group_id == target_id
+        {
+            return;
+        }
+        let target = if target_id == 0 {
+            None
+        } else {
+            Some(target_id as u32)
+        };
+        let result = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no session".to_string()),
+                Some(session) => session
+                    .doc
+                    .move_group_to_group(group_id as u32, target)
+                    .map(|()| session.dirty = true)
+                    .map_err(|e| e.to_string()),
+            }
+        };
+        if let Err(e) = result {
+            self.as_mut().group_hint(&e);
+            return;
+        }
+        self.as_mut().refresh_preview();
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"group-move\",\"id\":{group_id},\
+             \"target\":{target_id}}}"
+        );
+    }
+
     // ---- 组混合模式 / 不透明度 / 穿透（P0）---------------------------
     pub fn group_blend_mode(self: Pin<&mut Self>, group_id: i32) -> i32 {
         self.session

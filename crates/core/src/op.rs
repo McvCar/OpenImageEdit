@@ -23,6 +23,8 @@ pub enum EditError {
     GroupNotFound(GroupId),
     #[error("grouping needs at least two ordinary layers")]
     GroupNeedsTwoLayers,
+    #[error("cannot move group {0} into its own subtree")]
+    GroupCycle(GroupId),
 }
 
 
