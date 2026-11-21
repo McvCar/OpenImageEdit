@@ -32,13 +32,6 @@ Item {
     readonly property int rowHeight: 44
     readonly property int rowSpacing: 3
     readonly property int multiCount: bridge.selectedLayerCount
-    readonly property bool hasGroups: {
-        try {
-            return JSON.parse(bridge.groups_json).length > 0
-        } catch (e) {
-            return false
-        }
-    }
     // PSD 阶段 2：图层后台加载完成前，面板所有命令一律灰掉并给进度提示。
     readonly property bool editLocked: bridge.editingLocked
 
@@ -475,11 +468,13 @@ Item {
                     anchors.left: btnGroup.right
                     anchors.leftMargin: 4
                     icon: "ungroup"
-                    tip: "解散分组（Ctrl+Shift+G）：图层本身保留"
-                    usable: layerPanel.hasGroups
+                    tip: "拆散选中的分组（Ctrl+Shift+G）：图层本身保留"
+                    // 只有先点选一个分组（组标题行高亮）才允许拆散，避免
+                    // 「以为在动图层结果把整个组拆了」的误操作（用户反馈）。
+                    usable: layerPanel.activeGroup !== null
                     onBlocked: layerPanel.hintText =
-                               "还没有分组：先选中两个以上图层点「编组」"
-                    onActivated: bridge.ungroup_selected_layers()
+                               "拆散分组要先点选一个分组：点击组标题行（组行高亮后生效）"
+                    onActivated: bridge.ungroup_group(layerPanel.activeGroup.gid)
                 }
                 // 删除只保留在右键菜单里：右上角这个 ✕ 太像「关闭面板」，
                 // 误点一次就可能删掉图层（用户反馈）。
@@ -603,72 +598,12 @@ Item {
                     }
                 }
 
-                // 组专属：不透明度（松手提交，一条历史）+ 穿透开关。
                 Rectangle {
                     visible: layerPanel.activeGroup !== null
                     anchors.verticalCenter: parent.verticalCenter
                     width: 1
                     height: 14
                     color: "#3a4048"
-                }
-                Text {
-                    visible: layerPanel.activeGroup !== null
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: "不透明"
-                    color: "#a9b0b8"
-                    font.pixelSize: 10
-                }
-                Item {
-                    id: groupOpacity
-                    visible: layerPanel.activeGroup !== null
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: 58
-                    height: 20
-                    property real value: layerPanel.activeGroup ? layerPanel.activeGroup.o / 100 : 1
-                    property bool dragging: false
-
-                    Rectangle {
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: parent.width
-                        height: 4
-                        radius: 2
-                        color: "#31363c"
-                    }
-                    Rectangle {
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: groupOpacity.value * groupOpacity.width
-                        height: 4
-                        radius: 2
-                        color: "#5b9dff"
-                    }
-                    MouseArea {
-                        anchors.fill: parent
-                        anchors.margins: -4
-                        cursorShape: Qt.PointingHandCursor
-                        onPressed: {
-                            if (layerPanel.editLocked || !layerPanel.activeGroup)
-                                return
-                            groupOpacity.dragging = true
-                            groupOpacity.value = Math.min(1, Math.max(0, mouse.x / groupOpacity.width))
-                        }
-                        onPositionChanged: if (groupOpacity.dragging)
-                            groupOpacity.value = Math.min(1, Math.max(0, mouse.x / groupOpacity.width))
-                        onReleased: {
-                            if (!groupOpacity.dragging)
-                                return
-                            groupOpacity.dragging = false
-                            bridge.set_group_opacity(layerPanel.activeGroup.gid,
-                                                     groupOpacity.value)
-                        }
-                    }
-                }
-                Text {
-                    visible: layerPanel.activeGroup !== null
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: 30
-                    text: Math.round(groupOpacity.value * 100) + "%"
-                    color: "#a9b0b8"
-                    font.pixelSize: 10
                 }
                 Rectangle {
                     id: passBtn
@@ -1472,6 +1407,8 @@ Item {
     }
 
     // ================= 底部：不透明度 =================
+    // 双用途：选中图层 → 图层不透明度；聚焦分组 → 组不透明度
+    // （第三排的组滑条已删，统一从这里调，用户反馈）。
     Column {
         id: panelFooter
         anchors.bottom: parent.bottom
@@ -1482,6 +1419,7 @@ Item {
         anchors.rightMargin: 10
         spacing: 6
         visible: bridge.selected_layer >= 0
+                 || layerPanel.activeGroup !== null
 
         Rectangle { width: parent.width; height: 1; color: "#31363c" }
 
@@ -1507,13 +1445,18 @@ Item {
 
                 function setValue(x) {
                     value = Math.min(1.0, Math.max(0.0, x / width))
+                    if (layerPanel.activeGroup)
+                        return // 组：拖动期间只刷显示，松手一次性提交（一条历史）
                     bridge.set_selected_opacity(value, false)
                 }
 
                 Binding {
                     target: opacitySlider
                     property: "value"
-                    value: host.selLayer ? host.selLayer.o / 100.0 : 1.0
+                    // 组焦点优先：点的是组行，滑条就该反映组不透明度。
+                    value: layerPanel.activeGroup
+                           ? layerPanel.activeGroup.o / 100.0
+                           : (host.selLayer ? host.selLayer.o / 100.0 : 1.0)
                     when: !opacitySlider.dragging
                 }
 
@@ -1556,7 +1499,11 @@ Item {
                     }
                     onReleased: {
                         opacitySlider.dragging = false
-                        bridge.set_selected_opacity(opacitySlider.value, true)
+                        if (layerPanel.activeGroup)
+                            bridge.set_group_opacity(layerPanel.activeGroup.gid,
+                                                     opacitySlider.value)
+                        else
+                            bridge.set_selected_opacity(opacitySlider.value, true)
                     }
                 }
             }
@@ -1646,14 +1593,13 @@ Item {
                 }
             }
             MenuRow {
-                label: "解散分组 (Ctrl+Shift+G)"
-                active: layerContext.targetGroupId > 0 || layerPanel.hasGroups
+                // 只有右键点在分组标题行上才出现（用户反馈：图层行的菜单
+                // 不该有拆散项，避免误拆整组）。
+                label: "拆散分组"
+                active: layerContext.targetGroupId > 0
                 onActivated: {
                     layerContext.visible = false
-                    if (layerContext.targetGroupId > 0)
-                        bridge.ungroup_group(layerContext.targetGroupId)
-                    else
-                        bridge.ungroup_selected_layers()
+                    bridge.ungroup_group(layerContext.targetGroupId)
                 }
             }
             MenuRow {
