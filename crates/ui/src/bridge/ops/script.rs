@@ -1253,6 +1253,36 @@ impl qobject::Bridge {
                 "layer-new" => self.as_mut().new_layer(),
                 "layer-dup" => self.as_mut().duplicate_selected_layer(),
                 "layer-merge-down" => self.as_mut().merge_selected_down(),
+                // 混合模式（P0）：`blend:index,mode`；index=-1 表示主选中层。
+                other if other.starts_with("blend:") => {
+                    let body = other.trim_start_matches("blend:");
+                    let mut it = body.split(',');
+                    let ix = it.next().and_then(|v| v.parse().ok()).unwrap_or(-1);
+                    let mode = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    self.as_mut().set_layer_blend_mode(ix, mode);
+                }
+                // `group-blend:id,mode` / `group-opacity:id,0..1` / `group-pass:id,0|1`
+                other if other.starts_with("group-blend:") => {
+                    let body = other.trim_start_matches("group-blend:");
+                    let mut it = body.split(',');
+                    let id = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let mode = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    self.as_mut().set_group_blend_mode(id, mode);
+                }
+                other if other.starts_with("group-opacity:") => {
+                    let body = other.trim_start_matches("group-opacity:");
+                    let mut it = body.split(',');
+                    let id = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let v = it.next().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+                    self.as_mut().set_group_opacity(id, v);
+                }
+                other if other.starts_with("group-pass:") => {
+                    let body = other.trim_start_matches("group-pass:");
+                    let mut it = body.split(',');
+                    let id = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let on = it.next().map(|v| v == "1" || v == "true").unwrap_or(true);
+                    self.as_mut().set_group_pass_through(id, on);
+                }
                 // 合并选中的多个图层（面板上的「合并图层」按钮）。
                 "layer-merge" => self.as_mut().merge_selected_layers(),
                 "merge-visible" => self.as_mut().merge_visible_layers(),

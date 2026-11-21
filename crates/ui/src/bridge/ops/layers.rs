@@ -962,4 +962,65 @@ impl qobject::Bridge {
         };
         self.apply_layer_edit(viewport, result);
     }
+
+    // ---- 混合模式（P0）------------------------------------------------
+    pub fn blend_mode_count(self: Pin<&mut Self>) -> i32 {
+        editcore::BlendMode::count()
+    }
+
+    pub fn blend_mode_label(self: Pin<&mut Self>, index: i32) -> QString {
+        editcore::BlendMode::from_index(index)
+            .map(|m| QString::from(m.label()))
+            .unwrap_or_default()
+    }
+
+    pub fn layer_blend_mode(self: Pin<&mut Self>, index: i32) -> i32 {
+        let ix = if index < 0 {
+            *self.selected_layer()
+        } else {
+            index
+        };
+        self.session
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.doc.layers.get(ix.max(0) as usize))
+            .map(|l| l.blend.index())
+            .unwrap_or(0)
+    }
+
+    pub fn set_layer_blend_mode(mut self: Pin<&mut Self>, index: i32, mode: i32) {
+        let Some(to) = editcore::BlendMode::from_index(mode) else {
+            self.as_mut()
+                .set_status(QString::from("未知的混合模式索引"));
+            return;
+        };
+        let ix = if index < 0 {
+            *self.selected_layer()
+        } else {
+            index
+        };
+        let Some(ix) = self.selected_guard(ix) else {
+            return;
+        };
+        if self.layer_locked(ix) {
+            self.as_mut().set_status(QString::from("图层已锁定"));
+            return;
+        }
+        let viewport = *self.viewport.borrow();
+        let result: Result<bool, String> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no document".into()),
+                Some(session) => session
+                    .doc
+                    .set_layer_blend(ix, to)
+                    .map(|()| {
+                        session.dirty = true;
+                        true
+                    })
+                    .map_err(|e| e.to_string()),
+            }
+        };
+        self.apply_layer_edit(viewport, result);
+    }
 }

@@ -41,6 +41,42 @@ Item {
     }
     // PSD 阶段 2：图层后台加载完成前，面板所有命令一律灰掉并给进度提示。
     readonly property bool editLocked: bridge.editingLocked
+
+    // ---- 混合模式下拉（P0）------------------------------------------
+    // 选项文字由 core::BlendMode::label 提供，避免 QML 再抄一份 27 项列表。
+    readonly property var blendChoices: {
+        const arr = []
+        const n = bridge.blend_mode_count()
+        for (var i = 0; i < n; i++)
+            arr.push({ i: i, n: bridge.blend_mode_label(i) })
+        return arr
+    }
+    property bool blendListOpen: false
+    // 选中的组：整组成员都被选中时算「选中组」，嵌套时取最深的那个。
+    readonly property var activeGroup: {
+        let best = null
+        const list = host.layerPanelList
+        for (var i = 0; i < list.length; i++) {
+            const r = list[i]
+            if (r && r.k === "group" && layerPanel.isSelectedRow(r))
+                if (best === null || (r.d || 0) > (best.d || 0))
+                    best = r
+        }
+        return best
+    }
+    readonly property bool hasBlendTarget: layerPanel.activeGroup !== null
+                                           || host.selLayer !== null
+    readonly property int currentBlend: {
+        if (layerPanel.activeGroup)
+            return layerPanel.activeGroup.b || 0
+        const l = host.selLayer
+        return l && l.b !== undefined ? l.b : 0
+    }
+    function currentBlendName() {
+        const c = layerPanel.blendChoices[layerPanel.currentBlend]
+        return c ? c.n : "正常"
+    }
+    function closeBlendList() { layerPanel.blendListOpen = false }
     // 按钮 hover 时的说明文字（面板里没有原生 tooltip，用一个固定行显示，
     // 免得浮层跑出面板边界）。
     property string hintText: ""
@@ -409,6 +445,157 @@ Item {
                 }
             }
 
+            // 第三排：混合模式（图层 / 选中组）。
+            Row {
+                width: parent.width
+                height: 20
+                spacing: 6
+                visible: layerPanel.hasBlendTarget
+
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: layerPanel.activeGroup ? "组混合" : "混合"
+                    color: "#a9b0b8"
+                    font.pixelSize: 11
+                }
+
+                Rectangle {
+                    id: blendBtn
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 118
+                    height: 20
+                    radius: 3
+                    color: layerPanel.editLocked ? "#24282d" : "#2b3036"
+                    border.color: layerPanel.blendListOpen ? "#6fa8dc" : "#3a4048"
+                    border.width: 1
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.left: parent.left
+                        anchors.leftMargin: 6
+                        width: parent.width - 20
+                        text: layerPanel.currentBlendName()
+                        color: layerPanel.editLocked ? "#666c74" : "#e3e7eb"
+                        font.pixelSize: 11
+                        elide: Text.ElideRight
+                    }
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.right: parent.right
+                        anchors.rightMargin: 6
+                        text: "▾"
+                        color: "#8ec7ff"
+                        font.pixelSize: 10
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            if (layerPanel.editLocked) {
+                                layerPanel.hintText = "图层加载中，暂不可修改混合模式"
+                                return
+                            }
+                            layerPanel.blendListOpen = !layerPanel.blendListOpen
+                        }
+                    }
+                }
+
+                // 组专属：不透明度（松手提交，一条历史）+ 穿透开关。
+                Rectangle {
+                    visible: layerPanel.activeGroup !== null
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 1
+                    height: 14
+                    color: "#3a4048"
+                }
+                Text {
+                    visible: layerPanel.activeGroup !== null
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "不透明"
+                    color: "#a9b0b8"
+                    font.pixelSize: 10
+                }
+                Item {
+                    id: groupOpacity
+                    visible: layerPanel.activeGroup !== null
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 58
+                    height: 20
+                    property real value: layerPanel.activeGroup ? layerPanel.activeGroup.o / 100 : 1
+                    property bool dragging: false
+
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width
+                        height: 4
+                        radius: 2
+                        color: "#31363c"
+                    }
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: groupOpacity.value * groupOpacity.width
+                        height: 4
+                        radius: 2
+                        color: "#5b9dff"
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        anchors.margins: -4
+                        cursorShape: Qt.PointingHandCursor
+                        onPressed: {
+                            if (layerPanel.editLocked || !layerPanel.activeGroup)
+                                return
+                            groupOpacity.dragging = true
+                            groupOpacity.value = Math.min(1, Math.max(0, mouse.x / groupOpacity.width))
+                        }
+                        onPositionChanged: if (groupOpacity.dragging)
+                            groupOpacity.value = Math.min(1, Math.max(0, mouse.x / groupOpacity.width))
+                        onReleased: {
+                            if (!groupOpacity.dragging)
+                                return
+                            groupOpacity.dragging = false
+                            bridge.set_group_opacity(layerPanel.activeGroup.gid,
+                                                     groupOpacity.value)
+                        }
+                    }
+                }
+                Text {
+                    visible: layerPanel.activeGroup !== null
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 30
+                    text: Math.round(groupOpacity.value * 100) + "%"
+                    color: "#a9b0b8"
+                    font.pixelSize: 10
+                }
+                Rectangle {
+                    id: passBtn
+                    visible: layerPanel.activeGroup !== null
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 32
+                    height: 18
+                    radius: 3
+                    color: layerPanel.activeGroup && layerPanel.activeGroup.pt ? "#2f5b7d" : "#2b3036"
+                    border.color: "#4a5560"
+                    border.width: 1
+                    Text {
+                        anchors.centerIn: parent
+                        text: "穿透"
+                        color: "#d7e2ec"
+                        font.pixelSize: 9
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            if (layerPanel.editLocked || !layerPanel.activeGroup)
+                                return
+                            bridge.set_group_pass_through(layerPanel.activeGroup.gid,
+                                                          !layerPanel.activeGroup.pt)
+                        }
+                    }
+                }
+            }
+
             // 说明行：hover 按钮时显示按钮用途，平时显示多选手势提示。
             Text {
                 width: parent.width
@@ -427,6 +614,88 @@ Item {
             width: parent.width
             height: 1
             color: "#31363c"
+        }
+    }
+
+    // 混合模式下拉：用 Flickable 装 27 项，面板再高也不溢出。
+    MouseArea {
+        z: 149
+        anchors.fill: parent
+        visible: layerPanel.blendListOpen
+        onClicked: layerPanel.closeBlendList()
+    }
+    Rectangle {
+        id: blendList
+        z: 150
+        visible: layerPanel.blendListOpen
+        readonly property point origin: blendBtn.mapToItem(layerPanel, 0, 0)
+        x: Math.max(4, Math.min(origin.x, layerPanel.width - width - 4))
+        y: origin.y + blendBtn.height + 2
+        width: 178
+        height: listFlick.height + 8
+        color: "#2a2f35"
+        border.color: "#4a5560"
+        border.width: 1
+        radius: 6
+
+        Flickable {
+            id: listFlick
+            x: 4
+            y: 4
+            width: parent.width - 8
+            height: Math.min(276, Math.max(48, layerPanel.height - blendList.y - 12))
+            contentWidth: width
+            contentHeight: blendCol.height
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+
+            Column {
+                id: blendCol
+                width: parent.width
+                spacing: 2
+                Repeater {
+                    model: layerPanel.blendChoices
+                    delegate: Rectangle {
+                        required property var modelData
+                        width: blendCol.width
+                        height: 24
+                        radius: 3
+                        color: modelData.i === layerPanel.currentBlend ? "#3d5a80"
+                             : blendItemMa.containsMouse ? "#363c44" : "transparent"
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.left: parent.left
+                            anchors.leftMargin: 8
+                            text: modelData.n
+                            color: "#e9eaec"
+                            font.pixelSize: 11
+                        }
+                        Text {
+                            visible: modelData.i === layerPanel.currentBlend
+                            anchors.verticalCenter: parent.verticalCenter
+                            anchors.right: parent.right
+                            anchors.rightMargin: 8
+                            text: "✓"
+                            color: "#ffffff"
+                            font.pixelSize: 11
+                        }
+                        MouseArea {
+                            id: blendItemMa
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                layerPanel.closeBlendList()
+                                if (layerPanel.activeGroup)
+                                    bridge.set_group_blend_mode(layerPanel.activeGroup.gid,
+                                                                modelData.i)
+                                else
+                                    bridge.set_layer_blend_mode(-1, modelData.i)
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

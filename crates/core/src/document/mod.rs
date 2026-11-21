@@ -901,6 +901,23 @@ impl Document {
         })
     }
 
+    /// 图层混合模式（PS 面板顶部下拉）。与锁定一样进统一历史。
+    pub fn set_layer_blend(&mut self, index: usize, blend: BlendMode) -> Result<(), EditError> {
+        let from = self
+            .layers
+            .get(index)
+            .ok_or(EditError::LayerIndex(index))?
+            .blend;
+        if from == blend {
+            return Ok(());
+        }
+        self.execute(EditOp::SetBlend {
+            index,
+            from,
+            to: blend,
+        })
+    }
+
     pub fn set_layer_locked(&mut self, index: usize, locked: bool) -> Result<(), EditError> {
         let from = self
             .layers

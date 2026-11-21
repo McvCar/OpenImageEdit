@@ -46,7 +46,58 @@ pub enum BlendMode {
     Luminosity,
 }
 
+/// 面板下拉的顺序。索引是 UI ↔ core 的契约：bridge 只传整数，QML 用
+/// [`BlendMode::label`] 显示文字，所以列表顺序改动等于改协议。
+pub const BLEND_MODES: [BlendMode; 27] = [
+    BlendMode::Normal,
+    BlendMode::Dissolve,
+    BlendMode::Multiply,
+    BlendMode::Screen,
+    BlendMode::Overlay,
+    BlendMode::Darken,
+    BlendMode::Lighten,
+    BlendMode::ColorDodge,
+    BlendMode::ColorBurn,
+    BlendMode::LinearDodge,
+    BlendMode::LinearBurn,
+    BlendMode::DarkerColor,
+    BlendMode::LighterColor,
+    BlendMode::SoftLight,
+    BlendMode::HardLight,
+    BlendMode::VividLight,
+    BlendMode::LinearLight,
+    BlendMode::PinLight,
+    BlendMode::HardMix,
+    BlendMode::Difference,
+    BlendMode::Exclusion,
+    BlendMode::Subtract,
+    BlendMode::Divide,
+    BlendMode::Hue,
+    BlendMode::Saturation,
+    BlendMode::Color,
+    BlendMode::Luminosity,
+];
+
 impl BlendMode {
+    /// UI 下拉用的整数索引；越界返回 `None` 而不是静默落到「正常」。
+    pub fn from_index(index: i32) -> Option<Self> {
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| BLEND_MODES.get(i).copied())
+    }
+
+    /// 与 [`BlendMode::from_index`] 互逆。
+    pub fn index(self) -> i32 {
+        BLEND_MODES
+            .iter()
+            .position(|m| *m == self)
+            .unwrap_or(0) as i32
+    }
+
+    pub fn count() -> i32 {
+        BLEND_MODES.len() as i32
+    }
+
     /// `true` for the mode that needs no math at all (fast path).
     pub fn is_normal(self) -> bool {
         matches!(self, BlendMode::Normal)

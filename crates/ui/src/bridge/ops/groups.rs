@@ -281,4 +281,111 @@ impl qobject::Bridge {
              \"locked\":{locked}}}"
         );
     }
+
+    // ---- 组混合模式 / 不透明度 / 穿透（P0）---------------------------
+    pub fn group_blend_mode(self: Pin<&mut Self>, group_id: i32) -> i32 {
+        self.session
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.doc.find_group(group_id.max(0) as u32))
+            .map(|g| g.blend.index())
+            .unwrap_or(0)
+    }
+
+    pub fn set_group_blend_mode(mut self: Pin<&mut Self>, group_id: i32, mode: i32) {
+        let Some(to) = editcore::BlendMode::from_index(mode) else {
+            self.as_mut()
+                .set_status(QString::from("未知的混合模式索引"));
+            return;
+        };
+        if !self.group_edit_allowed() || group_id <= 0 {
+            return;
+        }
+        let result = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err(editcore::EditError::GroupNotFound(group_id as u32).to_string()),
+                Some(session) => session
+                    .doc
+                    .set_group_blend(group_id as u32, to)
+                    .map(|()| session.dirty = true)
+                    .map_err(|e| e.to_string()),
+            }
+        };
+        if let Err(e) = result {
+            self.as_mut().group_hint(&e);
+            return;
+        }
+        self.as_mut().refresh_preview();
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"group-blend\",\"id\":{group_id},\
+             \"mode\":{mode}}}"
+        );
+    }
+
+    pub fn group_opacity(self: Pin<&mut Self>, group_id: i32) -> f32 {
+        self.session
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.doc.find_group(group_id.max(0) as u32))
+            .map(|g| g.opacity)
+            .unwrap_or(1.0)
+    }
+
+    pub fn set_group_opacity(mut self: Pin<&mut Self>, group_id: i32, opacity: f32) {
+        if !self.group_edit_allowed() || group_id <= 0 {
+            return;
+        }
+        let result = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err(editcore::EditError::GroupNotFound(group_id as u32).to_string()),
+                Some(session) => session
+                    .doc
+                    .set_group_opacity(group_id as u32, opacity)
+                    .map(|()| session.dirty = true)
+                    .map_err(|e| e.to_string()),
+            }
+        };
+        if let Err(e) = result {
+            self.as_mut().group_hint(&e);
+            return;
+        }
+        self.as_mut().refresh_preview();
+    }
+
+    pub fn group_pass_through(self: Pin<&mut Self>, group_id: i32) -> bool {
+        self.session
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.doc.find_group(group_id.max(0) as u32))
+            .map(|g| g.pass_through)
+            .unwrap_or(true)
+    }
+
+    pub fn set_group_pass_through(mut self: Pin<&mut Self>, group_id: i32, pass: bool) {
+        if !self.group_edit_allowed() || group_id <= 0 {
+            return;
+        }
+        let result = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err(editcore::EditError::GroupNotFound(group_id as u32).to_string()),
+                Some(session) => session
+                    .doc
+                    .set_group_pass_through(group_id as u32, pass)
+                    .map(|()| session.dirty = true)
+                    .map_err(|e| e.to_string()),
+            }
+        };
+        if let Err(e) = result {
+            self.as_mut().group_hint(&e);
+            return;
+        }
+        self.as_mut().refresh_preview();
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"group-passthrough\",\"id\":{group_id},\
+             \"pass\":{pass}}}"
+        );
+    }
 }

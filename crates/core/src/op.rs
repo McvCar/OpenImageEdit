@@ -44,6 +44,22 @@ pub enum EditOp {
     /// 现在它也进历史 —— 误锁一下能 Ctrl+Z 回来。
     SetLocked { index: usize, from: bool, to: bool },
     SetOpacity { index: usize, from: f32, to: f32 },
+    /// 图层混合模式（PS 面板顶部下拉）。进历史，可撤销。
+    SetBlend {
+        index: usize,
+        from: BlendMode,
+        to: BlendMode,
+    },
+    /// 组的混合模式：整组先合成、再按此模式盖到下层。
+    SetGroupBlend {
+        id: GroupId,
+        from: BlendMode,
+        to: BlendMode,
+    },
+    /// 组不透明度：整合成一次应用，不是乘进每个成员。
+    SetGroupOpacity { id: GroupId, from: f32, to: f32 },
+    /// PSD 的 `pass`（穿透）：成员直接与组下方混合，组不是隔离容器。
+    SetGroupPassThrough { id: GroupId, from: bool, to: bool },
     TranslateLayer { index: usize, from: (i32, i32), to: (i32, i32) },
     /// P0-1 参数化变换历史：from/to 只存参数 + `Arc<原图>` 的浅引用，
     /// 一条 op 取代整文档快照。P0-2 统一会话启用后，移动 / 缩放 / 旋转
@@ -238,6 +254,41 @@ impl EditOp {
                     .get_mut(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
                 layer.opacity = to.clamp(0.0, 1.0);
+                Ok(())
+            }
+            EditOp::SetBlend { index, to, .. } => {
+                let layer = doc
+                    .layers
+                    .get_mut(*index)
+                    .ok_or(EditError::LayerIndex(*index))?;
+                layer.blend = *to;
+                Ok(())
+            }
+            EditOp::SetGroupBlend { id, to, .. } => {
+                let group = doc
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.id == *id)
+                    .ok_or(EditError::GroupNotFound(*id))?;
+                group.blend = *to;
+                Ok(())
+            }
+            EditOp::SetGroupOpacity { id, to, .. } => {
+                let group = doc
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.id == *id)
+                    .ok_or(EditError::GroupNotFound(*id))?;
+                group.opacity = to.clamp(0.0, 1.0);
+                Ok(())
+            }
+            EditOp::SetGroupPassThrough { id, to, .. } => {
+                let group = doc
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.id == *id)
+                    .ok_or(EditError::GroupNotFound(*id))?;
+                group.pass_through = *to;
                 Ok(())
             }
             EditOp::TranslateLayer { index, from, to } => {
@@ -533,6 +584,41 @@ impl EditOp {
                     .get_mut(*index)
                     .ok_or(EditError::LayerIndex(*index))?;
                 layer.opacity = *from;
+                Ok(())
+            }
+            EditOp::SetBlend { index, from, .. } => {
+                let layer = doc
+                    .layers
+                    .get_mut(*index)
+                    .ok_or(EditError::LayerIndex(*index))?;
+                layer.blend = *from;
+                Ok(())
+            }
+            EditOp::SetGroupBlend { id, from, .. } => {
+                let group = doc
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.id == *id)
+                    .ok_or(EditError::GroupNotFound(*id))?;
+                group.blend = *from;
+                Ok(())
+            }
+            EditOp::SetGroupOpacity { id, from, .. } => {
+                let group = doc
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.id == *id)
+                    .ok_or(EditError::GroupNotFound(*id))?;
+                group.opacity = *from;
+                Ok(())
+            }
+            EditOp::SetGroupPassThrough { id, from, .. } => {
+                let group = doc
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.id == *id)
+                    .ok_or(EditError::GroupNotFound(*id))?;
+                group.pass_through = *from;
                 Ok(())
             }
             EditOp::TranslateLayer { index, from, to } => {

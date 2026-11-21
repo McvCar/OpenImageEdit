@@ -39,5 +39,7 @@ probe_layer_ops.png
 probe_layer_ops.log
 probe_layer_groups.png
 probe_layer_groups.log
+probe_blend_modes.png
+probe_blend_modes.log
 test_workspace.log
 build_test.log

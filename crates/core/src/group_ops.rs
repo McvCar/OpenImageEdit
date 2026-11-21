@@ -200,6 +200,53 @@ impl Document {
         })
     }
 
+    /// 组混合模式 / 不透明度 / 穿透：三项都改变合成结果，走统一历史。
+    pub fn set_group_blend(&mut self, gid: GroupId, blend: BlendMode) -> Result<(), EditError> {
+        let from = self
+            .find_group(gid)
+            .ok_or(EditError::GroupNotFound(gid))?
+            .blend;
+        if from == blend {
+            return Ok(());
+        }
+        self.execute(EditOp::SetGroupBlend {
+            id: gid,
+            from,
+            to: blend,
+        })
+    }
+
+    pub fn set_group_opacity(&mut self, gid: GroupId, opacity: f32) -> Result<(), EditError> {
+        let from = self
+            .find_group(gid)
+            .ok_or(EditError::GroupNotFound(gid))?
+            .opacity;
+        let to = opacity.clamp(0.0, 1.0);
+        if (from - to).abs() < f32::EPSILON {
+            return Ok(());
+        }
+        self.execute(EditOp::SetGroupOpacity {
+            id: gid,
+            from,
+            to,
+        })
+    }
+
+    pub fn set_group_pass_through(&mut self, gid: GroupId, pass: bool) -> Result<(), EditError> {
+        let from = self
+            .find_group(gid)
+            .ok_or(EditError::GroupNotFound(gid))?
+            .pass_through;
+        if from == pass {
+            return Ok(());
+        }
+        self.execute(EditOp::SetGroupPassThrough {
+            id: gid,
+            from,
+            to: pass,
+        })
+    }
+
     /// 折叠 / 展开是纯视图状态：不进撤销栈、不动像素版本（PS 也是这个语义）。
     /// UI 侧另有 `groupViewEpoch` 负责刷新面板。
     pub fn set_group_collapsed_view(

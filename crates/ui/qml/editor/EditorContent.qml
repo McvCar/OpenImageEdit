@@ -2578,7 +2578,10 @@ function buildLayerPanelRows() {
             i: -1, id: -grp.id, gid: grp.id, k: "group",
             n: empty ? grp.n + "（空）" : grp.n,
             v: grp.v, sv: grp.sv === undefined ? grp.v : grp.sv,
-            l: grp.l, o: 100, c: grp.c, d: grp.d || 0,
+            l: grp.l, o: grp.o === undefined ? 100 : grp.o,
+            b: grp.b === undefined ? 0 : grp.b,
+            pt: grp.pt === undefined ? true : grp.pt,
+            c: grp.c, d: grp.d || 0,
             cnt: empty ? 0 : grp.cnt, mids: grp.mids || [],
             x: 0, y: 0, w: 0, h: 0, g: grp.p || 0, base: false
         }

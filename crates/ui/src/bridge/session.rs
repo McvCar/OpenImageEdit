@@ -1391,10 +1391,11 @@ impl Session {
                 mk
             };
             parts.push(format!(
-                "{{\"i\":{i},\"id\":{},\"n\":\"{name}\",\"v\":{},\"o\":{},\"l\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"a\":{:.3},\"sw\":{},\"sh\":{},\"k\":\"{kind}\",\"g\":{}{extra}}}",
+                "{{\"i\":{i},\"id\":{},\"n\":\"{name}\",\"v\":{},\"o\":{},\"b\":{},\"l\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"a\":{:.3},\"sw\":{},\"sh\":{},\"k\":\"{kind}\",\"g\":{}{extra}}}",
                 layer.id,
                 layer.visible,
                 (layer.opacity * 100.0).round() as i32,
+                layer.blend.index(),
                 layer.locked,
                 bounds.x,
                 bounds.y,
@@ -1414,7 +1415,8 @@ impl Session {
     ///
     /// 字段：`id` / `n` 名字 / `c` 折叠 / `v` **有效**眼睛（自己 & 全部祖先）/
     /// `sv` 自己的眼睛（点眼睛时按它取反）/ `l` 整组是否已锁 / `cnt` 子树
-    /// 图层数 / `mids` 子树成员的稳定 id / `p` 父组（0 = 顶层）/ `d` 深度。
+    /// 图层数 / `mids` 子树成员的稳定 id / `p` 父组（0 = 顶层）/ `d` 深度 /
+    /// `b` 组混合模式索引 / `o` 组不透明度(%) / `pt` 是否穿透。
     ///
     /// 一次遍历 `layers` 按组反查再沿父子链累加，复杂度 O(组数 × 层数)，
     /// 只在图层/组变化时调用（不是每帧）。
@@ -1451,7 +1453,7 @@ impl Session {
                 next = parent.parent;
             }
             parts.push(format!(
-                "{{\"id\":{},\"n\":\"{name}\",\"c\":{},\"v\":{},\"sv\":{},\"l\":{},\"cnt\":{},\"mids\":[{}],\"p\":{},\"d\":{}}}",
+                "{{\"id\":{},\"n\":\"{name}\",\"c\":{},\"v\":{},\"sv\":{},\"l\":{},\"cnt\":{},\"mids\":[{}],\"p\":{},\"d\":{},\"b\":{},\"o\":{},\"pt\":{}}}",
                 group.id,
                 group.collapsed,
                 effective,
@@ -1460,7 +1462,10 @@ impl Session {
                 ids.len(),
                 ids.join(","),
                 group.parent.unwrap_or(0),
-                self.doc.group_depth(group.id)
+                self.doc.group_depth(group.id),
+                group.blend.index(),
+                (group.opacity * 100.0).round() as i32,
+                group.pass_through
             ));
         }
         format!("[{}]", parts.join(","))

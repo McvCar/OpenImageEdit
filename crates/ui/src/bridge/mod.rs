@@ -792,6 +792,40 @@ pub mod qobject {
         #[qinvokable]
         fn set_group_locked(self: Pin<&mut Self>, group_id: i32, locked: bool);
 
+        // ---- 混合模式 / 组属性（P0）----
+        /// 下拉项数：`blend_mode_label(0..count)` 取显示名（与 core 同源）。
+        #[qinvokable]
+        fn blend_mode_count(self: Pin<&mut Self>) -> i32;
+
+        #[qinvokable]
+        fn blend_mode_label(self: Pin<&mut Self>, index: i32) -> QString;
+
+        /// 图层混合模式索引；index < 0 = 当前选中层。
+        #[qinvokable]
+        fn layer_blend_mode(self: Pin<&mut Self>, index: i32) -> i32;
+
+        #[qinvokable]
+        fn set_layer_blend_mode(self: Pin<&mut Self>, index: i32, mode: i32);
+
+        #[qinvokable]
+        fn group_blend_mode(self: Pin<&mut Self>, group_id: i32) -> i32;
+
+        #[qinvokable]
+        fn set_group_blend_mode(self: Pin<&mut Self>, group_id: i32, mode: i32);
+
+        /// 0..1，面板按百分比显示。
+        #[qinvokable]
+        fn group_opacity(self: Pin<&mut Self>, group_id: i32) -> f32;
+
+        #[qinvokable]
+        fn set_group_opacity(self: Pin<&mut Self>, group_id: i32, opacity: f32);
+
+        #[qinvokable]
+        fn group_pass_through(self: Pin<&mut Self>, group_id: i32) -> bool;
+
+        #[qinvokable]
+        fn set_group_pass_through(self: Pin<&mut Self>, group_id: i32, pass: bool);
+
         /// 图层缩略图 URL（面板每行一张；按需生成 + 缓存）。
         #[qinvokable]
         fn layer_thumb_url(self: Pin<&mut Self>, index: i32) -> QString;
