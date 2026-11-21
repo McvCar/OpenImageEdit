@@ -2577,7 +2577,9 @@ function buildLayerPanelRows() {
         return {
             i: -1, id: -grp.id, gid: grp.id, k: "group",
             n: empty ? grp.n + "（空）" : grp.n,
-            v: grp.v, sv: grp.sv === undefined ? grp.v : grp.sv,
+            // ev 是面板眼睛图标显示态：组保持原语义（有效显隐，含祖先）；
+            // 图层行则是「自身意愿」，组隐藏时成员图标不变（见 session.rs）。
+            v: grp.v, ev: grp.v, sv: grp.sv === undefined ? grp.v : grp.sv,
             l: grp.l, o: grp.o === undefined ? 100 : grp.o,
             b: grp.b === undefined ? 0 : grp.b,
             pt: grp.pt === undefined ? true : grp.pt,
@@ -2700,8 +2702,16 @@ function topLayerAt(mx, my) {
         if (l.base === true || l.v !== true || l.l === true)
             continue
         if (l.w > 0 && l.h > 0
-            && ix >= l.x && ix <= l.x + l.w && iy >= l.y && iy <= l.y + l.h)
-            return l
+            && ix >= l.x && ix <= l.x + l.w && iy >= l.y && iy <= l.y + l.h) {
+            // ★矩形外框只是粗筛：被图层蒙版 / 透明像素裁掉的区域不能响应
+            // 点击，否则「点空白」会选中蒙版图（用户报的 bug）。alpha 已含
+            // 蒙版（core::hit_alpha_at）；阈值 16 让半透明边缘仍可点中。
+            // 保真模式只有 1 层合成、无逐层数据，i 缺失时退回矩形判定。
+            if (l.i === undefined || l.i < 0)
+                return l
+            if (bridge.layer_hit_alpha(l.i, Math.floor(ix), Math.floor(iy)) >= 16)
+                return l
+        }
     }
     return null
 }
@@ -3356,6 +3366,47 @@ Timer {
         }
         bridge.dump_panel_rows(JSON.stringify(out))
     }
+}
+
+// Probe: --probe-reveal=index —— 在 QML 树就绪后（大 PSD 加载要 ~0.8s）
+// 选中目标层，走真实的 onSelected_layerChanged 路径验证「选中折叠组内层
+// 自动展开并定位」。脚本路径在 bridge.start() 里跑，早于 Connections 建立。
+readonly property int probeRevealIndex: {
+    const a = Qt.application.arguments
+    for (var i = 0; i < a.length; i++)
+        if (a[i].indexOf("--probe-reveal=") === 0)
+            return parseInt(a[i].slice("--probe-reveal=".length), 10)
+    return -1
+}
+Timer {
+    id: revealProbeTimer
+    interval: 120
+    repeat: true
+    // 大 PSD 首帧要 ~4s，图层装配更早，但 must 等 layerPanelList 有行
+    // 再选，否则 select_layer_ex 落在空文档上、回调白跑。
+    running: root.probeRevealIndex >= 0 && !root._revealProbeDone
+    onTriggered: {
+        // 等整份图层栈装配完（637 层）再选，避免装配中途的 selected_layer
+        // 抖动把目标覆盖（用户实际操作也是文档加载完成后才点击）。
+        if (root.layerList.length < 600)
+            return
+        root._revealProbeDone = true
+        stop()
+        bridge.select_layer_ex(root.probeRevealIndex, 0)
+        bridge.mark("reveal-selected:" + root.probeRevealIndex)
+    }
+}
+property bool _revealProbeDone: false
+// 供 LayerPanel 定位完成后回调上报：目标行 row、contentY、视口高度，
+// 探针据此判断目标行是否落在可见区。
+function reportReveal(index, row, contentY, viewH) {
+    if (root.probeRevealIndex !== index)
+        return
+    // 不用内嵌 JSON：bridge.mark 的 name 字段没转义引号，嵌套 {} 会让
+    // 整行不再是合法 JSON，探针无法 raw_decode。用扁平的 key=value。
+    bridge.mark("reveal-report:idx=" + index + ",row=" + row
+                + ",cy=" + Math.round(contentY) + ",vh=" + Math.round(viewH)
+                + ",rows=" + root.layerPanelList.length)
 }
 
 // Probe: --probe-picker opens the color-picker panel (colors come from

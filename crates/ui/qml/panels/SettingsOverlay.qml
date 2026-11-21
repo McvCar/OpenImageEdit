@@ -23,12 +23,37 @@ Rectangle {
     }
 
     Rectangle {
+        id: settingsCard
         width: 420
         height: settingsCol.height + 28
-        anchors.centerIn: parent
+        x: 0
+        y: 0
+        Component.onCompleted: {
+            x = Math.max(0, (parent.width - width) / 2)
+            y = Math.max(0, (parent.height - height) / 2)
+        }
         radius: 8
         color: "#2b2e33"
         border.color: "#3c4043"
+
+        // 标题栏拖动（覆盖顶部 42px，让出右上角关闭键）。
+        MouseArea {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.rightMargin: 40
+            anchors.top: parent.top
+            height: 42
+            z: 3
+            property real dx: 0
+            property real dy: 0
+            onPressed: { dx = mouse.x; dy = mouse.y }
+            onPositionChanged: {
+                settingsCard.x = Math.max(0, Math.min(parent.width - settingsCard.width,
+                                                      settingsCard.x + mouse.x - dx))
+                settingsCard.y = Math.max(0, Math.min(parent.height - settingsCard.height,
+                                                      settingsCard.y + mouse.y - dy))
+            }
+        }
 
         Column {
             id: settingsCol
@@ -257,6 +282,67 @@ Rectangle {
                 text: "控制「另存副本 / 另存为 / 导出」的质量：\n· JPG：数值越低文件越小（有损压缩）\n· WebP：本版本仅无损编码，质量不影响体积\n· PNG / TIFF 等无损：质量 < 50 时改用最大压缩，文件最小、保存稍慢"
                 color: "#8f96a3"
                 font.pixelSize: 11
+            }
+
+            Rectangle { width: parent.width; height: 1; color: "#3c4043" }
+
+            // ---- 2b. 图层面板滚轮速度 ----
+            Text {
+                text: "图层面板滚轮速度"
+                color: "#b8bcc0"
+                font.pixelSize: 12
+            }
+            Row {
+                spacing: 8
+                anchors.verticalCenter: undefined
+
+                ToolButton {
+                    label: "−"
+                    active: bridge.layerScrollSpeed > 0.25
+                    onClicked: bridge.update_layer_scroll_speed(bridge.layerScrollSpeed - 0.5)
+                }
+                Item {
+                    width: 56
+                    height: 26
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    Rectangle {
+                        anchors.fill: parent
+                        color: "#1b1c1e"
+                        border.color: speedInput.activeFocus ? "#6aa9ff" : "#3c4043"
+                        border.width: speedInput.activeFocus ? 2 : 1
+                        radius: 3
+                    }
+                    TextInput {
+                        id: speedInput
+                        anchors.fill: parent
+                        anchors.margins: 5
+                        text: bridge.layerScrollSpeed.toFixed(1)
+                        font.pixelSize: 13
+                        color: "#e9eaec"
+                        verticalAlignment: TextInput.AlignVCenter
+                        validator: DoubleValidator { bottom: 0.25; top: 8.0; decimals: 2 }
+                        selectByMouse: true
+                        onActiveFocusChanged: if (activeFocus) selectAll()
+                        onEditingFinished: {
+                            const v = parseFloat(text)
+                            if (!isNaN(v))
+                                bridge.update_layer_scroll_speed(v)
+                            text = bridge.layerScrollSpeed.toFixed(1)
+                        }
+                    }
+                }
+                ToolButton {
+                    label: "+"
+                    active: bridge.layerScrollSpeed < 8.0
+                    onClicked: bridge.update_layer_scroll_speed(bridge.layerScrollSpeed + 0.5)
+                }
+                Text {
+                    text: "×（0.25–8，默认 2）"
+                    color: "#6b7076"
+                    font.pixelSize: 11
+                    anchors.verticalCenter: parent.verticalCenter
+                }
             }
 
             Rectangle { width: parent.width; height: 1; color: "#3c4043" }

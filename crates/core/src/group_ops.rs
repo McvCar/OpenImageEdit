@@ -7,9 +7,47 @@
 //! 整层替换时归属自动跟着走，不需要维护第二份成员表。
 use super::*;
 
+/// 一个组（含其祖先链）对外表现出的状态。拖动图层进出组时要按它同步
+/// 成员的显隐与预览刷新：组隐藏 = 成员必须跟着隐藏；组被隔离
+/// （非穿透 / 不透明度 < 100%）= 渲染会变，必须重出预览帧。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GroupStateFlags {
+    pub hidden: bool,
+    pub effects: bool,
+    /// 最近一个处于隐藏状态的组 id，用来读 `hidden_snapshot` 还原显隐。
+    pub hidden_group: Option<GroupId>,
+}
+
 impl Document {
     pub fn find_group(&self, id: GroupId) -> Option<&LayerGroup> {
         self.groups.iter().find(|g| g.id == id)
+    }
+
+    /// 从给定组往上走完整祖先链，收集隐藏 / 隔离状态。带环路保护。
+    pub fn group_state_flags(&self, gid: Option<GroupId>) -> GroupStateFlags {
+        let mut flags = GroupStateFlags::default();
+        let mut cur = gid;
+        let mut guard = 0;
+        while let Some(id) = cur {
+            let Some(group) = self.find_group(id) else {
+                break;
+            };
+            if !group.visible {
+                flags.hidden = true;
+                if flags.hidden_group.is_none() {
+                    flags.hidden_group = Some(id);
+                }
+            }
+            if group.isolated() {
+                flags.effects = true;
+            }
+            cur = group.parent;
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+        }
+        flags
     }
 
     /// 组成员在文档栈里的下标（升序，即 z 序从低到高）。
@@ -200,6 +238,65 @@ impl Document {
         })
     }
 
+    /// 把单个图层移入 / 移出分组（`None` = 顶层）。不重排 `layers`、不动像素。
+    ///
+    /// ★隐藏组靠批量写成员 `visible` 生效（合成只认成员），所以拖进隐藏组
+    /// 必须同步把该层隐藏；从隐藏组拖出来则按 `hidden_snapshot` 还原（没有
+    /// 记录就显示）。这两个 `SetVisible` 与归组放在同一批里，撤销 / 重做
+    /// 会一起精确回滚。组自身有混合效果（隔离组）时不改成员字段，渲染差异
+    /// 交给 bridge 的 `refresh_preview` 处理。
+    pub fn set_layer_group(
+        &mut self,
+        index: usize,
+        group: Option<GroupId>,
+    ) -> Result<(), EditError> {
+        if let Some(gid) = group {
+            self.find_group(gid)
+                .ok_or(EditError::GroupNotFound(gid))?;
+        }
+        let layer = self.layers.get(index).ok_or(EditError::LayerIndex(index))?;
+        let from = layer.group;
+        if from == group {
+            return Ok(());
+        }
+        let from_flags = self.group_state_flags(from);
+        let to_flags = self.group_state_flags(group);
+        let layer_id = layer.id;
+        let was_visible = layer.visible;
+
+        let visible_to = if to_flags.hidden && !from_flags.hidden {
+            if was_visible { Some(false) } else { None }
+        } else if !to_flags.hidden && from_flags.hidden {
+            let restore = from_flags
+                .hidden_group
+                .and_then(|gid| self.find_group(gid))
+                .and_then(|g| {
+                    g.hidden_snapshot
+                        .iter()
+                        .find(|(id, _)| *id == layer_id)
+                        .map(|(_, v)| *v)
+                })
+                .unwrap_or(true);
+            if was_visible != restore { Some(restore) } else { None }
+        } else {
+            None
+        };
+
+        let mut ops = vec![EditOp::SetLayerGroup {
+            index,
+            from,
+            to: group,
+        }];
+        if let Some(to) = visible_to {
+            ops.push(EditOp::SetVisible {
+                index,
+                from: was_visible,
+                to,
+            });
+        }
+        self.execute(EditOp::Batch(ops))
+    }
+
     /// 组混合模式 / 不透明度 / 穿透：三项都改变合成结果，走统一历史。
     pub fn set_group_blend(&mut self, gid: GroupId, blend: BlendMode) -> Result<(), EditError> {
         let from = self
@@ -214,6 +311,41 @@ impl Document {
             from,
             to: blend,
         })
+    }
+
+    /// 面板改组混合模式：非「正常」模式在 PS 里会同时关掉穿透，否则
+    /// `blend_group` 根本不会被调用，用户选了 Multiply 却看不到变化。
+    /// 两步放进同一批历史，撤销一次就回到原来的模式 + 穿透状态。
+    pub fn set_group_blend_isolating(
+        &mut self,
+        gid: GroupId,
+        blend: BlendMode,
+    ) -> Result<(), EditError> {
+        let (from_blend, from_pass) = {
+            let group = self
+                .find_group(gid)
+                .ok_or(EditError::GroupNotFound(gid))?;
+            (group.blend, group.pass_through)
+        };
+        let mut ops = Vec::new();
+        if from_blend != blend {
+            ops.push(EditOp::SetGroupBlend {
+                id: gid,
+                from: from_blend,
+                to: blend,
+            });
+        }
+        if blend != BlendMode::Normal && from_pass {
+            ops.push(EditOp::SetGroupPassThrough {
+                id: gid,
+                from: true,
+                to: false,
+            });
+        }
+        if ops.is_empty() {
+            return Ok(());
+        }
+        self.execute(EditOp::Batch(ops))
     }
 
     pub fn set_group_opacity(&mut self, gid: GroupId, opacity: f32) -> Result<(), EditError> {
@@ -261,6 +393,33 @@ impl Document {
             .ok_or(EditError::GroupNotFound(gid))?;
         group.collapsed = collapsed;
         Ok(())
+    }
+
+    /// 展开某图层所在组及其全部折叠祖先，返回实际被展开的组 id。
+    /// 用文档里的真实组状态（不依赖 UI 侧可能过期的 groups_json 快照），
+    /// 供「画布选层后定位到面板行」使用。折叠是视图态，不进撤销栈。
+    pub fn expand_layer_ancestors(&mut self, index: usize) -> Vec<GroupId> {
+        let Some(layer) = self.layers.get(index) else {
+            return Vec::new();
+        };
+        let mut gid = layer.group;
+        let mut out = Vec::new();
+        let mut guard = 0;
+        while let Some(id) = gid {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(g) = self.groups.iter_mut().find(|g| g.id == id) else {
+                break;
+            };
+            gid = g.parent;
+            if g.collapsed {
+                g.collapsed = false;
+                out.push(id);
+            }
+        }
+        out
     }
 
     /// 整组显隐。合成只认成员的 `visible`，所以这里批量写成员；
@@ -330,6 +489,82 @@ impl Document {
             to: groups,
         });
         self.execute(EditOp::Batch(ops))
+    }
+
+    /// 面板眼睛该显示的显隐 —— 图层「自身的可见意愿」。
+    ///
+    /// 合成只认成员的 `visible`，所以隐藏组时成员被批量写成 false；但 PS 里
+    /// 组内图层的眼睛仍显示各自原状（只有组的眼睛变闭）。自身意愿保存在
+    /// `hidden_snapshot` 里：任一隐藏祖先组的快照认为它可见，就显示睁眼。
+    pub fn layer_display_visible(&self, index: usize) -> bool {
+        let Some(layer) = self.layers.get(index) else {
+            return false;
+        };
+        if layer.visible {
+            return true;
+        }
+        let mut gid = layer.group;
+        let mut guard = 0;
+        while let Some(id) = gid {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(g) = self.find_group(id) else {
+                break;
+            };
+            if !g.visible
+                && g.hidden_snapshot
+                    .iter()
+                    .any(|(lid, v)| *lid == layer.id && *v)
+            {
+                return true;
+            }
+            gid = g.parent;
+        }
+        false
+    }
+
+    /// 点面板眼睛：组隐藏时改的是「自身可见意愿」（`hidden_snapshot`），
+    /// 不动合成真值 `layer.visible`（它必须保持 false，否则组隐藏失效）。
+    /// 不在隐藏组里时走常规 `set_layer_visible`。整批进历史，可撤销。
+    pub fn set_layer_eye(&mut self, index: usize, visible: bool) -> Result<(), EditError> {
+        if index >= self.layers.len() {
+            return Err(EditError::LayerIndex(index));
+        }
+        let layer_id = self.layers[index].id;
+        let mut gid = self.layers[index].group;
+        let mut guard = 0;
+        while let Some(id) = gid {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(g) = self.find_group(id) else {
+                break;
+            };
+            if !g.visible {
+                let mut groups = self.groups.clone();
+                if let Some(group) = groups.iter_mut().find(|g| g.id == id) {
+                    if let Some((_, v)) = group
+                        .hidden_snapshot
+                        .iter_mut()
+                        .find(|(lid, _)| *lid == layer_id)
+                    {
+                        if *v != visible {
+                            *v = visible;
+                            return self.execute(EditOp::SetGroups {
+                                from: self.groups.clone(),
+                                to: groups,
+                            });
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            gid = g.parent;
+        }
+        self.set_layer_visible(index, visible)
     }
 
     /// 整组锁定 / 解锁（批量写成员 `locked`，可撤销）。同样覆盖嵌套子组。
@@ -427,6 +662,32 @@ mod group_tests {
     }
 
     #[test]
+    fn hidden_group_keeps_member_eye_icons() {
+        let mut doc = doc_with_layers(3);
+        doc.set_layer_visible(2, false).unwrap();
+        let gid = doc.group_layers(&[1, 2, 3], None).unwrap();
+        doc.set_group_visible(gid, false).unwrap();
+        // 合成真值：全隐藏；眼睛图标：保持各自被隐藏前的状态。
+        assert!(doc.group_members(gid).iter().all(|&i| !doc.layers[i].visible));
+        assert!(doc.layer_display_visible(1), "原本显示的成员眼睛仍是睁眼");
+        assert!(!doc.layer_display_visible(2), "原本手动隐藏的成员仍是闭眼");
+        assert!(doc.layer_display_visible(3));
+
+        // 组隐藏期间点成员眼睛：改的是「自身意愿」，不改合成真值。
+        doc.set_layer_eye(1, false).unwrap();
+        assert!(!doc.layer_display_visible(1), "点眼睛应立刻反映到图标");
+        assert!(!doc.layers[1].visible, "合成真值保持隐藏");
+        doc.set_layer_eye(2, true).unwrap();
+        assert!(doc.layer_display_visible(2));
+
+        // 显示整组后：按自身意愿还原，不是一律点亮。
+        doc.set_group_visible(gid, true).unwrap();
+        assert!(!doc.layers[1].visible, "刚点的闭眼成员保持隐藏");
+        assert!(doc.layers[2].visible, "刚点的睁眼成员恢复显示");
+        assert!(doc.layers[3].visible);
+    }
+
+    #[test]
     fn ungroup_keeps_layers_and_order() {
         let mut doc = doc_with_layers(3);
         let ids: Vec<u32> = doc.layers.iter().map(|l| l.id).collect();
@@ -458,6 +719,56 @@ mod group_tests {
 
         doc.undo().unwrap();
         assert!(doc.group_members(gid).iter().all(|&i| !doc.layers[i].visible));
+    }
+
+    #[test]
+    fn moving_layer_into_hidden_group_hides_it_and_out_restores_visibility() {
+        let mut doc = doc_with_layers(3);
+        let gid = doc.group_layers(&[1, 2], None).unwrap();
+        doc.set_group_visible(gid, false).unwrap();
+        assert!(!doc.layers[1].visible && !doc.layers[2].visible);
+        assert!(doc.layers[3].visible, "组外那层仍是显示的");
+
+        // 拖进隐藏组：显隐必须跟着组走，且与归组在同一批历史里。
+        doc.set_layer_group(3, Some(gid)).unwrap();
+        assert_eq!(doc.group_of(3), Some(gid));
+        assert!(!doc.layers[3].visible, "拖进隐藏组的层也要隐藏");
+        doc.undo().unwrap();
+        assert_eq!(doc.group_of(3), None);
+        assert!(doc.layers[3].visible, "撤销归组要一并还原显隐");
+        doc.redo().unwrap();
+        assert_eq!(doc.group_of(3), Some(gid));
+        assert!(!doc.layers[3].visible);
+
+        // 从隐藏组拖出来：恢复显示；重新显示整个组时也不该有孤立的隐藏层。
+        doc.set_layer_group(3, None).unwrap();
+        assert!(doc.layers[3].visible);
+        doc.set_group_visible(gid, true).unwrap();
+        assert!(doc.layers.iter().all(|l| l.visible));
+    }
+
+    #[test]
+    fn isolated_group_flags_mark_render_affecting_moves() {
+        let mut doc = doc_with_layers(2);
+        let gid = doc.group_layers(&[1, 2], None).unwrap();
+        let plain = doc.group_state_flags(Some(gid));
+        assert!(!plain.hidden && !plain.effects, "默认穿透组不改变渲染");
+
+        doc.set_group_pass_through(gid, false).unwrap();
+        let isolated = doc.group_state_flags(Some(gid));
+        assert!(isolated.effects, "非穿透组要触发预览重绘");
+        assert!(!doc.group_state_flags(None).effects);
+
+        // 面板里只改混合模式：core 会同时关掉穿透，让模式真正参与合成。
+        doc.set_group_pass_through(gid, true).unwrap();
+        doc.set_group_blend_isolating(gid, BlendMode::Multiply)
+            .unwrap();
+        assert!(!doc.find_group(gid).unwrap().pass_through);
+        assert!(doc.find_group(gid).unwrap().isolated());
+        assert!(doc.group_state_flags(Some(gid)).effects);
+        doc.undo().unwrap();
+        assert_eq!(doc.find_group(gid).unwrap().blend, BlendMode::Normal);
+        assert!(doc.find_group(gid).unwrap().pass_through);
     }
 
     #[test]
@@ -554,5 +865,21 @@ mod group_tests {
         assert!(doc.group_members(gid).iter().all(|&i| doc.layers[i].locked));
         doc.undo().unwrap();
         assert!(doc.group_members(gid).iter().all(|&i| !doc.layers[i].locked));
+    }
+
+    #[test]
+    fn expand_layer_ancestors_opens_whole_collapsed_chain() {
+        let mut doc = doc_with_layers(2);
+        // 外层含层1 + 内层，内层含层2（见 doc_with_layers 的组结构）。
+        let gid = doc.group_layers(&[1, 2], None).unwrap();
+        doc.set_group_collapsed_view(gid, true).unwrap();
+        assert!(doc.find_group(gid).unwrap().collapsed);
+
+        let expanded = doc.expand_layer_ancestors(1);
+        assert!(expanded.contains(&gid), "应展开层1所在的折叠组");
+        assert!(!doc.find_group(gid).unwrap().collapsed);
+        // 折叠是视图态：不进撤销栈。撤销建组后该组已不存在，谈不上恢复折叠。
+        doc.undo().unwrap();
+        assert!(doc.find_group(gid).is_none());
     }
 }

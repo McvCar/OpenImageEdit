@@ -550,6 +550,38 @@ impl qobject::Bridge {
                         ),
                     }
                 }
+                // `eye:<index>,<0|1>` —— 面板眼睛点击路径：组隐藏时改成员
+                // 的自身显隐意愿（不动合成真值），无头验证用。
+                other if other.starts_with("eye:") => {
+                    let nums: Vec<i32> = other
+                        .strip_prefix("eye:")
+                        .unwrap_or("")
+                        .split(',')
+                        .map(str::trim)
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                    if nums.len() == 2 {
+                        self.as_mut().set_layer_eye(nums[0], nums[1] != 0);
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"eye\",\"index\":{},\"v\":{}}}",
+                            nums[0], nums[1]
+                        );
+                    } else {
+                        println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}")
+                    }
+                }
+                other if other.starts_with("rename-at:") => {
+                    // `rename-at:<index>:<name>` —— 按行下标重命名（面板入口）。
+                    let body = other.strip_prefix("rename-at:").unwrap_or("");
+                    if let Some((ix, name)) = body.split_once(':') {
+                        if let Ok(index) = ix.trim().parse::<i32>() {
+                            self.as_mut().rename_layer_at(
+                                index,
+                                &QString::from(name.trim().to_string()),
+                            );
+                        }
+                    }
+                }
                 other if other.starts_with("rename:") => {
                     let name = other.strip_prefix("rename:").unwrap_or("").trim();
                     if !name.is_empty() {
@@ -1253,6 +1285,27 @@ impl qobject::Bridge {
                 "layer-new" => self.as_mut().new_layer(),
                 "layer-dup" => self.as_mut().duplicate_selected_layer(),
                 "layer-merge-down" => self.as_mut().merge_selected_down(),
+                // `move-group:index,group`（group=0 移到顶层）—— 拖入拖出组。
+                other if other.starts_with("move-group:") => {
+                    let body = other.trim_start_matches("move-group:");
+                    let mut it = body.split(',');
+                    let ix = it.next().and_then(|v| v.parse().ok()).unwrap_or(-1);
+                    let gid = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    self.as_mut().move_layer_to_group(ix, gid);
+                }
+                // `hit-alpha:index,x,y` —— 画布点选命中测试（含蒙版）。
+                other if other.starts_with("hit-alpha:") => {
+                    let body = other.trim_start_matches("hit-alpha:");
+                    let mut it = body.split(',');
+                    let ix = it.next().and_then(|v| v.parse().ok()).unwrap_or(-1);
+                    let x = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let y = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let a = self.as_mut().layer_hit_alpha(ix, x, y);
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"hit-alpha\",\"index\":{ix},\
+                         \"x\":{x},\"y\":{y},\"alpha\":{a}}}"
+                    );
+                }
                 // 混合模式（P0）：`blend:index,mode`；index=-1 表示主选中层。
                 other if other.starts_with("blend:") => {
                     let body = other.trim_start_matches("blend:");

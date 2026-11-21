@@ -66,6 +66,25 @@ Item {
         color: "#2b2e33"
         border.color: "#3c4043"
 
+        // 标题栏拖动（覆盖顶部 42px，让出右上角关闭键）。
+        MouseArea {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.rightMargin: 40
+            anchors.top: parent.top
+            height: 42
+            z: 3
+            property real dx: 0
+            property real dy: 0
+            onPressed: { dx = mouse.x; dy = mouse.y }
+            onPositionChanged: {
+                dialog.x = Math.max(0, Math.min(parent.width - dialog.width,
+                                                dialog.x + mouse.x - dx))
+                dialog.y = Math.max(0, Math.min(parent.height - dialog.height,
+                                                dialog.y + mouse.y - dy))
+            }
+        }
+
         Column {
             id: col
             anchors.top: parent.top

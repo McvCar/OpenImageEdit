@@ -1390,10 +1390,14 @@ impl Session {
             } else {
                 mk
             };
+            // `v` = 合成真值（隐藏组会连带写 false）；`ev` = 面板眼睛该显示的
+            // 「自身意愿」。组隐藏时成员图标保持原样，只有组的眼睛变闭。
+            let eye = self.doc.layer_display_visible(i);
             parts.push(format!(
-                "{{\"i\":{i},\"id\":{},\"n\":\"{name}\",\"v\":{},\"o\":{},\"b\":{},\"l\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"a\":{:.3},\"sw\":{},\"sh\":{},\"k\":\"{kind}\",\"g\":{}{extra}}}",
+                "{{\"i\":{i},\"id\":{},\"n\":\"{name}\",\"v\":{},\"ev\":{},\"o\":{},\"b\":{},\"l\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"a\":{:.3},\"sw\":{},\"sh\":{},\"k\":\"{kind}\",\"g\":{}{extra}}}",
                 layer.id,
                 layer.visible,
+                eye,
                 (layer.opacity * 100.0).round() as i32,
                 layer.blend.index(),
                 layer.locked,
@@ -1504,6 +1508,14 @@ impl Session {
             return false;
         };
         if !layer.visible || layer.opacity <= 0.0 {
+            return false;
+        }
+        // ★活动层必须是**最顶层可见层**才能用两纹理：static 是「隐藏活动层
+        // 后的整幅」，active 画在它上面 = 活动层被临时提到最顶。拖一个底部
+        // 图层（用户举的「背景之类的层」）时它会盖住本在其上的层，松手才
+        // 弹回原 z 序。上方还有可见层就回退 CPU 合成，保证拖动期间层级正确。
+        // 顶层图层（绝大多数拖动）仍走快路径，性能不受影响。
+        if self.doc.layers[index + 1..].iter().any(|l| l.visible && l.opacity > 0.0) {
             return false;
         }
         let canvas = self.doc.canvas;

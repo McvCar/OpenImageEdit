@@ -13,13 +13,38 @@ Item {
     // Native-dialog-style window: title bar with close button, body with
     // warning icon + message, footer with right-aligned actions.
     Rectangle {
+        id: confirmCard
         width: 420
         height: host.confirmMode === "psd-lossy" ? 244 : 190
-        anchors.centerIn: parent
+        x: 0
+        y: 0
+        Component.onCompleted: {
+            x = Math.max(0, (parent.width - width) / 2)
+            y = Math.max(0, (parent.height - height) / 2)
+        }
         radius: 8
         color: "#25272b"
         border.color: "#4a4e54"
         clip: true
+
+        // 标题栏拖动：弹窗固定居中不方便（可能挡住要参照的内容）。
+        MouseArea {
+            anchors.left: confirmTitle.left
+            anchors.top: confirmTitle.top
+            anchors.bottom: confirmTitle.bottom
+            anchors.right: confirmTitle.right
+            anchors.rightMargin: 44
+            z: 1
+            property real dragX: 0
+            property real dragY: 0
+            onPressed: { dragX = mouse.x; dragY = mouse.y }
+            onPositionChanged: {
+                confirmCard.x = Math.max(0, Math.min(parent.width - confirmCard.width,
+                                                     confirmCard.x + mouse.x - dragX))
+                confirmCard.y = Math.max(0, Math.min(parent.height - confirmCard.height,
+                                                     confirmCard.y + mouse.y - dragY))
+            }
+        }
 
         // Title bar
         Item {

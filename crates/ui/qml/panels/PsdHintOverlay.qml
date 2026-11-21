@@ -17,6 +17,9 @@ Item {
 
     property string noticeText: ""
     property string noticeTitle: "PSD 分层说明"
+    // 弹窗位置：初始居中，之后允许拖标题栏移动。用 x/y 而不是
+    // anchors.centerIn，才能在 onCompleted 里摆一次中心、再由鼠标改。
+    property bool positioned: false
 
     function showNotice(text, title) {
         noticeText = text
@@ -34,13 +37,47 @@ Item {
     MouseArea { anchors.fill: parent }
 
     Rectangle {
-        width: 440
-        height: 210
-        anchors.centerIn: parent
+        id: noticeCard
+        width: Math.min(520, parent.width - 40)
+        // 高度随正文行数增长（长说明不再被截断），上限 80% 窗口高，
+        // 超出部分正文区自己可滚。
+        height: Math.min(parent.height * 0.8,
+                         psdHintTitle.height + bodyText.implicitHeight + 44
+                         + psdHintFooter.height)
+        x: 0
+        y: 0
+        Component.onCompleted: centerCard()
+        function centerCard() {
+            x = Math.max(0, (parent.width - width) / 2)
+            y = Math.max(0, (parent.height - height) / 2)
+            positioned = true
+        }
         radius: 8
         color: "#25272b"
         border.color: "#4a4e54"
         clip: true
+
+        // 标题栏拖动：改弹窗 x/y，不动内容布局。
+        MouseArea {
+            anchors.left: psdHintTitle.left
+            anchors.top: psdHintTitle.top
+            anchors.bottom: psdHintTitle.bottom
+            anchors.right: psdHintTitle.right
+            anchors.rightMargin: 44   // 让出右上角关闭按钮
+            z: 1
+            property real dragX: 0
+            property real dragY: 0
+            onPressed: {
+                dragX = mouse.x
+                dragY = mouse.y
+            }
+            onPositionChanged: {
+                noticeCard.x = Math.max(0, Math.min(parent.width - noticeCard.width,
+                                                    noticeCard.x + mouse.x - dragX))
+                noticeCard.y = Math.max(0, Math.min(parent.height - noticeCard.height,
+                                                    noticeCard.y + mouse.y - dragY))
+            }
+        }
 
         Item {
             id: psdHintTitle
@@ -81,16 +118,26 @@ Item {
             anchors.left: parent.left
             anchors.right: parent.right
 
-            Text {
-                anchors.left: parent.left
-                anchors.leftMargin: 18
-                anchors.right: parent.right
-                anchors.rightMargin: 18
-                anchors.verticalCenter: parent.verticalCenter
-                text: psdHintOverlay.noticeText
-                color: "#c9cdd2"
-                font.pixelSize: 13
-                wrapMode: Text.WordWrap
+            Flickable {
+                anchors.fill: parent
+                anchors.margins: 4
+                contentWidth: width
+                contentHeight: bodyText.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                Text {
+                    id: bodyText
+                    anchors.left: parent.left
+                    anchors.leftMargin: 14
+                    anchors.right: parent.right
+                    anchors.rightMargin: 14
+                    anchors.top: parent.top
+                    anchors.topMargin: 10
+                    text: psdHintOverlay.noticeText
+                    color: "#c9cdd2"
+                    font.pixelSize: 13
+                    wrapMode: Text.WordWrap
+                }
             }
         }
 

@@ -39,6 +39,8 @@ pub(in crate::bridge) struct AppConfig {
     pub(in crate::bridge) show_guides: bool,
     /// D16：关闭时求解直接短路，不吸附也不画线。
     pub(in crate::bridge) snap_enabled: bool,
+    /// 图层面板鼠标滚轮速度倍率（默认 2.0 = 原速两倍）。
+    pub(in crate::bridge) layer_scroll_speed: f32,
 }
 
 impl AppConfig {
@@ -107,6 +109,13 @@ impl AppConfig {
                         }
                         "show_guides" => cfg.show_guides = value != "false",
                         "snap_enabled" => cfg.snap_enabled = value != "false",
+                        "layer_scroll_speed" => {
+                            if let Ok(v) = value.parse::<f32>() {
+                                if v.is_finite() {
+                                    cfg.layer_scroll_speed = v.clamp(0.25, 8.0);
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -121,7 +130,7 @@ impl AppConfig {
                 let _ = std::fs::create_dir_all(dir);
             }
             let text = format!(
-                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\nruler_bottom_up={}\nmax_dimension={}\nsel_border={}\nsel_smooth={}\nsel_feather={}\nsel_tool={}\nsel_wand={}\npaint_spec={}\ntransform_panel_visible={}\nshow_guides={}\nsnap_enabled={}\n",
+                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\nruler_bottom_up={}\nmax_dimension={}\nsel_border={}\nsel_smooth={}\nsel_feather={}\nsel_tool={}\nsel_wand={}\npaint_spec={}\ntransform_panel_visible={}\nshow_guides={}\nsnap_enabled={}\nlayer_scroll_speed={}\n",
                 self.checker_light,
                 self.checker_dark,
                 self.open_in_new_window,
@@ -136,7 +145,8 @@ impl AppConfig {
                 self.paint_spec,
                 self.transform_panel_visible,
                 self.show_guides,
-                self.snap_enabled
+                self.snap_enabled,
+                self.layer_scroll_speed
             );
             let _ = std::fs::write(path, text);
         }

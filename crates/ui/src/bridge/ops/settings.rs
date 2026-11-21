@@ -132,6 +132,19 @@ impl qobject::Bridge {
         self.persist_config();
     }
 
+    /// 图层面板滚轮速度倍率，钳到 0.25–8 并持久化。
+    pub fn update_layer_scroll_speed(mut self: Pin<&mut Self>, value: f32) {
+        if !value.is_finite() {
+            return;
+        }
+        let value = value.clamp(0.25, 8.0);
+        if (*self.layer_scroll_speed() - value).abs() < f32::EPSILON {
+            return;
+        }
+        self.as_mut().set_layer_scroll_speed(value);
+        self.persist_config();
+    }
+
     /// D13：数值面板显示状态跨启动记忆。
     pub fn update_transform_panel_visible(mut self: Pin<&mut Self>, value: bool) {
         if *self.transform_panel_visible() == value {

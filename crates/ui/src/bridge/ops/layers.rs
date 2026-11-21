@@ -22,6 +22,15 @@ impl qobject::Bridge {
             .unwrap_or(false)
     }
 
+    pub fn layer_hit_alpha(self: Pin<&mut Self>, index: i32, x: i32, y: i32) -> i32 {
+        self.session
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.doc.layers.get(index.max(0) as usize))
+            .map(|l| l.hit_alpha_at(x, y) as i32)
+            .unwrap_or(0)
+    }
+
     pub fn select_layer(mut self: Pin<&mut Self>, index: i32) {
         // 单选 = 多选集合被替换成这一层（`select_layer_ex` 里统一处理，
         // 顺带把 `layerSelectionIds` 一起发布出去，面板高亮不会残留）。
@@ -125,6 +134,20 @@ impl qobject::Bridge {
     }
 
     pub fn set_layer_visible_at(mut self: Pin<&mut Self>, index: i32, visible: bool) {
+        self.as_mut().set_layer_visible_impl(index, visible, false);
+    }
+
+    /// 面板眼睛点击：组隐藏时改的是成员「自身显隐意愿」（不动合成真值）。
+    pub fn set_layer_eye(mut self: Pin<&mut Self>, index: i32, visible: bool) {
+        self.as_mut().set_layer_visible_impl(index, visible, true);
+    }
+
+    fn set_layer_visible_impl(
+        mut self: Pin<&mut Self>,
+        index: i32,
+        visible: bool,
+        eye_only: bool,
+    ) {
         if index < 0 {
             return;
         }
@@ -136,6 +159,12 @@ impl qobject::Bridge {
                 Some(session) => {
                     if index as usize >= session.doc.layers.len() {
                         Err("layer index out of range".into())
+                    } else if eye_only {
+                        session
+                            .doc
+                            .set_layer_eye(index as usize, visible)
+                            .map(|()| true)
+                            .map_err(|e| e.to_string())
                     } else {
                         session
                             .doc
@@ -155,6 +184,8 @@ impl qobject::Bridge {
                         s.dirty = true;
                     }
                 }
+                // 自身意愿的变化不改像素，但面板眼睛图标 / 组快照要刷新；
+                // 走完整预览刷新在隐藏组里是无害的（合成真值没变）。
                 self.as_mut().refresh_preview();
             }
             Ok(false) => {}
@@ -374,15 +405,26 @@ impl qobject::Bridge {
         self.apply_layer_edit(viewport, result);
     }
 
-    pub fn rename_selected_layer(self: Pin<&mut Self>, name: &QString) {
+    pub fn rename_selected_layer(mut self: Pin<&mut Self>, name: &QString) {
+        let ix = self.selected_guard(*self.selected_layer());
+        self.as_mut().rename_layer_impl(ix, name);
+    }
+
+    /// 按显示行下标重命名（面板双击 / 右键菜单用，不依赖当前选中态）。
+    pub fn rename_layer_at(mut self: Pin<&mut Self>, index: i32, name: &QString) {
+        let ix = if index < 0 { None } else { Some(index as usize) };
+        self.as_mut().rename_layer_impl(ix, name);
+    }
+
+    fn rename_layer_impl(self: Pin<&mut Self>, ix: Option<usize>, name: &QString) {
         let new_name = name.to_string();
         if new_name.trim().is_empty() {
             return;
         }
-        let viewport = *self.viewport.borrow();
-        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+        let Some(ix) = ix else {
             return;
         };
+        let viewport = *self.viewport.borrow();
         let result: Result<bool, String> = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {

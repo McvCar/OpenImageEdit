@@ -211,6 +211,8 @@ pub mod qobject {
         /// Show ruler Y coordinates from the BOTTOM edge (origin at the
         /// bottom-left, Y grows upward) instead of the top-left origin.
         #[qproperty(bool, ruler_bottom_up, cxx_name = "rulerBottomUp")]
+        /// 图层面板滚轮速度倍率（0.25–8，默认 2）。
+        #[qproperty(f32, layer_scroll_speed, cxx_name = "layerScrollSpeed")]
         // ---- 拾色器 (color picker) ----
         #[qproperty(bool, picker_open, cxx_name = "pickerOpen")]
         /// JSON of the last picked color ("" until the first pick).
@@ -710,6 +712,11 @@ pub mod qobject {
         #[qinvokable]
         fn layer_visible(self: Pin<&mut Self>, index: i32) -> bool;
 
+        /// 画布点选命中：图层在 `(x, y)`（图像坐标）处实际可见的 alpha
+        /// （0–255，已乘图层蒙版）。矩形外框命中后用它剔除透明/蒙版区。
+        #[qinvokable]
+        fn layer_hit_alpha(self: Pin<&mut Self>, index: i32, x: i32, y: i32) -> i32;
+
         #[qinvokable]
         fn select_layer(self: Pin<&mut Self>, index: i32);
 
@@ -778,9 +785,19 @@ pub mod qobject {
         #[qinvokable]
         fn select_group(self: Pin<&mut Self>, group_id: i32);
 
+        /// 拖动图层进出分组：group_id=0 表示移到顶层（脱离所有组）。
+        /// 只改组织元数据、不改 z 序与像素（画面不变）。
+        #[qinvokable]
+        fn move_layer_to_group(self: Pin<&mut Self>, index: i32, group_id: i32);
+
         /// 折叠 / 展开（纯视图状态，不进撤销栈）。
         #[qinvokable]
         fn set_group_collapsed(self: Pin<&mut Self>, group_id: i32, collapsed: bool);
+
+        /// 展开图层所在的全部折叠祖先组（用文档真实状态），并刷新面板
+        /// 数据。返回是否有组被展开 —— 供画布选层后定位面板行使用。
+        #[qinvokable]
+        fn reveal_layer_groups(self: Pin<&mut Self>, index: i32) -> bool;
 
         #[qinvokable]
         fn rename_group(self: Pin<&mut Self>, group_id: i32, name: &QString);
@@ -835,6 +852,11 @@ pub mod qobject {
 
         #[qinvokable]
         fn set_layer_visible_at(self: Pin<&mut Self>, index: i32, visible: bool);
+
+        /// 面板眼睛点击：组隐藏时改的是成员「自身显隐意愿」（不动合成真值），
+        /// 否则等同 set_layer_visible_at。组隐藏时成员图标保持原样靠它实现。
+        #[qinvokable]
+        fn set_layer_eye(self: Pin<&mut Self>, index: i32, visible: bool);
 
         #[qinvokable]
         fn delete_selected_layer(self: Pin<&mut Self>);
@@ -1025,6 +1047,10 @@ pub mod qobject {
         #[qinvokable]
         fn update_ruler_bottom_up(self: Pin<&mut Self>, value: bool);
 
+        /// 图层面板滚轮速度倍率（0.25–8），持久化到 settings.ini。
+        #[qinvokable]
+        fn update_layer_scroll_speed(self: Pin<&mut Self>, value: f32);
+
         // ---- P0-4 / P0-5 开关与数值面板 ----
         #[qinvokable]
         fn update_transform_panel_visible(self: Pin<&mut Self>, value: bool);
@@ -1173,6 +1199,10 @@ pub mod qobject {
         #[qinvokable]
         fn rename_selected_layer(self: Pin<&mut Self>, name: &QString);
 
+        /// 按显示行下标重命名指定层（面板双击 / 右键菜单用，不依赖选中态）。
+        #[qinvokable]
+        fn rename_layer_at(self: Pin<&mut Self>, index: i32, name: &QString);
+
         #[qinvokable]
         fn scale_selected_layer(self: Pin<&mut Self>, width: i32, height: i32, keep_ratio: bool);
 
@@ -1251,6 +1281,7 @@ impl Default for AppConfig {
             transform_panel_visible: false,
             show_guides: true,
             snap_enabled: true,
+            layer_scroll_speed: 2.0,
         }
     }
 }
@@ -1348,6 +1379,8 @@ pub struct BridgeRust {
     adjust_histogram: QString,
     /// Ruler Y direction (see [`AppConfig::ruler_bottom_up`]).
     ruler_bottom_up: bool,
+    /// 图层面板滚轮速度倍率（见 `AppConfig::layer_scroll_speed`）。
+    layer_scroll_speed: f32,
     /// True while an image decodes off the UI thread (see `loading`).
     loading: bool,
     /// Downsampling-first open for very large images (see `large_downsample`).
@@ -1514,6 +1547,7 @@ impl Default for BridgeRust {
             adjust_values: QString::default(),
             adjust_histogram: QString::default(),
             ruler_bottom_up: cfg.ruler_bottom_up,
+            layer_scroll_speed: cfg.layer_scroll_speed,
             loading: false,
             large_downsample: cfg.max_dimension != 0,
             decode_job: RefCell::new(None),
@@ -1605,6 +1639,7 @@ impl qobject::Bridge {
             transform_panel_visible: *self.transform_panel_visible(),
             show_guides: *self.show_guides(),
             snap_enabled: *self.snap_enabled(),
+            layer_scroll_speed: *self.layer_scroll_speed(),
         }
         .save();
     }

@@ -181,6 +181,71 @@ impl qobject::Bridge {
         );
     }
 
+    /// 拖动图层进出分组。z 序与像素都不变，但两侧组的状态可能改变画面：
+    /// * 隐藏组：core 已经把成员的 `visible` 跟着改了（可撤销）；
+    /// * 隔离组（非穿透 / 组不透明度 < 100%）：合成时整组先画到缓冲再
+    ///   按组模式盖回，移进移出都必须重出预览帧，否则列表变了画面没变。
+    ///
+    /// 两者都没有时才走轻量刷新，保真 / 校准态不被无谓地切掉。
+    pub fn move_layer_to_group(mut self: Pin<&mut Self>, index: i32, group_id: i32) {
+        if !self.group_edit_allowed() || index < 0 {
+            return;
+        }
+        if group_id < 0 {
+            self.as_mut().group_hint("目标分组无效");
+            return;
+        }
+        let target = if group_id == 0 { None } else { Some(group_id as u32) };
+        let (result, needs_preview) = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => (
+                    Err(editcore::EditError::LayerIndex(index as usize).to_string()),
+                    false,
+                ),
+                Some(session) => {
+                    let idx = index as usize;
+                    let src_flags = session.doc.group_state_flags(session.doc.group_of(idx));
+                    let dst_flags = session.doc.group_state_flags(target);
+                    let visible_before = session
+                        .doc
+                        .layers
+                        .get(idx)
+                        .map(|l| l.visible)
+                        .unwrap_or(false);
+                    let result = session
+                        .doc
+                        .set_layer_group(idx, target)
+                        .map(|()| session.dirty = true)
+                        .map_err(|e| e.to_string());
+                    let visible_after = session
+                        .doc
+                        .layers
+                        .get(idx)
+                        .map(|l| l.visible)
+                        .unwrap_or(false);
+                    let needs_preview = visible_before != visible_after
+                        || src_flags.effects
+                        || dst_flags.effects;
+                    (result, needs_preview)
+                }
+            }
+        };
+        if let Err(e) = result {
+            self.as_mut().group_hint(&e);
+            return;
+        }
+        if needs_preview {
+            self.as_mut().refresh_preview();
+        } else {
+            self.as_mut().refresh_layers_only();
+        }
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"layer-move-group\",\"index\":{index},\
+             \"group\":{group_id}}}"
+        );
+    }
+
     /// 折叠 / 展开：纯视图状态，不进撤销栈、不动像素。
     pub fn set_group_collapsed(mut self: Pin<&mut Self>, group_id: i32, collapsed: bool) {
         if group_id <= 0 {
@@ -202,6 +267,27 @@ impl qobject::Bridge {
                  \"collapsed\":{collapsed}}}"
             );
         }
+    }
+
+    /// 展开目标层所在的全部折叠祖先组（读文档真实状态，不看 UI 快照），
+    /// 并同步刷新 groups_json / layers_json 给面板。返回是否改动过。
+    pub fn reveal_layer_groups(mut self: Pin<&mut Self>, index: i32) -> bool {
+        if index < 0 {
+            return false;
+        }
+        let expanded = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => false,
+                Some(session) => {
+                    !session.doc.expand_layer_ancestors(index as usize).is_empty()
+                }
+            }
+        };
+        if expanded {
+            self.as_mut().refresh_groups_only();
+        }
+        expanded
     }
 
     pub fn rename_group(mut self: Pin<&mut Self>, group_id: i32, name: &QString) {
@@ -307,7 +393,7 @@ impl qobject::Bridge {
                 None => Err(editcore::EditError::GroupNotFound(group_id as u32).to_string()),
                 Some(session) => session
                     .doc
-                    .set_group_blend(group_id as u32, to)
+                    .set_group_blend_isolating(group_id as u32, to)
                     .map(|()| session.dirty = true)
                     .map_err(|e| e.to_string()),
             }

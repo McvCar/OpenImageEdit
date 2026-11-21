@@ -482,6 +482,50 @@ impl Layer {
         }
     }
 
+    /// 画布坐标 `(x, y)` 处该层**实际可见**的 alpha（0–255）。
+    ///
+    /// 用途：画布点选的命中测试。只用矩形外框会让「被蒙版裁掉的透明区」
+    /// 也响应点击 —— 用户点空白却选到蒙版图就是这么来的。这里把位图
+    /// alpha 与图层蒙版一起算进去；剪贴 / 变换属于合成期语义，点在剪贴
+    /// 层被裁掉的区域能否选中没有统一口径，命中测试按「内容 + 蒙版」
+    /// 判定，与可见像素一致。标记层按其矩形返回不透明（形状细节不影响
+    /// 点选手感）。
+    pub fn hit_alpha_at(&self, x: i32, y: i32) -> u8 {
+        if !self.visible {
+            return 0;
+        }
+        match &self.content {
+            LayerContent::Mark(m) => {
+                let rect = m.canvas_rect();
+                if x >= rect.x && x < rect.x + rect.width as i32
+                    && y >= rect.y && y < rect.y + rect.height as i32
+                {
+                    255
+                } else {
+                    0
+                }
+            }
+            LayerContent::Raster(r) => {
+                let (ox, oy) = r.offset;
+                let lx = x - ox;
+                let ly = y - oy;
+                if lx < 0 || ly < 0 || lx >= r.image.width() as i32
+                    || ly >= r.image.height() as i32
+                {
+                    return 0;
+                }
+                let a = r.image.get_pixel(lx as u32, ly as u32).0[3];
+                if a == 0 {
+                    return 0;
+                }
+                match &self.mask {
+                    Some(m) => ((a as f32 / 255.0) * m.coverage(x, y) * 255.0).round() as u8,
+                    None => a,
+                }
+            }
+        }
+    }
+
     /// 不透明内容的包围盒（**源图**像素坐标 `(x, y, w, h)`）。
     /// 有变换参数时取 `transform.source`（未插值原图），否则直接扫 `image`。
     /// 标记与全透明层返回 `None`。
