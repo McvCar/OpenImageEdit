@@ -135,6 +135,9 @@ pub(in crate::bridge) struct Session {
     pub(in crate::bridge) gpu_index: usize,
     /// 活动层显示矩形 + 不透明度（QML 逻辑像素）：x, y, w, h, opacity。
     pub(in crate::bridge) gpu_rect: (f64, f64, f64, f64, f64),
+    /// 起手时的设备像素比：矩形按**物理像素整数**落点（见 [`gpu_physical`]），
+    /// 拖动帧也要用它换算，所以存一份。
+    pub(in crate::bridge) gpu_dpr: f64,
     // ---- 组样式影子层的跟随刷新（decode::rebake_group_styles）----
     /// 文档签名（epoch + 层表指纹）。变了才扫一遍样式组，活帧拖动零开销
     /// （活帧手势在 rebake_group_styles 里直接短路）。
@@ -1142,6 +1145,7 @@ impl Session {
                 gpu_start_offset: (0, 0),
                 gpu_index: 0,
                 gpu_rect: (0.0, 0.0, 0.0, 0.0, 1.0),
+                gpu_dpr: 1.0,
                 // 0 = 首次 refresh 会扫一遍样式组、把加载烘焙记为基线指纹
                 //（首见只记指纹不重烘焙，见 decode::rebake_group_styles）。
                 fx_sig: 0,
@@ -1848,6 +1852,15 @@ impl Session {
             }
             (full, true)
         };
+        // ★纹理按物理像素预缩（见 `gpu_physical` 的说明）：拖动帧只做 1:1
+        //   整数像素平移，边缘覆盖率和落定后的 CPU 合成帧一致 —— 否则 Qt
+        //   每帧双线性缩放到分数矩形，边界那半列像素被丢掉，用户就看到
+        //   「拖动时图层小一点点、松手才还原」。
+        let dpr_sane = if dpr.is_finite() && dpr > 0.0 { dpr } else { 1.0 };
+        let phys = disp_scale * dpr_sane;
+        let full_scale = target.width as f64 / canvas.width.max(1) as f64;
+        let (active_img, tex_w, tex_h) =
+            gpu_physical(active_img, if gpu_full { full_scale } else { phys });
 
         // 隐藏一段区间 → 合成 → 恢复。visible 翻转不动像素、不 bump
         // epoch，composer 的缩放缓存原样可用（两次合成共享同一批缓存）。
@@ -1908,20 +1921,24 @@ impl Session {
         self.gpu_full = gpu_full;
         self.gpu_batch = false;
         self.gpu_start_offset = self.doc.layers[index].offset();
+        self.gpu_dpr = dpr_sane;
         self.gpu_rect = if gpu_full {
+            // 烘过的整幅纹理已经预缩到 target 尺寸 → 铺满显示区就是 1:1。
             (
                 0.0,
                 0.0,
-                canvas.width as f64 * disp_scale,
-                canvas.height as f64 * disp_scale,
+                display.width as f64,
+                display.height as f64,
                 opacity as f64,
             )
         } else {
+            // 矩形落在整物理像素上；宽高直接用纹理尺寸（tex_w/tex_h）而不是
+            // 再算一遍 img×disp，免得两处取整不一致。
             (
-                self.doc.layers[index].offset().0 as f64 * disp_scale,
-                self.doc.layers[index].offset().1 as f64 * disp_scale,
-                active_img.width() as f64 * disp_scale,
-                active_img.height() as f64 * disp_scale,
+                snap_phys(self.gpu_start_offset.0 as f64 * phys, dpr_sane),
+                snap_phys(self.gpu_start_offset.1 as f64 * phys, dpr_sane),
+                (tex_w as f64 / dpr_sane).max(1.0),
+                (tex_h as f64 / dpr_sane).max(1.0),
                 opacity as f64,
             )
         };
@@ -1932,6 +1949,7 @@ impl Session {
         println!(
             "{{\"phase\":\"ui\",\"event\":\"gpu-begin\",\"index\":{index},\"full\":{gpu_full},\
              \"target\":\"{}x{}\",\"display\":\"{}x{}\",\"disp\":{disp_scale:.6},\
+             \"dpr\":{dpr_sane:.3},\"tex\":\"{tex_w}x{tex_h}\",\
              \"rect\":\"{:.2},{:.2},{:.2},{:.2}\"}}",
             target.width,
             target.height,
@@ -2019,6 +2037,8 @@ impl Session {
             let (ox, oy) = layer.offset();
             image::imageops::overlay(&mut full, layer.img(), ox as i64, oy as i64);
         }
+        // 和单层路径一样：烘焙纹理预缩到 target（物理像素），拖动帧 1:1 平移。
+        let (full, ..) = gpu_physical(full, target.width as f64 / canvas.width.max(1) as f64);
 
         // static = 整组之下的栈（隐藏 [lo..]），above = 整组之上的栈（隐藏 [..=hi]）。
         let flipped_below: Vec<usize> = self.doc.layers[lo..]
@@ -2074,11 +2094,13 @@ impl Session {
         self.gpu_full = true;
         self.gpu_batch = true;
         self.gpu_start_offset = (0, 0);
+        self.gpu_dpr = if dpr.is_finite() && dpr > 0.0 { dpr } else { 1.0 };
+        // 纹理已预缩到 target（物理像素）→ 铺满显示区即 1:1。
         self.gpu_rect = (
             0.0,
             0.0,
-            canvas.width as f64 * disp_scale,
-            canvas.height as f64 * disp_scale,
+            display.width as f64,
+            display.height as f64,
             1.0,
         );
         self.gpu_live = true;
@@ -2097,6 +2119,10 @@ impl Session {
         if !self.gpu_live || !(disp_scale > 0.0) {
             return;
         }
+        // 位置也要落到整物理像素上（理由同 `gpu_physical`）：分数位置会让
+        // 四边形边界那半列被裁掉，看起来就是图层「小了一点点」。
+        let dpr = if self.gpu_dpr > 0.0 { self.gpu_dpr } else { 1.0 };
+        let phys = disp_scale * dpr;
         // ★整幅烘焙的纹理（蒙版 / 剪贴 / 批量整组）以起手位置为基准，实时
         //   矩形按**位移增量**平移 —— 以前这里直接 return，带蒙版的图层
         //   拖动期间纹丝不动，松手才跳到新位置（看起来「拖不动」）。
@@ -2118,13 +2144,13 @@ impl Session {
                     })
                     .unwrap_or((0, 0))
             };
-            self.gpu_rect.0 = dx as f64 * disp_scale;
-            self.gpu_rect.1 = dy as f64 * disp_scale;
+            self.gpu_rect.0 = snap_phys(dx as f64 * phys, dpr);
+            self.gpu_rect.1 = snap_phys(dy as f64 * phys, dpr);
             return;
         }
         if let Some(layer) = self.doc.layers.get(self.gpu_index) {
-            self.gpu_rect.0 = layer.offset().0 as f64 * disp_scale;
-            self.gpu_rect.1 = layer.offset().1 as f64 * disp_scale;
+            self.gpu_rect.0 = snap_phys(layer.offset().0 as f64 * phys, dpr);
+            self.gpu_rect.1 = snap_phys(layer.offset().1 as f64 * phys, dpr);
             self.gpu_rect.4 = layer.opacity as f64;
         }
     }
@@ -2343,6 +2369,38 @@ impl Session {
             .collect();
         format!("[{}]", parts.join(","))
     }
+}
+
+/// 一张纹理贴到屏幕上时占用的**物理像素**尺寸，需要时按面积权重预缩。
+///
+/// ★为什么必须预缩：拖动帧若把原生分辨率纹理交给 QML 拉伸到「逻辑矩形」
+///   上，Qt 会每帧做一次双线性缩放，而目标矩形几乎总是带分数（
+///   `offset × disp_scale`，实测 607.25 宽）。四边形右/下边界的像素中心落
+///   在矩形外 → 那半列像素**根本不画**，网格上量到的有效跨度从 607.25 掉到
+///   606.5（面积 -0.77%），用户看到的就是「拖动时图层比松手后小一点点」。
+///   落定帧走 CPU 合成（`resize_to` 面积平均），边缘覆盖率是解析算出来的，
+///   所以一松手就"还原"。起手时把纹理预缩到物理尺寸、拖动帧只做 1:1 整数
+///   像素平移，两条路径的边缘才终于一致。
+///
+/// 放大（scale ≥ 1）不预缩：那只会把纹理撑大、白占内存，而双线性放大本来
+/// 就是落定帧走的那条路（`resize_to` 的 Triangle 上采样）。
+fn gpu_physical(image: RgbaImage, scale: f64) -> (RgbaImage, u32, u32) {
+    let tw = ((image.width() as f64 * scale).round() as u32).max(1);
+    let th = ((image.height() as f64 * scale).round() as u32).max(1);
+    // 源图比目标大 12 倍以上时不做预缩：那一趟面积平均要扫过全部源像素，
+    // 大画布（6000×4000 缩到 31%）在 debug 下会明显拖慢起手。这种情况退回
+    // 让 Qt 拉伸（略糊，但拖动照样跟手）。
+    let too_big = image.width() as u64 * image.height() as u64 > 12 * tw as u64 * th as u64;
+    if scale < 1.0 && !too_big && (tw != image.width() || th != image.height()) {
+        return (render::resize_to(&image, Size::new(tw, th)), tw, th);
+    }
+    (image, tw, th)
+}
+
+/// 逻辑坐标 → 物理像素整数 → 逻辑坐标。矩形必须落在整物理像素上，否则
+/// 边界那半列会被裁掉（见 [`gpu_physical`]）。
+fn snap_phys(v: f64, dpr: f64) -> f64 {
+    (v * dpr).round() / dpr
 }
 
 /// 组样式跟随刷新的门控签名：epoch + 层表指纹（每层的 id / 位置 / 归组 /

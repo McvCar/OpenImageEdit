@@ -651,10 +651,16 @@ Item {
         height: Math.max(1, gpuLayer.rect.h || 0)
         opacity: gpuLayer.rect.o === undefined ? 1 : gpuLayer.rect.o
         source: view.bridge.gpuActiveUrl
-        fillMode: Image.Stretch
+        // ★纹理在 Rust 侧已按物理像素预缩（`gpu_physical`）：1:1 时用
+        //   `Image.Pad` 走「原样贴」的快路径，别让 Stretch 的缩放采样把
+        //   边界那半列糊掉/缩掉（用户报的「拖动时图层小一点点」）；只有
+        //   放大（纹理比矩形小）才交给 Stretch 双线性插值。
+        readonly property bool oneToOne:
+            width === implicitWidth && height === implicitHeight
+        fillMode: oneToOne ? Image.Pad : Image.Stretch
         cache: false
         asynchronous: true
-        smooth: true
+        smooth: !oneToOne
         // 纯平移走 x/y；矩阵通道留给 P1-A 的缩放 / 旋转统一采样器。
         transformOrigin: Item.TopLeft
         onStatusChanged: if (status === Image.Ready) gpuLayer.rdyActive = source.toString()
