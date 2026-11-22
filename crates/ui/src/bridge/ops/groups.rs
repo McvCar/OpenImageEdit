@@ -404,6 +404,34 @@ impl qobject::Bridge {
         );
     }
 
+    /// 组块 z 序调整（同级分组拖动换位）。不动 parent，纯排序；
+    /// 失败给提示，成功统一 refresh_preview（组隔离环境可能变化）。
+    pub fn move_group_z(mut self: Pin<&mut Self>, group_id: i32, anchor: i32, above: bool) {
+        if !self.group_edit_allowed() || group_id <= 0 || anchor < 0 {
+            return;
+        }
+        let result = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no session".to_string()),
+                Some(session) => session
+                    .doc
+                    .move_group_z(group_id as u32, anchor as usize, above)
+                    .map(|()| session.dirty = true)
+                    .map_err(|e| e.to_string()),
+            }
+        };
+        if let Err(e) = result {
+            self.as_mut().group_hint(&e);
+            return;
+        }
+        self.as_mut().refresh_preview();
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"group-z\",\"id\":{group_id},\
+             \"anchor\":{anchor},\"above\":{above}}}"
+        );
+    }
+
     // ---- 组混合模式 / 不透明度 / 穿透（P0）---------------------------
     pub fn group_blend_mode(self: Pin<&mut Self>, group_id: i32) -> i32 {
         self.session

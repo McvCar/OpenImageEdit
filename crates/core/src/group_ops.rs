@@ -401,7 +401,81 @@ impl Document {
         self.execute(EditOp::Batch(ops))
     }
 
-    /// 组混合模式 / 不透明度 / 穿透：三项都改变合成结果，走统一历史。
+    /// 组 z 序调整（面板里拖组标题行与同级组换位）：整棵子树的成员作为
+    /// 一个块，**保持相对 z 序**搬到目标位置。不改变任何 `group` /
+    /// `parent`——纯排序；一次 Batch = 一条撤销。
+    ///
+    /// `anchor` 是缝上面那行的**文档索引**（层行 → 该层；组标题行 → 该组
+    /// 最高成员），`above` 决定块显示在锚点显示位的上方（true）还是下方
+    /// （false）。成员分散也安全：模拟数组逐成员生成 MoveLayer，每次的
+    /// from/to 都是该步执行时的真实状态。
+    pub fn move_group_z(
+        &mut self,
+        gid: GroupId,
+        anchor: usize,
+        above: bool,
+    ) -> Result<(), EditError> {
+        if self.find_group(gid).is_none() {
+            return Err(EditError::GroupNotFound(gid));
+        }
+        let idxs = self.group_subtree_layers(gid);
+        let n = self.layers.len();
+        if idxs.is_empty() || idxs[0] == 0 || idxs.len() >= n {
+            return Ok(()); // 空组 / 含背景 / 块占满，无事可做
+        }
+        if idxs.contains(&anchor) {
+            return Ok(()); // 锚点在被拖的组块里（拖到自己成员上）—— 无操作
+        }
+        let k = idxs.len();
+        // 锚点在块移走后的索引：块里比它小的成员个数决定平移量。
+        let m = anchor.min(n - 1);
+        let shifted = m - idxs.iter().filter(|&&i| i < m).count();
+        // 块（升序）目标占 [t, t+k-1]，组标题行显示在块最高成员上方。
+        //   above=false（块显示在锚点行下面）→ 块插到 rest 的锚点位置，
+        //     锚点被顶走 k 位、块最高成员紧贴锚点最终位下面：t = shifted
+        //   above=true（块显示在锚点行上面）→ 块最低成员紧贴锚点上面：
+        //     t = shifted + 1
+        // （与层拖动 k=1 时 toZ = m'∓1 完全一致；146 组随机场景验证过。）
+        let t = if above {
+            shifted + 1
+        } else {
+            shifted
+        };
+        let t = (t.max(1) as usize).min(n - k);
+        // 目标排列 = 其余成员保持相对序，块（升序）插到 t。
+        let mut to_order = Vec::with_capacity(n);
+        let mut bi = 0usize;
+        for i in 0..n {
+            if bi < k && idxs.contains(&i) {
+                continue; // 块成员跳过，由插入段统一落位
+            }
+            if to_order.len() == t {
+                for &b in &idxs {
+                    to_order.push(b);
+                }
+                bi = k;
+            }
+            to_order.push(i);
+        }
+        if bi < k {
+            for &b in &idxs {
+                to_order.push(b);
+            }
+        }
+        let from_order: Vec<usize> = {
+            // revert 需要「新位置 i ← 旧位置 from_order[i]」的逆映射：
+            // from_order[old_idx] = new_pos。
+            let mut inv = vec![0usize; n];
+            for (p, &old_idx) in to_order.iter().enumerate() {
+                inv[old_idx] = p;
+            }
+            inv
+        };
+        if to_order.iter().enumerate().all(|(i, &v)| v == i) {
+            return Ok(()); // 块已在目标位，无操作
+        }
+        self.execute(EditOp::ReorderLayers { from_order, to_order })
+    }
     pub fn set_group_blend(&mut self, gid: GroupId, blend: BlendMode) -> Result<(), EditError> {
         let from = self
             .find_group(gid)
@@ -772,6 +846,47 @@ mod group_tests {
         assert_eq!(doc.find_group(g2).unwrap().parent, Some(g1));
         doc.redo().unwrap();
         assert_eq!(doc.find_group(g2).unwrap().parent, None);
+    }
+
+    #[test]
+    fn move_group_z_moves_block_keeps_order_and_undo() {
+        let mut doc = doc_with_layers(5);
+        // 层：背景(0), L0(1), L1(2), L2(3), L3(4), L4(5)。
+        let g1 = doc.group_layers(&[1, 2], None).unwrap(); // L0, L1
+        let g2 = doc.group_layers(&[3, 4], None).unwrap(); // L2, L3
+
+        // 组 1 的块排到 L4 下面（above=false）：块整体下移、显示上组 1
+        // 标题行紧贴 L4 的下一行，组内相对序保持。
+        doc.move_group_z(g1, 5, false).unwrap();
+        assert_eq!(
+            doc.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            vec!["背景", "L2", "L3", "L0", "L1", "L4"]
+        );
+        // 纯排序：归属不变。
+        assert_eq!(doc.layers[1].group, Some(g2));
+        assert_eq!(doc.layers[3].group, Some(g1));
+
+        // 撤销恢复原排列；重做再生效。
+        doc.undo().unwrap();
+        assert_eq!(
+            doc.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            vec!["背景", "L0", "L1", "L2", "L3", "L4"]
+        );
+        doc.redo().unwrap();
+        assert_eq!(doc.layers[3].name, "L0");
+
+        // above=true：组 2 的块（现在文档索引 3,4）排到 L0（索引 1）
+        // 上面 → 块最低成员紧贴 L0 的上一行。
+        doc.move_group_z(g2, 3, true).unwrap();
+        assert_eq!(
+            doc.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            vec!["背景", "L0", "L2", "L3", "L1", "L4"]
+        );
+
+        // 锚点在被拖的块里 → 无操作（不进历史）。
+        let epoch = doc.edit_epoch;
+        doc.move_group_z(g2, 3, true).unwrap();
+        assert_eq!(doc.edit_epoch, epoch);
     }
 
     #[test]

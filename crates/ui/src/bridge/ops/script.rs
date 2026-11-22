@@ -1293,6 +1293,24 @@ impl qobject::Bridge {
                     let gid = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
                     self.as_mut().move_layer_to_group(ix, gid);
                 }
+                // `z-move:from,to` —— 模拟面板拖动的 reorder_layer 落点
+                // （remove+insert，to 即最终文档索引），验证两步组合。
+                other if other.starts_with("z-move:") => {
+                    let body = other.trim_start_matches("z-move:");
+                    let mut it = body.split(',');
+                    let from = it.next().and_then(|v| v.parse().ok()).unwrap_or(-1);
+                    let to = it.next().and_then(|v| v.parse().ok()).unwrap_or(-1);
+                    self.as_mut().reorder_layer(from, to);
+                }
+                // `group-z:gid,anchor,0|1` —— 模拟组块拖动排序落点。
+                other if other.starts_with("group-z:") => {
+                    let body = other.trim_start_matches("group-z:");
+                    let mut it = body.split(',');
+                    let gid = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let anchor = it.next().and_then(|v| v.parse().ok()).unwrap_or(-1);
+                    let above = it.next().map(|v| v.trim() != "0").unwrap_or(false);
+                    self.as_mut().move_group_z(gid, anchor, above);
+                }
                 // `hit-alpha:index,x,y` —— 画布点选命中测试（含蒙版）。
                 other if other.starts_with("hit-alpha:") => {
                     let body = other.trim_start_matches("hit-alpha:");

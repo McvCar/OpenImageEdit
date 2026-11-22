@@ -811,6 +811,12 @@ pub mod qobject {
         #[qinvokable]
         fn move_group_to_group(self: Pin<&mut Self>, group_id: i32, target_id: i32);
 
+        /// 组块 z 序调整（同级分组拖动换位）：anchor 是缝上面那行的文档
+        /// 索引（层行 → 该层；组标题行 → 该组最高成员），above 决定块
+        /// 显示在锚点上方还是下方。一条 ReorderLayers 历史。
+        #[qinvokable]
+        fn move_group_z(self: Pin<&mut Self>, group_id: i32, anchor: i32, above: bool);
+
         #[qinvokable]
         fn set_group_locked(self: Pin<&mut Self>, group_id: i32, locked: bool);
 

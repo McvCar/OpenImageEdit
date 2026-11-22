@@ -1217,11 +1217,14 @@ Item {
                         cursorShape: Qt.PointingHandCursor
                         property bool reordering: false
                         property int fromPos: -1
-                        // 层拖动：toPos = 插入缝（gap），toGroup = 落点容器
-                        // 组（0 = 顶层），toZ = 目标文档 z 索引（-1 = 只改
-                        // 归属不动 z）。组拖动：toPos = 悬停行。
+                        // 层/组拖动共用「插入缝」模型：toPos = 缝（gap），
+                        // toGroup = 落点容器组（0 = 顶层，-1 = 不改归属）。
+                        // toZ = 层的目标文档 z 索引（-1 = 只改归属）；组拖动
+                        // 用 toAnchor + toAbove 表达「块插到锚点行上/下方」。
                         property int toPos: -1
                         property int toGroup: -1
+                        property int toAnchor: -1
+                        property bool toAbove: false
                         property int toZ: -1
                         property real pressY: 0
 
@@ -1251,6 +1254,8 @@ Item {
                             reordering = false
                             toGroup = -1
                             toZ = -1
+                            toAnchor = -1
+                            toAbove = false
                             // ★拖动期间关掉 Flickable 的惯性/边缘滚动：否则
                             // 鼠标移到列表上下沿时 Qt 自动滚 contentY，落点
                             // 计算跟着跳，图层怎么拖都放不到想去的位置。
@@ -1272,21 +1277,55 @@ Item {
                             const colY = layerRow.mapToItem(layerColumn, 0, mouse.y).y
                             const raw = colY / pitch
                             const idx = Math.max(0, Math.min(Math.floor(raw), total - 1))
+                            // 「插入缝」几何量提前算好，层/组拖动共用：行的
+                            // 上半 = 缝在该行上方、下半 = 缝在下方；above =
+                            // 缝上面那行（决定落点容器与 z 锚点）。
+                            const inUpper = (raw - Math.floor(raw)) < 0.5
+                            const gap = Math.max(0, Math.min(inUpper ? idx : idx + 1,
+                                                             total - 1))
+                            const above = gap > 0 ? host.layerPanelList[gap - 1] : null
                             const draggedGroup = layerRow.row && layerRow.isGroup
                                                  ? layerRow.row.gid : 0
                             if (draggedGroup > 0) {
-                                // 组拖动保留「最近行」判定：拖到组标题行 = 进
-                                // 该组（嵌套），拖到普通行 = 落到那行的容器。
-                                const t = Math.max(0, Math.min(Math.floor(raw + 0.5),
-                                                               total - 1))
-                                toPos = t
-                                const target = host.layerPanelList[t]
-                                toGroup = target
-                                    ? (target.k === "group" ? target.gid : (target.g || 0))
-                                    : 0
-                                toZ = -1
-                                dropIndicator.y = layerColumn.y + t * pitch - 2
-                                dropIndicator.visible = t !== fromPos
+                                // ★组拖动同样用「插入缝」：above = 缝上面
+                                // 那行。组标题行下方 = 进该组（嵌套，成为组
+                                // 内最上）；层行下方 = 组块排到那行下面（同
+                                // 级换位 / 跨容器）；列表顶 / 背景上方 = 顶
+                                // 层最上 / 顶层最底。防环由 bridge 校验。
+                                const parentGid = layerRow.row.g || 0
+                                toPos = gap
+                                toGroup = -1
+                                toAnchor = -1
+                                toAbove = false
+                                if (gap === 0 || !above) {
+                                    toGroup = 0
+                                    const layers = host.layerList
+                                    if (layers.length > 1) {
+                                        toAnchor = layers[0].i
+                                        toAbove = true
+                                    }
+                                } else if (above.k === "group") {
+                                    // 缝在组标题行下方 = 嵌套进该组最上。
+                                    toGroup = above.gid
+                                    const m = layerPanel.groupTopMemberIndex(above.gid)
+                                    if (m > 0) {
+                                        toAnchor = m
+                                        toAbove = true
+                                    }
+                                } else if (above.base) {
+                                    toGroup = 0
+                                    toAnchor = 1
+                                    toAbove = false
+                                } else {
+                                    // 缝在层行下方：组块排到该行下面。
+                                    toGroup = above.g || 0
+                                    toAnchor = above.i
+                                    toAbove = false
+                                }
+                                const meaningful = toGroup !== parentGid
+                                                   || (toAnchor > 0)
+                                dropIndicator.y = layerColumn.y + gap * pitch - 2
+                                dropIndicator.visible = meaningful && gap !== fromPos
                                 dropIndicator.color = toGroup > 0 ? "#7ec8a0" : "#6fa8dc"
                                 layerPanel.dropTargetGroupId = toGroup > 0 ? toGroup : -1
                                 return
@@ -1299,12 +1338,10 @@ Item {
                             // 组标题行 → 该组自身；列表顶端 → 顶层。
                             const from = layerRow.row ? layerRow.row.i : -1
                             const fromGroup = layerRow.row ? (layerRow.row.g || 0) : 0
-                            const inUpper = (raw - Math.floor(raw)) < 0.5
-                            let gap = Math.max(0, Math.min(inUpper ? idx : idx + 1,
-                                                           total - 1))
                             toPos = gap
                             toZ = -1
-                            const above = gap > 0 ? host.layerPanelList[gap - 1] : null
+                            toAnchor = -1
+                            toAbove = false
                             // z 索引换算（文档索引，越大越顶）：move_layer 是
                             // 先 remove 再 insert，`to` 即最终文档索引。锚点
                             // 索引先按「自己被移走」平移：m' = m > from ? m-1 : m。
@@ -1360,21 +1397,28 @@ Item {
                             const snapRow = layerRow.row
                             const snapToGroup = toGroup
                             const snapToZ = toZ
+                            const snapAnchor = toAnchor
+                            const snapAbove = toAbove
+                            const snapParent = snapRow ? (snapRow.g || 0) : 0
                             reordering = false
                             toPos = -1
                             toGroup = -1
                             toZ = -1
+                            toAnchor = -1
+                            toAbove = false
                             layerPanel.dropTargetGroupId = -1
                             dropIndicator.visible = false
                             listArea.interactive = true
                             if (doMove) {
                                 if (dragGid > 0) {
-                                    // 组拖动：拖到组标题行 = 进该组（嵌套），
-                                    // 拖到顶层行 / 组外 = 移回顶层。防环由
-                                    // bridge 校验（移进自己的子树会被拒绝）。
-                                    if (snapToGroup !== dragGid)
-                                        bridge.move_group_to_group(dragGid,
-                                                                   Math.max(snapToGroup, 0))
+                                    // 组拖动（缝模型）：容器不同 → 改归属
+                                    // （0 = 移回顶层，防环由 bridge 校验）；
+                                    // 锚点有效 → 组块 z 排到缝位。两步组合
+                                    // 时先归组再排序（z 排序不改 parent）。
+                                    if (snapToGroup >= 0 && snapToGroup !== snapParent)
+                                        bridge.move_group_to_group(dragGid, snapToGroup)
+                                    if (snapAnchor > 0)
+                                        bridge.move_group_z(dragGid, snapAnchor, snapAbove)
                                 } else if (snapRow && snapRow.i > 0) {
                                     // 落点容器 != 当前组 → 改归属（显隐 /
                                     // 隔离刷新由 bridge 处理）；toZ 是按
@@ -1420,6 +1464,8 @@ Item {
                             toPos = -1
                             toGroup = -1
                             toZ = -1
+                            toAnchor = -1
+                            toAbove = false
                             layerPanel.dropTargetGroupId = -1
                             dropIndicator.visible = false
                             listArea.interactive = true

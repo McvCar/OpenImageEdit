@@ -41,6 +41,14 @@ pub enum EditOp {
     AddLayer { layer: Layer, index: usize },
     RemoveLayer { layer: Layer, index: usize },
     MoveLayer { from: usize, to: usize },
+    /// 全量排列快照（组块拖动排序等复杂重排）：两个序列都必须是
+    /// `0..layers.len()` 的排列。apply 按 `to_order` 重排，undo 按
+    /// `from_order` 还原 —— 比把块移动拆成一串 MoveLayer 可靠
+    /// （逐成员移动会把块挤散，模拟验证过）。
+    ReorderLayers {
+        from_order: Vec<usize>,
+        to_order: Vec<usize>,
+    },
     SetVisible { index: usize, from: bool, to: bool },
     /// 图层锁定开关（可撤销）。锁定的层拒绝移动 / 缩放 / 删除 / 排序，
     /// 现在它也进历史 —— 误锁一下能 Ctrl+Z 回来。
@@ -232,6 +240,17 @@ impl EditOp {
                 }
                 let layer = doc.layers.remove(*from);
                 doc.layers.insert(*to, layer);
+                Ok(())
+            }
+            EditOp::ReorderLayers { to_order, .. } => {
+                if to_order.len() != doc.layers.len()
+                    || !is_permutation(to_order)
+                {
+                    return Err(EditError::LayerIndex(doc.layers.len()));
+                }
+                let reordered: Vec<_> =
+                    to_order.iter().map(|&i| doc.layers[i].clone()).collect();
+                doc.layers = reordered;
                 Ok(())
             }
             EditOp::SetVisible { index, to, .. } => {
@@ -564,6 +583,17 @@ impl EditOp {
                 doc.layers.insert(*from, layer);
                 Ok(())
             }
+            EditOp::ReorderLayers { from_order, .. } => {
+                if from_order.len() != doc.layers.len()
+                    || !is_permutation(from_order)
+                {
+                    return Err(EditError::LayerIndex(doc.layers.len()));
+                }
+                let restored: Vec<_> =
+                    from_order.iter().map(|&i| doc.layers[i].clone()).collect();
+                doc.layers = restored;
+                Ok(())
+            }
             EditOp::SetVisible { index, from, .. } => {
                 let layer = doc
                     .layers
@@ -822,3 +852,13 @@ impl History {
     }
 }
 
+
+/// `order` 是否为 `0..len` 的排列（每个值恰好出现一次）。
+fn is_permutation(order: &[usize]) -> bool {
+    let n = order.len();
+    let mut seen = vec![false; n];
+    order.iter().all(|&i| i < n && !seen[i] && {
+        seen[i] = true;
+        true
+    })
+}
