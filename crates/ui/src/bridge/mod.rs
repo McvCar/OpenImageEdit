@@ -1802,6 +1802,19 @@ impl qobject::Bridge {
     /// Eye toggle on the base row: hide/show the background (undoable).
     /// Re-publish `layers_json` (lock toggles change panel state only).
     fn refresh_layers_only(mut self: Pin<&mut Self>) {
+        // 元数据刷新也可能改变影子层的输入（归组 / 解组不动像素但改成员
+        // 归属）：先跑一遍跟随刷新，真有组被重烘焙就升级为整幅预览刷新。
+        let rebaked = {
+            let mut guard = self.session.borrow_mut();
+            guard
+                .as_mut()
+                .map(|session| session.rebake_group_styles())
+                .unwrap_or(false)
+        };
+        if rebaked {
+            self.as_mut().refresh_preview();
+            return;
+        }
         let (json, groups) = {
             let guard = self.session.borrow();
             match guard.as_ref() {
@@ -1828,7 +1841,20 @@ impl qobject::Bridge {
     /// 分组命令专用刷新：只重发面板数据，**不重建预览**。
     /// 编组 / 解组 / 重命名 / 折叠都不改像素，走这里就不会把原生合成
     /// 校准误判成「文档被编辑过」而切回按层重建的画面。
+    /// 例外：把成员移进/移出带样式的组会改变影子层的输入 —— 跟随刷新
+    /// 真的重烘焙了就升级为整幅预览刷新（画面确实变了）。
     fn refresh_groups_only(mut self: Pin<&mut Self>) {
+        let rebaked = {
+            let mut guard = self.session.borrow_mut();
+            guard
+                .as_mut()
+                .map(|session| session.rebake_group_styles())
+                .unwrap_or(false)
+        };
+        if rebaked {
+            self.as_mut().refresh_preview();
+            return;
+        }
         let json = {
             let guard = self.session.borrow();
             guard

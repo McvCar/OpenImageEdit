@@ -1530,7 +1530,11 @@ impl qobject::Bridge {
                                 .filter(|l| l.synthetic && l.group == Some(g.id))
                                 .map(|l| {
                                     let n = l.name.replace('\\', "\\\\").replace('"', "");
-                                    format!("\\\"{}:v={}\\\"", n, l.visible)
+                                    // ★Rust 里 "\\\"" 是字面量 `\"` —— 拼进外层
+                                    // JSON 模板会变成非法的 `[\"...\"]`（字符串
+                                    // 外的转义）。影子项就是普通 JSON 字符串，
+                                    // 直接用裸引号。
+                                    format!("\"{}:v={}\"", n, l.visible)
                                 })
                                 .collect();
                             let gname = g.name.replace('\\', "\\\\").replace('"', "");

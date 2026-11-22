@@ -9,7 +9,8 @@ pub use image::ImageFormat as Format;
 mod psd_effects;
 mod psd_layers;
 pub use psd_layers::{
-    decode_psd_layers, decode_psd_layers_with_progress, PsdLayerData, PsdLayerSet,
+    decode_psd_layers, decode_psd_layers_with_progress, rebake_group_styles, PsdLayerData,
+    PsdLayerSet, RebakeHashes,
 };
 
 mod psd_pattern;

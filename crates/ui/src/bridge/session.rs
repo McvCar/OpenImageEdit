@@ -1,4 +1,6 @@
 // Session 渲染管线核心。所有项标 pub(in crate::bridge)，mod.rs 再导出。
+use std::collections::HashMap;
+
 use super::*;
 
 pub(in crate::bridge) struct Session {
@@ -124,6 +126,11 @@ pub(in crate::bridge) struct Session {
     pub(in crate::bridge) gpu_index: usize,
     /// 活动层显示矩形 + 不透明度（QML 逻辑像素）：x, y, w, h, opacity。
     pub(in crate::bridge) gpu_rect: (f64, f64, f64, f64, f64),
+    // ---- 组样式影子层的跟随刷新（decode::rebake_group_styles）----
+    /// 文档签名（epoch + 层表指纹）。变了才扫一遍样式组，活帧拖动零开销。
+    pub(in crate::bridge) fx_sig: u64,
+    /// 每个带影子层的组一份联合 alpha 指纹；指纹变了才真正重新烘焙。
+    pub(in crate::bridge) fx_hashes: decode::RebakeHashes,
 }
 
 impl Session {
@@ -882,6 +889,10 @@ impl Session {
                 gpu_active_url: String::new(),
                 gpu_index: 0,
                 gpu_rect: (0.0, 0.0, 0.0, 0.0, 1.0),
+                // 0 = 首次 refresh 会扫一遍样式组、把加载烘焙记为基线指纹
+                //（首见只记指纹不重烘焙，见 decode::rebake_group_styles）。
+                fx_sig: 0,
+                fx_hashes: HashMap::new(),
             },
             ms,
         )
@@ -1390,11 +1401,15 @@ impl Session {
             } else {
                 mk
             };
+            // 组样式影子层（synthetic）：画面里可见，但面板不显示这一行
+            //（QML 按 syn 过滤）。仍出现在 layers_json 里，画布逻辑与拖放
+            // 落点的「全文档索引」计算（layerList.length 等）才不受影响。
+            let syn = if layer.synthetic { ",\"syn\":1" } else { "" };
             // `v` = 合成真值（隐藏组会连带写 false）；`ev` = 面板眼睛该显示的
             // 「自身意愿」。组隐藏时成员图标保持原样，只有组的眼睛变闭。
             let eye = self.doc.layer_display_visible(i);
             parts.push(format!(
-                "{{\"i\":{i},\"id\":{},\"n\":\"{name}\",\"v\":{},\"ev\":{},\"o\":{},\"b\":{},\"l\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"a\":{:.3},\"sw\":{},\"sh\":{},\"k\":\"{kind}\",\"g\":{}{extra}}}",
+                "{{\"i\":{i},\"id\":{},\"n\":\"{name}\",\"v\":{},\"ev\":{},\"o\":{},\"b\":{},\"l\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"a\":{:.3},\"sw\":{},\"sh\":{},\"k\":\"{kind}\",\"g\":{}{extra}{syn}}}",
                 layer.id,
                 layer.visible,
                 eye,
@@ -1432,7 +1447,15 @@ impl Session {
         for group in &self.doc.groups {
             let name = group.name.replace('\\', "\\\\").replace('"', "\\\"");
             // 子树成员：嵌套组的成员也算「整组」的一部分（显隐 / 锁定 / 高亮）。
-            let members = self.doc.group_subtree_layers(group.id);
+            // 面板元数据要剔除影子层（面板不显示它们，锁态 / 成员数 / 高亮
+            // 判定混进影子层会失真：影子层恒锁定，含它的组会永远显示已锁）。
+            // 整组显隐仍走 core 的 group_subtree_layers（含影子层）。
+            let members: Vec<usize> = self
+                .doc
+                .group_subtree_layers(group.id)
+                .into_iter()
+                .filter(|&i| !self.doc.layers[i].synthetic)
+                .collect();
             let mut ids: Vec<String> = Vec::with_capacity(members.len());
             let mut all_locked = !members.is_empty();
             for &i in &members {
@@ -1685,7 +1708,33 @@ impl Session {
         format!("[{}]", parts.join(","))
     }
 
+    // ---- 组样式影子层的跟随刷新 ---------------------------------------
+
+    /// 影子层是派生视图（decode::rebake_group_styles 的说明同样适用）：
+    /// 重烘焙直接改文档像素，不进历史、不算 dirty，但要 bump `edit_epoch`
+    /// 让预览合成器 / GPU 静态纹理 / 缩略图缓存全部失效重画。
+    /// 返回是否有组真的被重烘焙（调用方据此决定要不要升级为整幅刷新）。
+    pub(in crate::bridge) fn rebake_group_styles(&mut self) -> bool {
+        let sig = fx_signature(&self.doc);
+        if sig == self.fx_sig {
+            return false;
+        }
+        self.fx_sig = sig;
+        let updated = decode::rebake_group_styles(&mut self.doc, &mut self.fx_hashes);
+        if updated > 0 {
+            self.doc.edit_epoch = self.doc.edit_epoch.wrapping_add(1);
+            self.fx_sig = fx_signature(&self.doc);
+            true
+        } else {
+            false
+        }
+    }
+
     pub(in crate::bridge) fn refresh(&mut self, zoom_only: bool, dpr: f64) -> Refresh {
+        // 组样式影子层的跟随刷新：成员变了（移动 / 显隐 / 归组 / 撤销）就在
+        // 渲染前重烘焙受影响的组。签名没变时是一次 O(层数) 的指纹比较，
+        // 活帧拖动 / 纯缩放零开销。
+        self.rebake_group_styles();
         // GPU 快路径：每次 refresh 只重算活动层的显示矩形（纯浮点）。
         if self.gpu_live {
             self.gpu_update_rect(self.disp_scale);
@@ -1754,6 +1803,41 @@ impl Session {
             .collect();
         format!("[{}]", parts.join(","))
     }
+}
+
+/// 组样式跟随刷新的门控签名：epoch + 层表指纹（每层的 id / 位置 / 归组 /
+/// 显隐 / 不透明度 / 外接框）+ 组表指纹。编辑 op 会 bump epoch；纯元数据
+/// op（归组等）不 bump epoch，但层表指纹会变 —— 两路都能触发扫描。
+/// 影子层自身的像素变化不进这个签名（它不是输入，是输出）。
+fn fx_signature(doc: &Document) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |h: &mut u64, bytes: &[u8]| {
+        for b in bytes {
+            *h = (*h ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    };
+    mix(&mut h, &doc.edit_epoch.to_le_bytes());
+    mix(&mut h, &(doc.layers.len() as u64).to_le_bytes());
+    for (i, l) in doc.layers.iter().enumerate() {
+        mix(&mut h, &(l.id as u64).to_le_bytes());
+        mix(&mut h, &(i as u64).to_le_bytes());
+        mix(&mut h, &(l.group.unwrap_or(0) as u64).to_le_bytes());
+        mix(&mut h, &[l.visible as u8, l.synthetic as u8]);
+        mix(&mut h, &l.opacity.to_bits().to_le_bytes());
+        let b = l.bounds();
+        mix(&mut h, &b.x.to_le_bytes());
+        mix(&mut h, &b.y.to_le_bytes());
+        mix(&mut h, &b.width.to_le_bytes());
+        mix(&mut h, &b.height.to_le_bytes());
+    }
+    for g in &doc.groups {
+        mix(&mut h, &(g.id as u64).to_le_bytes());
+        mix(&mut h, &(g.parent.unwrap_or(0) as u64).to_le_bytes());
+        mix(&mut h, &[g.visible as u8]);
+        mix(&mut h, &g.opacity.to_bits().to_le_bytes());
+        mix(&mut h, &(g.blend.index() as u64).to_le_bytes());
+    }
+    h
 }
 
 /// Quick-mask overlay (PS's Q): multiply the pixels OUTSIDE the selection

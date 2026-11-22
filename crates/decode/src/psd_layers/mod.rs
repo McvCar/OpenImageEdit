@@ -19,6 +19,7 @@ mod adjustments;
 mod group_styles;
 mod groups;
 mod masks;
+mod rebake;
 mod styles;
 #[cfg(test)]
 mod tests;
@@ -32,6 +33,7 @@ use group_styles::bake_group_style_layers;
 use groups::{ancestor_is_annotation_group, inherited_group_state};
 use masks::{channel_plane, decode_mask, mask_at, mask_probe, mask_probe_at};
 pub(crate) use masks::unpack_packbits;
+pub use rebake::{rebake_group_styles, RebakeHashes};
 use styles::bake_layer_styles;
 use validate::{check_header, validate_psd_layer_records};
 

@@ -54,7 +54,9 @@ def run(path, script, needle, timeout=45.0, extra=None):
         text=True, errors="replace", env=env(), bufsize=1,
     )
     lines, _ = pump(proc, needle, timeout=timeout)
-    time.sleep(0.4)
+    # 1.2s：panelRowsProbe 定时器（900ms）要吐出显示行，0.4s 的 settle
+    # 会被 drop-log 自检 dump（更早命中 needle）掐掉。
+    time.sleep(1.2)
     if proc.poll() is None:
         proc.terminate()
         try:
@@ -82,8 +84,15 @@ def rows(lines):
 
 
 def panel_rows(lines):
+    # ★诊断通道共享：LayerPanel 的 drop-log 自检 dump 也走 panel-rows-dump，
+    # 它的 rows 是「行数」(int) 不是行列表。倒序取第一个 rows 真是行列表的
+    # dump（--probe-panel-rows 定时器吐的显示行）。
     dumps = parse_events(lines, "panel-rows-dump")
-    return dumps[-1].get("rows", []) if dumps else []
+    for d in reversed(dumps):
+        rows = d.get("rows", [])
+        if isinstance(rows, list) and rows:
+            return rows
+    return []
 
 
 def layer_records(path):

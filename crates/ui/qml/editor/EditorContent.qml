@@ -2604,6 +2604,13 @@ function buildLayerPanelRows() {
     }
     for (var i = 0; i < layerList.length; i++) {
         const l = layerList[i]
+        // 组样式影子层（syn 标记）：画面里可见，但不是用户可操作的图层 ——
+        // 不进面板、不可选、不可拖。组标题行会在第一个「真实」成员行处插入，
+        // 位置不变（影子层在 z 序里贴着组块边界，跳过它不影响标题落点）。
+        // ★syn 是 JSON 数字 1（layers_json 里的 "syn":1），用真值判断，
+        // 别写成 === true。
+        if (l.syn)
+            continue
         const gid = l.g || 0
         let hidden = false
         let depth = 0
@@ -2681,7 +2688,7 @@ function findLayerBox() {
 function nonBaseRowCount() {
     let n = 0
     for (var i = 0; i < root.layerList.length; i++)
-        if (root.layerList[i].base !== true)
+        if (root.layerList[i].base !== true && !root.layerList[i].syn)
             n++
     return n
 }
@@ -2699,7 +2706,8 @@ function topLayerAt(mx, my) {
     const iy = (my - view.pad) / s
     for (var k = 0; k < root.layerList.length; k++) {
         const l = root.layerList[k]
-        if (l.base === true || l.v !== true || l.l === true)
+        // 影子层（组样式烘焙）锁着且不进面板，画布点选永远不能命中它。
+        if (l.base === true || l.v !== true || l.l === true || l.syn)
             continue
         if (l.w > 0 && l.h > 0
             && ix >= l.x && ix <= l.x + l.w && iy >= l.y && iy <= l.y + l.h) {
@@ -3358,6 +3366,10 @@ Timer {
     id: panelRowsProbe
     interval: 900
     running: root.probePanelRows
+    // ★repeat：drop-log 自检 dump（面板首次建列表时）会先于本定时器命中
+    // 探针的等待 needle，单发定时器可能还没来得及吐行进程就被收尾了。
+    // 探针取「最后一个 rows 是行列表的 dump」，重复吐对探针无害。
+    repeat: true
     onTriggered: {
         const out = []
         for (var i = 0; i < root.layerPanelList.length; i++) {

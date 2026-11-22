@@ -111,7 +111,10 @@ Item {
         const layers = host.layerList
         for (var j = 0; j < layers.length; j++) {
             const l = layers[j]
-            if (l.i > 0 && mids.indexOf(l.id) >= 0)
+            // ★跳过影子层（组样式烘焙，syn 标记）：锚点必须是「最上面的真实
+            // 成员」。插到影子层上方会让新成员落到前景样式之外（描边/叠加
+            // 盖不住它），跟 PS 的渲染顺序对不上。syn 是数字 1，用真值判断。
+            if (l.i > 0 && !l.syn && mids.indexOf(l.id) >= 0)
                 return l.i
         }
         return -1
