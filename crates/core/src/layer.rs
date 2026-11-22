@@ -70,6 +70,11 @@ pub struct LayerGroup {
     /// PSD 的 `pass`（穿透）：成员直接与组下方的画面混合，组不是隔离容器。
     /// 应用里新建的组只是标签，默认保持穿透以免改变既有渲染。
     pub pass_through: bool,
+    /// 组样式（PSD folder 记录上的 `lfxs`）的**原始字节**：保存时原样写回，
+    /// 让 PS 里样式保持「活」的（可再编辑）。加载时组样式已烘焙成影子层，
+    /// 写回时影子层不落盘、由这个字节块还原样式 —— 两边只留一个。
+    /// `None` = 该组没有（或已放弃透传）组样式。
+    pub raw_style: Option<Vec<u8>>,
 }
 
 impl LayerGroup {
@@ -84,6 +89,7 @@ impl LayerGroup {
             blend: BlendMode::Normal,
             opacity: 1.0,
             pass_through: true,
+            raw_style: None,
         }
     }
 
@@ -237,6 +243,10 @@ pub struct Layer {
     /// 所属分组（`None` = 不属于任何组）。组只影响面板组织与批量显隐，
     /// 不改变 z 序、不参与合成。`duplicated()` 会继承它。
     pub group: Option<GroupId>,
+    /// PSD 组样式烘焙出的「影子层」（投影垫底 / 前景样式盖顶）。它只是
+    /// 组样式在应用内的视觉替身：不可编辑、不写回 PSD（保存时由
+    /// `LayerGroup::raw_style` 原样还原样式）。`false` = 普通图层。
+    pub synthetic: bool,
     pub content: LayerContent,
 }
 
@@ -280,6 +290,7 @@ impl Layer {
             knockout: Knockout::None,
             transparency_shapes: true,
             group: None,
+            synthetic: false,
             content: LayerContent::Raster(RasterLayer {
                 image,
                 offset: (0, 0),
@@ -363,6 +374,7 @@ impl Layer {
             knockout: Knockout::None,
             transparency_shapes: true,
             group: None,
+            synthetic: false,
             content: LayerContent::Mark(mark),
         }
     }

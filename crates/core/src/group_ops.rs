@@ -250,6 +250,20 @@ impl Document {
         index: usize,
         group: Option<GroupId>,
     ) -> Result<(), EditError> {
+        let ops = self.set_layer_group_ops(index, group)?;
+        if ops.is_empty() {
+            return Ok(());
+        }
+        self.execute(EditOp::Batch(ops))
+    }
+
+    /// `set_layer_group` 的 op 序列构造（供「归组 + 落位」组合复用）。
+    /// 归属没变时返回空。
+    fn set_layer_group_ops(
+        &self,
+        index: usize,
+        group: Option<GroupId>,
+    ) -> Result<Vec<EditOp>, EditError> {
         if let Some(gid) = group {
             self.find_group(gid)
                 .ok_or(EditError::GroupNotFound(gid))?;
@@ -257,7 +271,7 @@ impl Document {
         let layer = self.layers.get(index).ok_or(EditError::LayerIndex(index))?;
         let from = layer.group;
         if from == group {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let from_flags = self.group_state_flags(from);
         let to_flags = self.group_state_flags(group);
@@ -294,6 +308,36 @@ impl Document {
                 to,
             });
         }
+        Ok(ops)
+    }
+
+    /// 归组 + z 落位一步完成（面板跨组拖层）。先改归属（含隐藏环境的
+    /// 显隐切换），再 `MoveLayer` 到 `to_z`；合成一条 Batch = 一次撤销。
+    ///
+    /// ★QML 必须走这个组合入口，不能拆两次 qinvokable：归组会同步触发
+    /// layers_json 重建、销毁正在拖的 delegate，第二次调用根本不执行
+    /// （用户报的「换分组固定在目标分组最上面」）。`to_z` 语义与
+    /// `MoveLayer.to` 一致（remove 后的最终文档索引）；`to_z == index`
+    /// 表示只归组不落位。
+    pub fn move_layer_to_group_at(
+        &mut self,
+        index: usize,
+        group: Option<GroupId>,
+        to_z: usize,
+    ) -> Result<(), EditError> {
+        let mut ops = self.set_layer_group_ops(index, group)?;
+        if to_z != index {
+            if to_z == 0 || to_z >= self.layers.len() {
+                return Err(EditError::LayerIndex(to_z));
+            }
+            ops.push(EditOp::MoveLayer {
+                from: index,
+                to: to_z,
+            });
+        }
+        if ops.is_empty() {
+            return Ok(());
+        }
         self.execute(EditOp::Batch(ops))
     }
 
@@ -314,6 +358,20 @@ impl Document {
         gid: GroupId,
         target: Option<GroupId>,
     ) -> Result<(), EditError> {
+        let ops = self.move_group_parent_ops(gid, target)?;
+        if ops.is_empty() {
+            return Ok(());
+        }
+        self.execute(EditOp::Batch(ops))
+    }
+
+    /// `move_group_to_group` 的 op 序列构造（供「归组 + 排序」组合复用）。
+    /// 已经在目标父组里时返回空。
+    fn move_group_parent_ops(
+        &mut self,
+        gid: GroupId,
+        target: Option<GroupId>,
+    ) -> Result<Vec<EditOp>, EditError> {
         if self.find_group(gid).is_none() {
             return Err(EditError::GroupNotFound(gid));
         }
@@ -355,7 +413,7 @@ impl Document {
                 .find(|g| g.id == gid)
                 .expect("group existence checked above");
             if group.parent == target {
-                return Ok(()); // 已经在那个组里，无事可做
+                return Ok(Vec::new()); // 已经在那个组里，无事可做
             }
             group.parent = target;
         }
@@ -398,6 +456,27 @@ impl Document {
                 }
             }
         }
+        Ok(ops)
+    }
+
+    /// 组「归组 + z 排序」一步完成（面板把组拖进别的组并落在指定缝位）。
+    /// 合成一条 Batch = 一次撤销；QML 拆两次调用会因 delegate 销毁丢掉
+    /// 第二步（与 `move_layer_to_group_at` 同理）。
+    pub fn move_group_to_group_at(
+        &mut self,
+        gid: GroupId,
+        target: Option<GroupId>,
+        anchor: Option<(usize, bool)>,
+    ) -> Result<(), EditError> {
+        let mut ops = self.move_group_parent_ops(gid, target)?;
+        if let Some((a, above)) = anchor {
+            if let Some(op) = self.move_group_z_op(gid, a, above)? {
+                ops.push(op);
+            }
+        }
+        if ops.is_empty() {
+            return Ok(());
+        }
         self.execute(EditOp::Batch(ops))
     }
 
@@ -415,16 +494,30 @@ impl Document {
         anchor: usize,
         above: bool,
     ) -> Result<(), EditError> {
+        match self.move_group_z_op(gid, anchor, above)? {
+            Some(op) => self.execute(op),
+            None => Ok(()),
+        }
+    }
+
+    /// `move_group_z` 的 op 构造（供「归组 + 排序」组合复用）。无操作时
+    /// 返回 `None`。
+    fn move_group_z_op(
+        &self,
+        gid: GroupId,
+        anchor: usize,
+        above: bool,
+    ) -> Result<Option<EditOp>, EditError> {
         if self.find_group(gid).is_none() {
             return Err(EditError::GroupNotFound(gid));
         }
         let idxs = self.group_subtree_layers(gid);
         let n = self.layers.len();
         if idxs.is_empty() || idxs[0] == 0 || idxs.len() >= n {
-            return Ok(()); // 空组 / 含背景 / 块占满，无事可做
+            return Ok(None); // 空组 / 含背景 / 块占满，无事可做
         }
         if idxs.contains(&anchor) {
-            return Ok(()); // 锚点在被拖的组块里（拖到自己成员上）—— 无操作
+            return Ok(None); // 锚点在被拖的组块里（拖到自己成员上）—— 无操作
         }
         let k = idxs.len();
         // 锚点在块移走后的索引：块里比它小的成员个数决定平移量。
@@ -444,20 +537,24 @@ impl Document {
         let t = (t.max(1) as usize).min(n - k);
         // 目标排列 = 其余成员保持相对序，块（升序）插到 t。
         let mut to_order = Vec::with_capacity(n);
-        let mut bi = 0usize;
+        // ★块成员一律由插入段负责落位（`contains` 持续跳过）：旧写法
+        // `bi < k && contains` 在插块点 t 落到块成员区间之前（组向上拖）
+        // 时，插块后 bi==k、后面的块成员被重复 push → to_order 不是
+        // 排列 → ReorderLayers 报 LayerIndex（用户报「同级分组调序异常」）。
+        let mut inserted = false;
         for i in 0..n {
-            if bi < k && idxs.contains(&i) {
-                continue; // 块成员跳过，由插入段统一落位
-            }
-            if to_order.len() == t {
+            if !inserted && to_order.len() >= t {
                 for &b in &idxs {
                     to_order.push(b);
                 }
-                bi = k;
+                inserted = true;
+            }
+            if idxs.contains(&i) {
+                continue; // 块成员跳过，由插入段统一落位
             }
             to_order.push(i);
         }
-        if bi < k {
+        if !inserted {
             for &b in &idxs {
                 to_order.push(b);
             }
@@ -472,9 +569,9 @@ impl Document {
             inv
         };
         if to_order.iter().enumerate().all(|(i, &v)| v == i) {
-            return Ok(()); // 块已在目标位，无操作
+            return Ok(None); // 块已在目标位，无操作
         }
-        self.execute(EditOp::ReorderLayers { from_order, to_order })
+        Ok(Some(EditOp::ReorderLayers { from_order, to_order }))
     }
     pub fn set_group_blend(&mut self, gid: GroupId, blend: BlendMode) -> Result<(), EditError> {
         let from = self
@@ -890,6 +987,105 @@ mod group_tests {
     }
 
     #[test]
+    fn move_layer_to_group_at_combines_regroup_and_move() {
+        let mut doc = doc_with_layers(5);
+        // 层：背景(0), L0(1), L1(2), L2(3), L3(4), L4(5)。
+        let g1 = doc.group_layers(&[1, 2], None).unwrap(); // L0, L1
+
+        // 把 L4 归入组 1 并移到 idx3（L2 前面）——归组不动 z，落位由
+        // MoveLayer 完成；一次调用一条历史。
+        doc.move_layer_to_group_at(5, Some(g1), 3).unwrap();
+        assert_eq!(doc.layers[3].name, "L4");
+        assert_eq!(
+            doc.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            vec!["背景", "L0", "L1", "L4", "L2", "L3"]
+        );
+        assert_eq!(doc.layers[3].group, Some(g1));
+        assert_eq!(doc.group_members(g1), vec![1, 2, 3]);
+
+        // 一次撤销同时恢复归属与 z 序（单条 Batch 的关键验收）。
+        doc.undo().unwrap();
+        assert_eq!(doc.layers[5].name, "L4");
+        assert_eq!(doc.layers[5].group, None);
+        assert_eq!(
+            doc.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            vec!["背景", "L0", "L1", "L2", "L3", "L4"]
+        );
+        doc.redo().unwrap();
+        assert_eq!(doc.layers[3].name, "L4");
+        // 回到初始状态，继续下面的用例。
+        doc.undo().unwrap();
+
+        // to_z 越界 → 报错且无副作用（归属也不变）。
+        assert_eq!(
+            doc.move_layer_to_group_at(5, Some(g1), 99),
+            Err(EditError::LayerIndex(99))
+        );
+        assert_eq!(doc.layers[5].group, None);
+
+        // to_z == index → 只归组不落位（等价 set_layer_group）。
+        doc.move_layer_to_group_at(5, Some(g1), 5).unwrap();
+        assert_eq!(doc.layers[5].name, "L4");
+        assert_eq!(doc.layers[5].group, Some(g1));
+        doc.undo().unwrap();
+        assert_eq!(doc.layers[5].group, None);
+
+        // 拖进隐藏组：可见成员跟着隐藏（一次调用内完成）。
+        doc.set_group_visible(g1, false).unwrap();
+        doc.move_layer_to_group_at(5, Some(g1), 3).unwrap();
+        assert!(!doc.layers[3].visible);
+        doc.set_group_visible(g1, true).unwrap();
+        assert!(doc.layers[3].visible);
+    }
+
+    #[test]
+    fn move_group_to_group_at_combines_parent_and_z() {
+        let mut doc = doc_with_layers(5);
+        let g1 = doc.group_layers(&[1, 2], None).unwrap(); // L0, L1
+        let g2 = doc.group_layers(&[3, 4], None).unwrap(); // L2, L3
+
+        // 组 2 进组 1，同时块排到 L1（idx2）下面。
+        doc.move_group_to_group_at(g2, Some(g1), Some((2, false)))
+            .unwrap();
+        assert_eq!(doc.find_group(g2).unwrap().parent, Some(g1));
+        assert_eq!(
+            doc.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            vec!["背景", "L0", "L2", "L3", "L1", "L4"]
+        );
+
+        // 一次撤销同时恢复 parent 与 z 序；重做再生效。
+        doc.undo().unwrap();
+        assert_eq!(doc.find_group(g2).unwrap().parent, None);
+        assert_eq!(
+            doc.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            vec!["背景", "L0", "L1", "L2", "L3", "L4"]
+        );
+        doc.redo().unwrap();
+        assert_eq!(doc.find_group(g2).unwrap().parent, Some(g1));
+        assert_eq!(doc.layers[2].name, "L2");
+
+        // anchor=None → 只归组（等价 move_group_to_group）。
+        doc.undo().unwrap();
+        doc.move_group_to_group_at(g2, Some(g1), None).unwrap();
+        assert_eq!(doc.find_group(g2).unwrap().parent, Some(g1));
+        assert_eq!(
+            doc.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(),
+            vec!["背景", "L0", "L1", "L2", "L3", "L4"]
+        );
+
+        // target=None → 只排序不改归属。
+        doc.undo().unwrap();
+        doc.move_group_to_group_at(g2, None, Some((2, false))).unwrap();
+        assert_eq!(doc.find_group(g2).unwrap().parent, None);
+        assert_eq!(doc.layers[2].name, "L2");
+
+        // 已在目标父组 → 整体无操作（不进历史）。
+        let epoch = doc.edit_epoch;
+        doc.move_group_to_group_at(g2, None, None).unwrap();
+        assert_eq!(doc.edit_epoch, epoch);
+    }
+
+    #[test]
     fn move_group_into_hidden_group_hides_subtree_members() {
         let mut doc = doc_with_layers(4);
         let g1 = doc.group_layers(&[1, 2], None).unwrap();
@@ -1056,6 +1252,7 @@ mod group_tests {
             blend_if: None,
             knockout: Knockout::None,
             transparency_shapes: true,
+            synthetic: false,
         };
         // 底 -> 顶：底层无组，中层在「内层」组，顶层在「外层」组。
         let mut doc = Document::from_psd_layers_with_groups(
@@ -1071,6 +1268,7 @@ mod group_tests {
                     blend: BlendMode::Normal,
                     opacity: 1.0,
                     pass_through: true,
+                    raw_style: None,
                 },
                 PsdGroupSeed {
                     psd_id: 7,
@@ -1081,6 +1279,7 @@ mod group_tests {
                     blend: BlendMode::Normal,
                     opacity: 1.0,
                     pass_through: true,
+                    raw_style: None,
                 },
             ],
         );

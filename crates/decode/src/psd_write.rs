@@ -121,6 +121,12 @@ enum PsdRecord {
         /// 已经是 4 字节 PSD 键：穿透组要写 `pass`，不能退化成 `norm`。
         blend: &'static [u8; 4],
         opacity: u8,
+        /// 组样式的**完整原始块**（8BIM 签名 + 键 + 长度 + 数据，来自加载时
+        /// 捕获的 folder 记录附加信息）。保存时原样写回，PS 里样式保持
+        /// 「活」的；同时烘焙影子层不落盘（见 `prepare_layers`），两边只
+        /// 留一个，否则 PS 会把样式再渲染一遍、叠两层。`None` = 无组样式
+        /// 或已放弃透传（影子层被关眼 / 丢失）。
+        raw_fx: Option<Vec<u8>>,
     },
 }
 
@@ -135,6 +141,21 @@ fn prepare_layers(doc: &Document) -> Result<Vec<PreparedLayer>, crate::DecodeErr
     let mut out = Vec::new();
 
     for (idx, layer) in doc.layers.iter().enumerate() {
+        // 组样式的烘焙影子层（「组「…」投影/样式(烘焙)」）默认不落盘：样式
+        // 由组 folder 记录的 `lfxs` 原始块还原（见 `group_style_passthrough`），
+        // 写回去 PS 会把活样式再渲染一遍，影子叠两层。但影子层不在样式组里
+        // （被拖走 / 组没了 / 样式已放弃）时透传不再发生，此时当普通层写回，
+        // 保住画面。
+        if layer.synthetic {
+            let passthrough = layer
+                .group
+                .and_then(|gid| doc.find_group(gid))
+                .and_then(|g| group_style_passthrough(doc, g).map(|_| ()))
+                .is_some();
+            if passthrough {
+                continue;
+            }
+        }
         let (plane, (ox, oy)) = layer.plane();
         let pw = plane.width() as i64;
         let ph = plane.height() as i64;
@@ -289,6 +310,7 @@ fn write_layer_record(out: &mut Vec<u8>, l: &PreparedLayer) -> Result<(), crate:
         l.knockout,
         l.transparency_shapes,
         None,
+        None,
     );
     Ok(())
 }
@@ -304,6 +326,7 @@ fn write_divider_record(
     section: u32,
     blend: &'static [u8; 4],
     opacity: u8,
+    raw_fx: Option<&[u8]>,
 ) {
     // 组混合模式落在 `lsct` 块里（PS 的约定）：穿透组记录字段是 `norm`，
     // 真正的 `pass` 写在 lsct 的混合键上；其他模式两处一致。读回来时解码器
@@ -323,6 +346,7 @@ fn write_divider_record(
         editcore::Knockout::None,
         true,
         Some((section, blend)),
+        raw_fx,
     );
 }
 
@@ -342,6 +366,8 @@ fn write_record(
     knockout: editcore::Knockout,
     transparency_shapes: bool,
     lsct: Option<(u32, &'static [u8; 4])>,
+    // 组样式完整原始块（8BIM + 键 + 长度 + 数据），原样追加到附加信息区。
+    raw_fx: Option<&[u8]>,
 ) {
     let (top, left, bottom, right) = rect;
     push_i32(out, top);
@@ -462,6 +488,13 @@ fn write_record(
         push_bytes(&mut extra, &[0, 0, 0, 0]);
     }
 
+    // 组样式：完整原始块（8BIM 签名 + 键 + 长度 + 数据）字节级还原 ——
+    // 键是原文件的（folder 记录上 PS 写 `lfxs`），数据连补位都原样，
+    // PS 里样式保持可再编辑。
+    if let Some(fx) = raw_fx {
+        push_bytes(&mut extra, fx);
+    }
+
     push_u32(out, extra.len() as u32); // extra data length
     push_bytes(out, &extra);
 }
@@ -515,6 +548,7 @@ fn prepare_records(doc: &editcore::Document, layers: Vec<PreparedLayer>) -> Vec<
                     section: if group.collapsed { 2 } else { 1 },
                     blend: group_blend_key(group),
                     opacity: group_opacity(group),
+                    raw_fx: group_style_passthrough(doc, group),
                 });
             }
         }
@@ -525,6 +559,7 @@ fn prepare_records(doc: &editcore::Document, layers: Vec<PreparedLayer>) -> Vec<
                 section: 3,
                 blend: b"norm",
                 opacity: 255,
+                raw_fx: None,
             });
         }
         open = want;
@@ -538,6 +573,7 @@ fn prepare_records(doc: &editcore::Document, layers: Vec<PreparedLayer>) -> Vec<
                 section: if group.collapsed { 2 } else { 1 },
                 blend: group_blend_key(group),
                 opacity: group_opacity(group),
+                raw_fx: group_style_passthrough(doc, group),
             });
         }
     }
@@ -552,12 +588,14 @@ fn prepare_records(doc: &editcore::Document, layers: Vec<PreparedLayer>) -> Vec<
             section: 3,
             blend: b"norm",
             opacity: 255,
+            raw_fx: None,
         });
         records.push(PsdRecord::Divider {
             name: group.name.clone(),
             section: if group.collapsed { 2 } else { 1 },
             blend: group_blend_key(group),
             opacity: group_opacity(group),
+            raw_fx: group_style_passthrough(doc, group),
         });
     }
     records
@@ -576,6 +614,55 @@ fn group_blend_key(group: &editcore::LayerGroup) -> &'static [u8; 4] {
     } else {
         blend_key(group.blend)
     }
+}
+
+/// 组样式原始块是否照原样透传。
+///
+/// 规则：该组**没有**烘焙影子层 → 直接透传（烘焙被跳过 / 组本来就是隐藏
+/// 的：文件里没有可以双重渲染的像素，样式数据必须保住，用户在 PS 里重新
+/// 开眼才不会丢投影）。有影子层 → 每层的不可见都必须是「祖先组被关眼」
+/// 连带造成的；影子层在所有组都可见的情况下被用户亲手关眼（或被删，但
+/// 影子层锁定删不掉），等于用户放弃这个样式，此时连同 `lfxs` 一起不写，
+/// PS 里也不会再渲染投影。组整体隐藏不算放弃。
+fn group_style_passthrough(doc: &Document, group: &editcore::LayerGroup) -> Option<Vec<u8>> {
+    let raw = group.raw_style.as_ref()?;
+    let shadows: Vec<&editcore::Layer> = doc
+        .layers
+        .iter()
+        .filter(|l| l.synthetic && l.group == Some(group.id))
+        .collect();
+    if shadows.is_empty() {
+        return Some(raw.clone());
+    }
+    for l in shadows {
+        if l.visible {
+            continue;
+        }
+        // 沿父组链找：只要链上有一个组是隐藏的，这层的不可见就是连带效果。
+        let mut gid = l.group;
+        let mut guard = 0;
+        let mut induced = false;
+        while let Some(id) = gid {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            match doc.find_group(id) {
+                Some(g) => {
+                    if !g.visible {
+                        induced = true;
+                        break;
+                    }
+                    gid = g.parent;
+                }
+                None => break,
+            }
+        }
+        if !induced {
+            return None; // 用户亲手关了影子层的眼睛 → 放弃样式
+        }
+    }
+    Some(raw.clone())
 }
 
 /// 图像资源段：目前只写回文档内嵌的 ICC（资源 1039）。
@@ -651,7 +738,15 @@ pub fn encode_psd(doc: &Document, _quality: u8) -> Result<Vec<u8>, crate::Decode
                 section,
                 blend,
                 opacity,
-            } => write_divider_record(&mut layer_info, name, *section, *blend, *opacity),
+                raw_fx,
+            } => write_divider_record(
+                &mut layer_info,
+                name,
+                *section,
+                *blend,
+                *opacity,
+                raw_fx.as_deref(),
+            ),
         }
     }
     // All channel DATA follows all records, in the same order the channel
@@ -863,6 +958,7 @@ mod tests {
             blend_if: None,
             knockout: editcore::Knockout::None,
             transparency_shapes: true,
+            synthetic: false,
         };
         let doc = Document::from_psd_layers_with_groups(
             (cw, ch),
@@ -876,6 +972,7 @@ mod tests {
                 blend: BlendMode::Multiply,
                 opacity: 0.5,
                 pass_through: false,
+                raw_style: None,
             }],
         );
         let bytes = encode_psd(&doc, 90).expect("encode_psd");
@@ -913,6 +1010,7 @@ mod tests {
             blend_if: None,
             knockout: editcore::Knockout::None,
             transparency_shapes: true,
+            synthetic: false,
         };
         let mut doc = Document::from_psd_layers((4, 4), vec![seed]);
         let want = BlendIf {
@@ -963,6 +1061,7 @@ mod tests {
             blend_if: None,
             knockout: Knockout::None,
             transparency_shapes: true,
+            synthetic: false,
         };
         for want in [Knockout::Shallow, Knockout::Deep] {
             let mut doc = Document::from_psd_layers((4, 4), vec![seed.clone()]);
@@ -1001,6 +1100,7 @@ mod tests {
             blend_if: None,
             knockout: Knockout::None,
             transparency_shapes: true,
+            synthetic: false,
         };
         // 默认开：不写键，读回来仍是 true。
         let doc = Document::from_psd_layers((4, 4), vec![seed.clone()]);
@@ -1094,6 +1194,7 @@ mod tests {
             blend_if: None,
             knockout: editcore::Knockout::None,
             transparency_shapes: true,
+            synthetic: false,
         };
         let doc = Document::from_psd_layers((4, 4), vec![seed("上层"), seed("下层")]);
         assert_eq!(doc.layers.len(), 3, "background + 2 seeds");
@@ -1108,6 +1209,126 @@ mod tests {
         let set2 = crate::decode_psd_layers(&bytes2, crate::DecodeOptions::default())
             .expect("second decode");
         assert_eq!(set2.layers.len(), 2, "second generation must not grow");
+    }
+
+    /// 2f) 组样式（`lfxs` 原始块）透传写回 + 烘焙影子层不落盘：
+    /// - 影子层可见 → `lfxs` 字节级一致地回到组 folder 记录上，影子层消失；
+    /// - 影子层被用户关眼 → `lfxs` 一起不写（放弃样式的语义）；
+    /// - 影子层缺失 → 同样不写（没有视觉替身就不再给活样式，避免双重渲染）。
+    #[test]
+    fn group_style_raw_block_roundtrip_and_shadow_skip() {
+        use editcore::{BlendMode, PsdGroupSeed, PsdLayerSeed};
+
+        // 伪造一个 lfxs 块：descriptor 内容不合法也不影响 raw 透传
+        // （decode 端 parse_layer_effects 失败只丢结构化效果，不丢字节）。
+        let data: Vec<u8> = vec![0, 0, 0, 16, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let mut fx = Vec::new();
+        fx.extend_from_slice(b"8BIM");
+        fx.extend_from_slice(b"lfxs");
+        fx.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        fx.extend_from_slice(&data);
+
+        let base = |name: &str, group: Option<u32>| PsdLayerSeed {
+            name: name.into(),
+            offset: (0, 0),
+            image: solid(4, 4, [10, 20, 30, 255]),
+            visible: true,
+            own_visible: true,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            group,
+            mask: None,
+            clipping: false,
+            clip_shape: None,
+            style: None,
+            blend_if: None,
+            knockout: editcore::Knockout::None,
+            transparency_shapes: true,
+            synthetic: false,
+        };
+        let group = |raw: Option<Vec<u8>>| PsdGroupSeed {
+            psd_id: 1,
+            parent: None,
+            name: "组".into(),
+            collapsed: false,
+            visible: true,
+            blend: BlendMode::Normal,
+            opacity: 1.0,
+            pass_through: false,
+            raw_style: raw,
+        };
+
+        // a) 影子层齐全且可见：lfxs 透传，影子层不写。
+        let mut shadow = base("影子", Some(1));
+        shadow.synthetic = true;
+        let doc = Document::from_psd_layers_with_groups(
+            (8, 8),
+            vec![base("成员", Some(1)), shadow],
+            vec![group(Some(fx.clone()))],
+        );
+        let bytes = encode_psd(&doc, 90).expect("encode");
+        let set = crate::psd_layers::decode_psd_layers(&bytes, crate::DecodeOptions::default())
+            .expect("decode");
+        assert_eq!(set.layers.len(), 1, "影子层不能写进 PSD");
+        assert_eq!(set.layers[0].name, "成员");
+        assert_eq!(
+            set.groups[0].raw_style.as_deref(),
+            Some(fx.as_slice()),
+            "lfxs 必须字节级一致"
+        );
+
+        // b) 影子层被关眼（所有组都可见）：用户放弃样式，lfxs 一起不写。
+        let mut shadow_off = base("影子", Some(1));
+        shadow_off.synthetic = true;
+        shadow_off.visible = false;
+        let doc = Document::from_psd_layers_with_groups(
+            (8, 8),
+            vec![base("成员", Some(1)), shadow_off],
+            vec![group(Some(fx.clone()))],
+        );
+        let bytes = encode_psd(&doc, 90).expect("encode");
+        let set = crate::psd_layers::decode_psd_layers(&bytes, crate::DecodeOptions::default())
+            .expect("decode");
+        assert!(
+            set.groups[0].raw_style.is_none(),
+            "影子层关眼 = 放弃样式，lfxs 不能透传"
+        );
+
+        // c) 组隐藏（影子层连带不可见）：组隐藏不是放弃样式，lfxs 照写。
+        //    装配信任 seed.visible 为合成真值，这里直接构造「组关眼、影子层
+        //    自身旗标仍开」的状态，等价于用户只关了组的眼睛。
+        let mut shadow2 = base("影子", Some(1));
+        shadow2.synthetic = true;
+        let mut hidden_group = group(Some(fx.clone()));
+        hidden_group.visible = false;
+        let doc = Document::from_psd_layers_with_groups(
+            (8, 8),
+            vec![base("成员", Some(1)), shadow2],
+            vec![hidden_group],
+        );
+        let bytes = encode_psd(&doc, 90).expect("encode");
+        let set = crate::psd_layers::decode_psd_layers(&bytes, crate::DecodeOptions::default())
+            .expect("decode");
+        assert!(
+            set.groups[0].raw_style.is_some(),
+            "组隐藏不该丢组样式"
+        );
+
+        // d) 烘焙被跳过的组（如隐藏组：成员折叠不可见， members_union 为空
+        //    → 没有影子层）：没有可双重渲染的像素，样式数据必须原样保住。
+        let doc = Document::from_psd_layers_with_groups(
+            (8, 8),
+            vec![base("成员", Some(1))],
+            vec![group(Some(fx.clone()))],
+        );
+        let bytes = encode_psd(&doc, 90).expect("encode");
+        let set = crate::psd_layers::decode_psd_layers(&bytes, crate::DecodeOptions::default())
+            .expect("decode");
+        assert_eq!(
+            set.groups[0].raw_style.as_deref(),
+            Some(fx.as_slice()),
+            "无影子层的组样式必须透传"
+        );
     }
 
     /// 2e) 图层蒙版（`-2` 通道，含自己的矩形与矩形外默认色）与剪贴位必须

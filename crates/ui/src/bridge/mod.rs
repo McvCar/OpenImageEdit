@@ -817,6 +817,28 @@ pub mod qobject {
         #[qinvokable]
         fn move_group_z(self: Pin<&mut Self>, group_id: i32, anchor: i32, above: bool);
 
+        /// 归组 + z 落位一步完成（面板跨组拖层）：单条 Batch 历史。
+        /// QML 拆两次调用会因 layers_json 同步重建销毁 delegate、丢掉
+        /// 第二步；to_z < 0 = 只归组不落位。
+        #[qinvokable]
+        fn move_layer_to_group_at(
+            self: Pin<&mut Self>,
+            index: i32,
+            group_id: i32,
+            to_z: i32,
+        );
+
+        /// 组归组 + z 排序一步完成（面板拖组跨容器）：单条 Batch 历史。
+        /// target_id < 0 = 只排序；anchor <= 0 = 只归组。
+        #[qinvokable]
+        fn move_group_to_group_at(
+            self: Pin<&mut Self>,
+            group_id: i32,
+            target_id: i32,
+            anchor: i32,
+            above: bool,
+        );
+
         #[qinvokable]
         fn set_group_locked(self: Pin<&mut Self>, group_id: i32, locked: bool);
 

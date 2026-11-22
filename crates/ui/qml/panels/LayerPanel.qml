@@ -196,6 +196,21 @@ Item {
             dropIndicator.visible = false
         }
     }
+    // 落点诊断日志通道自检：console.log 在 Windows GUI 下走
+    // OutputDebugString，不进 stderr 重定向，所以诊断统一走
+    // bridge.dump_panel_rows（原样打印 JSON → stdout 日志可查）。
+    property bool _dropLogChecked: false
+    Connections {
+        target: host
+        function onLayerPanelListChanged() {
+            if (!layerPanel._dropLogChecked) {
+                layerPanel._dropLogChecked = true
+                bridge.dump_panel_rows(JSON.stringify(
+                    { d: "drop-log", channel: "ok",
+                      rows: host.layerPanelList.length }))
+            }
+        }
+    }
     // 选中的 id 集合：面板高亮用它，而不是下标（重排后下标会变）。
     readonly property var selIds: {
         try {
@@ -1227,6 +1242,8 @@ Item {
                         property bool toAbove: false
                         property int toZ: -1
                         property real pressY: 0
+                        // 诊断：最近一次悬停的「缝上那行」快照（onReleased 打日志用）。
+                        property var lastAbove: null
 
                         onPressed: (mouse) => {
                             // 正在重命名时点别的行本体 → 先提交并收起输入框。
@@ -1284,6 +1301,7 @@ Item {
                             const gap = Math.max(0, Math.min(inUpper ? idx : idx + 1,
                                                              total - 1))
                             const above = gap > 0 ? host.layerPanelList[gap - 1] : null
+                            lastAbove = above
                             const draggedGroup = layerRow.row && layerRow.isGroup
                                                  ? layerRow.row.gid : 0
                             if (draggedGroup > 0) {
@@ -1347,15 +1365,21 @@ Item {
                             // 索引先按「自己被移走」平移：m' = m > from ? m-1 : m。
                             //   缝在锚点显示位下方（更底层）→ to = m' - 1
                             //   缝在锚点显示位上方（更顶层）→ to = m' + 1
-                            // 上限 = layerList.length - 2（remove 后的最顶索引）。
-                            const cap = Math.max(0, host.layerList.length - 2)
+                            // 上限 = layerList.length - 1：MoveLayer 是
+                            // remove 后 insert，insert 位置允许 = 移除后
+                            // 的长度（append = 成为全文档最顶层）。n-2 会把
+                            // 「插到最顶」钳掉一位：组顶成员就是全文档最顶
+                            // 层时，拖到组顶必现落点差一位。
+                            const cap = Math.max(0, host.layerList.length - 1)
                             if (gap === 0 || !above) {
                                 toGroup = 0
                                 const layers = host.layerList
                                 const topI = layers.length ? layers[0].i : -1
                                 // 自己已经是最顶层时拖到最顶 = 无事可做。
+                                // to = topI：remove 后 append 位 → 自己成为
+                                // 新的最顶层（topI-1 会落到第二名）。
                                 if (topI > 0 && topI !== from)
-                                    toZ = Math.min(topI - 1, cap)
+                                    toZ = Math.min(topI, cap)
                             } else if (above.k === "group") {
                                 // 缝在组标题行下方 = 进该组、插到子树最上面
                                 // 成员上方（z 更高，成为新的最上成员）。
@@ -1373,10 +1397,14 @@ Item {
                             } else {
                                 // 缝在层行下方 = 与它同容器、紧贴它下面
                                 // （z 更低一位）。锚点是自己 = 无事可做。
+                                // ★to = m'，不是 m'-1：insert at m' 会把
+                                // 锚点顶到 m'+1，落点正好紧贴锚点下方；
+                                // 用 m'-1 会和锚点下面那层换位、反而往下掉
+                                // （from=1, m=5 → to=3 把 idx4 顶上去）。
                                 toGroup = above.g || 0
                                 const m = above.i
                                 if (m > 0 && m !== from)
-                                    toZ = Math.max(1, (m > from ? m - 1 : m) - 1)
+                                    toZ = Math.max(1, m > from ? m - 1 : m)
                             }
                             dropIndicator.y = layerColumn.y + gap * pitch - 2
                             dropIndicator.visible = toZ !== from || toGroup !== fromGroup
@@ -1400,6 +1428,21 @@ Item {
                             const snapAnchor = toAnchor
                             const snapAbove = toAbove
                             const snapParent = snapRow ? (snapRow.g || 0) : 0
+                            // 落点诊断：真实交互里 gap/above 的实际值
+                            // （dump_panel_rows → stdout → debug 日志可查）。
+                            const ab = lastAbove
+                            bridge.dump_panel_rows(JSON.stringify({
+                                d: "drop",
+                                kind: dragGid > 0 ? "group" : "layer",
+                                doMove: doMove, gap: toPos,
+                                row: snapRow ? { n: snapRow.n, i: snapRow.i,
+                                                 g: snapRow.g || 0,
+                                                 k: snapRow.k || "" } : null,
+                                toG: snapToGroup, toZ: snapToZ,
+                                anchor: snapAnchor, abv: snapAbove,
+                                ab: ab ? { k: ab.k, i: ab.i, gid: ab.gid,
+                                           n: ab.n, g: ab.g || 0 } : null
+                            }))
                             reordering = false
                             toPos = -1
                             toGroup = -1
@@ -1411,26 +1454,53 @@ Item {
                             listArea.interactive = true
                             if (doMove) {
                                 if (dragGid > 0) {
-                                    // 组拖动（缝模型）：容器不同 → 改归属
-                                    // （0 = 移回顶层，防环由 bridge 校验）；
-                                    // 锚点有效 → 组块 z 排到缝位。两步组合
-                                    // 时先归组再排序（z 排序不改 parent）。
-                                    if (snapToGroup >= 0 && snapToGroup !== snapParent)
-                                        bridge.move_group_to_group(dragGid, snapToGroup)
-                                    if (snapAnchor > 0)
-                                        bridge.move_group_z(dragGid, snapAnchor, snapAbove)
+                                    // 组拖动（缝模型）：★一次调用完成归组 +
+                                    // z 排序。拆两次 qinvokable 时第一步的
+                                    // layers_json 同步重建会销毁本 delegate、
+                                    // 第二步永远不执行（用户报「换分组后
+                                    // 顺序异常 / 固定在最上面」的根因）。
+                                    // target=-1 = 只排序不改归属；anchor=-1
+                                    // = 只归组不排序（bridge 侧分支处理）。
+                                    const needRegroup =
+                                        snapToGroup >= 0 && snapToGroup !== snapParent
+                                    if (needRegroup || snapAnchor > 0) {
+                                        bridge.dump_panel_rows(JSON.stringify(
+                                            { d: "drop-call",
+                                              op: "move_group_to_group_at",
+                                              gid: dragGid, g: snapToGroup,
+                                              anchor: snapAnchor,
+                                              above: snapAbove }))
+                                        bridge.move_group_to_group_at(
+                                            dragGid,
+                                            needRegroup ? snapToGroup : -1,
+                                            snapAnchor > 0 ? snapAnchor : -1,
+                                            snapAbove)
+                                    }
                                 } else if (snapRow && snapRow.i > 0) {
-                                    // 落点容器 != 当前组 → 改归属（显隐 /
-                                    // 隔离刷新由 bridge 处理）；toZ 是按
-                                    // PS 语义算好的插入 z 索引（缝模型，
-                                    // 见 onPositionChanged）。两步都做才
-                                    // 能既进组又落在想要的位置。
+                                    // 层拖动：★同样一次调用完成归组 + 落位。
+                                    // toZ 是按 PS 缝语义算好的插入 z 索引
+                                    // （见 onPositionChanged）；snapToZ<0 =
+                                    // 只归组（空组 / 落点无 z 变化）。
                                     const from = snapRow.i
                                     const fromGroup = snapRow.g || 0
-                                    if (snapToGroup >= 0 && snapToGroup !== fromGroup)
-                                        bridge.move_layer_to_group(from, snapToGroup)
-                                    if (snapToZ >= 0 && snapToZ !== from)
+                                    if (snapToGroup >= 0 && snapToGroup !== fromGroup) {
+                                        bridge.dump_panel_rows(JSON.stringify(
+                                            { d: "drop-call",
+                                              op: "move_layer_to_group_at",
+                                              from: from, g: snapToGroup,
+                                              z: snapToZ }))
+                                        bridge.move_layer_to_group_at(
+                                            from, snapToGroup, snapToZ)
+                                    } else if (snapToZ >= 0 && snapToZ !== from) {
+                                        bridge.dump_panel_rows(JSON.stringify(
+                                            { d: "drop-call", op: "reorder_layer",
+                                              from: from, z: snapToZ }))
                                         bridge.reorder_layer(from, snapToZ)
+                                    } else {
+                                        bridge.dump_panel_rows(JSON.stringify(
+                                            { d: "drop-skip", from: from,
+                                              z: snapToZ, g: snapToGroup }))
+                                    }
                                 }
                             } else if (snapRow && !snapRow.isBase
                                        && (!layerRow.locked || layerRow.isGroup)) {

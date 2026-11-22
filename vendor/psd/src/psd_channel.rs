@@ -370,6 +370,7 @@ mod tests {
             brightness_contrast: None,
             hue_saturation: None,
             layer_effects: None,
+            raw_lfx2: None,
             mask_rect: None,
             vector_mask: None,
             vector_fill: None,

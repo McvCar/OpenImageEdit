@@ -56,6 +56,18 @@ const KEY_GRADIENT_SHEET: &[u8; 4] = b"GdFl";
 const KEY_LAYER_EFFECTS_V0: &[u8; 4] = b"lmfx";
 const KEY_LAYER_EFFECTS_V1: &[u8; 4] = b"lfxs";
 
+/// Capture priority for raw effect blocks: Photoshop renders from the modern
+/// generation, so `lfxs` beats `lfx2` beats the legacy `lmfx`.
+fn effects_key_priority(key: &[u8]) -> u8 {
+    if key == KEY_LAYER_EFFECTS_V1 {
+        2
+    } else if key == KEY_LAYER_EFFECTS {
+        1
+    } else {
+        0
+    }
+}
+
 pub mod groups;
 pub mod layer;
 pub mod layers;
@@ -585,6 +597,10 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
     let mut hue_saturation = None;
     // Layer styles, kept so the decoder can bake the visible ones.
     let mut layer_effects: Option<Vec<crate::effects::LayerEffect>> = None;
+    // Raw bytes of the last effects block seen, for byte-identical write-back
+    // while the style stays unedited. Later blocks win: a file carrying both
+    // an old `lmfx` and a newer `lfxs` is read by Photoshop from the `lfxs`.
+    let mut raw_lfx2: Option<Vec<u8>> = None;
     // 形状图层的矢量轮廓与填充。
     let mut vector_mask: Option<crate::vector::VectorMask> = None;
     let mut vector_fill: Option<crate::vector::VectorFill> = None;
@@ -699,7 +715,30 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
                 if let Some(fx) = crate::effects::parse_layer_effects(block) {
                     layer_effects.get_or_insert_with(Vec::new).extend(fx);
                 }
+                // Keep the whole block verbatim — signature + key + declared
+                // length + data (padding included) — so the write-back
+                // reproduces it byte for byte. Records can carry several
+                // effect generations at once (a legacy `lmfx` plus a modern
+                // `lfxs`, sometimes an `lfx2` too); Photoshop renders from
+                // the modern one, so the capture prefers `lfxs` > `lfx2` >
+                // `lmfx` instead of letting the last block in file order win.
                 let end = start.saturating_add(len).min(cursor.get_ref().len());
+                if let Some(hdr) = start.checked_sub(12) {
+                    if let Some(full) = cursor.get_ref().get(hdr..end) {
+                        let prio = effects_key_priority(&key);
+                        let keep = raw_lfx2
+                            .as_ref()
+                            .map(|cur| {
+                                effects_key_priority(
+                                    cur.get(4..8).unwrap_or(b"lmfx"),
+                                ) <= prio
+                            })
+                            .unwrap_or(true);
+                        if keep {
+                            raw_lfx2 = Some(full.to_vec());
+                        }
+                    }
+                }
                 cursor.seek(end as u64);
             }
 
@@ -780,6 +819,7 @@ fn read_layer_record(cursor: &mut PsdCursor) -> Result<LayerRecord, PsdLayerErro
         brightness_contrast,
         hue_saturation,
         layer_effects,
+        raw_lfx2,
         mask_rect,
         vector_mask,
         // 形状内部的填充以 sheet setting（SoCo / GdFl）为准；没有 sheet

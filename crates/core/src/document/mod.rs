@@ -174,6 +174,8 @@ pub struct PsdLayerSeed {
     pub knockout: Knockout,
     /// 透明形状图层（PSD `tsly`），默认开。
     pub transparency_shapes: bool,
+    /// 组样式烘焙出的影子层（见 [`Layer::synthetic`]）：锁定、不写回 PSD。
+    pub synthetic: bool,
 }
 
 /// One PSD folder ("layer group"). `layers` 里的成员通过 `PsdLayerSeed::group`
@@ -190,6 +192,9 @@ pub struct PsdGroupSeed {
     pub blend: BlendMode,
     pub opacity: f32,
     pub pass_through: bool,
+    /// 组样式（folder 记录 `lfxs`）的原始字节，保存时透传写回；
+    /// `None` = 该组没有组样式。
+    pub raw_style: Option<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -221,6 +226,7 @@ mod psd_assembly_tests {
             blend_if: None,
             knockout: Knockout::None,
             transparency_shapes: true,
+            synthetic: false,
         }
     }
 
@@ -240,6 +246,7 @@ mod psd_assembly_tests {
             blend,
             opacity,
             pass_through,
+            raw_style: None,
         }
     }
 
@@ -625,6 +632,7 @@ impl Document {
             groups[i].blend = seed.blend;
             groups[i].opacity = seed.opacity.clamp(0.0, 1.0);
             groups[i].pass_through = seed.pass_through;
+            groups[i].raw_style = seed.raw_style.clone();
         }
         // 成员自身旗标（折叠前），与 `layers[1..]` 一一对应；循环按值消费
         // `seeds`，先取出来。
@@ -641,7 +649,8 @@ impl Document {
             layer.blend_if = seed.blend_if;
             layer.knockout = seed.knockout;
             layer.transparency_shapes = seed.transparency_shapes;
-            layer.locked = false;
+            layer.synthetic = seed.synthetic;
+            layer.locked = seed.synthetic;
             layer.background = false;
             layer.group = seed.group.and_then(|gid| group_of.get(&gid).copied());
             if let Some(raster) = layer.raster_mut() {

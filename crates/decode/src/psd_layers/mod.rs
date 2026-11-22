@@ -84,6 +84,10 @@ pub struct PsdLayerData {
     pub knockout: editcore::Knockout,
     /// 透明形状图层（PSD `tsly`），默认开。
     pub transparency_shapes: bool,
+    /// 组样式烘焙出的影子层（`组「…」投影/样式(烘焙)`）：装配时打
+    /// `Layer::synthetic` 标记 —— 锁定不可编辑，保存时不写回（组样式由
+    /// `LayerGroup::raw_style` 原始字节还原）。
+    pub synthetic: bool,
 }
 
 /// 烘焙样式前的 alpha 平面（1 字节/像素，行优先）连同它自己的矩形。
@@ -153,6 +157,9 @@ pub struct PsdGroupData {
     pub opacity: f32,
     /// PSD 的 `pass`：成员直接与组下方的画面混合，不隔离。
     pub pass_through: bool,
+    /// 组样式（folder 记录 `lfxs`）的原始字节，保存时透传写回；
+    /// `None` = 该组没有组样式。
+    pub raw_style: Option<Vec<u8>>,
 }
 
 /// Result of the second-stage parse. `layers` is bottom -> top.
@@ -217,6 +224,7 @@ impl PsdLayerSet {
                 blend_if: l.blend_if,
                 knockout: l.knockout,
                 transparency_shapes: l.transparency_shapes,
+                synthetic: l.synthetic,
             })
             .collect()
     }
@@ -234,6 +242,7 @@ impl PsdLayerSet {
                 blend: g.blend,
                 opacity: g.opacity,
                 pass_through: g.pass_through,
+                raw_style: g.raw_style.clone(),
             })
             .collect()
     }
@@ -887,6 +896,7 @@ fn build_layers<F: FnMut(usize, usize)>(
             blend_if,
             knockout,
             transparency_shapes: layer.transparency_shapes(),
+            synthetic: false,
         });
         clips.push(layer.is_clipping_mask());
         progress(step + 1, total);
@@ -958,6 +968,7 @@ fn build_layers<F: FnMut(usize, usize)>(
             blend: map_blend_mode(group.blend_mode()).unwrap_or(editcore::BlendMode::Normal),
             opacity: group.opacity() as f32 / 255.0,
             pass_through: matches!(group.blend_mode(), psd::BlendMode::PassThrough),
+            raw_style: group.raw_lfx2().map(|b| b.to_vec()),
         });
     }
 

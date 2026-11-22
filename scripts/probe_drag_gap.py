@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
-"""模拟面板拖动的落点换算（release 两步组合）在真实 app 里的行为。
+"""模拟面板拖动的落点换算在真实 app 里的行为（一步式 API）。
 
-场景 A（用户 88→24 报告）：层 A 在组 1（z 高），层 B 在组 2。拖 A 到
-B 行下半 → release = move_group(A→组2) + z-move(A, m-1)，期望显示序
-中 A 紧贴 B 下一行。
+场景 A1/A2：跨组拖层 —— release 只调一次 lmove-at:index,gid,z
+（归组 + MoveLayer 单条历史）。z 是按 PS 缝语义算好的插入索引：
+  缝在层行下方 → to = m'（锚点 remove 后索引）；缝在组标题行下
+  方 / 层行上方（组顶）→ to = m'+1。旧两步组合会因 layers_json
+  同步重建销毁 delegate、吞掉第二步（用户报「换分组固定在组顶」）。
 
-场景 B（同级分组调序）：拖组 1 到组 2 最高成员下面 → group-z，期望
-组 1 标题出现在组 2 下面、组块连续、其余相对序不变。
+场景 D：同组内拖到组顶（用户报「88 拖到上方图层没插到最前方」）。
+
+场景 B/B2：组块 z 排序 group-z。B2 是「组向上拖」（t 落到块成员
+索引之前）—— 旧构造循环在这里产出重复索引、ReorderLayers 直接
+报错（用户报「同级分组调整顺序异常」）。
 """
 import os
 import subprocess
@@ -32,16 +37,16 @@ def run(ops, timeout=90):
     return lines
 
 
-def show(rows, groups):
-    """按显示序打印行。"""
-    gmeta = {g['id']: g for g in groups}
-    out = []
-    for r in rows:
-        if r.get('gid'):
-            out.append('[组%d %s]' % (r['gid'], gmeta.get(r['gid'], {}).get('n', '')))
-        else:
-            out.append('L%d(%s)' % (r['i'], r.get('n', '')))
-    return ' '.join(out)
+def names(lines):
+    """显示序名字序列（行序恒为文档索引降序，位置变化看名字）。"""
+    ld = parse_events(lines, 'layers-dump')[-1]['layers']
+    return [r.get('n') for r in ld if r.get('i', -1) > 0]
+
+
+def group_of_name(lines, name):
+    """按层名查归属（层移动后文档索引会变，名字才稳定）。"""
+    ld = parse_events(lines, 'layers-dump')[-1]['layers']
+    return next((r.get('g', 0) for r in ld if r.get('n') == name), 0)
 
 
 def main():
@@ -53,46 +58,80 @@ def main():
              'layer-group']
     lines = run(SETUP + ['groups-dump', 'layers-dump'])
     gd = parse_events(lines, 'groups-dump')[-1]['groups']
-    ld = parse_events(lines, 'layers-dump')[-1]['layers']
-    print('初始:', show(ld, gd))
-    g2 = next(g['id'] for g in gd if 3 in (g.get('mids') or []))
+    print('初始:', [r.get('n') for r in
+                    parse_events(lines, 'layers-dump')[-1]['layers']])
+    # mids 是层稳定 id（= 文档索引 + 1，背景 id=1），不是文档索引。
+    g1 = next(g['id'] for g in gd if 2 in (g.get('mids') or []))
+    g2 = next(g['id'] for g in gd if 4 in (g.get('mids') or []))
 
-    # ---- 场景 A：层 2（组1 内）拖到层 3（组3 内）行下半 ----
-    # release 两步：move_group(2→组3) + z-move(2, 2)（m=3, m'-1=2）。
-    # 层 2 原文档索引 2 → toZ==from 不动 z，只改归属 → 显示序不变，
-    # 但 L2 显示在 L3 下一行（L2 在组 3 内、索引 2 < 3）。
-    lines = run(SETUP + ['move-group:2,%d' % g2, 'z-move:2,2',
-                         'groups-dump', 'layers-dump'])
+    ok = {}
+
+    # ---- A1：层 2（组1 内，idx2）拖到层 3（组2 内，idx3）行下方 ----
+    # 缝在 L3 下方 = L2 原位（L2 就在 L3 下面相邻）→ toZ = m' = 2 =
+    # from → 只归组不落位。显示序不变，归属变 g2。
+    lines = run(SETUP + ['lmove-at:2,%d,2' % g2, 'layers-dump'])
+    seq = names(lines)
+    ok['A1'] = seq == ['5', '4', '3', '2', '1'] and group_of_name(lines, '2') == g2
+    print('A1 原位归组:', seq, 'PASS' if ok['A1'] else 'FAIL')
+
+    # ---- A2：层 2 拖到层 3 行上方 = 组 2 标题行下方 = 组顶 ----
+    # toZ = mp+1 = (3-1)+1 = 3 → remove(2) 后 L2 落 idx3 > L3(idx2)。
+    lines = run(SETUP + ['lmove-at:2,%d,3' % g2, 'layers-dump'])
+    seq = names(lines)
+    ok['A2'] = seq == ['5', '4', '2', '3', '1'] and group_of_name(lines, '2') == g2
+    print('A2 跨组一步到组顶:', seq, 'PASS' if ok['A2'] else 'FAIL')
+
+    # ---- D：同组内把层 1（组1 底，idx1）拖到组内最高成员层 2 上方 ----
+    # toZ = mp+1 = (2-1)+1 = 2 → remove(1) 后 L1 落 idx2 > L2(idx1)。
+    lines = run(SETUP + ['z-move:1,2', 'layers-dump'])
+    seq = names(lines)
+    ok['D'] = seq == ['5', '4', '3', '1', '2']
+    print('D 同组拖到组顶:', seq, 'PASS' if ok['D'] else 'FAIL')
+
+    # ---- E：跨组一步式（层 1 → 组 2 组顶），撤销一次全恢复 ----
+    lines = run(SETUP + ['lmove-at:1,%d,4' % g2, 'layers-dump'])
+    seq = names(lines)
+    in_g2 = group_of_name(lines, '1') == g2
+    lines = run(SETUP + ['lmove-at:1,%d,4' % g2, 'undo', 'layers-dump'])
+    seq_undo = names(lines)
+    ok['E'] = (seq == ['5', '1', '4', '3', '2'] and in_g2
+               and seq_undo == ['5', '4', '3', '2', '1'])
+    print('E 跨组一步+undo:', seq, '→', seq_undo,
+          'PASS' if ok['E'] else 'FAIL')
+
+    # ---- B：把组 1（块 {1,2}）排到层 4 下面（锚=4, above=False）----
+    # shifted = 4-2 = 2 → t=2 → 块占 [2,3] → doc=[0,3,1,2,4,5]。
+    lines = run(SETUP + ['group-z:1,4,0', 'layers-dump'])
+    seq = names(lines)
+    ok['B'] = seq == ['5', '4', '2', '1', '3']
+    print('B 组块向下排:', seq, 'PASS' if ok['B'] else 'FAIL')
+
+    # ---- B2：组 2（块 {3,4}）向上拖到层 1 下面（锚=1, above=False）----
+    # shifted = 1 → t=1 落在块成员索引之前：修复前构造循环在这里重复
+    # push 块成员 → ReorderLayers 报 LayerIndex(6)。
+    lines = run(SETUP + ['group-z:%d,1,0' % g2, 'groups-dump', 'layers-dump'])
     gd = parse_events(lines, 'groups-dump')[-1]['groups']
-    ld = parse_events(lines, 'layers-dump')[-1]['layers']
-    # 显示顺序 = dump 行序；行 i 字段恒为文档索引降序（rev），位置变化
-    # 要看名字序列。
-    seq = [r.get('n') for r in ld if r.get('i', -1) > 0]
-    ok_a = seq == ['5', '4', '3', '2', '1']
-    in_g2 = next((r['g'] for r in ld if r.get('i') == 2), 0) == g2
-    print('场景A 显示层序:', seq, 'PASS' if (ok_a and in_g2) else 'FAIL',
-          '|', show(ld, gd))
+    seq = names(lines)
+    ok['B2'] = seq == ['5', '2', '1', '4', '3']
+    print('B2 组块向上排:', seq, 'PASS' if ok['B2'] else 'FAIL', '|',
+          [(r['i'], r.get('n'), r.get('g')) for r in
+           parse_events(lines, 'layers-dump')[-1]['layers']])
 
-    # ---- 场景 B：把组 1（块 {1,2}）排到层 4 下面（锚=4, above=False）----
-    # shifted = 4-2 = 2 → t=2 → 块占 [2,3] → doc=[0,3,1,2,4]
-    # 显示序 4,2,1,3：组 1 标题紧贴 L4 下一行 ✓
-    lines = run(SETUP + ['group-z:1,4,0', 'groups-dump', 'layers-dump'])
-    gd = parse_events(lines, 'groups-dump')[-1]['groups']
-    ld = parse_events(lines, 'layers-dump')[-1]['layers']
-    print('场景B raw:', [(r['i'], r.get('n')) for r in ld])
-    seq = [r.get('n') for r in ld if r.get('i', -1) > 0]
-    ok_b = seq == ['5', '4', '2', '1', '3']
-    print('场景B 显示层序:', seq, 'PASS' if ok_b else 'FAIL',
-          '|', show(ld, gd))
-
-    # ---- 场景 C：撤销场景 B 恢复原状 ----
+    # ---- C：撤销场景 B 恢复原状 ----
     lines = run(SETUP + ['group-z:1,4,0', 'undo', 'layers-dump'])
-    ld = parse_events(lines, 'layers-dump')[-1]['layers']
-    seq = [r.get('n') for r in ld if r.get('i', -1) > 0]
-    ok_c = seq == ['5', '4', '3', '2', '1']
-    print('场景C undo 显示层序:', seq, 'PASS' if ok_c else 'FAIL')
+    seq = names(lines)
+    ok['C'] = seq == ['5', '4', '3', '2', '1']
+    print('C undo:', seq, 'PASS' if ok['C'] else 'FAIL')
 
-    print('RESULT:', 'PASS' if (ok_a and ok_b and ok_c) else 'FAIL')
+    # ---- F：to = n-1（append 位）插到全文档最顶 ----
+    # 旧 cap = n-2 把它钳到 n-2 → 只落到第二名（cap 修复的回归）。
+    lines = run(SETUP + ['z-move:1,5', 'layers-dump'])
+    seq = names(lines)
+    ok['F'] = seq == ['1', '5', '4', '3', '2']
+    print('F to=n-1 插到最顶:', seq, 'PASS' if ok['F'] else 'FAIL')
+
+    bad = [k for k, v in ok.items() if not v]
+    print('RESULT:', 'PASS' if not bad else 'FAIL ' + ','.join(bad))
 
 
 if __name__ == '__main__':

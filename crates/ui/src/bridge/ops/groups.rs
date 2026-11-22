@@ -432,6 +432,128 @@ impl qobject::Bridge {
         );
     }
 
+    /// 归组 + z 落位一步完成（面板跨组拖层）。★必须走这里，不能在 QML
+    /// 里拆 `move_layer_to_group` + `reorder_layer` 两次调用：归组同步
+    /// 触发 layers_json 重建、销毁拖拽 delegate，第二步永远不执行
+    /// （用户报的「换分组固定在目标分组最上面」）。`to_z < 0` = 只归组。
+    pub fn move_layer_to_group_at(
+        mut self: Pin<&mut Self>,
+        index: i32,
+        group_id: i32,
+        to_z: i32,
+    ) {
+        if !self.group_edit_allowed() || index < 0 || group_id < 0 {
+            return;
+        }
+        let target = if group_id == 0 { None } else { Some(group_id as u32) };
+        let (result, needs_preview) = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => (Err("no document".to_string()), false),
+                Some(session) => {
+                    let idx = index as usize;
+                    let src_flags =
+                        session.doc.group_state_flags(session.doc.group_of(idx));
+                    let dst_flags = session.doc.group_state_flags(target);
+                    let visible_before = session
+                        .doc
+                        .layers
+                        .get(idx)
+                        .map(|l| l.visible)
+                        .unwrap_or(false);
+                    // to_z < 0 → 传 idx（= to_z == index，core 里自动只归组）。
+                    let z = if to_z < 0 { idx } else { to_z as usize };
+                    let result = session
+                        .doc
+                        .move_layer_to_group_at(idx, target, z)
+                        .map(|()| session.dirty = true)
+                        .map_err(|e| e.to_string());
+                    let visible_after = session
+                        .doc
+                        .layers
+                        .get(idx)
+                        .map(|l| l.visible)
+                        .unwrap_or(false);
+                    // 落位改变合成顺序，与显隐切换、隔离组环境变化一样要
+                    // 整幅重算，不能只刷缩略图。
+                    let needs_preview = visible_before != visible_after
+                        || src_flags.effects
+                        || dst_flags.effects
+                        || (to_z >= 0 && to_z != index);
+                    (result, needs_preview)
+                }
+            }
+        };
+        if let Err(e) = result {
+            self.as_mut().group_hint(&e);
+            return;
+        }
+        if needs_preview {
+            self.as_mut().refresh_preview();
+        } else {
+            self.as_mut().refresh_layers_only();
+        }
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"layer-move-group-at\",\"index\":{index},\
+             \"group\":{group_id},\"z\":{to_z}}}"
+        );
+    }
+
+    /// 组「归组 + z 排序」一步完成（面板拖组跨容器）。`target_id < 0` =
+    /// 只排序不改归属；`anchor <= 0` = 只归组不排序。
+    pub fn move_group_to_group_at(
+        mut self: Pin<&mut Self>,
+        group_id: i32,
+        target_id: i32,
+        anchor: i32,
+        above: bool,
+    ) {
+        if !self.group_edit_allowed() || group_id <= 0 {
+            return;
+        }
+        let want_regroup = target_id >= 0 && group_id != target_id;
+        let want_z = anchor > 0;
+        if !want_regroup && !want_z {
+            return;
+        }
+        let target = if target_id == 0 { None } else { Some(target_id as u32) };
+        let result = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                None => Err("no session".to_string()),
+                Some(session) => {
+                    let doc = &mut session.doc;
+                    match (want_regroup, want_z) {
+                        (true, true) => doc
+                            .move_group_to_group_at(
+                                group_id as u32,
+                                target,
+                                Some((anchor as usize, above)),
+                            )
+                            .map(|()| session.dirty = true),
+                        (true, false) => doc
+                            .move_group_to_group(group_id as u32, target)
+                            .map(|()| session.dirty = true),
+                        (false, true) => doc
+                            .move_group_z(group_id as u32, anchor as usize, above)
+                            .map(|()| session.dirty = true),
+                        (false, false) => Ok(()),
+                    }
+                    .map_err(|e| e.to_string())
+                }
+            }
+        };
+        if let Err(e) = result {
+            self.as_mut().group_hint(&e);
+            return;
+        }
+        self.as_mut().refresh_preview();
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"group-move-at\",\"id\":{group_id},\
+             \"target\":{target_id},\"anchor\":{anchor},\"above\":{above}}}"
+        );
+    }
+
     // ---- 组混合模式 / 不透明度 / 穿透（P0）---------------------------
     pub fn group_blend_mode(self: Pin<&mut Self>, group_id: i32) -> i32 {
         self.session

@@ -47,6 +47,11 @@ pub struct LayerProperties {
     /// Layer styles (`lfx2` block), when present. Disabled styles are kept:
     /// the decoder filters on `enabled`.
     pub(crate) layer_effects: Option<Vec<crate::effects::LayerEffect>>,
+    /// The **complete** raw effects block (signature + key + length + data) of
+    /// the last effects record (`lfx2`/`lfxs`/`lmfx`), kept for byte-identical
+    /// write-back while the style stays unedited. The parsed
+    /// [`Self::layer_effects`] drives baking; this drives the round-trip.
+    pub(crate) raw_lfx2: Option<Vec<u8>>,
     /// Rectangle of the user layer mask (channel `-2`), when the layer has one.
     pub(crate) mask_rect: Option<MaskRect>,
     /// 矢量蒙版（`vmsk` / `vsms`）：形状图层的轮廓，见 [`crate::vector`]。
@@ -183,6 +188,7 @@ impl LayerProperties {
             brightness_contrast: layer_record.brightness_contrast,
             hue_saturation: layer_record.hue_saturation,
             layer_effects: layer_record.layer_effects.clone(),
+            raw_lfx2: layer_record.raw_lfx2.clone(),
             mask_rect: layer_record.mask_rect,
             vector_mask: layer_record.vector_mask.clone(),
             vector_fill: layer_record.vector_fill.clone(),
@@ -233,6 +239,12 @@ impl LayerProperties {
     /// Layer styles (`lfx2`), in file order, including disabled ones.
     pub fn layer_effects(&self) -> Option<&[crate::effects::LayerEffect]> {
         self.layer_effects.as_deref()
+    }
+
+    /// The complete raw effects block on this record (`lfx2` / `lfxs`), for
+    /// byte-identical write-back while the style stays unedited.
+    pub fn raw_lfx2(&self) -> Option<&[u8]> {
+        self.raw_lfx2.as_deref()
     }
 
     /// 形状图层的矢量轮廓（`vmsk` / `vsms`）。`None` 表示这层不是形状层。
@@ -628,6 +640,9 @@ pub struct LayerRecord {
     pub(super) hue_saturation: Option<HueSaturation>,
     /// Layer styles ("lfx2"), when present
     pub(super) layer_effects: Option<Vec<crate::effects::LayerEffect>>,
+    /// Raw bytes of the last effects block, for byte-identical write-back.
+    /// See [`LayerProperties::raw_lfx2`].
+    pub(super) raw_lfx2: Option<Vec<u8>>,
     /// User layer mask rectangle (channel `-2`), when present
     pub(super) mask_rect: Option<MaskRect>,
     /// 矢量蒙版（`vmsk` / `vsms`）

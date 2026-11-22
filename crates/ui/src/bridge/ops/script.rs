@@ -1311,6 +1311,28 @@ impl qobject::Bridge {
                     let above = it.next().map(|v| v.trim() != "0").unwrap_or(false);
                     self.as_mut().move_group_z(gid, anchor, above);
                 }
+                // `lmove-at:index,gid,z` —— 模拟面板跨组拖层的一步式落位
+                // （归组 + MoveLayer 单条历史）；z=-1 = 只归组。
+                other if other.starts_with("lmove-at:") => {
+                    let body = other.trim_start_matches("lmove-at:");
+                    let mut it = body.split(',');
+                    let ix = it.next().and_then(|v| v.parse().ok()).unwrap_or(-1);
+                    let gid = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let z = it.next().and_then(|v| v.parse().ok()).unwrap_or(-1);
+                    self.as_mut().move_layer_to_group_at(ix, gid, z);
+                }
+                // `gmove-at:gid,target,anchor,0|1` —— 模拟面板拖组跨容器的
+                // 一步式落位（归组 + ReorderLayers 单条历史）；
+                // target=-1 = 只排序，anchor<=0 = 只归组。
+                other if other.starts_with("gmove-at:") => {
+                    let body = other.trim_start_matches("gmove-at:");
+                    let mut it = body.split(',');
+                    let gid = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let target = it.next().and_then(|v| v.parse().ok()).unwrap_or(-1);
+                    let anchor = it.next().and_then(|v| v.parse().ok()).unwrap_or(-1);
+                    let above = it.next().map(|v| v.trim() != "0").unwrap_or(false);
+                    self.as_mut().move_group_to_group_at(gid, target, anchor, above);
+                }
                 // `hit-alpha:index,x,y` —— 画布点选命中测试（含蒙版）。
                 other if other.starts_with("hit-alpha:") => {
                     let body = other.trim_start_matches("hit-alpha:");
@@ -1493,6 +1515,38 @@ impl qobject::Bridge {
                     println!(
                         "{{\"phase\":\"ui\",\"event\":\"groups-dump\",\"groups\":{json}}}"
                     );
+                }
+                // `fx-dump` —— 组样式透传诊断：每个组的 raw_style 字节数与
+                // 影子层（synthetic）数量/可见性，排查 lfxs 为什么没写回。
+                "fx-dump" => {
+                    let guard = self.session.borrow();
+                    if let Some(s) = guard.as_ref() {
+                        let mut rows = Vec::new();
+                        for g in &s.doc.groups {
+                            let shadows: Vec<String> = s
+                                .doc
+                                .layers
+                                .iter()
+                                .filter(|l| l.synthetic && l.group == Some(g.id))
+                                .map(|l| {
+                                    let n = l.name.replace('\\', "\\\\").replace('"', "");
+                                    format!("\\\"{}:v={}\\\"", n, l.visible)
+                                })
+                                .collect();
+                            let gname = g.name.replace('\\', "\\\\").replace('"', "");
+                            rows.push(format!(
+                                "{{\"gid\":{},\"n\":\"{}\",\"raw\":{},\"shadows\":[{}]}}",
+                                g.id,
+                                gname,
+                                g.raw_style.as_ref().map(|b| b.len()).unwrap_or(0),
+                                shadows.join(",")
+                            ));
+                        }
+                        println!(
+                            "{{\"phase\":\"ui\",\"event\":\"fx-dump\",\"groups\":[{}]}}",
+                            rows.join(",")
+                        );
+                    }
                 }
                 // `layer-dump:index:path` —— 把图层位图原样存成 PNG。
                 // 诊断「拖动帧里图层那一块是空的」时，先确认图层位图本身有
