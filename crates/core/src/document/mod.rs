@@ -1071,6 +1071,97 @@ impl Document {
         self.set_layer_transform(index, Some(to))
     }
 
+    /// 批量平移：所有目标包进一条 `EditOp::Batch` = **一条撤销**。
+    ///
+    /// 与 [`Document::translate_layer`] 同语义（参数层同步 `center`，标记层
+    /// 走 `TranslateLayer`），只是把 N 层合成一步。多选拖动 / 组选中整组
+    /// 拖动都走这里，否则「拖一下按一次 Ctrl+Z 只退一层」。
+    ///
+    /// 锁定 / 越界的层由调用方过滤后传入；core 遇到越界会整体失败（Batch
+    /// 已生效的部分会回滚），不做静默跳过 —— 宁可整步不做，也不要「拖了
+    /// 一半」的状态。
+    pub fn translate_layers(
+        &mut self,
+        indices: &[usize],
+        dx: i32,
+        dy: i32,
+    ) -> Result<(), EditError> {
+        if dx == 0 && dy == 0 || indices.is_empty() {
+            return Ok(());
+        }
+        let mut ops: Vec<EditOp> = Vec::with_capacity(indices.len());
+        let mut seen: Vec<usize> = Vec::with_capacity(indices.len());
+        for &i in indices {
+            if seen.contains(&i) {
+                continue;
+            }
+            seen.push(i);
+            let layer = self
+                .layers
+                .get(i)
+                .ok_or(EditError::LayerIndex(i))?;
+            if layer.is_mark() {
+                let from = layer.offset();
+                ops.push(EditOp::TranslateLayer {
+                    index: i,
+                    from,
+                    to: (from.0 + dx, from.1 + dy),
+                });
+                continue;
+            }
+            let r = layer.raster().ok_or(EditError::LayerIndex(i))?;
+            let from = r.transform.clone().unwrap_or_else(|| {
+                LayerTransform::from_offset(r.image.clone(), r.offset.0, r.offset.1)
+            });
+            let mut to = from.clone();
+            to.center.0 += dx as f64;
+            to.center.1 += dy as f64;
+            ops.push(EditOp::SetLayerTransform {
+                index: i,
+                from: Some(from),
+                to: Some(to),
+            });
+        }
+        if ops.is_empty() {
+            return Ok(());
+        }
+        self.execute(EditOp::Batch(ops))
+    }
+
+    /// 批量参数变换（缩放 / 旋转落定）：一次 `Batch` = 一条撤销。
+    ///
+    /// `items` 是 `(图层下标, 目标变换)`；与当前参数完全相同的条目会被
+    /// 跳过（不产生空历史）。标记层没有参数变换，传进来会整体失败 ——
+    /// 调用方应只挑位图图层。
+    pub fn set_layer_transforms(
+        &mut self,
+        items: &[(usize, Option<LayerTransform>)],
+    ) -> Result<(), EditError> {
+        let mut ops: Vec<EditOp> = Vec::with_capacity(items.len());
+        for (i, to) in items {
+            let r = self
+                .layers
+                .get(*i)
+                .and_then(|l| l.raster())
+                .ok_or(EditError::LayerIndex(*i))?;
+            let from = r.transform.clone().unwrap_or_else(|| {
+                LayerTransform::from_offset(r.image.clone(), r.offset.0, r.offset.1)
+            });
+            if to.as_ref() == Some(&from) {
+                continue;
+            }
+            ops.push(EditOp::SetLayerTransform {
+                index: *i,
+                from: Some(from),
+                to: to.clone(),
+            });
+        }
+        if ops.is_empty() {
+            return Ok(());
+        }
+        self.execute(EditOp::Batch(ops))
+    }
+
     /// P0-1 参数化变换入口。from/to 只带参数与 `Arc<原图>`，一条历史即可
     /// 精确撤销；P0-2 的统一会话会把移动 / 缩放 / 旋转全部汇流到这里。
     /// 传 `None` = 把该层烘焙成普通位图图层（丢弃无损状态）。

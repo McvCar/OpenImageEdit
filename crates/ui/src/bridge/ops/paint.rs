@@ -589,10 +589,20 @@ impl qobject::Bridge {
     /// 都只被插值一次，画质不会越拖越糊。角度对话框用 false —— 它每次都是
     /// 从「图层当前的样子」出发的一次性操作。
     pub fn rotate_layer_begin(self: Pin<&mut Self>, index: i32, keep_session: bool) -> f64 {
+        // ★批量旋转（多选 ≥2 / 组选中）：绕并集框中心整组转，落定一条 Batch。
+        //   基角恒 0（整组没有「累计角」的概念），QML 只拿它做框簿记。
+        let targets = super::transform::batch_targets_of(&*self, true);
         let mut guard = self.session.borrow_mut();
         let Some(session) = guard.as_mut() else {
             return 0.0;
         };
+        if targets.len() >= 2 {
+            session.clear_live_gestures();
+            if let Some(b) = super::transform::build_batch_state(session, &targets, BATCH_ROTATE) {
+                session.put_batch_state(b);
+            }
+            return 0.0;
+        }
         let ix = index.max(0) as usize;
         let Some(layer) = session.doc.layers.get(ix) else {
             return 0.0;
@@ -682,6 +692,35 @@ impl qobject::Bridge {
         expand: bool,
         mods: i32,
     ) {
+        // ★批量旋转实时帧：整组角度加同一个增量、中心绕并集框中心转。
+        let handled = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                Some(session) if session.batch_kind() == Some(BATCH_ROTATE) => {
+                    let Some(mut b) = session.take_batch_state() else {
+                        return;
+                    };
+                    let snapped = editcore::snap_angle(
+                        degrees,
+                        mods & super::transform::MOD_SHIFT != 0,
+                        15.0,
+                        if mods & super::transform::MOD_MAGNET != 0 {
+                            super::transform::MAGNET_TOL
+                        } else {
+                            0.0
+                        },
+                    );
+                    apply_batch_rotate(&mut session.doc, &mut b, snapped);
+                    session.put_batch_state(b);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if handled {
+            self.refresh_preview();
+            return;
+        }
         {
             let mut guard = self.session.borrow_mut();
             let Some(session) = guard.as_mut() else { return };
@@ -756,6 +795,51 @@ impl qobject::Bridge {
         expand: bool,
         mods: i32,
     ) {
+        // ★批量旋转落定：取消 = 整组回滚；提交 = 最终角再算一帧 + 一条 Batch。
+        let batch: Option<Result<bool, String>> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                Some(session) if session.batch_kind() == Some(BATCH_ROTATE) => {
+                    let Some(mut b) = session.take_batch_state() else {
+                        return;
+                    };
+                    if apply {
+                        let snapped = editcore::snap_angle(
+                            degrees,
+                            mods & super::transform::MOD_SHIFT != 0,
+                            15.0,
+                            if mods & super::transform::MOD_MAGNET != 0 {
+                                super::transform::MAGNET_TOL
+                            } else {
+                                0.0
+                            },
+                        );
+                        apply_batch_rotate(&mut session.doc, &mut b, snapped);
+                        let r = commit_batch(&mut session.doc, &b);
+                        if let Ok(true) = r {
+                            session.dirty = true;
+                        }
+                        Some(r)
+                    } else {
+                        rollback_batch(&mut session.doc, &b);
+                        Some(Ok(false))
+                    }
+                }
+                _ => None,
+            }
+        };
+        if let Some(result) = batch {
+            let viewport = *self.viewport.borrow();
+            let ok = matches!(result, Ok(true));
+            self.as_mut().apply_layer_edit(viewport, result);
+            if !ok {
+                self.as_mut().refresh_preview();
+            }
+            println!(
+                "{{\"phase\":\"ui\",\"event\":\"batch-rotate-end\",\"apply\":{apply},\"deg\":{degrees:.2}}}"
+            );
+            return;
+        }
         {
             let mut guard = self.session.borrow_mut();
             let Some(session) = guard.as_mut() else { return };

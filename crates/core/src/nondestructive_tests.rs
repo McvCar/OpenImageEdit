@@ -238,3 +238,82 @@ fn panel_x_y_are_plain_translations_and_undo_is_one_step() {
     let q = doc.layers[1].transform_state().panel_values();
     assert_eq!(q.x, 0.0);
 }
+
+// ---- 批量变换（多选拖动 / 缩放 / 旋转）--------------------------------
+
+fn doc_with_two_layers() -> Document {
+    let mut doc = Document::from_image(checker(120, 100));
+    doc.layers.push(Layer::new("A", checker(30, 20)));
+    doc.layers.push(Layer::new("B", checker(40, 24)));
+    doc.layers[1].set_offset((10, 10));
+    doc.layers[2].set_offset((60, 40));
+    doc
+}
+
+#[test]
+fn translate_layers_is_one_history_step_and_undo_restores_all() {
+    let mut doc = doc_with_two_layers();
+    let before = doc.history_len();
+    doc.translate_layers(&[1, 2], 7, -5).unwrap();
+    assert_eq!(doc.history_len(), before + 1, "批量平移必须只产生一条历史");
+    assert_eq!(doc.layers[1].offset(), (17, 5));
+    assert_eq!(doc.layers[2].offset(), (67, 35));
+    // 参数层的 center 也要同步（否则渲染框内容分家）。
+    for i in [1usize, 2] {
+        let t = doc.layers[i].xform().expect("平移后应为参数层");
+        let b = doc.layers[i].bounds();
+        assert!(
+            (t.center.0 - (b.x as f64 + b.width as f64 / 2.0)).abs() < 1.5,
+            "center 应与外接框中心一致"
+        );
+    }
+    doc.undo().unwrap();
+    assert_eq!(doc.layers[1].offset(), (10, 10));
+    assert_eq!(doc.layers[2].offset(), (60, 40));
+    doc.redo().unwrap();
+    assert_eq!(doc.layers[1].offset(), (17, 5));
+    assert_eq!(doc.layers[2].offset(), (67, 35));
+}
+
+#[test]
+fn translate_layers_handles_marks_and_dedups() {
+    let mut doc = doc_with_two_layers();
+    // 重复下标只能生效一次。
+    doc.translate_layers(&[1, 1, 2], 4, 4).unwrap();
+    assert_eq!(doc.layers[1].offset(), (14, 14));
+    assert_eq!(doc.layers[2].offset(), (64, 44));
+    // 空集合 / 零位移不产生历史。
+    let before = doc.history_len();
+    doc.translate_layers(&[], 5, 5).unwrap();
+    doc.translate_layers(&[1], 0, 0).unwrap();
+    assert_eq!(doc.history_len(), before);
+}
+
+#[test]
+fn set_layer_transforms_is_one_step_and_undo_restores_each_layer() {
+    let mut doc = doc_with_two_layers();
+    let mut a = doc.layers[1].xform().cloned().unwrap_or_else(|| {
+        LayerTransform::from_offset(doc.layers[1].image().unwrap().clone(), 10, 10)
+    });
+    let mut b = doc.layers[2].xform().cloned().unwrap_or_else(|| {
+        LayerTransform::from_offset(doc.layers[2].image().unwrap().clone(), 60, 40)
+    });
+    // 两层各放大 2 倍（模拟批量缩放落定）。
+    a.scale = (2.0, 2.0);
+    a.center = (25.0, 20.0);
+    b.scale = (2.0, 2.0);
+    b.center = (80.0, 52.0);
+    let before = doc.history_len();
+    doc.set_layer_transforms(&[(1, Some(a.clone())), (2, Some(b.clone()))]).unwrap();
+    assert_eq!(doc.history_len(), before + 1, "批量缩放必须只产生一条历史");
+    assert_eq!(doc.layers[1].image().unwrap().dimensions(), (60, 40));
+    assert_eq!(doc.layers[2].image().unwrap().dimensions(), (80, 48));
+    doc.undo().unwrap();
+    assert_eq!(doc.layers[1].image().unwrap().dimensions(), (30, 20));
+    assert_eq!(doc.layers[2].image().unwrap().dimensions(), (40, 24));
+    // 与当前一致的空写入不产生历史。
+    let cur = doc.layers[1].xform().cloned().unwrap();
+    let before = doc.history_len();
+    doc.set_layer_transforms(&[(1, Some(cur))]).unwrap();
+    assert_eq!(doc.history_len(), before);
+}

@@ -1,5 +1,6 @@
 // 全部图层操作。
 use super::super::*;
+use super::transform::*;
 
 impl qobject::Bridge {
     pub fn layer_name(self: Pin<&mut Self>, index: i32) -> QString {
@@ -529,7 +530,7 @@ impl qobject::Bridge {
     }
 
     pub fn scale_layer_update(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         w: i32,
         h: i32,
         ox: i32,
@@ -541,6 +542,33 @@ impl qobject::Bridge {
         center_dx: f64,
         center_dy: f64,
     ) {
+        // ★批量缩放实时帧：整组按「并集框 → 新框」映射，逐层写参数层并
+        //   烘一版像素（渲染器只认烘焙位图）。起手快照在 BatchState 里，
+        //   每帧都从快照重算，不累积插值。
+        let batch = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                Some(session) if session.batch_kind() == Some(BATCH_SCALE) => {
+                    let Some(mut b) = session.take_batch_state() else {
+                        return;
+                    };
+                    if w >= 1 && h >= 1 {
+                        apply_batch_scale(
+                            &mut session.doc,
+                            &mut b,
+                            (ox as f64, oy as f64, w as f64, h as f64),
+                        );
+                    }
+                    session.put_batch_state(b);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if batch {
+            self.refresh_preview();
+            return;
+        }
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
             return;
         };
@@ -611,6 +639,48 @@ impl qobject::Bridge {
         skew_x: f64,
         skew_y: f64,
     ) {
+        let viewport = *self.viewport.borrow();
+        // ★批量缩放落定：取消 = 整组回滚；提交 = 用最终框重算一遍再提交。
+        let batch: Option<Result<bool, String>> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                Some(session) if session.batch_kind() == Some(BATCH_SCALE) => {
+                    let Some(mut b) = session.take_batch_state() else {
+                        return;
+                    };
+                    if commit {
+                        if w >= 1 && h >= 1 {
+                            apply_batch_scale(
+                                &mut session.doc,
+                                &mut b,
+                                (ox as f64, oy as f64, w as f64, h as f64),
+                            );
+                        }
+                        let r = commit_batch(&mut session.doc, &b);
+                        if let Ok(true) = r {
+                            session.dirty = true;
+                        }
+                        Some(r)
+                    } else {
+                        rollback_batch(&mut session.doc, &b);
+                        Some(Ok(false))
+                    }
+                }
+                _ => None,
+            }
+        };
+        if let Some(result) = batch {
+            let ok = matches!(result, Ok(true));
+            self.as_mut().apply_layer_edit(viewport, result);
+            if !ok {
+                // 取消时 apply_layer_edit 不会重绘，实时帧要自己抹掉。
+                self.as_mut().refresh_preview();
+            }
+            println!(
+                "{{\"phase\":\"ui\",\"event\":\"batch-scale-end\",\"commit\":{commit},\"w\":{w},\"h\":{h}}}"
+            );
+            return;
+        }
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
             return;
         };
@@ -847,12 +917,6 @@ impl qobject::Bridge {
     }
 
     pub fn drag_translate_begin(mut self: Pin<&mut Self>) {
-        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
-            return;
-        };
-        if self.layer_locked(ix) {
-            return;
-        }
         // ★起手先把可能残留的旋转 / 缩放临时预览态清干净。合成器只要还停在
         //   special 分支，画的就是「旧快照 + 旧 offset」，而 layers_json 报的
         //   是当前文档的新 offset —— 框跟着鼠标走、内容钉在原地。旋转 45°
@@ -873,6 +937,23 @@ impl qobject::Bridge {
             // 立刻按真实文档重画一帧，把残留的临时合成帧换掉。
             self.as_mut().refresh_preview();
         }
+        // ★批量（多选 ≥2 / 组选中）：一整组实时平移，落定一条 Batch 历史。
+        let targets = batch_targets_of(&*self, false);
+        if targets.len() >= 2 {
+            let mut guard = self.session.borrow_mut();
+            if let Some(session) = guard.as_mut() {
+                if let Some(b) = build_batch_state(session, &targets, BATCH_MOVE) {
+                    session.put_batch_state(b);
+                }
+            }
+            return;
+        }
+        let Some(ix) = self.selected_guard(*self.selected_layer()) else {
+            return;
+        };
+        if self.layer_locked(ix) {
+            return;
+        }
         // 起点不再是 BridgeRust 上另一个孤立字段，而是统一会话的一部分：
         // 缩放 / 旋转起手时清会话会连带把旧起点一起丢掉，不会再出现
         // 「新手势已经起手、旧 drag_start 还留着」的错位。
@@ -891,7 +972,31 @@ impl qobject::Bridge {
         }
     }
 
-    pub fn drag_translate_update(self: Pin<&mut Self>, dx: i32, dy: i32) {
+    pub fn drag_translate_update(mut self: Pin<&mut Self>, dx: i32, dy: i32) {
+        // 批量移动：整组按「起手快照 + 总位移」实时写文档（不记历史）。
+        let handled: Option<bool> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                Some(session) if session.batch_kind() == Some(BATCH_MOVE) => {
+                    let Some(mut b) = session.take_batch_state() else {
+                        return;
+                    };
+                    let same = b.live && b.delta == (dx, dy);
+                    if !same {
+                        apply_batch_move(&mut session.doc, &mut b, dx, dy);
+                    }
+                    session.put_batch_state(b);
+                    Some(!same)
+                }
+                _ => None,
+            }
+        };
+        if let Some(changed) = handled {
+            if changed {
+                self.refresh_preview();
+            }
+            return;
+        }
         let Some((start, start_center)) = self.session.borrow().as_ref().and_then(|s| {
             match s.transform.as_ref() {
                 Some(TransformSession::Move { start, start_center, .. }) => {
@@ -943,8 +1048,37 @@ impl qobject::Bridge {
         self.refresh_preview();
     }
 
-    pub fn drag_translate_end(self: Pin<&mut Self>, commit: bool) {
+    pub fn drag_translate_end(mut self: Pin<&mut Self>, commit: bool) {
         let viewport = *self.viewport.borrow();
+        // 批量落定：取消 = 整组回滚；提交 = 一条 Batch 历史。
+        let batch: Option<Result<bool, String>> = {
+            let mut guard = self.session.borrow_mut();
+            match guard.as_mut() {
+                Some(session) if session.batch_kind() == Some(BATCH_MOVE) => {
+                    let Some(b) = session.take_batch_state() else {
+                        return;
+                    };
+                    if commit {
+                        let r = commit_batch(&mut session.doc, &b);
+                        if let Ok(true) = r {
+                            session.dirty = true;
+                        }
+                        Some(r)
+                    } else {
+                        rollback_batch(&mut session.doc, &b);
+                        Some(Ok(false))
+                    }
+                }
+                _ => None,
+            }
+        };
+        if let Some(result) = batch {
+            self.as_mut().apply_layer_edit(viewport, result);
+            println!(
+                "{{\"phase\":\"ui\",\"event\":\"batch-move-end\",\"commit\":{commit}}}"
+            );
+            return;
+        }
         let Some((_, start, start_center)) = self
             .session
             .borrow_mut()

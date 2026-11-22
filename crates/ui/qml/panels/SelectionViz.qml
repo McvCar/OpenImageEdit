@@ -324,7 +324,8 @@ Item {
             const b = host.selLayerBox
             if (b === null)
                 return ""
-            return "图层 " + Math.round(b.w) + " × " + Math.round(b.h)
+            // 多选时 selLayerBox 是并集包围盒（带 n = "N 个图层"）。
+            return (b.n ? b.n : "图层") + " " + Math.round(b.w) + " × " + Math.round(b.h)
         }
 
         // 不钳画布：超出 previewImage 也照常画（PAD 区域里看得见）。

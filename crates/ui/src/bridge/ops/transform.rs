@@ -57,12 +57,15 @@ const HOLES_PER_SOURCE: usize = 6;
 /// 图层除了自己的外框，还会把**被内容围住的透明区域（洞）**当虚拟图层加
 /// 进来（`hole_candidates`）：元素比洞大、或者只想让一条边压在洞壁上时，
 /// 咬合求解器（要求内容装得下）帮不上忙，但「洞的边 / 中心」照样能吸。
-fn prepare_snap(session: &mut Session, moving: usize) {
+///
+/// `moving` 是本次手势带着走的所有图层（多选批量时是一整组）：它们不能
+/// 出现在候选里，否则「自己吸自己」永远差 0 却疯狂闪参考线。
+fn prepare_snap(session: &mut Session, moving: &[usize]) {
     let cw = session.doc.canvas.width as f64;
     let ch = session.doc.canvas.height as f64;
     let mut c = canvas_candidates(cw, ch);
     for (i, layer) in session.doc.layers.iter().enumerate() {
-        if i == moving || !layer.visible {
+        if moving.contains(&i) || !layer.visible {
             continue;
         }
         let b = layer.bounds();
@@ -105,13 +108,103 @@ fn prepare_snap(session: &mut Session, moving: usize) {
     session.snap = SnapResult::default();
     // 拼图咬合的基准：移动图层**自己的内容框**（alpha 包围盒）。带透明
     // 边距的素材按外框去卡空窗会永远差一个 padding，这里换成真实内容。
-    session.gesture_index = moving as i32;
-    session.fit_content = session
-        .doc
-        .layers
-        .get(moving)
-        .filter(|l| l.visible)
-        .and_then(|l| l.content_bounds(ALPHA_THRESHOLD));
+    // 批量拖动（多选 / 组）不做咬合：整组内容框的「装得下」没有统一语义，
+    // 保持外框对齐即可。
+    session.gesture_index = moving.first().copied().unwrap_or(0) as i32;
+    session.fit_content = if moving.len() == 1 {
+        session
+            .doc
+            .layers
+            .get(moving[0])
+            .filter(|l| l.visible)
+            .and_then(|l| l.content_bounds(ALPHA_THRESHOLD))
+    } else {
+        None
+    };
+}
+
+/// 多选批量目标：≥2 个**未锁定**图层（升序去重）。
+///
+/// `raster_only` = 缩放 / 旋转只吃位图图层（标记层没有参数变换；标记跟着
+/// 整组移动没问题，但它没法被「缩放」）。
+pub(super) fn batch_targets_of(bridge: &qobject::Bridge, raster_only: bool) -> Vec<usize> {
+    let guard = bridge.session.borrow();
+    let Some(session) = guard.as_ref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for i in bridge.selection_indices() {
+        let Some(l) = session.doc.layers.get(i) else { continue };
+        if l.locked {
+            continue;
+        }
+        if raster_only && l.is_mark() {
+            continue;
+        }
+        out.push(i);
+    }
+    out
+}
+
+/// 由目标集合构造批量会话快照（并集框、旋转中心、每层原始参数）。
+///
+/// 返回 `None` = 目标不足两层（或全部没有有效外接框），调用方退回单层路径。
+pub(super) fn build_batch_state(
+    session: &Session,
+    targets: &[usize],
+    kind: i32,
+) -> Option<BatchState> {
+    let mut items = Vec::with_capacity(targets.len());
+    let (mut x0, mut y0) = (f64::MAX, f64::MAX);
+    let (mut x1, mut y1) = (f64::MIN, f64::MIN);
+    for &i in targets {
+        let layer = session.doc.layers.get(i)?;
+        if layer.is_mark() && kind != BATCH_MOVE {
+            return None;
+        }
+        let b = layer.bounds();
+        let (bx, by) = (b.x as f64, b.y as f64);
+        let (bw, bh) = (b.width as f64, b.height as f64);
+        if bw <= 0.0 || bh <= 0.0 {
+            continue;
+        }
+        x0 = x0.min(bx);
+        y0 = y0.min(by);
+        x1 = x1.max(bx + bw);
+        y1 = y1.max(by + bh);
+        let (orig, had_xform) = match layer.raster() {
+            Some(r) => match r.transform.clone() {
+                Some(t) => (Some(t), true),
+                // 无参数层：用当前位图 + offset 造一个 identity，回滚 / 落定
+                // 都按它反推，不需要另存一份像素。
+                None => (
+                    Some(LayerTransform::from_offset(r.image.clone(), b.x, b.y)),
+                    false,
+                ),
+            },
+            None => (None, false),
+        };
+        items.push(BatchItem {
+            index: i,
+            is_mark: layer.is_mark(),
+            orig,
+            had_xform,
+            bounds: (bx, by, bw, bh),
+            last: None,
+        });
+    }
+    if items.len() < 2 {
+        return None;
+    }
+    Some(BatchState {
+        kind,
+        box_: (x0, y0, (x1 - x0).max(1.0), (y1 - y0).max(1.0)),
+        pivot: ((x0 + x1) / 2.0, (y0 + y1) / 2.0),
+        items,
+        angle: 0.0,
+        delta: (0, 0),
+        live: false,
+    })
 }
 
 /// 每帧重建「内容框 + 阈值」窗口的占位栅格，求空窗咬合。
@@ -230,15 +323,20 @@ impl qobject::Bridge {
             let Some(ts) = session.transform.take() else {
                 return false;
             };
-            if let TransformSession::Move { index, start, start_center, .. } = ts {
-                if let Some(layer) = session.doc.layers.get_mut(index) {
-                    layer.set_offset(start);
-                    // 与 drag_translate_update 配对的回滚：手势期间 center 也跟着
-                    // 位移了，只还原 offset 会让框和内容错开。
-                    if let (Some(c), Some(t)) = (start_center, layer.xform_mut()) {
-                        t.center = c;
+            match ts {
+                TransformSession::Move { index, start, start_center, .. } => {
+                    if let Some(layer) = session.doc.layers.get_mut(index) {
+                        layer.set_offset(start);
+                        // 与 drag_translate_update 配对的回滚：手势期间 center 也跟着
+                        // 位移了，只还原 offset 会让框和内容错开。
+                        if let (Some(c), Some(t)) = (start_center, layer.xform_mut()) {
+                            t.center = c;
+                        }
                     }
                 }
+                // 批量：实时帧已经写进文档，按起手快照整组回滚。
+                TransformSession::Batch(b) => rollback_batch(&mut session.doc, &b),
+                _ => {}
             }
             session.snap = SnapResult::default();
             session.gesture = -1;
@@ -283,6 +381,10 @@ impl qobject::Bridge {
         disp_scale: f64,
     ) -> bool {
         let enabled = *self.snap_enabled();
+        // ★批量：多选（≥2）/ 组选中时，三种手势都作用在整组上。
+        //   缩放 / 旋转只吃位图层（标记没有参数变换），移动可以带上标记。
+        let targets = batch_targets_of(&*self, gesture != GESTURE_MOVE);
+        let batch = targets.len() >= 2;
         {
             let mut guard = self.session.borrow_mut();
             let Some(session) = guard.as_mut() else {
@@ -293,20 +395,44 @@ impl qobject::Bridge {
             session.disp_scale = if disp_scale > 0.0 { disp_scale } else { 1.0 };
             session.gesture = gesture;
             session.gesture_start = (px, py);
-            session.gesture_rect = session
-                .doc
-                .layers
-                .get(index.max(0) as usize)
-                .map(|l| {
-                    let b = l.bounds();
-                    (b.x as f64, b.y as f64, b.width as f64, b.height as f64)
-                })
-                .unwrap_or((0.0, 0.0, 0.0, 0.0));
+            session.gesture_rect = if batch {
+                // 整组的并集框：吸附 / 咬合按整组外框求解。
+                let mut r = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+                for &i in &targets {
+                    if let Some(l) = session.doc.layers.get(i) {
+                        let b = l.bounds();
+                        r.0 = r.0.min(b.x as f64);
+                        r.1 = r.1.min(b.y as f64);
+                        r.2 = r.2.max(b.x as f64 + b.width as f64);
+                        r.3 = r.3.max(b.y as f64 + b.height as f64);
+                    }
+                }
+                if r.0 > r.2 || r.1 > r.3 {
+                    (0.0, 0.0, 0.0, 0.0)
+                } else {
+                    (r.0, r.1, r.2 - r.0, r.3 - r.1)
+                }
+            } else {
+                session
+                    .doc
+                    .layers
+                    .get(index.max(0) as usize)
+                    .map(|l| {
+                        let b = l.bounds();
+                        (b.x as f64, b.y as f64, b.width as f64, b.height as f64)
+                    })
+                    .unwrap_or((0.0, 0.0, 0.0, 0.0))
+            };
             session.snap = SnapResult::default();
             session.fit_content = None;
             session.gesture_index = index.max(0);
             if snap_allowed(enabled, gesture, mods) && gesture != GESTURE_ROTATE {
-                prepare_snap(session, index.max(0) as usize);
+                let moving: Vec<usize> = if batch {
+                    targets.clone()
+                } else {
+                    vec![index.max(0) as usize]
+                };
+                prepare_snap(session, &moving);
             } else {
                 session.snap_statics.clear();
             }
@@ -328,7 +454,23 @@ impl qobject::Bridge {
                     }
                 }
                 self.as_mut().set_gpu_live(false);
-                self.as_mut().scale_layer_begin();
+                if batch {
+                    // 批量缩放：记快照即可，实时帧由 scale_layer_update 推。
+                    let started = {
+                        let mut guard = self.session.borrow_mut();
+                        let Some(session) = guard.as_mut() else {
+                            return false;
+                        };
+                        build_batch_state(session, &targets, BATCH_SCALE)
+                            .map(|b| session.put_batch_state(b))
+                            .is_some()
+                    };
+                    if !started {
+                        return false;
+                    }
+                } else {
+                    self.as_mut().scale_layer_begin();
+                }
             }
             GESTURE_ROTATE => {
                 {
@@ -338,11 +480,26 @@ impl qobject::Bridge {
                     }
                 }
                 self.as_mut().set_gpu_live(false);
-                self.as_mut().rotate_layer_begin(index, true);
+                if batch {
+                    let started = {
+                        let mut guard = self.session.borrow_mut();
+                        let Some(session) = guard.as_mut() else {
+                            return false;
+                        };
+                        build_batch_state(session, &targets, BATCH_ROTATE)
+                            .map(|b| session.put_batch_state(b))
+                            .is_some()
+                    };
+                    if !started {
+                        return false;
+                    }
+                } else {
+                    self.as_mut().rotate_layer_begin(index, true);
+                }
             }
             GESTURE_MOVE => {
                 self.as_mut().drag_translate_begin();
-                // Tier 1：只对「移动」启用两纹理快路径（缩放 / 旋转涉及重采样，
+                // Tier 1：只对「移动」启用纹理快路径（缩放 / 旋转涉及重采样，
                 // 落定锐度一致性留 P1-A 统一采样器后再接）。生成失败或命中
                 // 回退条件时自动走原 CPU 路径，行为不变。
                 let ix = index.max(0) as usize;
@@ -352,7 +509,12 @@ impl qobject::Bridge {
                     let Some(session) = guard.as_mut() else {
                         return false;
                     };
-                    let on = session.gpu_begin(ix, session.disp_scale, dpr);
+                    // 批量移动用整组静态纹理；单层仍是原来的两/三纹理。
+                    let on = if batch {
+                        session.gpu_begin_set(&targets, session.disp_scale, dpr)
+                    } else {
+                        session.gpu_begin(ix, session.disp_scale, dpr)
+                    };
                     (
                         on,
                         session.gpu_static_url.clone(),
@@ -463,7 +625,7 @@ impl qobject::Bridge {
         // 脚本探针可单独调用（没有手势起手），此时补一次候选预生成。
         if session.snap_statics.is_empty() {
             let ix = (*self.selected_layer()).max(0) as usize;
-            prepare_snap(session, ix);
+            prepare_snap(session, &[ix]);
         }
         let active = if edges <= 0 {
             EDGE_ALL
@@ -497,7 +659,7 @@ impl qobject::Bridge {
                 return QString::from(r#"{"ok":false,"why":"no-session"}"#);
             };
             session.disp_scale = if disp_scale > 0.0 { disp_scale } else { 1.0 };
-            prepare_snap(session, index.max(0) as usize);
+            prepare_snap(session, &[index.max(0) as usize]);
             let threshold = 8.0 / session.disp_scale;
             let fit = solve_fit(session, (dx, dy), threshold);
             let content = session
@@ -577,7 +739,7 @@ impl qobject::Bridge {
             };
             session.disp_scale = if disp_scale > 0.0 { disp_scale } else { 1.0 };
             let ix = index.max(0) as usize;
-            prepare_snap(session, ix);
+            prepare_snap(session, &[ix]);
             let (x, y, w, h) = session
                 .doc
                 .layers
@@ -780,7 +942,7 @@ impl qobject::Bridge {
             // 非斜切手势才吸附（Ctrl 的语义在 scale 手势里是斜切）。
             if !ctrl && enabled {
                 if session.snap_statics.is_empty() {
-                    prepare_snap(session, ix);
+                    prepare_snap(session, &[ix]);
                 }
                 let res = solve_rect(
                     (x, y, w, h),

@@ -125,9 +125,13 @@ pub(in crate::bridge) struct Session {
     pub(in crate::bridge) gpu_active_url: String,
     /// 三明治上层：活动层**之上**所有可见层的透明底合成（拖任何一层都用）。
     pub(in crate::bridge) gpu_above_url: String,
-    /// 活动纹理是整幅画布（带蒙版 / 剪贴的活动层在起手时烘进画布坐标）：
-    /// 显示矩形恒 (0,0,canvas)，`gpu_update_rect` 不得跟随活动层 offset。
+    /// 活动纹理是整幅画布（带蒙版 / 剪贴的活动层在起手时烘进画布坐标；
+    /// 批量移动时是整组烘成一张）：显示矩形从 (0,0) 起，跟随手势位移。
     pub(in crate::bridge) gpu_full: bool,
+    /// true = 活动纹理是「多选整组」烘出来的（矩形按批量会话的位移走）。
+    pub(in crate::bridge) gpu_batch: bool,
+    /// gpu_full 单层纹理的起手 offset（实时矩形按它与当前 offset 的差平移）。
+    pub(in crate::bridge) gpu_start_offset: (i32, i32),
     pub(in crate::bridge) gpu_index: usize,
     /// 活动层显示矩形 + 不透明度（QML 逻辑像素）：x, y, w, h, opacity。
     pub(in crate::bridge) gpu_rect: (f64, f64, f64, f64, f64),
@@ -156,8 +160,39 @@ impl Session {
         // ★统一会话后只剩一个 take：不可能再出现「清了缩放却漏了旋转帧」
         // 这种半截状态。返回值仍按旧四元组报，live-stale 日志不变。
         match self.transform.take() {
-            Some(ts) => ts.stale_flags(),
+            Some(ts) => {
+                // 批量会话的实时量已经写进文档（无历史），丢弃会话前必须
+                // 回滚，否则文档会停在一个「没历史、也回不去」的半截状态。
+                if let TransformSession::Batch(b) = &ts {
+                    rollback_batch(&mut self.doc, b);
+                }
+                ts.stale_flags()
+            }
             None => (false, false, false, false),
+        }
+    }
+
+    /// 取走批量会话（不自动回滚：调用方决定先提交还是先回滚）。
+    pub(in crate::bridge) fn take_batch_state(&mut self) -> Option<BatchState> {
+        match self.transform.take() {
+            Some(TransformSession::Batch(b)) => Some(b),
+            other => {
+                self.transform = other;
+                None
+            }
+        }
+    }
+
+    /// 放回批量会话（实时帧由调用方继续维护）。
+    pub(in crate::bridge) fn put_batch_state(&mut self, b: BatchState) {
+        self.transform = Some(TransformSession::Batch(b));
+    }
+
+    /// 当前是否处在某种批量会话中（移动 / 缩放 / 旋转）。
+    pub(in crate::bridge) fn batch_kind(&self) -> Option<i32> {
+        match self.transform.as_ref() {
+            Some(TransformSession::Batch(b)) => Some(b.kind),
+            _ => None,
         }
     }
 
@@ -235,6 +270,14 @@ impl Session {
                         r#""base":{:.2},"delta":{:.2},"frame":{},"token":{}"#,
                         live.base_degrees, live.last_delta,
                         frame.is_some(), live.token
+                    ),
+                    TransformSession::Batch(b) => format!(
+                        r#""bkind":{},"count":{},"box":[{:.2},{:.2},{:.2},{:.2}],"angle":{:.2},"live":{}"#,
+                        b.kind,
+                        b.items.len(),
+                        b.box_.0, b.box_.1, b.box_.2, b.box_.3,
+                        b.angle,
+                        b.live
                     ),
                 };
                 format!(
@@ -532,6 +575,8 @@ pub(in crate::bridge) enum TransformSession {
         frame: Option<LiveRotate>,
         cap: Option<u32>,
     },
+    /// 多选批量变换（≥2 层）：移动 / 缩放 / 旋转都作用在**整组**上。
+    Batch(BatchState),
 }
 
 impl TransformSession {
@@ -540,6 +585,7 @@ impl TransformSession {
             Self::Move { .. } => "move",
             Self::Scale(_) => "scale",
             Self::Rotate { .. } => "rotate",
+            Self::Batch(_) => "batch",
         }
     }
 
@@ -548,6 +594,7 @@ impl TransformSession {
             Self::Move { index, .. } => *index,
             Self::Scale(ls) => ls.index,
             Self::Rotate { live, .. } => live.index,
+            Self::Batch(b) => b.items.first().map(|it| it.index).unwrap_or(0),
         }
     }
 
@@ -559,11 +606,14 @@ impl TransformSession {
     }
 
     /// 该会话是否需要走「special 合成分支」（不能用上一帧的 BMP 复用）。
+    ///
+    /// 批量会话的实时量直接写进文档（参数 + 烘焙像素），普通合成路径就是
+    /// 正确画面，不需要合成器的 live 分支。
     pub(in crate::bridge) fn special(&self) -> bool {
         match self {
             Self::Scale(_) => true,
             Self::Rotate { frame, .. } => frame.is_some(),
-            Self::Move { .. } => false,
+            Self::Move { .. } | Self::Batch(_) => false,
         }
     }
 
@@ -573,6 +623,199 @@ impl TransformSession {
             Self::Move { .. } => (false, false, false, false),
             Self::Scale(_) => (false, false, true, false),
             Self::Rotate { frame, cap, .. } => (true, frame.is_some(), false, cap.is_some()),
+            Self::Batch(b) => (false, false, false, b.live),
+        }
+    }
+}
+
+/// 批量手势的种类（与 `transform_begin` 的 gesture 同值）。
+pub(in crate::bridge) const BATCH_MOVE: i32 = 0;
+pub(in crate::bridge) const BATCH_SCALE: i32 = 1;
+pub(in crate::bridge) const BATCH_ROTATE: i32 = 2;
+
+/// 多选批量变换会话（≥2 层）：一次手势 = 一条 `Batch` 历史。
+///
+/// 起手快照每层原始参数与并集包围盒；拖动期间**实时写文档**（移动写
+/// offset + center，缩放 / 旋转写参数层并烘一版像素 —— 渲染器只认烘焙
+/// 位图），一律不记历史。落定先 `rollback_batch` 回到起手状态、再用
+/// `Document::translate_layers` / `set_layer_transforms` 提交一条 Batch：
+/// 撤销一次整组复位，手势中断也不会把文档留在半截。
+pub(in crate::bridge) struct BatchState {
+    pub(in crate::bridge) kind: i32,
+    /// 起手并集包围盒（图像坐标）。
+    pub(in crate::bridge) box_: (f64, f64, f64, f64),
+    /// 旋转中心 / 缩放锚点 = 并集框中心（图像坐标）。
+    pub(in crate::bridge) pivot: (f64, f64),
+    pub(in crate::bridge) items: Vec<BatchItem>,
+    /// rotate：当前增量角（度）；move：最近一次位移（供 GPU 纹理跟随）。
+    pub(in crate::bridge) angle: f64,
+    pub(in crate::bridge) delta: (i32, i32),
+    /// 实时帧是否已经写进文档（回滚判据）。
+    pub(in crate::bridge) live: bool,
+}
+
+/// 批量手势里的单个图层快照。
+pub(in crate::bridge) struct BatchItem {
+    pub(in crate::bridge) index: usize,
+    pub(in crate::bridge) is_mark: bool,
+    /// 起手参数层（无参数层时由 `from_offset` 合成，`orig` 恒有值）。
+    pub(in crate::bridge) orig: Option<LayerTransform>,
+    /// 起手是否本来就有参数层；false 时回滚 / 落定后要清成 None。
+    pub(in crate::bridge) had_xform: bool,
+    /// 起手外接框（图像坐标）。
+    pub(in crate::bridge) bounds: (f64, f64, f64, f64),
+    /// 实时帧最近一次算出的目标参数（缩放 / 旋转落定直接用它提交）。
+    pub(in crate::bridge) last: Option<LayerTransform>,
+}
+
+impl BatchState {
+    pub(in crate::bridge) fn indices(&self) -> Vec<usize> {
+        self.items.iter().map(|it| it.index).collect()
+    }
+}
+
+/// 把批量会话的实时写入回滚到起手状态（不记历史）。
+pub(in crate::bridge) fn rollback_batch(doc: &mut Document, b: &BatchState) {
+    if !b.live {
+        return;
+    }
+    for it in &b.items {
+        let Some(layer) = doc.layers.get_mut(it.index) else {
+            continue;
+        };
+        if it.is_mark {
+            layer.set_offset((it.bounds.0.round() as i32, it.bounds.1.round() as i32));
+            continue;
+        }
+        let Some(orig) = it.orig.as_ref() else { continue };
+        // 从起手参数重算像素：确定性、不需要在会话里存整张位图。
+        let (image, offset) = orig.render_compatible();
+        layer.set_transform_pixels(image, offset, orig.clone());
+        if !it.had_xform {
+            layer.ensure_baked();
+        }
+    }
+}
+
+/// 批量移动的实时帧：整组按 `(dx, dy)` 平移（起点取起手快照，不累积）。
+pub(in crate::bridge) fn apply_batch_move(
+    doc: &mut Document,
+    b: &mut BatchState,
+    dx: i32,
+    dy: i32,
+) {
+    for it in &b.items {
+        let Some(layer) = doc.layers.get_mut(it.index) else {
+            continue;
+        };
+        let (bx, by, bw, bh) = it.bounds;
+        let (nx, ny) = (bx.round() as i32 + dx, by.round() as i32 + dy);
+        layer.set_offset((nx, ny));
+        if let Some(t) = layer.xform_mut() {
+            // 参数层的 center 跟着走（渲染真值是 center，不同步就「框走内容不动」）。
+            t.center = (bx + bw / 2.0 + dx as f64, by + bh / 2.0 + dy as f64);
+        }
+    }
+    b.delta = (dx, dy);
+    b.live = true;
+}
+
+/// 批量缩放的实时帧：把起手并集框映射到 `target`，逐层按同一映射解算。
+///
+/// 每层用 `set_bounds_rect(映射后的外接框, 0)` 反解 scale（0 = 整体摆到
+/// 目标框，不做单边锚定）。非 90° 整数倍的旋转层在该函数内部退化为等比
+/// 缩放 —— 与单层手柄的行为一致，不会把图压扁。
+pub(in crate::bridge) fn apply_batch_scale(
+    doc: &mut Document,
+    b: &mut BatchState,
+    target: (f64, f64, f64, f64),
+) {
+    let (x0, y0, w0, h0) = b.box_;
+    if w0 <= 1e-6 || h0 <= 1e-6 {
+        return;
+    }
+    let (tx, ty, tw, th) = target;
+    if tw <= 1e-6 || th <= 1e-6 {
+        return;
+    }
+    let sx = tw / w0;
+    let sy = th / h0;
+    for it in &mut b.items {
+        let Some(orig) = it.orig.as_ref() else { continue };
+        let (bx, by, bw, bh) = it.bounds;
+        let rect = editcore::RectF::new(
+            tx + (bx - x0) * sx,
+            ty + (by - y0) * sy,
+            (bw * sx).max(1.0),
+            (bh * sy).max(1.0),
+        );
+        let mut t = orig.clone();
+        if !t.set_bounds_rect(rect, 0) {
+            continue;
+        }
+        let (image, offset) = t.render_compatible();
+        if let Some(layer) = doc.layers.get_mut(it.index) {
+            layer.set_transform_pixels(image, offset, t.clone());
+            it.last = Some(t);
+        }
+    }
+    b.live = true;
+}
+
+/// 批量旋转的实时帧：每层角度加 `degrees`，中心绕并集框中心旋转。
+pub(in crate::bridge) fn apply_batch_rotate(
+    doc: &mut Document,
+    b: &mut BatchState,
+    degrees: f64,
+) {
+    let (px, py) = b.pivot;
+    let r = degrees.to_radians();
+    let (s, c) = (r.sin(), r.cos());
+    for it in &mut b.items {
+        let Some(orig) = it.orig.as_ref() else { continue };
+        let mut t = orig.clone();
+        t.rotation += degrees;
+        let dx = orig.center.0 - px;
+        let dy = orig.center.1 - py;
+        t.center = (px + dx * c - dy * s, py + dx * s + dy * c);
+        let (image, offset) = t.render_compatible();
+        if let Some(layer) = doc.layers.get_mut(it.index) {
+            layer.set_transform_pixels(image, offset, t.clone());
+            it.last = Some(t);
+        }
+    }
+    b.angle = degrees;
+    b.live = true;
+}
+
+/// 批量落定：先回滚实时帧，再用**一条** Batch 提交（一次撤销整组复位）。
+pub(in crate::bridge) fn commit_batch(
+    doc: &mut Document,
+    b: &BatchState,
+) -> Result<bool, String> {
+    if !b.live {
+        return Ok(false);
+    }
+    rollback_batch(doc, b);
+    match b.kind {
+        BATCH_MOVE => {
+            let (dx, dy) = b.delta;
+            doc.translate_layers(&b.indices(), dx, dy)
+                .map(|()| true)
+                .map_err(|e| e.to_string())
+        }
+        _ => {
+            let items: Vec<(usize, Option<LayerTransform>)> = b
+                .items
+                .iter()
+                .filter_map(|it| it.last.clone().map(|t| (it.index, Some(t))))
+                .collect();
+            if items.is_empty() {
+                return Ok(false);
+            }
+            doc.set_layer_transforms(&items)
+                .map(|()| true)
+                .map_err(|e| e.to_string())
         }
     }
 }
@@ -895,6 +1138,8 @@ impl Session {
                 gpu_active_url: String::new(),
                 gpu_above_url: String::new(),
                 gpu_full: false,
+                gpu_batch: false,
+                gpu_start_offset: (0, 0),
                 gpu_index: 0,
                 gpu_rect: (0.0, 0.0, 0.0, 0.0, 1.0),
                 // 0 = 首次 refresh 会扫一遍样式组、把加载烘焙记为基线指纹
@@ -1661,6 +1906,8 @@ impl Session {
         self.gpu_above_url = file_url(&po);
         self.gpu_index = index;
         self.gpu_full = gpu_full;
+        self.gpu_batch = false;
+        self.gpu_start_offset = self.doc.layers[index].offset();
         self.gpu_rect = if gpu_full {
             (
                 0.0,
@@ -1686,13 +1933,181 @@ impl Session {
         true
     }
 
+    /// 多选整组拖动的 GPU 快路径：把整组烘成**一张**画布尺寸纹理。
+    ///
+    /// 前提（任一不满足就回退 CPU，正确性优先）：
+    /// * 选中集合是**连续 z 区间**（中间不能夹着不参与拖动的可见层，否则
+    ///   一张纹理表达不了它们之间的遮挡关系）；
+    /// * 每层都是位图、Normal 混合、满不透明、无蒙版 / 剪贴 / 样式笔迹；
+    /// * 上方紧邻的层不是剪贴层（它要实时跟随整组里的基底走）。
+    ///
+    /// 整组一起平移 ⇒ 单张烘焙纹理就够（层间遮挡已经烘进去了），拖动帧只
+    /// 平移纹理矩形，零 CPU 合成。
+    pub(in crate::bridge) fn gpu_begin_set(
+        &mut self,
+        indices: &[usize],
+        disp_scale: f64,
+        dpr: f64,
+    ) -> bool {
+        self.gpu_end();
+        if self.calibration_active()
+            || self.adjust.is_some()
+            || self.quick_mask
+            || self.preview_hidden_mark >= 0
+            || self.doc.layers.iter().any(|l| l.is_mark() && l.visible)
+            || !(disp_scale > 0.0)
+            || indices.len() < 2
+        {
+            return false;
+        }
+        let n = self.doc.layers.len();
+        let (mut lo, mut hi) = (usize::MAX, 0usize);
+        for &i in indices {
+            if i >= n {
+                return false;
+            }
+            lo = lo.min(i);
+            hi = hi.max(i);
+        }
+        for i in lo..=hi {
+            if !indices.contains(&i) {
+                return false;
+            }
+            let l = &self.doc.layers[i];
+            if !l.is_raster()
+                || !l.visible
+                || l.opacity < 0.999
+                || l.blend != editcore::BlendMode::Normal
+                || l.mask.is_some()
+                || l.clipping
+                || l.style.is_some()
+            {
+                return false;
+            }
+        }
+        if self
+            .doc
+            .layers
+            .get(hi + 1)
+            .map(|l| l.clipping && l.visible && l.opacity > 0.0)
+            == Some(true)
+        {
+            return false;
+        }
+        let canvas = self.doc.canvas;
+        let display = display_size(canvas, self.zoom, dpr);
+        let target = preview_target(display, canvas, dpr);
+        if target.pixels() == 0 {
+            return false;
+        }
+        // 整组按 z 序烘进画布坐标（Normal + 不透明 ⇒ 普通 source-over 即可）。
+        let mut full = RgbaImage::new(canvas.width.max(1), canvas.height.max(1));
+        for i in lo..=hi {
+            let layer = &self.doc.layers[i];
+            let (ox, oy) = layer.offset();
+            image::imageops::overlay(&mut full, layer.img(), ox as i64, oy as i64);
+        }
+
+        // static = 整组之下的栈（隐藏 [lo..]），above = 整组之上的栈（隐藏 [..=hi]）。
+        let flipped_below: Vec<usize> = self.doc.layers[lo..]
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, l)| l.visible)
+            .map(|(k, _)| lo + k)
+            .collect();
+        for &i in &flipped_below {
+            self.doc.layers[i].visible = false;
+        }
+        let static_img = self.composer.composite_adjusted(&self.doc, target, None);
+        for &i in &flipped_below {
+            self.doc.layers[i].visible = true;
+        }
+
+        let flipped_above: Vec<usize> = self.doc.layers[..=hi]
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, l)| l.visible)
+            .map(|(k, _)| k)
+            .collect();
+        for &i in &flipped_above {
+            self.doc.layers[i].visible = false;
+        }
+        let above_img = self.composer.composite_adjusted(&self.doc, target, None);
+        for &i in &flipped_above {
+            self.doc.layers[i].visible = true;
+        }
+
+        let (Ok(bytes_s), Ok(bytes_a), Ok(bytes_o)) = (
+            encode(&static_img, Format::Bmp, 90),
+            encode(&full, Format::Bmp, 90),
+            encode(&above_img, Format::Bmp, 90),
+        ) else {
+            return false;
+        };
+        self.render_count = self.render_count.wrapping_add(1);
+        let tag = self.render_count;
+        let ps = std::env::temp_dir().join(format!("imageedit-gpu-{}-s-{tag}.bmp", self.id));
+        let pa = std::env::temp_dir().join(format!("imageedit-gpu-{}-a-{tag}.bmp", self.id));
+        let po = std::env::temp_dir().join(format!("imageedit-gpu-{}-o-{tag}.bmp", self.id));
+        if std::fs::write(&ps, bytes_s).is_err()
+            || std::fs::write(&pa, bytes_a).is_err()
+            || std::fs::write(&po, bytes_o).is_err()
+        {
+            return false;
+        }
+        self.gpu_static_url = file_url(&ps);
+        self.gpu_active_url = file_url(&pa);
+        self.gpu_above_url = file_url(&po);
+        self.gpu_index = hi;
+        self.gpu_full = true;
+        self.gpu_batch = true;
+        self.gpu_start_offset = (0, 0);
+        self.gpu_rect = (
+            0.0,
+            0.0,
+            canvas.width as f64 * disp_scale,
+            canvas.height as f64 * disp_scale,
+            1.0,
+        );
+        self.gpu_live = true;
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"gpu-begin-set\",\"lo\":{lo},\"hi\":{hi},\
+             \"count\":{},\"target\":\"{}x{}\"}}",
+            hi - lo + 1,
+            target.width,
+            target.height
+        );
+        true
+    }
+
     /// 每帧只重算活动层的显示矩形（纯浮点，零分配）。
     pub(in crate::bridge) fn gpu_update_rect(&mut self, disp_scale: f64) {
         if !self.gpu_live || !(disp_scale > 0.0) {
             return;
         }
-        // 整幅烘焙的活动纹理画布对齐，显示矩形恒定，不跟随活动层 offset。
+        // ★整幅烘焙的纹理（蒙版 / 剪贴 / 批量整组）以起手位置为基准，实时
+        //   矩形按**位移增量**平移 —— 以前这里直接 return，带蒙版的图层
+        //   拖动期间纹丝不动，松手才跳到新位置（看起来「拖不动」）。
         if self.gpu_full {
+            let (dx, dy) = if self.gpu_batch {
+                match self.transform.as_ref() {
+                    Some(TransformSession::Batch(b)) => b.delta,
+                    _ => (0, 0),
+                }
+            } else {
+                self.doc
+                    .layers
+                    .get(self.gpu_index)
+                    .map(|l| {
+                        (
+                            l.offset().0 - self.gpu_start_offset.0,
+                            l.offset().1 - self.gpu_start_offset.1,
+                        )
+                    })
+                    .unwrap_or((0, 0))
+            };
+            self.gpu_rect.0 = dx as f64 * disp_scale;
+            self.gpu_rect.1 = dy as f64 * disp_scale;
             return;
         }
         if let Some(layer) = self.doc.layers.get(self.gpu_index) {
@@ -1704,6 +2119,7 @@ impl Session {
 
     pub(in crate::bridge) fn gpu_end(&mut self) {
         self.gpu_live = false;
+        self.gpu_batch = false;
     }
 
     pub(in crate::bridge) fn gpu_rect_json(&self) -> String {

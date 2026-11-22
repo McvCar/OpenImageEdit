@@ -104,6 +104,35 @@ Item {
         }
     }
 
+    // 多选批量包围盒命中：**框内透明区域也算点到整组**。
+    //
+    // 需求（用户定稿）：选中多个图层 / 整组时，点在并集包围盒的透明区
+    // 不应该穿透去点中下面的其它图层 —— 那样一拖就把别人拖走了。这里
+    // 与 layerPickAt 用同一套「工具/修饰键/选区优先」的前置条件，唯一
+    // 区别是命中判据从「图层 alpha」换成「并集矩形」。
+    function batchBoxHit(mx, my, mods) {
+        if (!host.moveMode || bridge.selectedLayerCount < 2)
+            return false
+        if (host.selTool === "quick" || host.selTool === "wand")
+            return false
+        if (host.paintTool !== "none" || host.markTool !== "none")
+            return false
+        if (((mods | 0) & (Qt.ShiftModifier | Qt.AltModifier)) !== 0)
+            return false
+        if (host.selExists && host.selTool !== "none") {
+            const p = toImage(mx, my)
+            if (bridge.sel_contains(Math.floor(p[0]), Math.floor(p[1])))
+                return false
+        }
+        const b = host.selLayerBox
+        const s = host.toDispScale()
+        if (b === null || s <= 0)
+            return false
+        const ix = (mx - view.pad) / s
+        const iy = (my - view.pad) / s
+        return ix >= b.x && ix <= b.x + b.w && iy >= b.y && iy <= b.y + b.h
+    }
+
     // 空白处单击 = 退出「图层 / 选区」选择（PS 的「点空白清选择」）。
     // ★图层优先，一次点击只解一层：否则「图层悄悄不选了、选区还在」这种
     //   看不见的状态会让人以为点击没生效。旧逻辑只在 selTool 为 none 时
@@ -390,6 +419,26 @@ Item {
                                          host.healSpacing / 100,
                                          host.healStrength / 100)
                 }
+                return
+            }
+            // ★多选批量包围盒优先于单层点选：框内（含透明区）按下 = 拖整组。
+            //   不换选中层、不清选区 —— 这正是「避免误点其它图层」。
+            if (batchBoxHit(mouse.x, mouse.y, mouse.modifiers)) {
+                if (host.rotating)
+                    host.finishLayerRotate(true, 0)
+                if (bridge.selected_mark >= 0)
+                    bridge.select_mark(-1)
+                moveSelActive = false
+                selOffX = 0
+                selOffY = 0
+                gestureMods = mouse.modifiers
+                liveMods = mouse.modifiers
+                pickDrag = true
+                pickMoved = false
+                startX = mouse.x
+                startY = mouse.y
+                curX = mouse.x
+                curY = mouse.y
                 return
             }
             // 选区工具激活时不拾取图层（见 layerPickAt）。

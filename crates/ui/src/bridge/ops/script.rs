@@ -1093,6 +1093,131 @@ impl qobject::Bridge {
                         );
                     }
                 }
+                // `batch-gesture:kind,a,b[,mods]` —— **多选批量手势**回归。
+                //
+                //   kind 0 = 移动（a=dx, b=dy）
+                //   kind 1 = 缩放（a/b = 目标并集框宽高，原点不动）
+                //   kind 2 = 旋转（a=角度，b=1 展开画布）
+                //
+                // 走的是画布手柄的真实入口（`transform_begin` → `scale_layer_update`
+                // / `rotate_layer_*` → 落定），所以这里通过 = 画布上拖整组通过。
+                // 打一行含「每层外接框」的 JSON，探针按它断言。
+                other if other.starts_with("batch-gesture") => {
+                    let n = parse_nums(other);
+                    let kind = n.first().copied().unwrap_or(0.0) as i32;
+                    let a = n.get(1).copied().unwrap_or(40.0);
+                    let b = n.get(2).copied().unwrap_or(30.0);
+                    let mods = n.get(3).copied().unwrap_or(0.0) as i32;
+                    let primary = (*self.selected_layer()).max(0) as i32;
+                    let indices = self.selection_indices();
+                    // 起手并集框 + 每层外接框（与 QML selLayerBox 同一套口径）。
+                    let (union, boxes0) = {
+                        let guard = self.session.borrow();
+                        let mut x0 = f64::MAX;
+                        let mut y0 = f64::MAX;
+                        let mut x1 = f64::MIN;
+                        let mut y1 = f64::MIN;
+                        let mut rows: Vec<String> = Vec::new();
+                        if let Some(s) = guard.as_ref() {
+                            for &i in &indices {
+                                let Some(l) = s.doc.layers.get(i) else { continue };
+                                let bb = l.bounds();
+                                let (bx, by) = (bb.x as f64, bb.y as f64);
+                                let (bw, bh) = (bb.width as f64, bb.height as f64);
+                                if bw <= 0.0 || bh <= 0.0 {
+                                    continue;
+                                }
+                                x0 = x0.min(bx);
+                                y0 = y0.min(by);
+                                x1 = x1.max(bx + bw);
+                                y1 = y1.max(by + bh);
+                                rows.push(format!("[{bx:.1},{by:.1},{bw:.1},{bh:.1}]"));
+                            }
+                        }
+                        if x0 > x1 || y0 > y1 {
+                            ((0.0, 0.0, 0.0, 0.0), rows)
+                        } else {
+                            ((x0, y0, x1 - x0, y1 - y0), rows)
+                        }
+                    };
+                    let (ux, uy, uw, uh) = union;
+                    let expand = b > 0.5;
+                    let (began, landed) = match kind {
+                        1 => {
+                            let begun =
+                                self.as_mut().transform_begin(1, primary, ux, uy, mods, 1.0);
+                            if begun {
+                                let (tw, th) = ((a as i32).max(1), (b as i32).max(1));
+                                let (tx, ty) = (ux.round() as i32, uy.round() as i32);
+                                self.as_mut().scale_layer_update(
+                                    tw, th, tx, ty, false, false, 0.0, 0.0, 0.0, 0.0,
+                                );
+                                self.as_mut().scale_layer_end(
+                                    true, tw, th, tx, ty, false, false, 0, 0.0, 0.0,
+                                );
+                            }
+                            (begun, begun)
+                        }
+                        2 => {
+                            self.as_mut().rotate_layer_begin(primary, expand);
+                            self.as_mut().rotate_layer_update(a, expand, mods);
+                            self.as_mut().rotate_layer_finish(true, a, expand, mods);
+                            (true, true)
+                        }
+                        _ => {
+                            let (dx, dy) = (a, b);
+                            let (cx, cy) = (ux + uw / 2.0, uy + uh / 2.0);
+                            let begun =
+                                self.as_mut().transform_begin(0, primary, cx, cy, mods, 1.0);
+                            if begun {
+                                for step in 1..=5 {
+                                    let t = step as f64 / 5.0;
+                                    self.as_mut().transform_update(
+                                        0,
+                                        cx + dx * t,
+                                        cy + dy * t,
+                                        mods,
+                                        1.0,
+                                    );
+                                }
+                                self.as_mut().drag_translate_end(true);
+                            }
+                            let landed = self.as_mut().transform_end(true, mods);
+                            (begun, landed)
+                        }
+                    };
+                    let boxes1 = {
+                        let guard = self.session.borrow();
+                        guard
+                            .as_ref()
+                            .map(|s| {
+                                indices
+                                    .iter()
+                                    .filter_map(|&i| s.doc.layers.get(i))
+                                    .map(|l| {
+                                        let bb = l.bounds();
+                                        format!(
+                                            "[{:.1},{:.1},{:.1},{:.1}]",
+                                            bb.x as f64,
+                                            bb.y as f64,
+                                            bb.width as f64,
+                                            bb.height as f64
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            })
+                            .unwrap_or_default()
+                    };
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"batch-gesture\",\"kind\":{kind},\
+                         \"began\":{began},\"landed\":{landed},\"count\":{},\
+                         \"union\":[{ux:.1},{uy:.1},{uw:.1},{uh:.1}],\
+                         \"before\":[{}],\"after\":[{boxes1}]}}",
+                        indices.len(),
+                        boxes0.join(",")
+                    );
+                }
                 // `sel-state` —— 当前选区是否还在（裁剪 / 提取 / 剪切后必须消失）。
                 "sel-state" => {
                     let guard = self.session.borrow();

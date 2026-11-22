@@ -2675,7 +2675,34 @@ function findSelLayer() {
     return null
 }
 
+function selectedLayerIds() {
+    try { return JSON.parse(bridge.layerSelectionIds) } catch (e) { return [] }
+}
+
 function findLayerBox() {
+    // ★多选（≥2）：返回**并集包围盒** —— 八向手柄 / 旋柄 / 尺寸徽标都围住
+    //   整组，缩放与旋转才会作用在整组上（Rust 侧按同一并集框求解）。
+    //   虚拟对象没有真实图层身份：i=-1、a=0（不做倾斜框）。
+    if (bridge.selectedLayerCount >= 2) {
+        const ids = selectedLayerIds()
+        let x0 = 1e18, y0 = 1e18, x1 = -1e18, y1 = -1e18, any = false
+        for (var i = 0; i < layerList.length; i++) {
+            const l = layerList[i]
+            if (l.syn || ids.indexOf(l.id) < 0)
+                continue
+            if (!(l.w > 0 && l.h > 0))
+                continue
+            x0 = Math.min(x0, l.x)
+            y0 = Math.min(y0, l.y)
+            x1 = Math.max(x1, l.x + l.w)
+            y1 = Math.max(y1, l.y + l.h)
+            any = true
+        }
+        if (any)
+            return ({ x: x0, y: y0, w: x1 - x0, h: y1 - y0,
+                      sw: x1 - x0, sh: y1 - y0, a: 0, i: -1,
+                      n: bridge.selectedLayerCount + " 个图层" })
+    }
     for (var i = 0; i < layerList.length; i++)
         if (!layerList[i].base && layerList[i].i === bridge.selected_layer)
             return layerList[i]
