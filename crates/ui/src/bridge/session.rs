@@ -1606,7 +1606,6 @@ impl Session {
 
         // 隐藏一段区间 → 合成 → 恢复。visible 翻转不动像素、不 bump
         // epoch，composer 的缩放缓存原样可用（两次合成共享同一批缓存）。
-        let n = self.doc.layers.len();
         let flipped_below: Vec<usize> = self.doc.layers[index..]
             .iter_mut()
             .enumerate()
@@ -1621,7 +1620,11 @@ impl Session {
             self.doc.layers[i].visible = true;
         }
 
-        let flipped_above: Vec<usize> = self.doc.layers[..index.min(n)]
+        // ★above 纹理必须**排除活动层自身**：只隐藏 [..index] 会把活动层
+        // 原位置烘进上层纹理 —— 拖动时出现「两个图层」（移动中的活动层 +
+        // 上层纹理里的残影）。隐藏 [..=index]（含活动层），above 只含
+        // index 之上的可见层。（index < n 已由上方 layers.get 保证。）
+        let flipped_above: Vec<usize> = self.doc.layers[..index + 1]
             .iter_mut()
             .enumerate()
             .filter(|(_, l)| l.visible)
