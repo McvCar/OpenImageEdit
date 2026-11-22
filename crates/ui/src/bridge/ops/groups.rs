@@ -165,7 +165,7 @@ impl qobject::Bridge {
     /// ★必须剔除**组样式影子层**（`synthetic`）：它们是重烘焙出来的派生层，
     /// 面板不显示、恒锁定，包围盒往往是整幅画布 —— 混进多选集会让组的框
     /// 一下子撑满画布，看着像选中了整张图。
-    pub fn select_group(mut self: Pin<&mut Self>, group_id: i32) {
+    pub fn select_group(mut self: Pin<&mut Self>, group_id: i32, additive: bool) {
         if group_id <= 0 {
             return;
         }
@@ -189,15 +189,50 @@ impl qobject::Bridge {
             }
         };
         let Some(&primary) = members.last() else {
+            // 空组：只把它记成组焦点（面板仍要亮组行、属性编辑仍要能改它）。
+            self.as_mut().set_group_focus(group_id);
             return;
         };
+        // Ctrl+点组行 = 把整组**并入**当前选择（分组也能批量选中：两个组、
+        // 或者「一层 + 一整组」）。普通点击 = 替换。
+        let mut picked = if additive {
+            let mut current = self.as_mut().selection_indices();
+            current.extend(members.iter().copied());
+            current.sort_unstable();
+            current.dedup();
+            current
+        } else {
+            members.clone()
+        };
+        picked.retain(|&i| i > 0);
         self.as_mut().set_selected_layer(primary as i32);
-        self.as_mut().set_selection_indices(&members);
+        self.as_mut().set_selection_indices(&picked);
+        self.as_mut().set_group_focus(group_id);
         println!(
             "{{\"phase\":\"ui\",\"event\":\"group-select\",\"id\":{group_id},\
-             \"count\":{}}}",
-            members.len()
+             \"count\":{},\"additive\":{additive}}}",
+            picked.len()
         );
+    }
+
+    /// 把「点组行」这件事记成组焦点，并立刻重算 `selected_group_id`。
+    ///
+    /// `set_selection_indices` 内部会发布一次，但那次发布发生在焦点写入之前，
+    /// 所以这里再补发一次（幂等：值没变就不会触发 QML 重建）。
+    pub(in crate::bridge) fn set_group_focus(mut self: Pin<&mut Self>, group_id: i32) {
+        self.group_focus.set(group_id);
+        let ids: Vec<u32> = {
+            let guard = self.session.borrow();
+            match guard.as_ref() {
+                Some(session) => self
+                    .selection_indices()
+                    .into_iter()
+                    .filter_map(|i| session.doc.layers.get(i).map(|l| l.id))
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        self.as_mut().publish_layer_selection(&ids);
     }
 
     /// 拖动图层进出分组。z 序与像素都不变，但两侧组的状态可能改变画面：

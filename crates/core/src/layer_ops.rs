@@ -114,12 +114,90 @@ fn draw_layer_into(out: &mut RgbaImage, origin: (i32, i32), layer: &Layer) {
 impl Document {
     /// 新建空（全透明）图层，盖住整个画布并插到栈顶。
     pub fn new_empty_layer(&mut self) -> Result<usize, EditError> {
+        self.new_empty_layer_at(self.layers.len())
+    }
+
+    /// 新建空（全透明）图层并插到 `at` 号位（`0` 号位恒为背景，会被夹到 1）。
+    ///
+    /// 面板的「新建图层」按当前选中位置插入（选中层下方 / 选中组内最上），
+    /// 不再恒顶 —— 恒顶会导致「在图层中间新建，新层跑到整摞最上面」。
+    pub fn new_empty_layer_at(&mut self, at: usize) -> Result<usize, EditError> {
+        self.new_empty_layer_in(at, None)
+    }
+
+    /// 同上，并把新层直接挂进 `group`（插入到组内时用，省一次 `set_layer_group`
+    /// 的撤销步）。
+    pub fn new_empty_layer_in(
+        &mut self,
+        at: usize,
+        group: Option<GroupId>,
+    ) -> Result<usize, EditError> {
         let image = RgbaImage::new(self.canvas.width, self.canvas.height);
         let mut layer = Layer::new(self.next_layer_name(), image);
         layer.set_offset((-self.view.x, -self.view.y));
-        let index = self.layers.len();
+        layer.group = group;
+        let index = at.clamp(1, self.layers.len());
         self.execute(EditOp::AddLayer { layer, index })?;
         Ok(index)
+    }
+
+    /// 粘贴一批图层到 `at` 号位，可选地把它们收进一个**新建**的同名分组。
+    ///
+    /// * `layers` 按 z 序自底向顶给（`layers[0]` 会先落位）。
+    /// * 组 id 由目标文档重新分配：跨文档粘贴时源文档的 id 没有意义，沿用
+    ///   会挂到别人的组上（用户报的「粘贴图层把上级分组也带过来了」）。
+    /// * 整件事是一条 `EditOp::Batch`：加层 + 建组一次撤销。
+    ///
+    /// 嵌套子组会被摊平成这一层组（成员的 z 序与像素不变，只是少了中间那
+    /// 层标题行）—— 粘贴一个多级 PSD 组时先给这个够用的版本。
+    pub fn paste_layers_at(
+        &mut self,
+        layers: Vec<Layer>,
+        at: usize,
+        group: Option<LayerGroup>,
+    ) -> Result<Vec<usize>, EditError> {
+        if layers.is_empty() {
+            return Err(EditError::LayerIndex(at));
+        }
+        let mut index = at.clamp(1, self.layers.len());
+        let mut ops: Vec<EditOp> = Vec::new();
+        let gid = match group {
+            Some(src) => {
+                // 新组 id 由本文件重新分配：源文档 / 源组的 id 沿用到目标文档
+                // 会撞上已有组（跨文档粘贴时甚至指向别人的组）。
+                let mut fresh = LayerGroup::new(src.name.clone());
+                fresh.visible = src.visible;
+                fresh.blend = src.blend;
+                fresh.opacity = src.opacity;
+                fresh.pass_through = src.pass_through;
+                // 新组恒为顶层组：粘贴出来的组不该继承源文档的父组。
+                fresh.parent = None;
+                let gid = fresh.id;
+                let mut groups = self.groups.clone();
+                groups.push(fresh);
+                ops.push(EditOp::SetGroups {
+                    from: self.groups.clone(),
+                    to: groups,
+                });
+                Some(gid)
+            }
+            None => None,
+        };
+        let mut placed = Vec::with_capacity(layers.len());
+        for mut layer in layers {
+            // 建组时强制归属新组；不带组时保留调用方给的归属（单层粘进组内）。
+            if gid.is_some() {
+                layer.group = gid;
+            }
+            ops.push(EditOp::AddLayer {
+                layer,
+                index,
+            });
+            placed.push(index);
+            index += 1;
+        }
+        self.execute(EditOp::Batch(ops))?;
+        Ok(placed)
     }
 
     /// 复制图层：副本插到原件**上面**并偏移 8px（与 PS 一致，避免完全重叠
@@ -542,6 +620,49 @@ mod tests {
         assert_eq!(doc.flatten(), blank(20, 10));
         doc.undo().unwrap();
         assert_eq!(doc.layers.len(), 1);
+    }
+
+    #[test]
+    fn new_empty_layer_at_inserts_at_the_anchor_not_the_top() {
+        let mut doc = Document::from_image(blank(20, 10));
+        doc.add_layer(dot(0, 0, 2, 2, [255, 0, 0, 255])).unwrap();
+        doc.add_layer(dot(2, 2, 2, 2, [0, 255, 0, 255])).unwrap();
+        // 插到 1 号位 = 最下面那个图层下面；背景 (0 号) 不受影响。
+        let i = doc.new_empty_layer_at(1).unwrap();
+        assert_eq!(i, 1);
+        assert_eq!(doc.layers.len(), 4);
+        assert!(doc.layers[0].background);
+        // 0 号位被夹开：背景恒在 0。
+        let j = doc.new_empty_layer_at(0).unwrap();
+        assert_eq!(j, 1);
+        assert!(doc.layers[0].background);
+        doc.undo().unwrap();
+        doc.undo().unwrap();
+        assert_eq!(doc.layers.len(), 3);
+    }
+
+    #[test]
+    fn paste_layers_at_rebuilds_a_group_in_one_undo() {
+        let mut doc = Document::from_image(blank(16, 16));
+        doc.add_layer(dot(0, 0, 4, 4, [255, 0, 0, 255])).unwrap();
+        let mut bottom = dot(1, 1, 3, 3, [0, 255, 0, 255]);
+        let mut top = dot(2, 2, 3, 3, [0, 0, 255, 255]);
+        bottom.group = Some(999); // 源文档的组 id：粘贴时必须丢弃
+        top.group = Some(999);
+        let group = LayerGroup::new("粘贴来的组");
+        let placed = doc
+            .paste_layers_at(vec![bottom, top], 1, Some(group))
+            .unwrap();
+        assert_eq!(placed, vec![1, 2]);
+        let gid = doc.layers[1].group.expect("新组");
+        assert_eq!(doc.layers[2].group, Some(gid));
+        assert_ne!(gid, 999);
+        assert_eq!(doc.find_group(gid).unwrap().name, "粘贴来的组");
+        assert_eq!(doc.find_group(gid).unwrap().parent, None);
+        // 一条 Batch = 一次撤销，图层和组表一起回退。
+        doc.undo().unwrap();
+        assert_eq!(doc.layers.len(), 2);
+        assert!(doc.find_group(gid).is_none());
     }
 
     #[test]

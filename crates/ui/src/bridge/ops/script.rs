@@ -274,6 +274,47 @@ impl qobject::Bridge {
                     }
                 }
                 "delete-selected" => self.as_mut().delete_selected_layer(),
+                "new-layer" => self.as_mut().new_layer(),
+                // `groups-dump` —— 打印分组表（id / 名字 / 成员 id），探针校验
+                // 「复制整组粘贴后是不是新建了一个组」用。
+                "groups-dump" => {
+                    let body = {
+                        let guard = self.session.borrow();
+                        guard.as_ref().map(|s| s.groups_json()).unwrap_or_default()
+                    };
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"groups-dump\",\"groups\":{body}}}"
+                    );
+                }
+                // `layers-group-dump` —— 每层 (下标, id, 所属组)，配合 groups-dump
+                // 判断粘贴出来的层挂到了谁身上。
+                "layers-group-dump" => {
+                    let body = {
+                        let guard = self.session.borrow();
+                        guard
+                            .as_ref()
+                            .map(|s| {
+                                s.doc
+                                    .layers
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, l)| {
+                                        format!(
+                                            "{{\"i\":{i},\"id\":{},\"g\":{},\"syn\":{}}}",
+                                            l.id,
+                                            l.group.unwrap_or(0),
+                                            l.synthetic
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            })
+                            .unwrap_or_default()
+                    };
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"layers-group-dump\",\"layers\":[{body}]}}"
+                    );
+                }
                 "layer-up" => self.as_mut().move_selected_up(),
                 "layer-down" => self.as_mut().move_selected_down(),
                 "paste" => {
@@ -1002,6 +1043,63 @@ impl qobject::Bridge {
                         );
                     }
                 }
+                // `gpu-hold:dx,dy[,disp_scale]` —— 起手 + 推进到终点但**不落定**，
+                // 手势停在拖动中。探针靠它截「拖动期间」的画面（gpu-gesture
+                // 一口气跑完，只能截到落定后）。
+                other if other.starts_with("gpu-hold") => {
+                    let n = parse_nums(other);
+                    let dx = n.first().copied().unwrap_or(40.0);
+                    let dy = n.get(1).copied().unwrap_or(30.0);
+                    // 第三参数省略 = 用**当前真实显示比例**（和 QML 传给
+                    // `transform_begin` 的 `toDispScale()` 同一套算法），否则
+                    // 探针在非 100% 缩放下会把「比例不对」当成 bug / 掩掉 bug。
+                    let scale = n.get(2).copied().unwrap_or(0.0);
+                    let scale = if scale > 0.0 {
+                        scale
+                    } else {
+                        let guard = self.session.borrow();
+                        guard
+                            .as_ref()
+                            .map(|s| {
+                                let canvas = s.doc.canvas;
+                                if canvas.width == 0 {
+                                    return 1.0;
+                                }
+                                let disp = display_size(canvas, s.zoom, self.dpr.get());
+                                disp.width as f64 / canvas.width as f64
+                            })
+                            .unwrap_or(1.0)
+                    };
+                    let ix = (*self.selected_layer()).max(0) as i32;
+                    let center = {
+                        let guard = self.session.borrow();
+                        guard
+                            .as_ref()
+                            .and_then(|s| s.doc.layers.get(ix.max(0) as usize))
+                            .map(|l| {
+                                (
+                                    l.offset().0 as f64 + l.img().width() as f64 / 2.0,
+                                    l.offset().1 as f64 + l.img().height() as f64 / 2.0,
+                                )
+                            })
+                    };
+                    match center {
+                        Some((cx, cy)) => {
+                            let began = self.as_mut().transform_begin(0, ix, cx, cy, 0, scale);
+                            for i in 1..=5 {
+                                let t = i as f64 / 5.0;
+                                self.as_mut().transform_update(0, cx + dx * t, cy + dy * t, 0, scale);
+                            }
+                            println!(
+                                "{{\"phase\":\"ui\",\"event\":\"gpu-hold\",\"began\":{began},\
+                                 \"dx\":{dx},\"dy\":{dy},\"scale\":{scale}}}"
+                            );
+                        }
+                        None => println!(
+                            "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
+                        ),
+                    }
+                }
                 // `gpu-gesture[:dx,dy]` —— 走一次真实移动手势
                 // （transform_begin → 5×transform_update → transform_end），
                 // 用来验证 Tier 1「静态层 + 活动层」两纹理快路径：日志必须
@@ -1610,14 +1708,13 @@ impl qobject::Bridge {
                     let t: i32 = it.next().and_then(|p| p.trim().parse().ok()).unwrap_or(0);
                     self.as_mut().move_group_to_group(id, t);
                 }
-                // `group-select:1`
+                // `group-select:1[,add]` —— add = Ctrl 语义（并进当前选择）。
                 other if other.starts_with("group-select:") => {
-                    let id: i32 = other
-                        .trim_start_matches("group-select:")
-                        .trim()
-                        .parse()
-                        .unwrap_or(0);
-                    self.as_mut().select_group(id);
+                    let body = other.trim_start_matches("group-select:");
+                    let mut parts = body.split(',');
+                    let id: i32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+                    let additive = parts.next().map(|s| s.trim() == "add").unwrap_or(false);
+                    self.as_mut().select_group(id, additive);
                 }
                 // `group-rename:1:新名字`
                 other if other.starts_with("group-rename:") => {

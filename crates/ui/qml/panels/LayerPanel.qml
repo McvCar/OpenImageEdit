@@ -50,19 +50,25 @@ Item {
     //     旋转都作用于整组（批量路径）；
     //   * 面板只高亮组标题行，成员行不跟着亮（用户报的「组和图层同时被
     //     选中」）；这个 id 同时供组属性编辑（混合模式 / 不透明度）读取。
-    property int selectedGroupId: -1
-    // 组行高亮 / 组属性编辑的唯一判据就是这个 id（不再因为「成员恰好全在
-    // 多选集合里」自动高亮 —— 单选一个成员层时会把组也点亮）。
+    //
+    // ★真值只有一份，在 Rust（`bridge.selectedGroupId`）：它由「多选集合 +
+    //   显式组焦点」算出来。面板不再自己记一份、也不按「成员恰好全选」另算
+    //   一份 —— 两份真值不同步就会出现用户报的那幕：Ctrl 点满一个组的两层，
+    //   两行都亮着、组行却不亮。
+    readonly property int selectedGroupId: bridge.selectedGroupId
     readonly property var activeGroup: {
-        let best = null
-        const list = host.layerPanelList
+        if (selectedGroupId <= 0)
+            return null
+        // ★`host.groupList` 来自 bridge.groups_json，字段是 `id`（不是显示行
+        //   的 `gid`）—— 写成 r.gid 会恒为 undefined，于是组行亮了、成员行
+        //   也照样亮（用户报的「组和图层同时高亮」又回来了）。
+        const list = host.groupList
         for (var i = 0; i < list.length; i++) {
-            const r = list[i]
-            if (r && r.k === "group" && layerPanel.isSelectedRow(r))
-                if (best === null || (r.d || 0) > (best.d || 0))
-                    best = r
+            const g = list[i]
+            if (g && g.id === selectedGroupId)
+                return g
         }
-        return best
+        return null
     }
     readonly property bool hasBlendTarget: layerPanel.activeGroup !== null
                                            || host.selLayer !== null
@@ -77,11 +83,8 @@ Item {
         return c ? c.n : "正常"
     }
     function closeBlendList() { layerPanel.blendListOpen = false }
-    // 画布上点选了图层 = 用户的心智已经转到那一层，组焦点随之作废；否则
-    // 组行会一直高亮、混合下拉还改的是组。点空白（`select_layer(-1)`）同样
-    // 作废 —— 否则「组一直在选中态」而画布上已经没有框了。
-    // 点组行会先调 `select_group`（把主选中层写成组内最上层），这个回调
-    // 先把 id 清掉，调用方随后再写回来，所以不会被误清。
+    // 画布上点选图层 → 列表自动滚到那一行。组焦点的作废由 Rust 负责
+    //（`select_layer_ex` 清掉显式组焦点），面板不再自己写一份状态。
     Connections {
         target: bridge
         // ★qproperty `selected_layer` 生成的信号是 `selected_layerChanged`
@@ -89,12 +92,8 @@ Item {
         // 根本不会被调用 —— 画布点选后列表不跟着滚就是这么来的。
         function onSelected_layerChanged() {
             const ix = bridge.selected_layer
-            if (ix >= 0) {
-                layerPanel.selectedGroupId = -1
+            if (ix >= 0)
                 layerPanel.revealLayerRow(ix)
-            } else {
-                layerPanel.selectedGroupId = -1
-            }
         }
     }
 
@@ -228,15 +227,10 @@ Item {
             return []
         }
     }
-    // ---- 「组选中」的唯一判据 -------------------------------------------
     // 组选中 = 整组成员进了多选集合（画布出并集框、批量变换吃整组），但面板
     // **只高亮组标题行**：成员行跟着一起亮就是用户报的「组和图层同时被选中」。
-    //
-    // 两条来源合成一个派生值，避免面板自己记一份、跟着选择集跑偏：
-    //   1) 点了组行（selectedGroupId）且成员还在选择集里；
-    //   2) 选择集**恰好等于**某个 ≥2 成员组的全部成员 —— 覆盖脚本 / 探针 /
-    //      别的代码路径调 `select_group` 的情况，和点组行看起来一致。
-    //      要求 ≥2 是有意的：只有 1 个成员的组，单选那层时不能把组也点亮。
+    // 判据只有 `bridge.selectedGroupId` 一个（派生规则见 Rust 的
+    // `derive_selected_group`），面板自己不再算第二份。
     function groupById(gid) {
         if (gid <= 0)
             return null
@@ -246,52 +240,13 @@ Item {
                 return list[i]
         return null
     }
-    function membersAllSelected(g) {
-        if (g === null)
-            return false
-        const mids = g.mids || []
-        if (mids.length === 0 || mids.length !== selIds.length)
-            return false
-        for (var i = 0; i < mids.length; i++)
-            if (selIds.indexOf(mids[i]) < 0)
-                return false
-        return true
-    }
-    readonly property int effectiveGroupId: {
-        if (layerPanel.membersAllSelected(layerPanel.groupById(
-                layerPanel.selectedGroupId)))
-            return layerPanel.selectedGroupId
-        if (bridge.selectedLayerCount >= 2) {
-            // 嵌套时可能有多个组同时「成员全中」（父组的 mids 含子组成员）：
-            // 取**最深**那个，才和用户点的子组一致。
-            let best = -1
-            let depth = -1
-            const list = host.groupList
-            for (var i = 0; i < list.length; i++) {
-                const g = list[i]
-                if (!g || (g.mids || []).length < 2)
-                    continue
-                if (!layerPanel.membersAllSelected(g))
-                    continue
-                if ((g.d || 0) > depth) {
-                    depth = g.d || 0
-                    best = g.id
-                }
-            }
-            return best
-        }
-        return -1
-    }
-    function focusedGroup() {
-        return layerPanel.groupById(layerPanel.effectiveGroupId)
-    }
     function isSelectedRow(row) {
         if (row === null || row === undefined)
             return false
         if (row.k === "group")
-            return row.gid === layerPanel.effectiveGroupId
+            return row.gid === layerPanel.selectedGroupId
         // 组选中态：组子树里的成员不单独高亮（框已经代表整组了）。
-        const g = layerPanel.focusedGroup()
+        const g = layerPanel.activeGroup
         if (g !== null) {
             const mids = g.mids || []
             if (mids.indexOf(row.id) >= 0)
@@ -584,7 +539,7 @@ Item {
                     usable: layerPanel.activeGroup !== null
                     onBlocked: layerPanel.hintText =
                                "拆散分组要先点选一个分组：点击组标题行（组行高亮后生效）"
-                    onActivated: bridge.ungroup_group(layerPanel.activeGroup.gid)
+                    onActivated: bridge.ungroup_group(layerPanel.activeGroup.id)
                 }
                 // 删除只保留在右键菜单里：右上角这个 ✕ 太像「关闭面板」，
                 // 误点一次就可能删掉图层（用户反馈）。
@@ -737,7 +692,7 @@ Item {
                         onClicked: {
                             if (layerPanel.editLocked || !layerPanel.activeGroup)
                                 return
-                            bridge.set_group_pass_through(layerPanel.activeGroup.gid,
+                            bridge.set_group_pass_through(layerPanel.activeGroup.id,
                                                           !layerPanel.activeGroup.pt)
                         }
                     }
@@ -835,7 +790,7 @@ Item {
                             onClicked: {
                                 layerPanel.closeBlendList()
                                 if (layerPanel.activeGroup)
-                                    bridge.set_group_blend_mode(layerPanel.activeGroup.gid,
+                                    bridge.set_group_blend_mode(layerPanel.activeGroup.id,
                                                                 modelData.i)
                                 else
                                     bridge.set_layer_blend_mode(-1, modelData.i)
@@ -1566,26 +1521,23 @@ Item {
                                 }
                             } else if (snapRow && !snapRow.isBase
                                        && (!layerRow.locked || layerRow.isGroup)) {
+                                // Ctrl = 切换 / 并入，Shift = 连选，普通点击 = 单选。
+                                // 事件自带的 modifiers 在「先松鼠标再松 Ctrl」时
+                                // 偶尔拿不到 Ctrl（释放事件里键盘状态已经是新的），
+                                // 所以再问一次实时键状态（bit0 Shift / bit1 Ctrl）。
+                                const bits = bridge.modifier_bits()
+                                const ctrl = (mouse.modifiers & Qt.ControlModifier) !== 0
+                                             || (bits & 2) !== 0
+                                const shift = (mouse.modifiers & Qt.ShiftModifier) !== 0
+                                              || (bits & 1) !== 0
                                 if (layerRow.isGroup) {
-                                    // 点组 = 选中整组：成员写进多选集合（画布出
-                                    // 并集包围盒、批量变换吃整组），面板只亮组标题行。
-                                    // ★顺序要紧：`select_group` 会把主选中层写成组内
-                                    //   最上层，`onSelected_layerChanged` 会先把
-                                    //   selectedGroupId 清成 -1，所以 id 必须在调用
-                                    //   **之后**再写。
-                                    bridge.select_group(snapRow.gid)
-                                    layerPanel.selectedGroupId = snapRow.gid
+                                    // 点组 = 选中整组（画布出并集包围盒、批量变换
+                                    // 吃整组），面板只亮组标题行。
+                                    // Ctrl+点组 = 把整组**并入**当前选择：分组也能
+                                    // 批量选中（两个组、或者「一层 + 一整组」一次
+                                    // 拖动 / 缩放）。
+                                    bridge.select_group(snapRow.gid, ctrl || shift)
                                 } else {
-                                    layerPanel.selectedGroupId = -1
-                                    // Ctrl = 切换，Shift = 连选，普通点击 = 单选。
-                                    // 事件自带的 modifiers 在「先松鼠标再松 Ctrl」时
-                                    // 偶尔拿不到 Ctrl（释放事件里键盘状态已经是新的），
-                                    // 所以再问一次实时键状态（bit0 Shift / bit1 Ctrl）。
-                                    const bits = bridge.modifier_bits()
-                                    const ctrl = (mouse.modifiers & Qt.ControlModifier) !== 0
-                                                 || (bits & 2) !== 0
-                                    const shift = (mouse.modifiers & Qt.ShiftModifier) !== 0
-                                                  || (bits & 1) !== 0
                                     if (!ctrl && !shift)
                                         bridge.sel_clear()
                                     bridge.select_layer_ex(snapRow.i,
@@ -1857,7 +1809,7 @@ Item {
                     onReleased: {
                         opacitySlider.dragging = false
                         if (layerPanel.activeGroup)
-                            bridge.set_group_opacity(layerPanel.activeGroup.gid,
+                            bridge.set_group_opacity(layerPanel.activeGroup.id,
                                                      opacitySlider.value)
                         else
                             bridge.set_selected_opacity(opacitySlider.value, true)

@@ -54,6 +54,36 @@ OPS = [
     "layers-dump",                       # ck4 移动后
     "undo",
     "layers-dump",                       # ck5 撤销后 == 基线
+    # ck6：Ctrl 逐个点满成员 —— 面板应亮**组行**（group-focus = gid），
+    # 而不是「两行图层都亮、组行不亮」（用户报的困惑点）。
+    "select-layer:-1",
+    "select-mode:%d,0" % MEMBERS[0],
+    "select-mode:%d,1" % MEMBERS[1],
+    "layer-sel-dump",
+    # ck7：Ctrl+点组行 = 把整组**并入**当前选择（分组也能批量选中）。
+    "select-layer:%d" % OUTSIDE,
+    "group-select:%d,add" % GID,
+    "layer-sel-dump",
+    # ck8：新建图层落在当前选中层的位置（选中第 1 层 → 新层插到 1 号位，
+    # 不再永远跑到整摞最上面）。
+    "select-layer:1",
+    "new-layer",
+    "layers-group-dump",
+    # ck9：复制组内单层 → 粘贴，不该把上级分组一起带出来（只多一层，
+    # 不新建组）。
+    "select-layer:1",
+    "copy",
+    "paste",
+    "groups-dump",
+    "layers-group-dump",
+    # ck10：选中整组复制 → 粘贴，应新建一个**同名**组并把成员收进去。
+    "select-layer:-1",
+    "group-select:%d" % GID,
+    "copy",
+    "paste",
+    "groups-dump",
+    "layers-group-dump",
+    "layer-sel-dump",
 ]
 
 D_BASE, D_MOVE, D_UNDO = 0, 1, 2
@@ -217,6 +247,93 @@ def main():
         want(all(near(box_of(un[i])[k], box_of(base[i])[k]) for k in range(4)),
              "ck5 **一次**撤销应同时复位成员层 %d：%s → %s"
              % (i, box_of(base[i]), box_of(un[i])))
+
+    # ---- ck6 Ctrl 逐个点满一组 → 面板亮组行（group-focus = 组 id） ----
+    focus = parse_events(lines, "group-focus")
+    focus_ids = [f.get("id") for f in focus]
+    s6 = sels[2]
+    print("ck6  ctrl 点满两层后 count=%s focus=%s（全部 focus=%s）"
+          % (s6.get("count"), focus_ids[-1] if focus_ids else None, focus_ids))
+    want(s6.get("count") == len(MEMBERS),
+         "ck6 Ctrl 点满组成员后应选中 %d 层，实际 %s"
+         % (len(MEMBERS), s6.get("count")))
+    want(GID in focus_ids,
+         "ck6 整组成员全选中时应报告 group-focus=%d（组行高亮），实际 %s"
+         % (GID, focus_ids))
+
+    # ---- ck7 Ctrl+点组行 = 整组并入当前选择（分组批量选中） ----
+    s7 = sels[3]
+    print("ck7  组外层 + Ctrl 点组后 count=%s primary=%s"
+          % (s7.get("count"), s7.get("primary")))
+    want(s7.get("count") == len(MEMBERS) + 1,
+         "ck7 「一层 + 一整组」应为 %d 层，实际 %s"
+         % (len(MEMBERS) + 1, s7.get("count")))
+    want(focus_ids.count(GID) >= 2,
+         "ck7 Ctrl 点组行后仍应报告 group-focus=%d，实际 %s" % (GID, focus_ids))
+
+    # ---- ck8 新建图层落在选中层的位置（不再恒顶） ----
+    new_ev = parse_events(lines, "layer-new")
+    lg = parse_events(lines, "layers-group-dump")
+    if not new_ev or len(lg) < 1:
+        fails.append("ck8 没拿到 layer-new / layers-group-dump")
+    else:
+        at = new_ev[0].get("index")
+        print("ck8  new-layer index=%s（选中第 1 层）" % at)
+        want(at == 1, "ck8 新层应插在选中层的位置（1 号位），实际 %s" % at)
+        rows = lg[0].get("layers") or []
+        want(len(rows) == 5, "ck8 加层后应有 5 层，实际 %d" % len(rows))
+        want([r["i"] for r in rows].count(at) == 1,
+             "ck8 新层应真的落在 %s 号位" % at)
+
+    # ---- ck9 复制组内单层 → 粘贴不带上级分组、不新建组 ----
+    g9 = parse_events(lines, "groups-dump")
+    pasted = parse_events(lines, "pasted")
+    if len(g9) < 2 or len(lg) < 2 or not pasted:
+        fails.append("ck9 没拿到 paste 后的 groups/layers dump")
+    else:
+        print("ck9  粘贴后组数=%d（复制单层不该新建组），pasted=%s"
+              % (len(g9[1].get("groups") or []), pasted[0].get("index")))
+        want(len(g9[1].get("groups") or []) == 1,
+             "ck9 复制**单层**粘贴后组数应还是 1，实际 %d"
+             % len(g9[1].get("groups") or []))
+        rows = lg[1].get("layers") or []
+        want(len(rows) == 6, "ck9 粘贴后应有 6 层，实际 %d" % len(rows))
+        pi = pasted[0].get("index")
+        prow = next((r for r in rows if r.get("i") == pi), None)
+        print("ck9  粘贴层 i=%s 所属组=%s（应为 0：只复制当前图层）"
+              % (pi, prow.get("g") if prow else "?"))
+        want(prow is not None and prow.get("g") == 0,
+             "ck9 单层粘贴不该挂进原来的组，实际 g=%s"
+             % (prow.get("g") if prow else "?"))
+
+    # ---- ck10 复制整组 → 粘贴新建同名组 ----
+    if len(g9) < 3 or len(lg) < 3:
+        fails.append("ck10 没拿到整组粘贴后的 dump")
+    else:
+        gl = g9[2].get("groups") or []
+        prev = {g.get("id"): g for g in (g9[1].get("groups") or [])}
+        src_mids = (prev.get(GID) or {}).get("mids") or []
+        s10 = sels[4]
+        print("ck10 整组粘贴后组数=%d，选择数=%s（源组 %d 层）"
+              % (len(gl), s10.get("count"), len(src_mids)))
+        want(len(gl) == 2, "ck10 复制整组粘贴应新建 1 个组（共 2 个），实际 %d" % len(gl))
+        if len(gl) == 2:
+            names = [g.get("n") for g in gl]
+            want(names[0] == names[1],
+                 "ck10 新组应沿用名字 %s，实际 %s" % (names[0], names[1]))
+            newg = gl[1]
+            want(len(newg.get("mids") or []) == len(src_mids),
+                 "ck10 新组应含 %d 个成员，实际 %d"
+                 % (len(src_mids), len(newg.get("mids") or [])))
+            want(s10.get("count") == len(src_mids),
+                 "ck10 整组粘贴后应选中整组（%d 层），实际 %s"
+                 % (len(src_mids), s10.get("count")))
+            gid10 = newg.get("id")
+            rows = lg[2].get("layers") or []
+            attached = [r for r in rows if r.get("g") == gid10]
+            want(len(attached) == len(src_mids),
+                 "ck10 新组应有 %d 层挂上，实际 %d 层"
+                 % (len(src_mids), len(attached)))
 
     # ---- 截图：组选中态（组行高亮 / 成员行不亮 / 并集框）----
     print("[3] launch (screenshot)", flush=True)

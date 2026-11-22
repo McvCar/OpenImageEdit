@@ -1,11 +1,29 @@
 // paths 相关项。所有项标 pub(in crate::bridge)，mod.rs 再导出。
 use super::*;
 
+/// 内部图层的剪贴板内容。
+///
+/// 单层复制只带**这一层**：用户的诉求是「复制图层不要顺手把上级分组也带过来」。
+/// 只有「选中分组」时复制才把整组（成员 + 组记录）一起带走，粘贴时重新建组。
+#[derive(Clone)]
+pub(in crate::bridge) struct Clip {
+    /// 自底向顶（`layers[0]` 先落位）。
+    pub layers: Vec<Layer>,
+    /// 复制整组时带上的组记录（id 会在粘贴时重新分配）。
+    pub group: Option<editcore::LayerGroup>,
+}
+
+impl Clip {
+    pub fn is_group(&self) -> bool {
+        self.group.is_some()
+    }
+}
+
 /// Process-global clipboard (per-window `RefCell` fields cannot share state
-/// across the multi-window Bridges). Holds a full `Layer`, so pixels survive
+/// across the multi-window Bridges). Holds full layers, so pixels survive
 /// opening a different document (cross-image copy/paste).
-pub(in crate::bridge) fn clipboard() -> &'static std::sync::Mutex<Option<Layer>> {
-    static CLIPBOARD: std::sync::OnceLock<std::sync::Mutex<Option<Layer>>> =
+pub(in crate::bridge) fn clipboard() -> &'static std::sync::Mutex<Option<Clip>> {
+    static CLIPBOARD: std::sync::OnceLock<std::sync::Mutex<Option<Clip>>> =
         std::sync::OnceLock::new();
     CLIPBOARD.get_or_init(|| std::sync::Mutex::new(None))
 }

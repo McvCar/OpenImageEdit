@@ -70,6 +70,80 @@ impl qobject::Bridge {
         self.as_mut()
             .set_layer_selection_ids(QString::from(format!("[{json}]").as_str()));
         self.as_mut().set_selected_layer_count(ids.len() as i32);
+        let gid = self.as_mut().derive_selected_group(ids);
+        if *self.selected_group_id() != gid {
+            self.as_mut().set_selected_group_id(gid);
+            println!(
+                "{{\"phase\":\"ui\",\"event\":\"group-focus\",\"id\":{gid},\"count\":{}}}",
+                ids.len()
+            );
+        }
+    }
+
+    /// 由「多选集合 + 显式组焦点」算出 `selected_group_id`（组行高亮的唯一真值）。
+    ///
+    /// 两条来源：
+    /// 1. `group_focus`（点了组标题行）且它的成员**仍在**集合里 —— 用户显式
+    ///    选的组优先，单成员组也能点亮组行；
+    /// 2. 派生：某个 ≥2 成员组（非影子层）的全部成员都在集合里、且包含主选中
+    ///    层 → 取**最深**的那个。这样「Ctrl 逐个点完一组」和「点组行」看
+    ///    起来完全一致，不会出现「成员行全亮、组行不亮」。
+    ///
+    /// 不含主选中层的组不算（否则选中 A 组的同时 B 组成员恰好也在集合里时，
+    /// 组属性编辑会打到看不见的那个组上）。
+    fn derive_selected_group(&self, ids: &[u32]) -> i32 {
+        let guard = self.session.borrow();
+        let Some(session) = guard.as_ref() else {
+            return -1;
+        };
+        let doc = &session.doc;
+        let member_ids = |gid: u32| -> Vec<u32> {
+            doc.group_subtree_layers(gid)
+                .into_iter()
+                .filter(|&i| doc.layers.get(i).map(|l| !l.synthetic).unwrap_or(false))
+                .map(|i| doc.layers[i].id)
+                .collect()
+        };
+        // 1) 显式组焦点
+        let focus = self.group_focus.get();
+        if focus > 0 && doc.find_group(focus as u32).is_some() {
+            let members = member_ids(focus as u32);
+            if !members.is_empty() && members.iter().all(|m| ids.contains(m)) {
+                return focus;
+            }
+            self.group_focus.set(0);
+        }
+        // 2) 派生：整组全选
+        let primary_id = if *self.selected_layer() >= 0 {
+            doc.layers
+                .get(*self.selected_layer() as usize)
+                .map(|l| l.id)
+        } else {
+            None
+        };
+        let Some(primary_id) = primary_id else {
+            return -1;
+        };
+        if ids.len() < 2 {
+            return -1;
+        }
+        let mut best = -1;
+        let mut depth = -1;
+        for g in &doc.groups {
+            let members = member_ids(g.id);
+            if members.len() < 2 || !members.contains(&primary_id) {
+                continue;
+            }
+            if !members.iter().all(|m| ids.contains(m)) {
+                continue;
+            }
+            let d = doc.group_depth(g.id);
+            if d as i32 > depth {
+                depth = d as i32;
+                best = g.id as i32;
+            }
+        }
+        best
     }
 
     /// 图层增删 / 重排之后重新校准多选（同 id 的层可能已经消失）。
@@ -118,6 +192,9 @@ impl qobject::Bridge {
 
     /// 单选 / Ctrl 切换 / Shift 连选。`index < 0` = 清空选中。
     pub fn select_layer_ex(mut self: Pin<&mut Self>, index: i32, mode: i32) {
+        // 点图层行 = 用户的心智已经离开「组」这个整体，显式组焦点作废
+        // （派生来源仍然有效：逐个 Ctrl 点满一组照样点亮组行）。
+        self.group_focus.set(0);
         if index < 0 {
             *self.selection_ids.borrow_mut() = Vec::new();
             self.as_mut().set_selected_layer(-1);
@@ -178,14 +255,63 @@ impl qobject::Bridge {
         );
     }
 
-    /// 新建空图层（插到栈顶并选中）。
+    /// 「新建 / 粘贴」的落点：返回 (插入下标, 应该挂进的组)。
+    ///
+    /// * 组整体选中 → 插到组内**最上面**（组标题行正下方），并挂进该组；
+    /// * 选中某个图层 → 插到它**下方**（该层上移一位）；`inherit_layer_group`
+    ///   决定是否沿用它的组归属（新建图层 = 沿用，粘贴单层 = 不沿用，否则
+    ///   用户会看到「复制一个图层粘贴，上级分组也跟过来了」）；
+    /// * 什么都没选 / 选的是背景 → 栈顶、顶层组（`layers[0]` 恒为背景，
+    ///   `AddLayer` 会拒绝 0 号位，所以下标至少为 1）。
+    ///
+    /// 以前恒插栈顶，用户报「在中间新建图层，新层跑到整摞最上面」。
+    pub(in crate::bridge) fn insert_anchor(
+        &self,
+        inherit_layer_group: bool,
+    ) -> (usize, Option<editcore::GroupId>) {
+        let guard = self.session.borrow();
+        let Some(session) = guard.as_ref() else {
+            return (usize::MAX, None);
+        };
+        let doc = &session.doc;
+        let top = doc.layers.len();
+        let gid = *self.selected_group_id();
+        if gid > 0 && doc.find_group(gid as u32).is_some() {
+            let members: Vec<usize> = doc
+                .group_subtree_layers(gid as u32)
+                .into_iter()
+                .filter(|&i| doc.layers.get(i).map(|l| !l.synthetic).unwrap_or(false))
+                .collect();
+            return match members.last() {
+                Some(&highest) => (highest.max(1), Some(gid as u32)),
+                // 空组：新层进组，位置就落在组本来占的那一段（栈顶）。
+                None => (top, Some(gid as u32)),
+            };
+        }
+        let primary = *self.selected_layer();
+        if primary > 0 && (primary as usize) < doc.layers.len() {
+            let group = if inherit_layer_group {
+                doc.layers[primary as usize].group
+            } else {
+                None
+            };
+            return (primary as usize, group);
+        }
+        (top, None)
+    }
+
+    /// 新建空图层（按当前选中位置插入并选中）。
     pub fn new_layer(mut self: Pin<&mut Self>) {
         let viewport = *self.viewport.borrow();
+        let (at, group) = self.as_mut().insert_anchor(true);
         let result: Result<usize, String> = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
                 None => Err("no document".into()),
-                Some(session) => session.doc.new_empty_layer().map_err(|e| e.to_string()),
+                Some(session) => session
+                    .doc
+                    .new_empty_layer_in(at, group)
+                    .map_err(|e| e.to_string()),
             }
         };
         match result {

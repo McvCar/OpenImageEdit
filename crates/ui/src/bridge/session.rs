@@ -1926,9 +1926,21 @@ impl Session {
             )
         };
         self.gpu_live = true;
+        // 诊断字段：拖动期「画面比落定后小一点点」这类问题，光看 target 不够 ——
+        // 要能对比 disp（QML 用的显示比例）、display（逻辑显示尺寸）和活动层
+        // 矩形，才能判断是比例错了、还是取整掉了几个像素。
         println!(
-            "{{\"phase\":\"ui\",\"event\":\"gpu-begin\",\"index\":{index},\"full\":{gpu_full},\"target\":\"{}x{}\"}}",
-            target.width, target.height
+            "{{\"phase\":\"ui\",\"event\":\"gpu-begin\",\"index\":{index},\"full\":{gpu_full},\
+             \"target\":\"{}x{}\",\"display\":\"{}x{}\",\"disp\":{disp_scale:.6},\
+             \"rect\":\"{:.2},{:.2},{:.2},{:.2}\"}}",
+            target.width,
+            target.height,
+            display.width,
+            display.height,
+            self.gpu_rect.0,
+            self.gpu_rect.1,
+            self.gpu_rect.2,
+            self.gpu_rect.3
         );
         true
     }

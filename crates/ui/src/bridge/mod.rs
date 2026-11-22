@@ -139,6 +139,13 @@ pub mod qobject {
         #[qproperty(QString, layer_selection_ids, cxx_name = "layerSelectionIds")]
         /// 多选：选中图层数量（面板标题 / 批量操作条用）。
         #[qproperty(i32, selected_layer_count, cxx_name = "selectedLayerCount")]
+        /// 当前「整体选中」的分组 id（-1 = 没有）。这是组行高亮的**唯一真值**：
+        /// 面板不再自己记一份，也不按「成员恰好全选」另算一份 —— 两份真值
+        /// 一旦不同步，就会出现「成员行全亮、组行不亮」这种让人困惑的状态。
+        /// 两种来源：① 点了组标题行（显式焦点）；② 多选集合刚好等于某个
+        /// ≥2 成员组的全部成员（例如 Ctrl 逐个点完）→ 派生，和点组行看起来
+        /// 完全一致。
+        #[qproperty(i32, selected_group_id, cxx_name = "selectedGroupId")]
         /// 文档像素版本（`Document::edit_epoch`）。面板把它混进列表签名，
         /// 像素一改就重建列表 → 缩略图跟着刷新。
         #[qproperty(i32, layer_epoch, cxx_name = "layerEpoch")]
@@ -799,8 +806,9 @@ pub mod qobject {
         fn ungroup_group(self: Pin<&mut Self>, group_id: i32) -> bool;
 
         /// 点组标题行：选中整组，主选中层为组内最上层。
+        /// `additive`（Ctrl+点）= 把整组**并入**当前选择，实现分组批量选中。
         #[qinvokable]
-        fn select_group(self: Pin<&mut Self>, group_id: i32);
+        fn select_group(self: Pin<&mut Self>, group_id: i32, additive: bool);
 
         /// 拖动图层进出分组：group_id=0 表示移到顶层（脱离所有组）。
         /// 只改组织元数据、不改 z 序与像素（画面不变）。
@@ -1393,6 +1401,10 @@ pub struct BridgeRust {
     /// 上面那份 id 的 JSON 形式（QML 直接读）。
     layer_selection_ids: QString,
     selected_layer_count: i32,
+    /// 显式「点了组标题行」的组 id（0 = 没有）。只是**提示**，发布给 QML 的
+    /// `selected_group_id` 还要校验它的成员仍在选择集里（见 publish_layer_selection）。
+    group_focus: std::cell::Cell<i32>,
+    selected_group_id: i32,
     layer_epoch: i32,
     /// 缩略图缓存：(会话 id, 图层 id) → (epoch, file:// URL, 临时文件路径)。
     thumb_cache: RefCell<std::collections::HashMap<(u32, u32), (u64, String, PathBuf)>>,
@@ -1576,6 +1588,8 @@ impl Default for BridgeRust {
             selection_ids: RefCell::new(Vec::new()),
             layer_selection_ids: QString::from("[]"),
             selected_layer_count: 0,
+            group_focus: std::cell::Cell::new(0),
+            selected_group_id: -1,
             layer_epoch: 0,
             thumb_cache: RefCell::new(std::collections::HashMap::new()),
             selected_mark: -1,

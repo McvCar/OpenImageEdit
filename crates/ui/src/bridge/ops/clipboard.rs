@@ -46,7 +46,10 @@ impl qobject::Bridge {
                     layer.img().width(),
                     layer.img().height()
                 );
-                *clipboard().lock().unwrap() = Some(layer);
+                *clipboard().lock().unwrap() = Some(Clip {
+                    layers: vec![layer],
+                    group: None,
+                });
                 consume_sys_clipboard();
                 *self.paste_counter.borrow_mut() = 0;
                 self.as_mut().set_status(QString::from(text.as_str()));
@@ -92,7 +95,10 @@ impl qobject::Bridge {
                     layer.img().width(),
                     layer.img().height()
                 );
-                *clipboard().lock().unwrap() = Some(layer);
+                *clipboard().lock().unwrap() = Some(Clip {
+                    layers: vec![layer],
+                    group: None,
+                });
                 consume_sys_clipboard();
                 *self.paste_counter.borrow_mut() = 0;
                 self.as_mut().set_status(QString::from(text.as_str()));
@@ -154,24 +160,70 @@ impl qobject::Bridge {
         }
     }
 
+    /// 复制图层 / 分组。
+    ///
+    /// * 当前是「组整体选中」(`selectedGroupId > 0`) → 复制**整组**：子树里
+    ///   的非影子成员（自底向顶）+ 组记录（名字 / 混合 / 不透明度 / 穿透）。
+    /// * 否则只复制主选中层，并且**清掉它的组归属**：以前副本会把 `group`
+    ///   一起带过去，粘贴后新层直接落进原来的组，用户看到的就是「复制一个
+    ///   图层，把上级分组也复制了」。
     pub fn copy_selected_layer(mut self: Pin<&mut Self>) {
         let Some(ix) = self.selected_guard(*self.selected_layer()) else {
             self.as_mut().set_status(QString::from("没有选中的图层"));
             return;
         };
-        let layer = {
+        let gid = *self.selected_group_id();
+        let (clip, text): (Result<Clip, String>, String) = {
             let guard = self.session.borrow();
-            match guard.as_ref() {
-                Some(session) => session.doc.layers[ix].clone(),
-                None => return,
+            let Some(session) = guard.as_ref() else {
+                return;
+            };
+            let doc = &session.doc;
+            if gid > 0 && doc.find_group(gid as u32).is_some() {
+                let members: Vec<usize> = doc
+                    .group_subtree_layers(gid as u32)
+                    .into_iter()
+                    .filter(|&i| doc.layers.get(i).map(|l| !l.synthetic).unwrap_or(false))
+                    .collect();
+                let layers: Vec<Layer> = members.iter().map(|&i| doc.layers[i].clone()).collect();
+                let group = doc.find_group(gid as u32).cloned();
+                let name = group
+                    .as_ref()
+                    .map(|g| g.name.clone())
+                    .unwrap_or_default();
+                (
+                    Ok(Clip { layers, group }),
+                    format!(
+                        "已复制分组「{}」共 {} 层（Ctrl+V 粘贴）",
+                        name,
+                        members.len()
+                    ),
+                )
+            } else {
+                let mut layer = doc.layers[ix].clone();
+                layer.group = None;
+                (
+                    Ok(Clip {
+                        layers: vec![layer],
+                        group: None,
+                    }),
+                    format!("已复制图层「{}」（Ctrl+V 粘贴，可跨文档）", doc.layers[ix].name),
+                )
             }
         };
-        let text = format!("已复制图层「{}」（Ctrl+V 粘贴，可跨文档）", layer.name);
-        *clipboard().lock().unwrap() = Some(layer);
-        consume_sys_clipboard();
-        *self.paste_counter.borrow_mut() = 0;
-        self.as_mut().set_status(QString::from(text.as_str()));
-        println!("{{\"phase\":\"ui\",\"event\":\"copied-layer\",\"index\":{ix}}}");
+        match clip {
+            Ok(clip) => {
+                *clipboard().lock().unwrap() = Some(clip);
+                consume_sys_clipboard();
+                *self.paste_counter.borrow_mut() = 0;
+                self.as_mut().set_status(QString::from(text.as_str()));
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"copied-layer\",\"index\":{ix},\
+                     \"group\":{gid}}}"
+                );
+            }
+            Err(message) => self.as_mut().set_status(QString::from(message.as_str())),
+        }
     }
 
     pub fn cut_selected_layer(mut self: Pin<&mut Self>) {
@@ -179,17 +231,38 @@ impl qobject::Bridge {
             self.as_mut().set_status(QString::from("没有选中的图层"));
             return;
         };
-        let layer = {
+        let gid = *self.selected_group_id();
+        {
             let guard = self.session.borrow();
-            match guard.as_ref() {
-                Some(session) => session.doc.layers[ix].clone(),
-                None => return,
-            }
-        };
-        *clipboard().lock().unwrap() = Some(layer);
+            let Some(session) = guard.as_ref() else {
+                return;
+            };
+            let doc = &session.doc;
+            let clip = if gid > 0 && doc.find_group(gid as u32).is_some() {
+                let members: Vec<usize> = doc
+                    .group_subtree_layers(gid as u32)
+                    .into_iter()
+                    .filter(|&i| doc.layers.get(i).map(|l| !l.synthetic).unwrap_or(false))
+                    .collect();
+                Clip {
+                    layers: members.iter().map(|&i| doc.layers[i].clone()).collect(),
+                    group: doc.find_group(gid as u32).cloned(),
+                }
+            } else {
+                let mut layer = doc.layers[ix].clone();
+                layer.group = None;
+                Clip {
+                    layers: vec![layer],
+                    group: None,
+                }
+            };
+            *clipboard().lock().unwrap() = Some(clip);
+        }
         consume_sys_clipboard();
         *self.paste_counter.borrow_mut() = 0;
-        println!("{{\"phase\":\"ui\",\"event\":\"cut-layer\",\"index\":{ix}}}");
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"cut-layer\",\"index\":{ix},\"group\":{gid}}}"
+        );
         self.as_mut().delete_selected_layer();
     }
 
@@ -275,41 +348,64 @@ impl qobject::Bridge {
         };
         let viewport = *self.viewport.borrow();
         const PASTE_SHIFT: i32 = 12;
-        let result: Result<usize, String> = {
+        // 单层粘贴**不继承**锚点图层的组归属（用户报的「复制图层把上级分组
+        // 也复制了」）；只有「选中分组」时锚点才给组，粘贴才进组。
+        let (anchor, anchor_group) = self.as_mut().insert_anchor(false);
+        let is_group = clip.is_group();
+        let result: Result<Vec<usize>, String> = {
             let mut guard = self.session.borrow_mut();
             match guard.as_mut() {
                 None => Err("这个窗口还没有打开图片".into()),
                 Some(session) => {
                     let canvas = session.doc.canvas;
                     let count = *self.paste_counter.borrow() as i32;
-                    let mut layer = clip.clone();
-                    // Auto-name by creation order ("1", "2", ...).
-                    layer.name = session.doc.next_layer_name();
-                    // Keep the pasted layer at its copied position, clamped so
-                    // part of it stays on the canvas; repeated pastes fan out.
-                    let (bx, by) = layer.offset();
-                    let ox = (bx + PASTE_SHIFT * count).clamp(
-                        -(layer.img().width() as i32 - 1),
-                        canvas.width as i32 - 1,
-                    );
-                    let oy = (by + PASTE_SHIFT * count).clamp(
-                        -(layer.img().height() as i32 - 1),
-                        canvas.height as i32 - 1,
-                    );
-                    layer.set_offset((ox, oy));
-                    match session.doc.add_layer(layer) {
-                        Ok(index) => {
+                    let mut layers = Vec::with_capacity(clip.layers.len());
+                    for src in &clip.layers {
+                        let mut layer = src.clone();
+                        // Auto-name by creation order ("1", "2", ...).
+                        layer.name = session.doc.next_layer_name();
+                        // Keep the pasted layer at its copied position, clamped so
+                        // part of it stays on the canvas; repeated pastes fan out.
+                        let (bx, by) = layer.offset();
+                        let ox = (bx + PASTE_SHIFT * count).clamp(
+                            -(layer.img().width() as i32 - 1),
+                            canvas.width as i32 - 1,
+                        );
+                        let oy = (by + PASTE_SHIFT * count).clamp(
+                            -(layer.img().height() as i32 - 1),
+                            canvas.height as i32 - 1,
+                        );
+                        layer.set_offset((ox, oy));
+                        layers.push(layer);
+                    }
+                    // 复制整组 → 粘贴也建一个组；组 id 由目标文档重新分配。
+                    let group = match (clip.group.clone(), anchor_group) {
+                        (Some(g), _) => Some(g),
+                        // 单层粘贴：沿用锚点所在组的归属（粘贴到组内就是组内）。
+                        (None, g) => {
+                            if let Some(gid) = g {
+                                for l in layers.iter_mut() {
+                                    l.group = Some(gid);
+                                }
+                            }
+                            None
+                        }
+                    };
+                    session
+                        .doc
+                        .paste_layers_at(layers, anchor, group)
+                        .map_err(|e| e.to_string())
+                        .map(|placed| {
                             session.dirty = true;
                             *self.paste_counter.borrow_mut() = count as u32 + 1;
-                            Ok(index)
-                        }
-                        Err(e) => Err(e.to_string()),
-                    }
+                            placed
+                        })
                 }
             }
         };
         match result {
-            Ok(index) => {
+            Ok(placed) => {
+                let index = *placed.last().unwrap_or(&0);
                 self.as_mut().set_selected_layer(index as i32);
                 {
                     let mut guard = self.session.borrow_mut();
@@ -317,8 +413,14 @@ impl qobject::Bridge {
                         s.refit_if_needed(viewport);
                     }
                 }
+                // 多选集合跟着粘贴结果走：整组粘贴时整组入集合（可直接拖动）。
+                self.as_mut().set_selection_indices(&placed);
                 self.as_mut().refresh_preview();
-                println!("{{\"phase\":\"ui\",\"event\":\"pasted\",\"index\":{index}}}");
+                println!(
+                    "{{\"phase\":\"ui\",\"event\":\"pasted\",\"index\":{index},\
+                     \"count\":{},\"group\":{is_group}}}",
+                    placed.len()
+                );
                 true
             }
             Err(message) => {
