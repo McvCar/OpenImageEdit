@@ -143,6 +143,9 @@ pub(super) fn bake_group_style_layers(
                         offset: baked.offset,
                         image: front,
                         visible: group_visible,
+                        // 烘焙样式是组的「影子成员」：跟随组的显隐快照还原，
+                        // 自身旗标恒真（否则外层组显隐一轮后样式层会丢）。
+                        own_visible: true,
                         opacity: 1.0,
                         blend: editcore::BlendMode::Normal,
                         degraded: Vec::new(),
@@ -170,6 +173,8 @@ pub(super) fn bake_group_style_layers(
                         offset: baked.offset,
                         image: behind,
                         visible: group_visible,
+                        // 同上：影子成员，自身旗标恒真。
+                        own_visible: true,
                         opacity: 1.0,
                         // 组的投影带着它自己的混合模式（PSD `Md  `）：PS 里
                         // 投影与组下方的画面混合，当成 Normal 图层盖上去会把

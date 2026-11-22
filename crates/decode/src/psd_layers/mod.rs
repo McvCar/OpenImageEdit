@@ -42,7 +42,11 @@ pub struct PsdLayerData {
     pub name: String,
     pub offset: (i32, i32),
     pub image: RgbaImage,
+    /// 折叠祖先组显隐之后的合成真值（渲染只认成员 visible）。
     pub visible: bool,
+    /// 成员自己的 PSD 眼睛旗标（折叠之前）。装配时隐藏组用它回填
+    /// `hidden_snapshot`，面板眼睛加载后立刻显示真实状态。
+    pub own_visible: bool,
     pub opacity: f32,
     /// Blend mode of the layer record (already mapped onto what `core` renders).
     pub blend: editcore::BlendMode,
@@ -202,6 +206,7 @@ impl PsdLayerSet {
                 offset: l.offset,
                 image: l.image,
                 visible: l.visible,
+                own_visible: l.own_visible,
                 opacity: l.opacity,
                 blend: l.blend,
                 group: l.group,
@@ -868,6 +873,7 @@ fn build_layers<F: FnMut(usize, usize)>(
             offset: layer_offset,
             image,
             visible: layer.visible() && ancestor_visible,
+            own_visible: layer.visible(),
             // 组不透明度不再乘进成员：合成时整组一次性应用（否则成员重叠处
             // 会叠两次，比 PS 更透）。
             opacity: layer.opacity() as f32 / 255.0,

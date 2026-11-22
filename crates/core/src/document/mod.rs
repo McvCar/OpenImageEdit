@@ -146,7 +146,13 @@ pub struct PsdLayerSeed {
     pub name: String,
     pub offset: (i32, i32),
     pub image: RgbaImage,
+    /// 折叠祖先组显隐**之后**的合成真值（渲染只认成员 visible）。
     pub visible: bool,
+    /// 成员自己的 PSD 眼睛旗标（折叠**之前**的值）。装配时隐藏组用它
+    /// 回填 `hidden_snapshot`，面板眼睛才能在加载后立刻显示真实状态
+    /// ——否则「一开始就是隐藏的组」成员眼睛全显示闭眼，要点一次组
+    /// 眼睛开→关（走 `set_group_visible` 的快照路径）才恢复。
+    pub own_visible: bool,
     pub opacity: f32,
     /// Blend mode carried by the PSD layer record.
     pub blend: BlendMode,
@@ -204,6 +210,7 @@ mod psd_assembly_tests {
             offset,
             image: RgbaImage::from_pixel(size.0, size.1, Rgba(color)),
             visible,
+            own_visible: visible,
             opacity,
             blend: BlendMode::Normal,
             group: None,
@@ -255,6 +262,30 @@ mod psd_assembly_tests {
         };
         assert_eq!(make(false).flatten().get_pixel(0, 0).0, [255, 0, 0, 255]);
         assert_eq!(make(true).flatten().get_pixel(0, 0).0, [255, 255, 255, 255]);
+    }
+
+    /// PSD 里一开始就是隐藏的组：成员 visible 被 decode 折叠成 false，但
+    /// 面板眼睛要按自身旗标（`own_visible`）保持睁眼 —— 装配时给隐藏组
+    /// 回填 `hidden_snapshot`；点组眼睛显示时按快照还原各自意愿。
+    #[test]
+    fn loaded_hidden_group_keeps_member_eye_and_restores_on_show() {
+        let mut member = seed("成员", (0, 0), [255, 0, 0, 255], (2, 2), false, 1.0);
+        member.own_visible = true; // 自己的眼睛是开的，因组隐藏被折叠
+        member.group = Some(5);
+        let mut off = seed("关", (0, 0), [0, 255, 0, 255], (2, 2), false, 1.0);
+        off.own_visible = false; // 自己本来就隐藏
+        off.group = Some(5);
+        let mut g = group_seed(5, "组", BlendMode::Normal, 1.0, false);
+        g.visible = false;
+        let mut doc = Document::from_psd_layers_with_groups((2, 2), vec![member, off], vec![g]);
+        let gid = doc.groups[0].id;
+        assert!(!doc.layers[1].visible, "合成真值仍是隐藏");
+        assert!(doc.layer_display_visible(1), "折叠隐藏的成员眼睛应保持睁眼");
+        assert!(!doc.layer_display_visible(2), "自身就隐藏的成员仍是闭眼");
+        assert_eq!(doc.groups[0].hidden_snapshot.len(), 2);
+        doc.set_group_visible(gid, true).expect("显示组");
+        assert!(doc.layers[1].visible, "显示组后按自身意愿还原");
+        assert!(!doc.layers[2].visible, "自身隐藏的成员不跟着打开");
     }
 
     /// 组不透明度只应用一次：两个 50% 黑层在 50% 的组里应当是 0.375 的黑。
@@ -595,6 +626,9 @@ impl Document {
             groups[i].opacity = seed.opacity.clamp(0.0, 1.0);
             groups[i].pass_through = seed.pass_through;
         }
+        // 成员自身旗标（折叠前），与 `layers[1..]` 一一对应；循环按值消费
+        // `seeds`，先取出来。
+        let own_flags: Vec<bool> = seeds.iter().map(|s| s.own_visible).collect();
         for seed in seeds {
             let mut layer = Layer::new(seed.name, seed.image);
             layer.visible = seed.visible;
@@ -614,6 +648,36 @@ impl Document {
                 raster.offset = seed.offset;
             }
             layers.push(layer);
+        }
+        // PSD 里一开始就是隐藏的组：成员 visible 已被 decode 折叠成 false
+        // （合成只认成员），但面板眼睛要显示成员自己的状态。给链上每个
+        // 隐藏祖先组回填 `hidden_snapshot`，值为「自身旗标 && 介于中间的
+        // 组都可见」。**子树全部成员都要入快照**（自身隐藏的记 false）：
+        // `set_group_visible(true)` 对不在快照里的成员默认点亮
+        // （`unwrap_or(true)`），漏记会把手动隐藏的成员误点亮。与
+        // `set_group_visible(false)` 的落点一致 —— 眼睛加载后立刻正确。
+        for (layer, &own) in layers.iter().skip(1).zip(own_flags.iter()) {
+            if layer.visible {
+                // 有隐藏祖先必被折叠成 false；仍可见说明链上没有隐藏组。
+                continue;
+            }
+            let mut gid = layer.group;
+            let mut cur = own;
+            let mut guard = 0;
+            while let Some(id) = gid {
+                guard += 1;
+                if guard > 64 {
+                    break;
+                }
+                let Some(g) = groups.iter_mut().find(|g| g.id == id) else {
+                    break;
+                };
+                if !g.visible {
+                    g.hidden_snapshot.push((layer.id, cur));
+                }
+                cur &= g.visible;
+                gid = g.parent;
+            }
         }
         Self {
             source: None,

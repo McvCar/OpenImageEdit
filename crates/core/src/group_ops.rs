@@ -930,6 +930,7 @@ mod group_tests {
             offset: (0, 0),
             image: RgbaImage::from_pixel(4, 4, Rgba([9, 9, 9, 255])),
             visible: true,
+            own_visible: true,
             opacity: 1.0,
             blend: BlendMode::Normal,
             group,
