@@ -803,6 +803,12 @@ impl qobject::Bridge {
         }
         // 真正的落定仍由旧 *_end 完成（它们内部已统一到 SetLayerTransform），
         // 这样 QML 只需在 release 时按手势类型再调一次对应收尾。
+        //
+        // ★这里必须是**真实渲染**，不能用「可重用」的 zoom 刷新：活帧手势
+        //   期间文档是**实时写**的（offset / 像素都动过），`edit_epoch` 却
+        //   故意没变（手势不记历史）；按 epoch 判重用会把拖动前那一帧顶上去
+        //   ——「松手后画面还停在原位」。重复合成一次（`*_end` 里已有一次）
+        //   是既有代价，缩放 / 旋转路径一直如此。
         self.as_mut().refresh_preview();
         true
     }

@@ -45,12 +45,14 @@ Item {
         return arr
     }
     property bool blendListOpen: false
-    // 点组标题行只「聚焦这个组」，不再把整组成员塞进多选集合（用户报的
-    // bug：点组 = 全选一堆层，随后任何操作都打到意外的层上）。组行高亮、
-    // 组属性编辑都读这个 id；它是纯面板状态，不进 bridge 的图层选择集。
+    // 点组标题行 = 选中整组（「组 = 一个整体」的手势入口）：
+    //   * 成员写进 bridge 多选集合 → 画布出**并集包围盒**，拖动 / 缩放 /
+    //     旋转都作用于整组（批量路径）；
+    //   * 面板只高亮组标题行，成员行不跟着亮（用户报的「组和图层同时被
+    //     选中」）；这个 id 同时供组属性编辑（混合模式 / 不透明度）读取。
     property int selectedGroupId: -1
-    // bridge 侧全选成员时（探针 / 其它路径）组行也要高亮，所以两种都认：
-    // 显式点组（selectedGroupId）或成员被整组选中（旧逻辑）。
+    // 组行高亮 / 组属性编辑的唯一判据就是这个 id（不再因为「成员恰好全在
+    // 多选集合里」自动高亮 —— 单选一个成员层时会把组也点亮）。
     readonly property var activeGroup: {
         let best = null
         const list = host.layerPanelList
@@ -76,8 +78,10 @@ Item {
     }
     function closeBlendList() { layerPanel.blendListOpen = false }
     // 画布上点选了图层 = 用户的心智已经转到那一层，组焦点随之作废；否则
-    // 组行会一直高亮、混合下拉还改的是组。点组行本身不动 selected_layer，
-    // 所以不会被这里误清。
+    // 组行会一直高亮、混合下拉还改的是组。点空白（`select_layer(-1)`）同样
+    // 作废 —— 否则「组一直在选中态」而画布上已经没有框了。
+    // 点组行会先调 `select_group`（把主选中层写成组内最上层），这个回调
+    // 先把 id 清掉，调用方随后再写回来，所以不会被误清。
     Connections {
         target: bridge
         // ★qproperty `selected_layer` 生成的信号是 `selected_layerChanged`
@@ -88,6 +92,8 @@ Item {
             if (ix >= 0) {
                 layerPanel.selectedGroupId = -1
                 layerPanel.revealLayerRow(ix)
+            } else {
+                layerPanel.selectedGroupId = -1
             }
         }
     }
@@ -222,21 +228,74 @@ Item {
             return []
         }
     }
+    // ---- 「组选中」的唯一判据 -------------------------------------------
+    // 组选中 = 整组成员进了多选集合（画布出并集框、批量变换吃整组），但面板
+    // **只高亮组标题行**：成员行跟着一起亮就是用户报的「组和图层同时被选中」。
+    //
+    // 两条来源合成一个派生值，避免面板自己记一份、跟着选择集跑偏：
+    //   1) 点了组行（selectedGroupId）且成员还在选择集里；
+    //   2) 选择集**恰好等于**某个 ≥2 成员组的全部成员 —— 覆盖脚本 / 探针 /
+    //      别的代码路径调 `select_group` 的情况，和点组行看起来一致。
+    //      要求 ≥2 是有意的：只有 1 个成员的组，单选那层时不能把组也点亮。
+    function groupById(gid) {
+        if (gid <= 0)
+            return null
+        const list = host.groupList
+        for (var i = 0; i < list.length; i++)
+            if (list[i] && list[i].id === gid)
+                return list[i]
+        return null
+    }
+    function membersAllSelected(g) {
+        if (g === null)
+            return false
+        const mids = g.mids || []
+        if (mids.length === 0 || mids.length !== selIds.length)
+            return false
+        for (var i = 0; i < mids.length; i++)
+            if (selIds.indexOf(mids[i]) < 0)
+                return false
+        return true
+    }
+    readonly property int effectiveGroupId: {
+        if (layerPanel.membersAllSelected(layerPanel.groupById(
+                layerPanel.selectedGroupId)))
+            return layerPanel.selectedGroupId
+        if (bridge.selectedLayerCount >= 2) {
+            // 嵌套时可能有多个组同时「成员全中」（父组的 mids 含子组成员）：
+            // 取**最深**那个，才和用户点的子组一致。
+            let best = -1
+            let depth = -1
+            const list = host.groupList
+            for (var i = 0; i < list.length; i++) {
+                const g = list[i]
+                if (!g || (g.mids || []).length < 2)
+                    continue
+                if (!layerPanel.membersAllSelected(g))
+                    continue
+                if ((g.d || 0) > depth) {
+                    depth = g.d || 0
+                    best = g.id
+                }
+            }
+            return best
+        }
+        return -1
+    }
+    function focusedGroup() {
+        return layerPanel.groupById(layerPanel.effectiveGroupId)
+    }
     function isSelectedRow(row) {
         if (row === null || row === undefined)
             return false
-        // 组标题行：显式点组（selectedGroupId）或 bridge 侧整组选中都高亮。
-        // ★不再因为「成员恰好全在 selIds」就自动全选 —— 那是 bug 的来源。
-        if (row.k === "group") {
-            if (row.gid === layerPanel.selectedGroupId)
-                return true
-            const mids = row.mids || []
-            if (mids.length === 0)
+        if (row.k === "group")
+            return row.gid === layerPanel.effectiveGroupId
+        // 组选中态：组子树里的成员不单独高亮（框已经代表整组了）。
+        const g = layerPanel.focusedGroup()
+        if (g !== null) {
+            const mids = g.mids || []
+            if (mids.indexOf(row.id) >= 0)
                 return false
-            for (var i = 0; i < mids.length; i++)
-                if (selIds.indexOf(mids[i]) < 0)
-                    return false
-            return true
         }
         return selIds.indexOf(row.id) >= 0
     }
@@ -1508,8 +1567,13 @@ Item {
                             } else if (snapRow && !snapRow.isBase
                                        && (!layerRow.locked || layerRow.isGroup)) {
                                 if (layerRow.isGroup) {
-                                    // 点组 = 聚焦组（高亮 + 组属性编辑），**不**
-                                    // 改图层多选集合：不要自动全选整组成员。
+                                    // 点组 = 选中整组：成员写进多选集合（画布出
+                                    // 并集包围盒、批量变换吃整组），面板只亮组标题行。
+                                    // ★顺序要紧：`select_group` 会把主选中层写成组内
+                                    //   最上层，`onSelected_layerChanged` 会先把
+                                    //   selectedGroupId 清成 -1，所以 id 必须在调用
+                                    //   **之后**再写。
+                                    bridge.select_group(snapRow.gid)
                                     layerPanel.selectedGroupId = snapRow.gid
                                 } else {
                                     layerPanel.selectedGroupId = -1

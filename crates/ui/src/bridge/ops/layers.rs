@@ -1050,6 +1050,20 @@ impl qobject::Bridge {
 
     pub fn drag_translate_end(mut self: Pin<&mut Self>, commit: bool) {
         let viewport = *self.viewport.borrow();
+        // ★落定前先撤掉 Tier 1 纹理（gpuLive → false），两件事一起解决：
+        //   1) 批量提交会 `take_batch_state`，`transform` 被清空；紧接着的
+        //      refresh 里 `gpu_update_rect` 读不到 `b.delta`，只能按 (0,0)
+        //      重算 → `gpuRectJson` 被打回起手位置 → 整组纹理「跳回原处」，
+        //      松手瞬间在原位闪一下（用户报的现象）。
+        //   2) 提前结束 GPU 后，这次 refresh 不再走 `gpu-skip`，会真的产出一帧
+        //      落定画面 —— QML 侧「等新帧上屏再淡出」才有帧可等。
+        {
+            let mut guard = self.session.borrow_mut();
+            if let Some(session) = guard.as_mut() {
+                session.gpu_end();
+            }
+        }
+        self.as_mut().set_gpu_live(false);
         // 批量落定：取消 = 整组回滚；提交 = 一条 Batch 历史。
         let batch: Option<Result<bool, String>> = {
             let mut guard = self.session.borrow_mut();

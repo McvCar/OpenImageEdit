@@ -158,6 +158,13 @@ impl qobject::Bridge {
     }
 
     /// 点组标题行：选中整组（含嵌套子组的成员），主选中层为组内最上层。
+    ///
+    /// 这是「组 = 一个整体」的入口：成员写进多选集合后，画布的并集包围盒、
+    /// 批量拖动 / 缩放 / 旋转全都自动作用到整组。
+    ///
+    /// ★必须剔除**组样式影子层**（`synthetic`）：它们是重烘焙出来的派生层，
+    /// 面板不显示、恒锁定，包围盒往往是整幅画布 —— 混进多选集会让组的框
+    /// 一下子撑满画布，看着像选中了整张图。
     pub fn select_group(mut self: Pin<&mut Self>, group_id: i32) {
         if group_id <= 0 {
             return;
@@ -165,7 +172,19 @@ impl qobject::Bridge {
         let members = {
             let guard = self.session.borrow();
             match guard.as_ref() {
-                Some(session) => session.doc.group_subtree_layers(group_id as u32),
+                Some(session) => session
+                    .doc
+                    .group_subtree_layers(group_id as u32)
+                    .into_iter()
+                    .filter(|&i| {
+                        session
+                            .doc
+                            .layers
+                            .get(i)
+                            .map(|l| !l.synthetic)
+                            .unwrap_or(false)
+                    })
+                    .collect::<Vec<usize>>(),
                 None => Vec::new(),
             }
         };

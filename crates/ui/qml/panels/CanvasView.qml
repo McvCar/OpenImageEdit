@@ -245,6 +245,9 @@ Flickable {
         property string pendingUrl: ""
         // 同一帧连续重派次数（pulse 里用；3 次以后改同步解码兜底）。
         property int retries: 0
+        // 已经上屏的帧序号（每次换台 +1）。GPU 落定后的淡出要等它变化，
+        // 见 gpuLayer 的 fadeBaseCount。
+        property int adoptCount: 0
 
         // 新的一帧到了：记下来交给后台那张去解（同一时刻只有一次解码在跑）。
         function pushUrl(url) {
@@ -300,6 +303,7 @@ Flickable {
             shownUrl = url
             frontIsB = !frontIsB
             retries = 0
+            adoptCount += 1
             if (!host.imageRendered)
                 host.imageRendered = true
             bridge.image_shown()
@@ -487,6 +491,23 @@ Item {
     visible: view.bridge.gpuLive || fadeOpacity > 0.01
     opacity: view.bridge.gpuLive ? 1.0 : fadeOpacity
     property real fadeOpacity: 0.0
+    // ★落定后**不能立刻淡出**：GPU 拖动期间 `render()` 走 `gpu-skip` 不产新帧，
+    //   下面的 CPU 预览还停在**起手前那一帧**（图层在原位）。立刻淡出 =
+    //   中间那几十毫秒（新帧还在解码）露出旧位置的内容 → 用户看到的
+    //   「放手瞬间移动前的位置闪一下图层」。
+    //   所以淡出改为「等 CPU 新帧真正上屏」再开始（或超时兜底，绝不卡住）：
+    //   * fadeBaseCount = 落定那一刻已经上屏的帧序号；`previewImage.adoptCount`
+    //     一变（新帧换台）就开始交叉过渡。用计数器而不是比较 URL：同一次
+    //     渲染可能复用同一个临时文件，URL 不变但画面已经换了。
+    //   * 700ms 兜底：新帧永远到不了（渲染被跳过 / 空文档）也要收掉纹理。
+    property bool fadeArmed: false
+    property int fadeBaseCount: -1
+    function beginFade() {
+        gpuFadeFallback.stop()
+        gpuLayer.fadeArmed = false
+        gpuLayer.fadeOpacity = 1.0
+        gpuFade.restart()
+    }
     NumberAnimation {
         id: gpuFade
         target: gpuLayer
@@ -496,15 +517,36 @@ Item {
         duration: 90
         easing.type: Easing.OutCubic
     }
+    Timer {
+        id: gpuFadeFallback
+        // 兜底放宽到 700ms：大画布一帧「合成 + 编码 + 异步解码」可能真的超过
+        // 400ms，提前淡出就会露出旧位置那一帧（正是要修的现象）。这段等待里
+        // GPU 纹理停在**最终位置**，观感只是稍钝，不会错位。
+        interval: 700
+        repeat: false
+        onTriggered: gpuLayer.beginFade()
+    }
+    Connections {
+        target: previewImage
+        function onAdoptCountChanged() {
+            if (gpuLayer.fadeArmed
+                && previewImage.adoptCount !== gpuLayer.fadeBaseCount)
+                gpuLayer.beginFade()
+        }
+    }
     Connections {
         target: view.bridge
         function onGpuLiveChanged() {
             if (view.bridge.gpuLive) {
                 gpuFade.stop()
+                gpuFadeFallback.stop()
+                gpuLayer.fadeArmed = false
                 gpuLayer.fadeOpacity = 1.0
             } else {
                 gpuLayer.fadeOpacity = 1.0
-                gpuFade.restart()
+                gpuLayer.fadeBaseCount = previewImage.adoptCount
+                gpuLayer.fadeArmed = true
+                gpuFadeFallback.restart()
             }
         }
     }

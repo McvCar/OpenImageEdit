@@ -2690,6 +2690,10 @@ function findLayerBox() {
             const l = layerList[i]
             if (l.syn || ids.indexOf(l.id) < 0)
                 continue
+            // 锁定的成员不参与变换（批量目标也跳过它们），框跟着排除，
+            // 否则「框比能拖的内容大一圈」，缩放手柄看着像没贴合。
+            if (l.l === true)
+                continue
             if (!(l.w > 0 && l.h > 0))
                 continue
             x0 = Math.min(x0, l.x)
