@@ -2019,14 +2019,17 @@ impl Session {
                 return false;
             }
             let l = &self.doc.layers[i];
-            if !l.is_raster()
-                || !l.visible
-                || l.opacity < 0.999
-                || l.blend != editcore::BlendMode::Normal
-                || l.mask.is_some()
-                || l.clipping
-                || l.style.is_some()
-            {
+            // ★蒙版 / 图层样式 / 不透明度都不再拒：下面改用合成器烘焙，它们
+            //   和落定帧走同一套代码，结果天然一致（以前手写 overlay 只能表达
+            //   「原图 + offset」，于是这几类层全被挡在快路径外面 —— PSD 图层
+            //   几乎都带蒙版，整组快路径实际上等于从没生效）。
+            //   仍然拒的只有「三明治表达不了」的两类：
+            //   * 剪贴层：它要乘下方基底的 alpha，而基底可能在这组之外；
+            //   * 非 Normal 混合：单张纹理盖不到静态层上，颜色会变。
+            if !l.is_raster() || !l.visible || l.clipping {
+                return false;
+            }
+            if l.blend != editcore::BlendMode::Normal {
                 return false;
             }
         }
@@ -2046,20 +2049,28 @@ impl Session {
         if target.pixels() == 0 {
             return false;
         }
-        // 整组按 z 序烘进画布坐标（Normal + 不透明 ⇒ 普通 source-over 即可）。
-        let mut full = RgbaImage::new(canvas.width.max(1), canvas.height.max(1));
-        for i in lo..=hi {
-            let layer = &self.doc.layers[i];
-            let (ox, oy) = layer.offset();
-            image::imageops::overlay(&mut full, layer.img(), ox as i64, oy as i64);
+        // ★整组按 z 序烘成一张画布尺寸纹理 —— 走**合成器**，不要手写
+        //   `imageops::overlay(layer.img(), offset)`。
+        //
+        //   2026-11-23 用户第 4 次反馈「拖动时画面缩小一点点，松手才还原，
+        //   而且只沿一个轴缩」。手写 overlay 只看原图和 offset：
+        //     * `Layer.transform`（缩放 / 旋转 / 非等比）被完全忽略 —— 组内
+        //       缩放过的图层在拖动期间按**原始尺寸**画出来，松手才回到缩放后
+        //       的尺寸；沿哪个轴缩过，就只在哪个轴看起来「缩了」；
+        //     * 蒙版 / 图层样式 / 不透明度同样丢失（而且上面还把它们当拒绝
+        //       条件，于是 PSD 分组永远走不到快路径）。
+        //   只留 [lo..=hi] 可见后交给 `composite_adjusted`，输出的就正是
+        //   「这一组在 target 分辨率下该长什么样」，与落定帧同源。
+        let hidden_outside: Vec<usize> = (0..n)
+            .filter(|&i| (i < lo || i > hi) && self.doc.layers[i].visible)
+            .collect();
+        for &i in &hidden_outside {
+            self.doc.layers[i].visible = false;
         }
-        // 和单层路径一致：烘焙纹理直接落到 target（画布网格 + 目标分辨率），
-        // 拖动帧只做 1:1 整像素平移。以前按比例预缩时低缩放档会命中 too_big
-        // 闸门，把整张原图交给 Qt 降采样，边缘糊开。
-        let full = render::resize_to(
-            &full,
-            Size::new(target.width.max(1), target.height.max(1)),
-        );
+        let full = self.composer.composite_adjusted(&self.doc, target, None);
+        for &i in &hidden_outside {
+            self.doc.layers[i].visible = true;
+        }
 
         // static = 整组之下的栈（隐藏 [lo..]），above = 整组之上的栈（隐藏 [..=hi]）。
         let flipped_below: Vec<usize> = self.doc.layers[lo..]
