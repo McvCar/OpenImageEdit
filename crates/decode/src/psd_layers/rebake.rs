@@ -21,6 +21,8 @@
 //!   并集包围盒分配 + 逐像素 f32 过混合，样式组一多、刷新一频就是卡顿
 //!   灾难）。调用方（session）另在活帧手势期间整体跳过重烘焙，落定后
 //!   一次性补上。
+//! * 成员**全空**（全部隐藏 / 全部移出）时影子层清成 1×1 透明 —— 内容
+//!   没了样式也该消失，留旧快照会让「隐藏子级分组后投影还浮在画布上」。
 
 use std::collections::HashMap;
 
@@ -159,6 +161,23 @@ pub fn rebake_group_styles(doc: &mut Document, hashes: &mut RebakeHashes) -> usi
             _ => {}
         }
         hashes.insert(gid, fp);
+        // 成员全空（全部隐藏 / 全部移出）：联合 alpha 没了 → 样式也该消失。
+        // 把影子层清成 1×1 透明，而不是留一张旧快照浮在画布上（★这条在
+        // fx 解析之前 —— 清空不依赖效果参数能否解析）。指纹已刷新，成员
+        // 回来时走正常烘焙恢复。
+        let Some((alpha, size, offset)) = group_joint_alpha(doc, gid) else {
+            let empty = crate::psd_effects::GroupBaked {
+                behind: None,
+                front: None,
+                behind_blend: editcore::BlendMode::Normal,
+                offset: (0, 0),
+                notes: Vec::new(),
+            };
+            if apply_group_bake(doc, gid, empty) {
+                updated += 1;
+            }
+            continue;
+        };
         // 效果参数从 raw_style 原始字节现场解析（与保存透传共用一份字节）。
         // 解析失败 = 这组的样式本来就没烘出来（加载时同样返回 None），跳过。
         let fx = match doc
@@ -168,9 +187,6 @@ pub fn rebake_group_styles(doc: &mut Document, hashes: &mut RebakeHashes) -> usi
         {
             Some(fx) => fx,
             None => continue,
-        };
-        let Some((alpha, size, offset)) = group_joint_alpha(doc, gid) else {
-            continue;
         };
         let Some(baked) = crate::psd_effects::bake_group_effects(&alpha, size, offset, &fx)
         else {
@@ -465,6 +481,34 @@ mod tests {
         doc.layers[3].visible = true;
         let _ = rebake_group_styles(&mut doc, &mut hashes);
         assert_ne!(hashes.get(&gid).copied(), fp0);
+    }
+
+    /// 成员全空（全部隐藏）：影子层清成 1×1 透明，而不是留旧快照浮在
+    /// 画布上。清空不依赖效果参数能否解析（伪 fx 块也能验证）。
+    #[test]
+    fn empty_members_clear_shadow() {
+        let mut fx = Vec::new();
+        fx.extend_from_slice(b"8BIM");
+        fx.extend_from_slice(b"lfxs");
+        fx.extend_from_slice(&16u32.to_be_bytes());
+        fx.extend_from_slice(&[0u8; 16]);
+        let mut doc = Document::from_psd_layers_with_groups(
+            (8, 8),
+            vec![seed("影子", Some(1), true), seed("成员", Some(1), false)],
+            vec![group(Some(fx))],
+        );
+        let gid = doc.groups[0].id;
+        let shadow_i = 1; // 背景0, 影子1, 成员2
+        let mut hashes = RebakeHashes::new();
+        assert_eq!(rebake_group_styles(&mut doc, &mut hashes), 0);
+        // 隐藏唯一成员 → 联合 alpha 全空 → 影子清空。
+        doc.layers[2].visible = false;
+        assert_eq!(rebake_group_styles(&mut doc, &mut hashes), 1);
+        let r = doc.layers[shadow_i].raster().unwrap();
+        assert_eq!(r.image.dimensions(), (1, 1));
+        assert_eq!(r.image.get_pixel(0, 0).0[3], 0);
+        // 重复扫描不再触发（指纹已刷新）。
+        assert_eq!(rebake_group_styles(&mut doc, &mut hashes), 0);
     }
 
     /// 影子层判定：子树成员区间之下 / 之上各认一张，内容与 offset 原位

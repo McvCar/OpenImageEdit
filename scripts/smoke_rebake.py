@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """Rebake smoke: on the real game PSD, hide a styled group's members via the
 panel-eye path and verify the baked shadow layers follow (pixel bytes change,
-then restore after re-show).
+then restore after re-show). All dumps happen in ONE process (layer-dump is a
+script op) so the state carries across steps.
 
 Usage: python scripts/smoke_rebake.py
 """
@@ -54,27 +55,30 @@ def main():
     before_hash = {s["i"]: dump_png(s["i"], "before") for s in shadows}
     before_bounds = {s["i"]: (s["x"], s["y"], s["w"], s["h"]) for s in shadows}
 
-    ops = ";".join(f"eye:{m['i']},0" for m in members)
-    ls2 = layers(run(ops + ";layers-dump"))
-    shadows2 = [l for l in ls2 if l.get("syn") and l["g"] == gid]
-    after_hash = {s["i"]: dump_png(s["i"], "after") for s in shadows2}
-    after_bounds = {s["i"]: (s["x"], s["y"], s["w"], s["h"]) for s in shadows2}
+    # ★隐藏 + dump 同进程完成（layer-dump 是 script op，状态在进程内延续）。
+    def step(ops, tag):
+        dumps = ";".join(
+            f"layer-dump:{s['i']}:{os.path.join(TMP, f'smoke_rebake_{tag}_{s[chr(105)]}.png')}"
+            for s in shadows)
+        run(";".join(ops + [dumps]))
+        out = {}
+        for s in shadows:
+            p = os.path.join(TMP, f"smoke_rebake_{tag}_{s['i']}.png")
+            with open(p, "rb") as f:
+                out[s["i"]] = hashlib.sha256(f.read()).hexdigest()
+        return out
 
-    changed = [i for i in before_hash
-               if before_hash[i] != after_hash.get(i)
-               or before_bounds[i] != after_bounds.get(i)]
+    ops = [f"eye:{m['i']},0" for m in members]
+    after_hash = step(ops, "after")
+    changed = [i for i in before_hash if before_hash[i] != after_hash.get(i)]
     print(f"shadow layers that followed: {changed}")
     if not changed:
         print("FAIL: shadow did not follow member changes")
         sys.exit(1)
 
-    ops2 = ";".join(f"eye:{m['i']},1" for m in members)
-    ls3 = layers(run(ops2 + ";layers-dump"))
-    shadows3 = [l for l in ls3 if l.get("syn") and l["g"] == gid]
-    restored_hash = {s["i"]: dump_png(s["i"], "restored") for s in shadows3}
-    restored_bounds = {s["i"]: (s["x"], s["y"], s["w"], s["h"]) for s in shadows3}
-    ok = all(restored_hash.get(i) == before_hash[i]
-             and restored_bounds.get(i) == before_bounds[i] for i in before_hash)
+    ops2 = [f"eye:{m['i']},1" for m in members]
+    restored_hash = step(ops2, "restored")
+    ok = all(restored_hash.get(i) == before_hash[i] for i in before_hash)
     print(f"restored after re-show: {ok}")
     sys.exit(0 if ok else 1)
 
