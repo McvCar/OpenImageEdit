@@ -1809,7 +1809,8 @@ impl Session {
             return false;
         }
         let canvas = self.doc.canvas;
-        let display = display_size(canvas, self.zoom, dpr);
+        // ★用 QML 传来的实际显示比例（见 [`display_from_scale`]），别用 zoom 重算。
+        let display = display_from_scale(canvas, disp_scale);
         let target = preview_target(display, canvas, dpr);
         if target.pixels() == 0 {
             return false;
@@ -2039,7 +2040,8 @@ impl Session {
             return false;
         }
         let canvas = self.doc.canvas;
-        let display = display_size(canvas, self.zoom, dpr);
+        // ★同 `gpu_begin`：显示尺寸取 QML 的实际比例，不用 zoom 重算。
+        let display = display_from_scale(canvas, disp_scale);
         let target = preview_target(display, canvas, dpr);
         if target.pixels() == 0 {
             return false;
@@ -2395,6 +2397,28 @@ impl Session {
 /// 而落定帧是按精确位移算的。
 fn snap_phys(v: f64, dpr: f64) -> f64 {
     (v * dpr).round() / dpr
+}
+
+/// 起手烘纹理时用的**画布显示尺寸**：必须等于 QML 上那块预览正在显示的
+/// 逻辑尺寸（`previewImage.width/height`），也就是用 QML 传来的
+/// `disp_scale`（= previewImage.width / image_width）乘出来。
+///
+/// ★不能用 `display_size(canvas, self.zoom, dpr)` 重算：缩放手势刚结束、
+///   fit 或拖窗口刚结束时，QML 的显示尺寸走的是**预测值**（`shownWidth`
+///   的 zoomPending / viewportPending 分支），而 `self.zoom` 还停在旧值。
+///   两者差一点时，三明治纹理按旧比例烘好、却被铺到新尺寸的预览上 ——
+///   整层被拉伸/压缩，松手后 CPU 帧按新比例重画，就成了用户报的
+///   「拖动时图层缩放，松手才还原」。
+fn display_from_scale(canvas: Size, disp_scale: f64) -> Size {
+    let s = if disp_scale.is_finite() && disp_scale > 0.0 {
+        disp_scale
+    } else {
+        1.0
+    };
+    Size::new(
+        ((canvas.width as f64 * s).round() as u32).max(1),
+        ((canvas.height as f64 * s).round() as u32).max(1),
+    )
 }
 
 /// 组样式跟随刷新的门控签名：epoch + 层表指纹（每层的 id / 位置 / 归组 /

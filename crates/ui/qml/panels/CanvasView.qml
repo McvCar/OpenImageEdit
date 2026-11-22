@@ -645,16 +645,23 @@ Item {
 
     Image {
         id: gpuActive
+        // ★★宽高必须与 static/above **同源**（都取预览尺寸），只把 rect 的
+        //   x/y 当拖动位移。
+        //   纹理是在**整幅画布**的 target 网格上烘的，它天生就该铺满显示区。
+        //   以前这里用 Rust 给的 `rect.w/h`，而 static/above 用
+        //   `anchors.fill: parent`（= previewImage 尺寸）—— 只要两边差一点
+        //   （缩放手势刚结束时的预测尺寸 vs Rust 里的 zoom、dpr 取整），
+        //   活动层就被拉伸/压缩到另一个尺寸，用户看到的就是「拖动时图层
+        //   缩放、松手才还原」。
+        width: gpuLayer.width
+        height: gpuLayer.height
         x: gpuLayer.rect.x || 0
         y: gpuLayer.rect.y || 0
-        width: Math.max(1, gpuLayer.rect.w || 0)
-        height: Math.max(1, gpuLayer.rect.h || 0)
         opacity: gpuLayer.rect.o === undefined ? 1 : gpuLayer.rect.o
         source: view.bridge.gpuActiveUrl
-        // ★纹理在 Rust 侧已按物理像素预缩（`gpu_physical`）：1:1 时用
-        //   `Image.Pad` 走「原样贴」的快路径，别让 Stretch 的缩放采样把
-        //   边界那半列糊掉/缩掉（用户报的「拖动时图层小一点点」）；只有
-        //   放大（纹理比矩形小）才交给 Stretch 双线性插值。
+        // 纹理在 Rust 侧已按 target 分辨率（物理像素）烘好：1:1 时用
+        // `Image.Pad` 走「原样贴」快路径，别让 Stretch 的缩放采样把边界
+        // 那半列糊掉；只有尺寸不相等（放大/差 1px）才交给 Stretch。
         readonly property bool oneToOne:
             width === implicitWidth && height === implicitHeight
         fillMode: oneToOne ? Image.Pad : Image.Stretch
