@@ -123,6 +123,11 @@ pub(in crate::bridge) struct Session {
     pub(in crate::bridge) gpu_live: bool,
     pub(in crate::bridge) gpu_static_url: String,
     pub(in crate::bridge) gpu_active_url: String,
+    /// 三明治上层：活动层**之上**所有可见层的透明底合成（拖任何一层都用）。
+    pub(in crate::bridge) gpu_above_url: String,
+    /// 活动纹理是整幅画布（带蒙版 / 剪贴的活动层在起手时烘进画布坐标）：
+    /// 显示矩形恒 (0,0,canvas)，`gpu_update_rect` 不得跟随活动层 offset。
+    pub(in crate::bridge) gpu_full: bool,
     pub(in crate::bridge) gpu_index: usize,
     /// 活动层显示矩形 + 不透明度（QML 逻辑像素）：x, y, w, h, opacity。
     pub(in crate::bridge) gpu_rect: (f64, f64, f64, f64, f64),
@@ -888,6 +893,8 @@ impl Session {
                 gpu_live: false,
                 gpu_static_url: String::new(),
                 gpu_active_url: String::new(),
+                gpu_above_url: String::new(),
+                gpu_full: false,
                 gpu_index: 0,
                 gpu_rect: (0.0, 0.0, 0.0, 0.0, 1.0),
                 // 0 = 首次 refresh 会扫一遍样式组、把加载烘焙记为基线指纹
@@ -1534,12 +1541,16 @@ impl Session {
         if !layer.visible || layer.opacity <= 0.0 {
             return false;
         }
-        // ★活动层必须是**最顶层可见层**才能用两纹理：static 是「隐藏活动层
-        // 后的整幅」，active 画在它上面 = 活动层被临时提到最顶。拖一个底部
-        // 图层（用户举的「背景之类的层」）时它会盖住本在其上的层，松手才
-        // 弹回原 z 序。上方还有可见层就回退 CPU 合成，保证拖动期间层级正确。
-        // 顶层图层（绝大多数拖动）仍走快路径，性能不受影响。
-        if self.doc.layers[index + 1..].iter().any(|l| l.visible && l.opacity > 0.0) {
+        // ★三明治（photocraft 同架构）：static = 活动层**之下**的栈（含基底），
+        // active = 活动层，above = 活动层之上所有可见层的透明底合成。QML 按
+        // 「下 → 活动 → 上」叠三层，z 序天然正确 —— 拖动任何一层都不再回退
+        // CPU 每帧全幅合成。合成只在起手时各做一次，拖动帧零 CPU 合成。
+        //
+        // 唯一回退：活动层是上方剪贴链的基底 —— 剪贴层要跟着基底实时走，
+        // 三明治里它们是静态纹理，拖动期间会脱节，保持 CPU 路径保证正确。
+        if self.doc.layers.get(index + 1).map(|l| l.clipping && l.visible && l.opacity > 0.0)
+            == Some(true)
+        {
             return false;
         }
         let canvas = self.doc.canvas;
@@ -1548,16 +1559,86 @@ impl Session {
         if target.pixels() == 0 {
             return false;
         }
-        let active_img = layer.img().clone();
         let opacity = layer.opacity;
-        let saved = self.doc.layers[index].visible;
-        self.doc.layers[index].visible = false;
-        let static_img = self.composer.composite_adjusted(&self.doc, target, None);
-        self.doc.layers[index].visible = saved;
+        // 活动纹理默认用原始位图（矩形 = 图层 bounds）。带蒙版 / 剪贴的活动
+        // 层必须把蒙版 × 基底覆盖率烘进画布坐标 —— 否则拖动期间显示未裁剪
+        // 的原始像素。烘过的纹理是整幅画布，显示矩形恒 (0,0,canvas)。
+        let (active_img, gpu_full) = if layer.mask.is_none() && !layer.clipping {
+            (layer.img().clone(), false)
+        } else {
+            let mut full = RgbaImage::new(canvas.width.max(1), canvas.height.max(1));
+            let img = layer.img();
+            let (ox, oy) = layer.offset();
+            let mask = layer.mask.as_ref();
+            for y in 0..img.height() {
+                for x in 0..img.width() {
+                    let cx = ox + x as i32;
+                    let cy = oy + y as i32;
+                    if cx < 0 || cy < 0 || cx >= canvas.width as i32 || cy >= canvas.height as i32
+                    {
+                        continue;
+                    }
+                    let p = img.get_pixel(x, y);
+                    let mut a = p.0[3] as f32 / 255.0;
+                    if let Some(m) = mask {
+                        a *= m.coverage(cx, cy);
+                    }
+                    if layer.clipping {
+                        a *= self.doc.clip_coverage_at(index, cx, cy);
+                    }
+                    if a <= 0.0 {
+                        continue;
+                    }
+                    full.put_pixel(
+                        cx as u32,
+                        cy as u32,
+                        image::Rgba([
+                            p.0[0],
+                            p.0[1],
+                            p.0[2],
+                            (a * 255.0).round() as u8,
+                        ]),
+                    );
+                }
+            }
+            (full, true)
+        };
 
-        let (Ok(bytes_s), Ok(bytes_a)) = (
+        // 隐藏一段区间 → 合成 → 恢复。visible 翻转不动像素、不 bump
+        // epoch，composer 的缩放缓存原样可用（两次合成共享同一批缓存）。
+        let n = self.doc.layers.len();
+        let flipped_below: Vec<usize> = self.doc.layers[index..]
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, l)| l.visible)
+            .map(|(k, _)| index + k)
+            .collect();
+        for &i in &flipped_below {
+            self.doc.layers[i].visible = false;
+        }
+        let static_img = self.composer.composite_adjusted(&self.doc, target, None);
+        for &i in &flipped_below {
+            self.doc.layers[i].visible = true;
+        }
+
+        let flipped_above: Vec<usize> = self.doc.layers[..index.min(n)]
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, l)| l.visible)
+            .map(|(k, _)| k)
+            .collect();
+        for &i in &flipped_above {
+            self.doc.layers[i].visible = false;
+        }
+        let above_img = self.composer.composite_adjusted(&self.doc, target, None);
+        for &i in &flipped_above {
+            self.doc.layers[i].visible = true;
+        }
+
+        let (Ok(bytes_s), Ok(bytes_a), Ok(bytes_o)) = (
             encode(&static_img, Format::Bmp, 90),
             encode(&active_img, Format::Bmp, 90),
+            encode(&above_img, Format::Bmp, 90),
         ) else {
             return false;
         };
@@ -1565,22 +1646,38 @@ impl Session {
         let tag = self.render_count;
         let ps = std::env::temp_dir().join(format!("imageedit-gpu-{}-s-{tag}.bmp", self.id));
         let pa = std::env::temp_dir().join(format!("imageedit-gpu-{}-a-{tag}.bmp", self.id));
-        if std::fs::write(&ps, bytes_s).is_err() || std::fs::write(&pa, bytes_a).is_err() {
+        let po = std::env::temp_dir().join(format!("imageedit-gpu-{}-o-{tag}.bmp", self.id));
+        if std::fs::write(&ps, bytes_s).is_err()
+            || std::fs::write(&pa, bytes_a).is_err()
+            || std::fs::write(&po, bytes_o).is_err()
+        {
             return false;
         }
         self.gpu_static_url = file_url(&ps);
         self.gpu_active_url = file_url(&pa);
+        self.gpu_above_url = file_url(&po);
         self.gpu_index = index;
-        self.gpu_rect = (
-            self.doc.layers[index].offset().0 as f64 * disp_scale,
-            self.doc.layers[index].offset().1 as f64 * disp_scale,
-            active_img.width() as f64 * disp_scale,
-            active_img.height() as f64 * disp_scale,
-            opacity as f64,
-        );
+        self.gpu_full = gpu_full;
+        self.gpu_rect = if gpu_full {
+            (
+                0.0,
+                0.0,
+                canvas.width as f64 * disp_scale,
+                canvas.height as f64 * disp_scale,
+                opacity as f64,
+            )
+        } else {
+            (
+                self.doc.layers[index].offset().0 as f64 * disp_scale,
+                self.doc.layers[index].offset().1 as f64 * disp_scale,
+                active_img.width() as f64 * disp_scale,
+                active_img.height() as f64 * disp_scale,
+                opacity as f64,
+            )
+        };
         self.gpu_live = true;
         println!(
-            "{{\"phase\":\"ui\",\"event\":\"gpu-begin\",\"index\":{index},\"target\":\"{}x{}\"}}",
+            "{{\"phase\":\"ui\",\"event\":\"gpu-begin\",\"index\":{index},\"full\":{gpu_full},\"target\":\"{}x{}\"}}",
             target.width, target.height
         );
         true
@@ -1589,6 +1686,10 @@ impl Session {
     /// 每帧只重算活动层的显示矩形（纯浮点，零分配）。
     pub(in crate::bridge) fn gpu_update_rect(&mut self, disp_scale: f64) {
         if !self.gpu_live || !(disp_scale > 0.0) {
+            return;
+        }
+        // 整幅烘焙的活动纹理画布对齐，显示矩形恒定，不跟随活动层 offset。
+        if self.gpu_full {
             return;
         }
         if let Some(layer) = self.doc.layers.get(self.gpu_index) {

@@ -97,7 +97,18 @@ impl super::PreviewComposer {
                     .map(|next| next.clipping)
                     .unwrap_or(false);
                 clip = if next_is_clip {
-                    Some(self.clip_coverage(li, layer, target, sx, sy))
+                    // 隐藏 / 全透明基底 → 整条剪贴链一起消失（与 core 渲染
+                    // 的 fill_clip_coverage 同语义）。覆盖率仍要占位（Some
+                    // 全 0）：传 None 会让链上的剪贴层被当成「无剪贴」按
+                    // 不裁剪画出来。
+                    if layer.visible && layer.opacity > 0.0 {
+                        Some(self.clip_coverage(li, layer, target, sx, sy))
+                    } else {
+                        Some(vec![
+                            0u8;
+                            target.width as usize * target.height as usize
+                        ])
+                    }
                 } else {
                     None
                 };

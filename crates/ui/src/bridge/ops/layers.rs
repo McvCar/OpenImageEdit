@@ -26,8 +26,7 @@ impl qobject::Bridge {
         self.session
             .borrow()
             .as_ref()
-            .and_then(|s| s.doc.layers.get(index.max(0) as usize))
-            .map(|l| l.hit_alpha_at(x, y) as i32)
+            .map(|s| s.doc.hit_alpha_at(index.max(0) as usize, x, y) as i32)
             .unwrap_or(0)
     }
 

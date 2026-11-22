@@ -800,6 +800,64 @@ impl Document {
         false
     }
 
+    /// `layers[index]`（剪贴层）所在剪贴链的基底覆盖率（0..1）。
+    /// 供 GPU 快路径把剪贴活动层烘进画布坐标时逐点采样，语义与
+    /// [`Document::hit_alpha_at`] 里的剪贴限幅完全一致。
+    pub fn clip_coverage_at(&self, index: usize, x: i32, y: i32) -> f32 {
+        let Some(layer) = self.layers.get(index) else {
+            return 0.0;
+        };
+        if !layer.clipping {
+            return 1.0;
+        }
+        let gid = layer.group;
+        self.layers[..index]
+            .iter()
+            .rev()
+            .take_while(|l| l.group == gid)
+            .find(|l| !l.clipping)
+            .map(|b| {
+                if !b.visible || b.opacity <= 0.0 {
+                    return 0.0f32;
+                }
+                match &b.clip_shape {
+                    Some(s) => {
+                        s.coverage(x, y)
+                            * b.mask
+                                .as_ref()
+                                .map(|m| m.coverage(x, y))
+                                .unwrap_or(1.0)
+                    }
+                    None => b.hit_alpha_at(x, y) as f32 / 255.0,
+                }
+            })
+            .unwrap_or(0.0)
+        .clamp(0.0, 1.0)
+    }
+
+    /// 画布点选的文档级命中：`layers[index]` 在画布坐标 `(x, y)` 处实际
+    /// 可见的 alpha（0–255）。
+    ///
+    /// 在 `Layer::hit_alpha_at`（内容 + 图层蒙版）之上补上**剪贴链限幅**：
+    /// 剪贴层只有落在下方最近非剪贴基底的内容形状里才算命中 —— 与渲染
+    /// （`composite_range` / `fill_clip_coverage`）同一语义。否则「点空白」
+    /// 会选中剪贴蒙版裁掉的透明区（用户报的 bug：蒙版裁剪区域被点击到）。
+    /// 非剪贴层原样透传，行为不变。
+    pub fn hit_alpha_at(&self, index: usize, x: i32, y: i32) -> u8 {
+        let Some(layer) = self.layers.get(index) else {
+            return 0;
+        };
+        let a = layer.hit_alpha_at(x, y);
+        if a == 0 || !layer.clipping {
+            return a;
+        }
+        // 渲染语义：剪贴链共享「下方最近非剪贴层」的覆盖率；隐藏 / 全透明
+        // 基底 → 整条链一起消失（覆盖率 0）。基底搜索不跨组：剪贴蒙版是
+        // 组内语义，链必须连续（PSD 亦如此），组边界上没有基底。
+        let cov = self.clip_coverage_at(index, x, y);
+        ((a as f32 / 255.0) * cov * 255.0).round() as u8
+    }
+
     /// 点面板眼睛：组隐藏时改的是「自身可见意愿」（`hidden_snapshot`），
     /// 不动合成真值 `layer.visible`（它必须保持 false，否则组隐藏失效）。
     /// 不在隐藏组里时走常规 `set_layer_visible`。整批进历史，可撤销。

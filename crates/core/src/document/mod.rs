@@ -504,6 +504,31 @@ mod psd_assembly_tests {
         assert_eq!(flat.get_pixel(3, 0).0[3], 0, "基底外剪贴层必须不可见");
     }
 
+    /// 画布点选的文档级命中：剪贴层在基底内容之外的 alpha 必须 = 0，
+    /// 与渲染一致 —— 否则点空白会选中剪贴蒙版裁掉的透明区。
+    #[test]
+    fn hit_alpha_respects_clip_chain() {
+        let base = seed("base", (0, 0), [0, 0, 0, 255], (2, 4), true, 1.0);
+        let mut top = seed("clip", (0, 0), [255, 0, 0, 255], (4, 4), true, 1.0);
+        top.clipping = true;
+        let doc = Document::from_psd_layers((4, 4), vec![base, top]);
+        // 装配会在 layers[0] 插透明占位背景，clip 层下标动态找。
+        let clip_ix = doc.layers.iter().position(|l| l.clipping).unwrap();
+        assert_eq!(doc.hit_alpha_at(clip_ix, 0, 0), 255, "基底内照常命中");
+        assert_eq!(
+            doc.hit_alpha_at(clip_ix, 3, 0),
+            0,
+            "基底外（蒙版裁掉的区域）不命中"
+        );
+        // 非剪贴层原样透传（基底自己在内容外框内仍命中）。
+        let base_ix = doc.layers.iter().position(|l| !l.clipping && l.name == "base").unwrap();
+        assert_eq!(doc.hit_alpha_at(base_ix, 0, 0), 255);
+        // 隐藏基底 → 整条剪贴链一起消失（与渲染同语义）。
+        let mut doc2 = doc.clone();
+        doc2.layers[base_ix].visible = false;
+        assert_eq!(doc2.hit_alpha_at(clip_ix, 0, 0), 0);
+    }
+
     /// 基底带烘焙样式时，剪贴边界取「内容」形状，不取被样式撑大的位图 alpha。
     ///
     /// PS 的剪贴蒙版只认基底的内容：外描边 / 投影不算边界。烘焙后的位图

@@ -347,7 +347,7 @@ impl qobject::Bridge {
                 // 回退条件时自动走原 CPU 路径，行为不变。
                 let ix = index.max(0) as usize;
                 let dpr = self.dpr.get();
-                let (on, su, au, rect) = {
+                let (on, su, au, ou, rect) = {
                     let mut guard = self.session.borrow_mut();
                     let Some(session) = guard.as_mut() else {
                         return false;
@@ -357,12 +357,14 @@ impl qobject::Bridge {
                         on,
                         session.gpu_static_url.clone(),
                         session.gpu_active_url.clone(),
+                        session.gpu_above_url.clone(),
                         session.gpu_rect_json(),
                     )
                 };
                 if on {
                     self.as_mut().set_gpu_static_url(QString::from(su.as_str()));
                     self.as_mut().set_gpu_active_url(QString::from(au.as_str()));
+                    self.as_mut().set_gpu_above_url(QString::from(ou.as_str()));
                     self.as_mut().set_gpu_rect_json(QString::from(rect.as_str()));
                     self.as_mut().set_gpu_live(true);
                 } else {

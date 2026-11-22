@@ -539,6 +539,18 @@ Item {
         // 纯平移走 x/y；矩阵通道留给 P1-A 的缩放 / 旋转统一采样器。
         transformOrigin: Item.TopLeft
     }
+
+    // 三明治上层：活动层**之上**的所有可见层（透明底合成）。静态不跟随
+    // 拖动 —— z 序由堆叠顺序保证：下层栈 → 活动层 → 上层栈。这样拖任何
+    // 一层（不只是最顶层）都不必回退 CPU 每帧全幅合成。
+    Image {
+        anchors.fill: parent
+        source: view.bridge.gpuAboveUrl
+        fillMode: Image.Stretch
+        cache: false
+        asynchronous: true
+        smooth: true
+    }
 }
 
     // ---- Persistent-selection interaction stack ----------------------

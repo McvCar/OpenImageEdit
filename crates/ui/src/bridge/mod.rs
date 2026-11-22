@@ -257,6 +257,8 @@ pub mod qobject {
         #[qproperty(bool, gpu_live, cxx_name = "gpuLive")]
         #[qproperty(QString, gpu_static_url, cxx_name = "gpuStaticUrl")]
         #[qproperty(QString, gpu_active_url, cxx_name = "gpuActiveUrl")]
+        /// 三明治上层：活动层之上所有可见层的透明底合成（拖任何一层都用）。
+        #[qproperty(QString, gpu_above_url, cxx_name = "gpuAboveUrl")]
         /// 活动层显示矩形 + 不透明度 JSON（每帧只改这几个数）。
         #[qproperty(QString, gpu_rect_json, cxx_name = "gpuRectJson")]
         #[namespace = "imageedit"]
@@ -1525,6 +1527,7 @@ pub struct BridgeRust {
     gpu_live: bool,
     gpu_static_url: QString,
     gpu_active_url: QString,
+    gpu_above_url: QString,
     gpu_rect_json: QString,
 }
 
@@ -1642,6 +1645,7 @@ impl Default for BridgeRust {
             gpu_live: false,
             gpu_static_url: QString::default(),
             gpu_active_url: QString::default(),
+            gpu_above_url: QString::default(),
             gpu_rect_json: QString::from("{}"),
         }
     }

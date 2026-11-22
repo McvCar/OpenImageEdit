@@ -819,6 +819,7 @@ impl qobject::Bridge {
         session.gpu_live = false;
         session.gpu_static_url.clear();
         session.gpu_active_url.clear();
+        session.gpu_above_url.clear();
         session.gpu_index = 0;
         session.gpu_rect = (0.0, 0.0, 0.0, 0.0, 1.0);
         session.sel_rev = session.sel_rev.wrapping_add(1);
@@ -1037,6 +1038,7 @@ impl qobject::Bridge {
             session.gpu_live = false;
             session.gpu_static_url.clear();
             session.gpu_active_url.clear();
+            session.gpu_above_url.clear();
             session.dirty = false;
             // C6: the worker already downscaled every layer to 40px. Queue
             // them for batched writing (<=6 rows per 50 ms tick) instead of
