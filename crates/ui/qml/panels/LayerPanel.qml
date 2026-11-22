@@ -186,6 +186,16 @@ Item {
     // 拖动图层时悬停到的目标组 id（-1 = 没有）。组行据此高亮，明确提示
     // 「松手会放进这个组」，比只有一条细指示线更醒目。
     property int dropTargetGroupId: -1
+    // 兜底：bridge 调用会同步重建 layerPanelList，正在拖的 delegate 可能
+    // 被当场销毁而跳过 onReleased → 绿线 / 组高亮残留。列表一变就清。
+    Connections {
+        target: host
+        function onLayerPanelListChanged() {
+            if (dropTargetGroupId >= 0)
+                dropTargetGroupId = -1
+            dropIndicator.visible = false
+        }
+    }
     // 选中的 id 集合：面板高亮用它，而不是下标（重排后下标会变）。
     readonly property var selIds: {
         try {
@@ -1295,22 +1305,20 @@ Item {
                             toPos = gap
                             toZ = -1
                             const above = gap > 0 ? host.layerPanelList[gap - 1] : null
-                            // z 索引换算：move_layer 是先 remove 再 insert，
-                            // `to` 即最终索引；锚点索引要先按「自己被移走」
-                            // 平移（m > from 时 m-1），插入点 ≤ 锚点时锚点还
-                            // 会再上移一位 —— 推导出的落点：
-                            //   紧贴锚点显示位下方 → to = m'
-                            //   紧贴锚点显示位上方 → to = m' + 1
-                            //（m' = m > from ? m-1 : m）。
+                            // z 索引换算（文档索引，越大越顶）：move_layer 是
+                            // 先 remove 再 insert，`to` 即最终文档索引。锚点
+                            // 索引先按「自己被移走」平移：m' = m > from ? m-1 : m。
+                            //   缝在锚点显示位下方（更底层）→ to = m' - 1
+                            //   缝在锚点显示位上方（更顶层）→ to = m' + 1
+                            // 上限 = layerList.length - 2（remove 后的最顶索引）。
+                            const cap = Math.max(0, host.layerList.length - 2)
                             if (gap === 0 || !above) {
                                 toGroup = 0
                                 const layers = host.layerList
                                 const topI = layers.length ? layers[0].i : -1
                                 // 自己已经是最顶层时拖到最顶 = 无事可做。
-                                const t = topI > 0 && topI !== from
-                                          ? (topI > from ? topI - 1 : topI) + 1 : -1
-                                if (t >= 0 && t < layers.length)
-                                    toZ = t
+                                if (topI > 0 && topI !== from)
+                                    toZ = Math.min(topI - 1, cap)
                             } else if (above.k === "group") {
                                 // 缝在组标题行下方 = 进该组、插到子树最上面
                                 // 成员上方（z 更高，成为新的最上成员）。
@@ -1318,20 +1326,20 @@ Item {
                                 toGroup = above.gid
                                 const m = layerPanel.groupTopMemberIndex(above.gid)
                                 if (m > 0 && m !== from) {
-                                    const t = (m > from ? m - 1 : m) + 1
-                                    if (t < host.layerList.length)
-                                        toZ = t
+                                    const mp = m > from ? m - 1 : m
+                                    toZ = Math.min(mp + 1, cap)
                                 }
                             } else if (above.base) {
                                 // 缝在背景行上方 = 最底层（紧贴背景上面）。
                                 toGroup = 0
                                 toZ = 1
                             } else {
-                                // 缝在层行下方 = 与它同容器、紧贴它下面。
+                                // 缝在层行下方 = 与它同容器、紧贴它下面
+                                // （z 更低一位）。锚点是自己 = 无事可做。
                                 toGroup = above.g || 0
                                 const m = above.i
-                                if (m > 0)
-                                    toZ = Math.max(1, m > from ? m - 1 : m)
+                                if (m > 0 && m !== from)
+                                    toZ = Math.max(1, (m > from ? m - 1 : m) - 1)
                             }
                             dropIndicator.y = layerColumn.y + gap * pitch - 2
                             dropIndicator.visible = toZ !== from || toGroup !== fromGroup
@@ -1342,37 +1350,50 @@ Item {
                         onReleased: (mouse) => {
                             if (mouse.button === Qt.RightButton)
                                 return
-                            const draggedGroup = layerRow.row && layerRow.isGroup
-                                                 ? layerRow.row.gid : 0
-                            if (reordering && toPos >= 0) {
-                                if (draggedGroup > 0) {
+                            // ★先快照落点、清理视觉状态，再调 bridge：
+                            // qinvokable 同步触发 layers_json NOTIFY → 列表
+                            // 重建 → 本 delegate 当场销毁，放后面的清理代码
+                            // 不会执行 → 绿线 / 组高亮残留（用户报的问题）。
+                            const doMove = reordering && toPos >= 0
+                            const dragGid = layerRow.row && layerRow.isGroup
+                                            ? layerRow.row.gid : 0
+                            const snapRow = layerRow.row
+                            const snapToGroup = toGroup
+                            const snapToZ = toZ
+                            reordering = false
+                            toPos = -1
+                            toGroup = -1
+                            toZ = -1
+                            layerPanel.dropTargetGroupId = -1
+                            dropIndicator.visible = false
+                            listArea.interactive = true
+                            if (doMove) {
+                                if (dragGid > 0) {
                                     // 组拖动：拖到组标题行 = 进该组（嵌套），
                                     // 拖到顶层行 / 组外 = 移回顶层。防环由
                                     // bridge 校验（移进自己的子树会被拒绝）。
-                                    if (toGroup !== draggedGroup)
-                                        bridge.move_group_to_group(draggedGroup,
-                                                                   Math.max(toGroup, 0))
-                                } else {
-                                    const from = layerRow.row ? layerRow.row.i : -1
-                                    const fromGroup = layerRow.row ? (layerRow.row.g || 0) : 0
-                                    if (from > 0) {
-                                        // 落点容器 != 当前组 → 改归属（显隐 /
-                                        // 隔离刷新由 bridge 处理）；toZ 是按
-                                        // PS 语义算好的插入 z 索引（缝模型，
-                                        // 见 onPositionChanged）。两步都做才
-                                        // 能既进组又落在想要的位置。
-                                        if (toGroup >= 0 && toGroup !== fromGroup)
-                                            bridge.move_layer_to_group(from, toGroup)
-                                        if (toZ >= 0 && toZ !== from)
-                                            bridge.reorder_layer(from, toZ)
-                                    }
+                                    if (snapToGroup !== dragGid)
+                                        bridge.move_group_to_group(dragGid,
+                                                                   Math.max(snapToGroup, 0))
+                                } else if (snapRow && snapRow.i > 0) {
+                                    // 落点容器 != 当前组 → 改归属（显隐 /
+                                    // 隔离刷新由 bridge 处理）；toZ 是按
+                                    // PS 语义算好的插入 z 索引（缝模型，
+                                    // 见 onPositionChanged）。两步都做才
+                                    // 能既进组又落在想要的位置。
+                                    const from = snapRow.i
+                                    const fromGroup = snapRow.g || 0
+                                    if (snapToGroup >= 0 && snapToGroup !== fromGroup)
+                                        bridge.move_layer_to_group(from, snapToGroup)
+                                    if (snapToZ >= 0 && snapToZ !== from)
+                                        bridge.reorder_layer(from, snapToZ)
                                 }
-                            } else if (!reordering && layerRow.row && !layerRow.isBase
+                            } else if (snapRow && !snapRow.isBase
                                        && (!layerRow.locked || layerRow.isGroup)) {
                                 if (layerRow.isGroup) {
                                     // 点组 = 聚焦组（高亮 + 组属性编辑），**不**
                                     // 改图层多选集合：不要自动全选整组成员。
-                                    layerPanel.selectedGroupId = layerRow.row.gid
+                                    layerPanel.selectedGroupId = snapRow.gid
                                 } else {
                                     layerPanel.selectedGroupId = -1
                                     // Ctrl = 切换，Shift = 连选，普通点击 = 单选。
@@ -1386,17 +1407,10 @@ Item {
                                                   || (bits & 1) !== 0
                                     if (!ctrl && !shift)
                                         bridge.sel_clear()
-                                    bridge.select_layer_ex(layerRow.row.i,
+                                    bridge.select_layer_ex(snapRow.i,
                                                            ctrl ? 1 : (shift ? 2 : 0))
                                 }
                             }
-                            reordering = false
-                            toPos = -1
-                            toGroup = -1
-                            toZ = -1
-                            layerPanel.dropTargetGroupId = -1
-                            dropIndicator.visible = false
-                            listArea.interactive = true
                         }
 
                         onCanceled: {
