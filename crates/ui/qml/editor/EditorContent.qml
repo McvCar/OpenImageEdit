@@ -769,6 +769,23 @@ Item {
     property real dpr: Screen.devicePixelRatio > 0 ? Screen.devicePixelRatio : 1.0
     onDprChanged: bridge.set_dpr(dpr)
 
+    // ---- 探针：把脚本推迟到「窗口真的上屏之后」再跑 -------------------
+    // `--script` 在窗口显示前就执行完了，任何「放手瞬间 / 落定这一帧」的
+    // 时序都拿不到（探针还没开始连拍，脚本已经跑完）。`--script-after-paint`
+    // 的脚本存在 bridge 里，等首帧上屏（imageRendered）后再等 scriptDelayMs
+    // 才真正执行 —— 这段等待给了探针启动连拍的窗口。
+    Timer {
+        id: deferredScriptTimer
+        interval: Math.max(0, bridge.scriptDelayMs)
+        repeat: false
+        // ★`pending_script` 没有 cxx_name，QML 里就是 snake_case 原名；
+        //   写成 pendingScript 会静默变成 undefined（不会报错，永远不跑）。
+        running: root.imageRendered
+                 && bridge.scriptDelayMs >= 0
+                 && bridge.pending_script.length > 0
+        onTriggered: bridge.run_pending_script()
+    }
+
     // ---- 单实例：接收另一个进程交过来的图片 -------------------------
     // 资源管理器里双击图片会新起一个进程；main() 发现已有实例时把路径通过
     // 本地回环 socket 交给它并退出，于是所有文档窗口都在同一个进程里（图层

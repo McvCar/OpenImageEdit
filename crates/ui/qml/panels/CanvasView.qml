@@ -224,7 +224,24 @@ Flickable {
     Item {
         id: previewImage
         // Tier 1 拖动期间由 gpuLayer 接管显示；这里透明但保留双缓冲状态机。
-        opacity: view.bridge.gpuLive ? 0 : 1
+        //
+        // ★★落定时**不能**立刻恢复不透明（`gpuLive ? 0 : 1` 的老写法）：
+        //   gpuLive 一变 false，这里瞬间回到 1，把**起手前那一帧**（活动层
+        //   还在原位）直接露出来。gpuLayer 的 static/above 是「透明底合成」
+        //   的全幅纹理 —— 活动层原来占的那块在 static/above 里本来就是透明
+        //   的，所以旧帧从透明处透出来 = 用户看到的「移动前的位置闪一下
+        //   当前图层」。这和淡出快慢无关，盖多少层都挡不住。
+        //   所以必须等 `gpuLayer.fadeArmed` 落下（= CPU 落定帧已经上屏、
+        //   交叉过渡开始的那一刻）再变不透明：那一帧的内容已经在**最终
+        //   位置**，透出来只会和 GPU 纹理重合。
+        //
+        // ★★起手时同样不能**立刻**透明：`gpu_begin` 换掉三张纹理的 URL，
+        //   而它们是 `asynchronous: true` + `cache: false` —— 换源那一瞬间
+        //   pixmap 被卸掉，新纹理还在解码，屏幕上什么都还没有。这时如果
+        //   CPU 预览已经透明，整块画布会空白 ~1-2 帧（实测连拍里出现
+        //   「洋红像素数掉到 0」的一帧）= 用户看到的「拖动时闪一下」。
+        //   所以只在三张纹理**都解好**之后才让位给 GPU（`gpuLayer.texReady`）。
+        opacity: (gpuLayer.texReady && (view.bridge.gpuLive || gpuLayer.fadeArmed)) ? 0 : 1
 
         width: view.shownWidth
         height: view.shownHeight
@@ -489,8 +506,46 @@ Item {
     //   （重新 gpu_begin 换纹理）才「突然正常」。淡出改用一条 NumberAnimation
     //   跑完自己结束，不可能卡住。
     visible: view.bridge.gpuLive || fadeOpacity > 0.01
-    opacity: view.bridge.gpuLive ? 1.0 : fadeOpacity
+    // 纹理没解好之前整层透明：三张 Image 各自异步解码，谁先好谁先上屏，
+    // 先上 static 就会出现「上层栈消失」的一两帧 —— 宁可等齐了一次性换。
+    opacity: view.bridge.gpuLive ? (texReady ? 1.0 : 0.0) : fadeOpacity
     property real fadeOpacity: 0.0
+    // 三张纹理是否**当前这批 URL** 都解码完成（见 previewImage.opacity 的说明）。
+    //
+    // ★不能只看 `status === Image.Ready`：`gpu_begin` 换 URL 与 QML 求值在同一个
+    //   事件回合里，这一瞬间 Image 的 status 还是**上一批纹理**的 Ready，判定会
+    //   假阳 —— 于是预览让位、新纹理还在解码 → 整块画布空白一两帧（连拍里
+    //   就是「洋红像素数掉到 0」那一帧，也就是用户说的「拖动时闪一下」）。
+    //   所以每张 Image 在 Ready 时把「解好的是哪个 URL」记下来，只有和当前
+    //   `source` 完全对上才算好。
+    property string rdyStatic: ""
+    property string rdyActive: ""
+    property string rdyAbove: ""
+    property double texSince: 0
+    property int texTick: 0
+    readonly property bool texReady: {
+        gpuLayer.texTick           // 看门狗强制重算（不读值，只建立依赖）
+        // 兜底：某张纹理解码失败（Error）或 1.2s 还没好 —— 绝不能把 CPU 预览
+        // 永远顶着，否则拖动时画面是冻的（比闪一下严重得多）。
+        if (gpuLayer.texSince > 0 && Date.now() - gpuLayer.texSince > 1200)
+            return true
+        const imgs = [gpuStatic, gpuActive, gpuAbove]
+        const done = [gpuLayer.rdyStatic, gpuLayer.rdyActive, gpuLayer.rdyAbove]
+        for (let i = 0; i < imgs.length; i++) {
+            if (imgs[i].status === Image.Error)
+                return true
+            const src = imgs[i].source.toString()
+            if (src.length > 0 && done[i] !== src)
+                return false
+        }
+        return true
+    }
+    Timer {
+        interval: 40
+        repeat: true
+        running: (view.bridge.gpuLive || gpuLayer.fadeArmed) && !gpuLayer.texReady
+        onTriggered: gpuLayer.texTick += 1
+    }
     // ★落定后**不能立刻淡出**：GPU 拖动期间 `render()` 走 `gpu-skip` 不产新帧，
     //   下面的 CPU 预览还停在**起手前那一帧**（图层在原位）。立刻淡出 =
     //   中间那几十毫秒（新帧还在解码）露出旧位置的内容 → 用户看到的
@@ -499,12 +554,18 @@ Item {
     //   * fadeBaseCount = 落定那一刻已经上屏的帧序号；`previewImage.adoptCount`
     //     一变（新帧换台）就开始交叉过渡。用计数器而不是比较 URL：同一次
     //     渲染可能复用同一个临时文件，URL 不变但画面已经换了。
-    //   * 700ms 兜底：新帧永远到不了（渲染被跳过 / 空文档）也要收掉纹理。
+    //   * 兜底**不立刻淡出**：等不到新帧时（渲染被跳过 / 超大画布编码慢）
+    //     宁可让 GPU 纹理（停在最终位置、只是略钝）继续顶着，也不能把那张
+    //     原位旧帧露出来 —— 这才是用户报的「闪一下」。所以兜底只是「再等
+    //     一轮」，最多 3 轮（~2.1s），之后才强制收掉；空文档（preview_url
+    //     为空）立刻收。
     property bool fadeArmed: false
     property int fadeBaseCount: -1
+    property int fallbackHits: 0
     function beginFade() {
         gpuFadeFallback.stop()
         gpuLayer.fadeArmed = false
+        gpuLayer.fallbackHits = 0
         gpuLayer.fadeOpacity = 1.0
         gpuFade.restart()
     }
@@ -519,12 +580,20 @@ Item {
     }
     Timer {
         id: gpuFadeFallback
-        // 兜底放宽到 700ms：大画布一帧「合成 + 编码 + 异步解码」可能真的超过
-        // 400ms，提前淡出就会露出旧位置那一帧（正是要修的现象）。这段等待里
-        // GPU 纹理停在**最终位置**，观感只是稍钝，不会错位。
+        // 700ms 一轮：大画布一帧「合成 + 编码 + 异步解码」可能真的超过 400ms，
+        // 提前淡出就会露出旧位置那一帧（正是要修的现象）。这段等待里 GPU 纹理
+        // 停在**最终位置**，观感只是稍钝，不会错位。
         interval: 700
         repeat: false
-        onTriggered: gpuLayer.beginFade()
+        onTriggered: {
+            // 还有帧要等（文档非空且没等够 3 轮）→ 继续顶着纹理再等一轮。
+            if (gpuLayer.fallbackHits < 3 && view.bridge.preview_url.length > 0) {
+                gpuLayer.fallbackHits += 1
+                gpuFadeFallback.restart()
+            } else {
+                gpuLayer.beginFade()
+            }
+        }
     }
     Connections {
         target: previewImage
@@ -541,10 +610,15 @@ Item {
                 gpuFade.stop()
                 gpuFadeFallback.stop()
                 gpuLayer.fadeArmed = false
+                gpuLayer.fallbackHits = 0
                 gpuLayer.fadeOpacity = 1.0
+                // 记下换纹理的时刻：`texReady` 的 1.2s 兜底从这里算起。
+                gpuLayer.texSince = Date.now()
+                gpuLayer.texTick += 1
             } else {
                 gpuLayer.fadeOpacity = 1.0
                 gpuLayer.fadeBaseCount = previewImage.adoptCount
+                gpuLayer.fallbackHits = 0
                 gpuLayer.fadeArmed = true
                 gpuFadeFallback.restart()
             }
@@ -564,6 +638,9 @@ Item {
         cache: false
         asynchronous: true
         smooth: true
+        // 记下「解好的是哪个 URL」：`texReady` 靠它区分「新纹理还没解」和
+        // 「旧纹理的 Ready 状态还没被重置」（见 texReady 的注释）。
+        onStatusChanged: if (status === Image.Ready) gpuLayer.rdyStatic = source.toString()
     }
 
     Image {
@@ -580,18 +657,21 @@ Item {
         smooth: true
         // 纯平移走 x/y；矩阵通道留给 P1-A 的缩放 / 旋转统一采样器。
         transformOrigin: Item.TopLeft
+        onStatusChanged: if (status === Image.Ready) gpuLayer.rdyActive = source.toString()
     }
 
     // 三明治上层：活动层**之上**的所有可见层（透明底合成）。静态不跟随
     // 拖动 —— z 序由堆叠顺序保证：下层栈 → 活动层 → 上层栈。这样拖任何
     // 一层（不只是最顶层）都不必回退 CPU 每帧全幅合成。
     Image {
+        id: gpuAbove
         anchors.fill: parent
         source: view.bridge.gpuAboveUrl
         fillMode: Image.Stretch
         cache: false
         asynchronous: true
         smooth: true
+        onStatusChanged: if (status === Image.Ready) gpuLayer.rdyAbove = source.toString()
     }
 }
 

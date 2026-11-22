@@ -13,6 +13,14 @@ impl qobject::Bridge {
             a.strip_prefix("--script=")
                 .map(|value| value.to_string())
         });
+        // ★`--script-after-paint=…`：推迟到第一帧上屏（`image_shown`）之后再跑。
+        //   `--script` 在窗口显示**之前**执行，任何「放手瞬间 / 落定后这一帧」
+        //   的时序都拿不到（探针连拍时脚本早就跑完了）。落定闪烁、GPU 淡出
+        //   这类只能靠屏幕像素判断的 bug 必须用这个入口。
+        let after_paint = std::env::args().find_map(|a| {
+            a.strip_prefix("--script-after-paint=")
+                .map(|value| value.to_string())
+        });
         let file = std::env::args().skip(1).find(|a| !a.starts_with("--"));
         let Some(file) = file else {
             self.as_mut().set_status(QString::from("no-input"));
@@ -30,7 +38,13 @@ impl qobject::Bridge {
             self.as_mut().load_path(Path::new(&file));
         }
 
-        if let Some(script) = script {
+        if let Some(deferred) = after_paint {
+            let delay = std::env::args()
+                .find_map(|a| a.strip_prefix("--script-delay=").and_then(|v| v.parse::<i32>().ok()))
+                .unwrap_or(700);
+            self.as_mut().set_pending_script(QString::from(deferred.as_str()));
+            self.as_mut().set_script_delay_ms(delay.max(0));
+        } else if let Some(script) = script {
             self.as_mut().run_script(&script);
         }
     }

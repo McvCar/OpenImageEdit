@@ -118,6 +118,14 @@ pub mod qobject {
         #[qproperty(i32, decode_ms)]
         #[qproperty(i32, shown_ms)]
         #[qproperty(bool, auto_quit)]
+        /// `--script-after-paint=…` 的待执行脚本。`--script` 是**窗口显示前**就跑
+        /// （拿不到任何「显示后」的时序），落定闪烁这类「放手瞬间」的 bug 因此
+        /// 测不到。这个参数把脚本推迟到「窗口真的上屏之后再过 N ms」，探针就能
+        /// 先开始连拍屏幕。空串 = 没有待执行脚本。
+        #[qproperty(QString, pending_script)]
+        /// 上面那个脚本要等的毫秒数（`--script-delay=`，默认 700）。QML 侧的
+        /// `Timer` 到点后调 `run_pending_script`。负数 = 该特性没启用。
+        #[qproperty(i32, script_delay_ms, cxx_name = "scriptDelayMs")]
         #[qproperty(bool, load_failed, cxx_name = "loadFailed")]
         #[qproperty(QString, default_save_url, cxx_name = "defaultSaveUrl")]
         #[qproperty(i32, layer_count)]
@@ -280,6 +288,13 @@ pub mod qobject {
 
         #[qinvokable]
         fn mark(self: Pin<&mut Self>, name: &QString);
+
+        /// 执行 `--script-after-paint` 的待跑脚本（QML 侧 `Timer` 到点后调用）。
+        /// 拆成「存 → 定时 → 跑」三步是因为 Rust 侧这里没有事件循环控制权：
+        /// 落定闪烁这类「放手瞬间」的时序必须让窗口先上屏、连拍已经跑起来，
+        /// 再让手势发生，否则脚本在首帧之前就跑完了，什么都测不到。
+        #[qinvokable]
+        fn run_pending_script(self: Pin<&mut Self>);
 
         /// 探针：把 QML 侧算出来的「面板显示行」原样打个结构化事件。
         /// 显示行（组标题 + 缩进 + 折叠）是 QML 拼的，Rust 看不到，所以由
@@ -1363,6 +1378,8 @@ pub struct BridgeRust {
     decode_ms: i32,
     shown_ms: i32,
     auto_quit: bool,
+    pending_script: QString,
+    script_delay_ms: i32,
     load_failed: bool,
     default_save_url: QString,
     layer_count: i32,
@@ -1548,6 +1565,8 @@ impl Default for BridgeRust {
             decode_ms: 0,
             shown_ms: 0,
             auto_quit: false,
+            pending_script: QString::default(),
+            script_delay_ms: -1,
             load_failed: false,
             default_save_url: QString::default(),
             layer_count: 0,

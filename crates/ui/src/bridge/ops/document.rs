@@ -13,6 +13,24 @@ impl qobject::Bridge {
             self.zoom_percent(),
             self.status(),
         );
+        // 第一帧真正上屏了：`--script-after-paint` 的脚本由 QML 的 `Timer`
+        // （看 `host.imageRendered`）再等 `scriptDelayMs` 才执行 —— 探针在这
+        // 段时间里已经把连拍跑起来了。
+    }
+
+    /// 执行 `--script-after-paint` 的待跑脚本（QML `Timer` 到点调用）。
+    pub fn run_pending_script(mut self: Pin<&mut Self>) {
+        let pending = self.pending_script().to_string();
+        if pending.is_empty() {
+            return;
+        }
+        self.as_mut().set_pending_script(QString::default());
+        self.as_mut().set_script_delay_ms(-1);
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"script-deferred-run\",\"ops\":\"{}\"}}",
+            pending.replace('"', "'")
+        );
+        self.as_mut().run_script(&pending);
     }
 
     pub fn mark(self: Pin<&mut Self>, name: &QString) {
