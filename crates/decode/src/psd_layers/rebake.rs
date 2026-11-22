@@ -16,6 +16,11 @@
 //!   ⚠ 加载烘焙用的是该记录**全部**效果块的合并结果，这里只解析捕获的
 //!   最优先块（`lfxs` > `lfx2` > `lmfx`）；对同时携带多代效果块且内容冲突
 //!   的记录，重烘焙结果可能与加载快照略有出入（PS 自己也只读最新代）。
+//! * 门控是**输入指纹**（成员字段 + 可用成员的 alpha 字节），不是合成
+//!   结果的哈希：指纹没变连联合 alpha 的合成都不做（旧版每轮都要按
+//!   并集包围盒分配 + 逐像素 f32 过混合，样式组一多、刷新一频就是卡顿
+//!   灾难）。调用方（session）另在活帧手势期间整体跳过重烘焙，落定后
+//!   一次性补上。
 
 use std::collections::HashMap;
 
@@ -24,9 +29,60 @@ use psd::effects::LayerEffect;
 
 use editcore::{Document, GroupId};
 
-/// 每个带影子层的组一个联合 alpha 指纹。只有 alpha 真的变了才重新烘焙
-/// （模糊渲染不便宜）。由调用方（session）持有，跨刷新存活。
+/// 每个带影子层的组一个**输入指纹**。指纹混的是联合 alpha 的全部输入
+/// （成员字段 + 可用成员的 alpha 字节），没变就意味着联合 alpha 没变 ——
+/// 只有指纹真的变了才做昂贵的合成与烘焙。由调用方（session）持有。
 pub type RebakeHashes = HashMap<GroupId, u64>;
+
+/// 单组输入指纹的累加器：FNV-1a，逐字节混入。
+struct GroupFp {
+    h: u64,
+    /// 已混入的成员计数（z 序），保证成员相对顺序参与指纹。
+    n: u64,
+}
+
+impl GroupFp {
+    fn new() -> Self {
+        GroupFp {
+            h: 0xcbf2_9ce4_8422_2325,
+            n: 0,
+        }
+    }
+    fn byte(&mut self, b: u8) {
+        self.h = (self.h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    fn bytes(&mut self, b: &[u8]) {
+        for &v in b {
+            self.byte(v);
+        }
+    }
+    /// 混入一个子树成员。字段对所有成员都混（显隐 / 不透明度 / 剪贴的
+    /// 开关都算输入变化）；alpha 字节只对「可用」成员混 —— 隐藏成员的
+    /// 位图根本不进联合 alpha，拖动它不该触发重烘焙。
+    fn mix_layer(&mut self, l: &editcore::Layer) {
+        let seq = self.n;
+        self.n += 1;
+        self.bytes(&seq.to_le_bytes());
+        self.bytes(&(l.id as u64).to_le_bytes());
+        self.byte(l.visible as u8);
+        self.bytes(&l.opacity.to_bits().to_le_bytes());
+        self.byte(l.clipping as u8);
+        let usable = l.visible && l.opacity > 0.0 && !l.clipping;
+        match l.raster() {
+            Some(r) if usable => {
+                self.bytes(&(r.image.width() as u64).to_le_bytes());
+                self.bytes(&(r.image.height() as u64).to_le_bytes());
+                self.bytes(&r.offset.0.to_le_bytes());
+                self.bytes(&r.offset.1.to_le_bytes());
+                let raw = r.image.as_raw();
+                for px in raw.chunks_exact(4) {
+                    self.byte(px[3]);
+                }
+            }
+            _ => self.byte(0xff),
+        }
+    }
+}
 
 /// 单个样式效果块的解析：剥掉 12 字节头（8BIM 签名 + 键 + 声明长度），
 /// 剩下的载荷与加载时 [`psd::effects::parse_layer_effects`] 吃到的完全
@@ -50,29 +106,59 @@ pub fn rebake_group_styles(doc: &mut Document, hashes: &mut RebakeHashes) -> usi
         .filter(|g| g.raw_style.is_some())
         .map(|g| g.id)
         .collect();
+    if styled.is_empty() {
+        return 0;
+    }
     styled.sort_by_key(|&id| std::cmp::Reverse(doc.group_depth(id)));
+
+    // 单遍扫描全部层：沿每层的组链向上，把成员字段（以及可用成员的
+    // alpha 字节）混进链上每个 styled 祖先的指纹；同时记录哪些 styled
+    // 组带自己的影子层。★本组影子层不算自己的输入（否则旧环把自己包
+    // 进新环），但它计入更外层 styled 祖先 —— 与 group_joint_alpha 的
+    // 成员判定逐条对应。
+    let styled_set: std::collections::HashSet<GroupId> = styled.iter().copied().collect();
+    let mut fps: HashMap<GroupId, GroupFp> = HashMap::new();
+    let mut has_shadow: std::collections::HashSet<GroupId> = std::collections::HashSet::new();
+    for l in doc.layers.iter() {
+        let mut gid = l.group;
+        let mut guard = 0usize;
+        while let Some(g) = gid {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            if styled_set.contains(&g) {
+                if l.synthetic && l.group == Some(g) {
+                    has_shadow.insert(g);
+                } else {
+                    fps.entry(g).or_insert_with(GroupFp::new).mix_layer(l);
+                }
+            }
+            gid = doc.find_group(g).and_then(|gr| gr.parent);
+        }
+    }
 
     let mut updated = 0usize;
     for gid in styled {
         // 纯透传组（加载时没有烘焙出影子层）没有可刷新的替身。
-        if !doc.layers.iter().any(|l| l.synthetic && l.group == Some(gid)) {
+        if !has_shadow.contains(&gid) {
             continue;
         }
-        let Some((alpha, size, offset)) = group_joint_alpha(doc, gid) else {
+        // 没有任何成员（fps 没条目）→ 联合 alpha 必为 None，无从烘焙。
+        let Some(fp) = fps.get(&gid).map(|f| f.h) else {
             continue;
         };
-        let hash = alpha_hash(&alpha);
         match hashes.get(&gid) {
-            // 没变：什么都不做。
-            Some(prev) if *prev == hash => continue,
+            // 没变：什么都不做（合成、烘焙统统不碰 —— 这是指纹门控的意义）。
+            Some(prev) if *prev == fp => continue,
             // 首见：只记基线，不烘焙（加载快照即基线）。
             None => {
-                hashes.insert(gid, hash);
+                hashes.insert(gid, fp);
                 continue;
             }
             _ => {}
         }
-        hashes.insert(gid, hash);
+        hashes.insert(gid, fp);
         // 效果参数从 raw_style 原始字节现场解析（与保存透传共用一份字节）。
         // 解析失败 = 这组的样式本来就没烘出来（加载时同样返回 None），跳过。
         let fx = match doc
@@ -82,6 +168,9 @@ pub fn rebake_group_styles(doc: &mut Document, hashes: &mut RebakeHashes) -> usi
         {
             Some(fx) => fx,
             None => continue,
+        };
+        let Some((alpha, size, offset)) = group_joint_alpha(doc, gid) else {
+            continue;
         };
         let Some(baked) = crate::psd_effects::bake_group_effects(&alpha, size, offset, &fx)
         else {
@@ -235,17 +324,6 @@ fn apply_group_bake(
     changed
 }
 
-/// 联合 alpha 的 FNV-1a 指纹（f32 位模式逐个混入）。
-fn alpha_hash(alpha: &[f32]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for v in alpha {
-        h = (h ^ v.to_bits() as u64).wrapping_mul(0x100_0000_01b3);
-        // 每个值再混一轮盐：单圈 FNV 对相邻相似值（大量 0.0 / 1.0）扩散不足。
-        h = (h ^ 0x9e37_79b9_7f4a_7c15).wrapping_mul(0x100_0000_01b3);
-    }
-    h
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,6 +427,44 @@ mod tests {
         // 成员移回原位：指纹回到第一版 → 与当前记录值不同 → 再次触发。
         doc.layers[2].set_offset((0, 0));
         let _ = rebake_group_styles(&mut doc, &mut hashes);
+    }
+
+    /// 输入指纹语义：隐藏成员挪位置不改变联合 alpha → 不触发重烘焙；
+    /// 显隐开关改变输入 → 触发。
+    #[test]
+    fn hidden_member_move_does_not_trigger() {
+        // 伪造 lfxs 块（解析不出活动效果 → 不产生烘焙更新，只验证指纹语义）。
+        let mut fx = Vec::new();
+        fx.extend_from_slice(b"8BIM");
+        fx.extend_from_slice(b"lfxs");
+        fx.extend_from_slice(&16u32.to_be_bytes());
+        fx.extend_from_slice(&[0u8; 16]);
+        let mut doc = Document::from_psd_layers_with_groups(
+            (8, 8),
+            vec![
+                seed("影子", Some(1), true),
+                seed("成员", Some(1), false),
+                {
+                    let mut s = seed("隐藏成员", Some(1), false);
+                    s.visible = false;
+                    s
+                },
+            ],
+            vec![group(Some(fx))],
+        );
+        let gid = doc.groups[0].id;
+        let mut hashes = RebakeHashes::new();
+        assert_eq!(rebake_group_styles(&mut doc, &mut hashes), 0);
+        let fp0 = hashes.get(&gid).copied();
+        // 隐藏成员挪位置：alpha 输入没变，指纹必须原样。
+        doc.layers[3].set_offset((2, 2));
+        assert_eq!(rebake_group_styles(&mut doc, &mut hashes), 0);
+        assert_eq!(hashes.get(&gid).copied(), fp0);
+        // 显示隐藏成员：输入变了（指纹必变；本组效果块解析不出 → 无烘焙
+        // 更新，但指纹已刷新）。
+        doc.layers[3].visible = true;
+        let _ = rebake_group_styles(&mut doc, &mut hashes);
+        assert_ne!(hashes.get(&gid).copied(), fp0);
     }
 
     /// 影子层判定：子树成员区间之下 / 之上各认一张，内容与 offset 原位

@@ -127,9 +127,10 @@ pub(in crate::bridge) struct Session {
     /// 活动层显示矩形 + 不透明度（QML 逻辑像素）：x, y, w, h, opacity。
     pub(in crate::bridge) gpu_rect: (f64, f64, f64, f64, f64),
     // ---- 组样式影子层的跟随刷新（decode::rebake_group_styles）----
-    /// 文档签名（epoch + 层表指纹）。变了才扫一遍样式组，活帧拖动零开销。
+    /// 文档签名（epoch + 层表指纹）。变了才扫一遍样式组，活帧拖动零开销
+    /// （活帧手势在 rebake_group_styles 里直接短路）。
     pub(in crate::bridge) fx_sig: u64,
-    /// 每个带影子层的组一份联合 alpha 指纹；指纹变了才真正重新烘焙。
+    /// 每个带影子层的组一份输入指纹；指纹变了才真正重新烘焙。
     pub(in crate::bridge) fx_hashes: decode::RebakeHashes,
 }
 
@@ -1715,6 +1716,13 @@ impl Session {
     /// 让预览合成器 / GPU 静态纹理 / 缩略图缓存全部失效重画。
     /// 返回是否有组真的被重烘焙（调用方据此决定要不要升级为整幅刷新）。
     pub(in crate::bridge) fn rebake_group_styles(&mut self) -> bool {
+        // 活帧手势（移动 / 缩放 / 旋转，含 GPU 快路径失效时的 CPU 回退）
+        // 绝不重烘焙：重烘焙 = 指纹扫描 + 联合 alpha 合成 + 效果烘焙，
+        // 同步跑在 UI 线程会把拖动帧率拖死。落定后的 refresh 会 bump
+        // epoch，届时一次性补上 —— 拖动期间影子层钉在原地，松手归位。
+        if self.gpu_live || self.gesture != -1 {
+            return false;
+        }
         let sig = fx_signature(&self.doc);
         if sig == self.fx_sig {
             return false;
