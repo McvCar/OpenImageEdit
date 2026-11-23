@@ -138,6 +138,10 @@ pub(in crate::bridge) struct Session {
     /// 起手时的设备像素比：拖动帧的平移量要按**物理像素整数**落点（见
     /// `snap_phys`），所以存一份。
     pub(in crate::bridge) gpu_dpr: f64,
+    /// 当前 GPU 快路径是否由**方向键 nudge** 建立（区别于鼠标拖动）。
+    /// 任何其它手势起手都会走 `clear_live_gestures` 把它清掉，nudge 的
+    /// 空闲落定据此判断会话是否还属于自己的，避免误提交别人的位移。
+    pub(in crate::bridge) nudge_active: bool,
     // ---- 组样式影子层的跟随刷新（decode::rebake_group_styles）----
     /// 文档签名（epoch + 层表指纹）。变了才扫一遍样式组，活帧拖动零开销
     /// （活帧手势在 rebake_group_styles 里直接短路）。
@@ -162,6 +166,8 @@ impl Session {
     pub(in crate::bridge) fn clear_live_gestures(&mut self) -> (bool, bool, bool, bool) {
         // ★统一会话后只剩一个 take：不可能再出现「清了缩放却漏了旋转帧」
         // 这种半截状态。返回值仍按旧四元组报，live-stale 日志不变。
+        // 任何新手势起手都意味着旧的 nudge 已被打断，落定时不得再提交它。
+        self.nudge_active = false;
         match self.transform.take() {
             Some(ts) => {
                 // 批量会话的实时量已经写进文档（无历史），丢弃会话前必须
@@ -406,6 +412,14 @@ fn psd_thumb_images(set: &decode::PsdLayerSet) -> Vec<RgbaImage> {
         .collect()
 }
 
+/// 一次异步解码的用途：打开为新文档，还是把结果插进当前画布。
+/// 外部拖图进已有画布时走后者（用户不希望当前文档被替换掉）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::bridge) enum DecodeIntent {
+    Open,
+    InsertAsLayer,
+}
+
 /// Message from the background decode worker (see `BridgeRust::decode_job`).
 /// `layer_job` is `Some` only for interactive PSD opens; the stage-2 thread is
 /// already running when this message is sent, so the first frame never waits
@@ -414,6 +428,7 @@ pub(in crate::bridge) struct DecodeMsg {
     pub(in crate::bridge) path: PathBuf,
     pub(in crate::bridge) result: Result<(Decoded, i32), String>,
     pub(in crate::bridge) layer_job: Option<mpsc::Receiver<PsdLayerMsg>>,
+    pub(in crate::bridge) intent: DecodeIntent,
 }
 
 /// Start the stage-2 PSD layer parse on its own thread. Returns `None` for
@@ -1146,6 +1161,7 @@ impl Session {
                 gpu_index: 0,
                 gpu_rect: (0.0, 0.0, 0.0, 0.0, 1.0),
                 gpu_dpr: 1.0,
+                nudge_active: false,
                 // 0 = 首次 refresh 会扫一遍样式组、把加载烘焙记为基线指纹
                 //（首见只记指纹不重烘焙，见 decode::rebake_group_styles）。
                 fx_sig: 0,

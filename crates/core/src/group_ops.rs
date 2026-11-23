@@ -1407,4 +1407,50 @@ mod group_tests {
         doc.undo().unwrap();
         assert!(doc.find_group(gid).is_none());
     }
+
+    #[test]
+    fn merge_group_turns_group_into_plain_layer_and_undoes() {
+        let mut doc = doc_with_layers(3);
+        let before_pixels = doc.flatten();
+        let gid = doc.group_layers(&[1, 2], None).unwrap();
+        assert_eq!(doc.groups.len(), 1);
+
+        let at = doc.merge_group(gid).unwrap();
+        // 组消失、结果层不带任何组归属、层数减一、落位在原最高成员处。
+        assert!(doc.find_group(gid).is_none(), "组应被移除");
+        assert!(doc.groups.is_empty());
+        assert_eq!(doc.layers[at].group, None, "结果层应变成普通图层");
+        assert_eq!(doc.layers.len(), 3, "2 层合成 1 层 + 背景 + 未组的 L2 = 3");
+        assert_eq!(doc.flatten(), before_pixels, "合并前后画面必须一致");
+
+        doc.undo().unwrap();
+        assert_eq!(doc.layers.len(), 4, "撤销后层数复原");
+        assert!(doc.find_group(gid).is_some(), "撤销后组复原");
+        assert_eq!(doc.group_members(gid), vec![1, 2]);
+        assert_eq!(doc.flatten(), before_pixels);
+    }
+
+    #[test]
+    fn merge_group_with_nested_child_removes_both_groups() {
+        let mut doc = doc_with_layers(3);
+        let before_pixels = doc.flatten();
+        // 先建外层（含 1/2/3），再在同一组内把 2/3 编成子组 —— 跨组混选
+        // 会被 group_layers 拒绝，嵌套只能这样建。
+        let outer = doc.group_layers(&[1, 2, 3], None).unwrap();
+        let inner = doc.group_layers(&[2, 3], None).unwrap();
+        assert_eq!(doc.find_group(inner).unwrap().parent, Some(outer));
+        // 外层子树 = 层1 + 层2 + 层3（内层成员）。
+        assert_eq!(doc.group_subtree_layers(outer).len(), 3);
+
+        doc.merge_group(outer).unwrap();
+        assert!(doc.find_group(outer).is_none());
+        assert!(doc.find_group(inner).is_none(), "后代组也要一起删掉，不能留孤儿组");
+        assert_eq!(doc.layers.len(), 2, "3 层合成 1 层 + 背景");
+        assert_eq!(doc.flatten(), before_pixels);
+
+        doc.undo().unwrap();
+        assert!(doc.find_group(outer).is_some());
+        assert!(doc.find_group(inner).is_some());
+        assert_eq!(doc.flatten(), before_pixels);
+    }
 }

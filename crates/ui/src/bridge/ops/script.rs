@@ -246,6 +246,18 @@ impl qobject::Bridge {
                     }
                 }
                 "save" => self.as_mut().save_edited(),
+                // `drop-insert:<path>` — 模拟「从资源管理器拖图进已有画布」：
+                // 异步解码后插成新图层，不替换当前文档。poll_decode 落地后
+                // 会打印 dropped-insert 事件供探针断言。
+                other if other.starts_with("drop-insert:") => {
+                    let raw = other.strip_prefix("drop-insert:").unwrap_or("").trim();
+                    if raw.is_empty() {
+                        println!("{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}");
+                    } else {
+                        let url = QUrl::from(file_url(Path::new(raw)).as_str());
+                        self.as_mut().insert_image_from_url(&url);
+                    }
+                }
                 // `save-as:<path>` — automation for the Save-As dialog route
                 // (used by probe_psd_roundtrip.py to verify that a plain image
                 // can be exported as a fresh layered PSD).
@@ -1137,6 +1149,44 @@ impl qobject::Bridge {
                             "{{\"phase\":\"ui\",\"event\":\"script-unknown\",\"op\":\"{other}\"}}"
                         ),
                     }
+                }
+                // `nudge-gesture:dx,dy[,step]` —— 模拟方向键连按：起手烘一次
+                // GPU 纹理，step 次只改 offset（走 gpu-skip，零 CPU 合成），
+                // 最后落定记一条历史。用来验证方向键快路径：日志应有
+                // gpu-begin + 多条 gpu-skip，且拖动帧无 render-profile。
+                other if other.starts_with("nudge-gesture") => {
+                    let n = parse_nums(other);
+                    let dx = n.first().copied().unwrap_or(40.0) as i32;
+                    let dy = n.get(1).copied().unwrap_or(30.0) as i32;
+                    let steps = n.get(2).copied().unwrap_or(6.0) as i32;
+                    let scale = {
+                        let guard = self.session.borrow();
+                        guard.as_ref().map(|s| {
+                            let canvas = s.doc.canvas;
+                            if canvas.width == 0 { return 1.0; }
+                            display_size(canvas, s.zoom, self.dpr.get()).width as f64
+                                / canvas.width as f64
+                        }).unwrap_or(1.0)
+                    };
+                    let began = self.as_mut().nudge_begin(scale);
+                    for i in 1..=steps.max(1) {
+                        let t = i as f64 / steps.max(1) as f64;
+                        self.as_mut().nudge_step((dx as f64 * t).round() as i32,
+                                                 (dy as f64 * t).round() as i32);
+                    }
+                    self.as_mut().nudge_end();
+                    let off = {
+                        let guard = self.session.borrow();
+                        guard.as_ref().and_then(|s| {
+                            let ix = (*self.selected_layer()).max(0) as usize;
+                            s.doc.layers.get(ix).map(|l| l.offset())
+                        }).unwrap_or((0, 0))
+                    };
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"nudge-gesture\",\"began\":{began},\
+                         \"dx\":{dx},\"dy\":{dy},\"steps\":{steps},\"offset\":({},{})}}",
+                        off.0, off.1
+                    );
                 }
                 // `move-gesture:dx,dy[,mods]` —— 走完整的「移动」三件套
                 //（transform_begin → 5×transform_update → transform_end），

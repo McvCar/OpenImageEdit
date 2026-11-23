@@ -371,6 +371,95 @@ impl qobject::Bridge {
 
     /// 手势起手：记录起点、预生成候选、把旧 live 会话拉起来。
     /// `gesture`: 0=move 1=scale 2=rotate；`px/py` 为图像坐标。
+    // ---- 方向键微调（nudge）------------------------------------------
+    //
+    // 与鼠标拖动共用同一套 live offset 会话 + GPU 三明治快路径，但没有鼠标
+    // 坐标也没有「松手」事件，所以由 QML 用一个空闲 Timer 决定何时落定。
+    // 连按期间每次 `nudge_step` 只改 offset / batch delta，`refresh_preview`
+    // 在 `gpu_live` 下走 gpu-skip（零合成、零写盘、零解码），跟手无卡顿。
+
+    /// 第一次方向键：建立与 `GESTURE_MOVE` 相同的 live 会话并烘 GPU 纹理。
+    /// 返回 true 表示快路径已启用；返回 false 时调用方应回退到逐次
+    /// `translate_selected`（非 Normal 混合 / 剪贴层等 GPU 表达不了的情形）。
+    pub fn nudge_begin(mut self: Pin<&mut Self>, disp_scale: f64) -> bool {
+        let ix = (*self.selected_layer()).max(0) as usize;
+        let targets = batch_targets_of(&*self, false);
+        let batch = targets.len() >= 2;
+        // 起手前清掉残留的旋转/缩放临时态，避免 stale 帧盖住 GPU 纹理
+        // （与 transform_begin 的 GESTURE_MOVE 分支同源）。
+        {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return false;
+            };
+            session.clear_live_gestures();
+            session.disp_scale = if disp_scale > 0.0 { disp_scale } else { 1.0 };
+        }
+        // 建立 live offset 会话（含多选/组的整组快照），不写像素、不进历史。
+        self.as_mut().drag_translate_begin();
+        let dpr = self.dpr.get();
+        let (on, su, au, ou, rect) = {
+            let mut guard = self.session.borrow_mut();
+            let Some(session) = guard.as_mut() else {
+                return false;
+            };
+            let on = if batch {
+                session.gpu_begin_set(&targets, session.disp_scale, dpr)
+            } else {
+                session.gpu_begin(ix, session.disp_scale, dpr)
+            };
+            (
+                on,
+                session.gpu_static_url.clone(),
+                session.gpu_active_url.clone(),
+                session.gpu_above_url.clone(),
+                session.gpu_rect_json(),
+            )
+        };
+        if on {
+            self.as_mut().set_gpu_static_url(QString::from(su.as_str()));
+            self.as_mut().set_gpu_active_url(QString::from(au.as_str()));
+            self.as_mut().set_gpu_above_url(QString::from(ou.as_str()));
+            self.as_mut().set_gpu_rect_json(QString::from(rect.as_str()));
+            self.as_mut().set_gpu_live(true);
+            if let Some(session) = self.session.borrow_mut().as_mut() {
+                session.nudge_active = true;
+            }
+        } else {
+            self.as_mut().set_gpu_live(false);
+        }
+        on
+    }
+
+    /// 连按推进。`(dx, dy)` 为相对起手的**累计**图像像素位移。
+    pub fn nudge_step(mut self: Pin<&mut Self>, dx: i32, dy: i32) {
+        self.as_mut().drag_translate_update(dx, dy);
+    }
+
+    /// 停手后落定。若手势已被其它操作（鼠标拖动 / 缩放 / 旋转）接管，
+    /// live 会话已不是本 nudge 建立的，此时**不能**调 `drag_translate_end`
+    /// ——它会误关掉新手势的 GPU 并把别人的位移当成自己的提交。
+    pub fn nudge_end(mut self: Pin<&mut Self>) {
+        let still_ours = self.session.borrow().as_ref().map(|s| {
+            s.nudge_active
+                && (matches!(s.transform, Some(TransformSession::Move { .. }))
+                    || s.batch_kind() == Some(BATCH_MOVE))
+        }).unwrap_or(false);
+        if !still_ours {
+            // 会话已被别的手势接管：只清标记，绝不碰 GPU / 文档。
+            if let Some(session) = self.session.borrow_mut().as_mut() {
+                session.nudge_active = false;
+            }
+            return;
+        }
+        if let Some(session) = self.session.borrow_mut().as_mut() {
+            session.nudge_active = false;
+        }
+        // drag_translate_end 内部已做 gpu_end + set_gpu_live(false)，并产出
+        // 真实落定帧（QML 侧等新帧上屏再淡出 GPU 纹理）。
+        self.as_mut().drag_translate_end(true);
+    }
+
     pub fn transform_begin(
         mut self: Pin<&mut Self>,
         gesture: i32,

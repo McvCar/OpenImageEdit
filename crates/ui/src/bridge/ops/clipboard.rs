@@ -440,6 +440,23 @@ impl qobject::Bridge {
     /// 外部图片没有「原位置」可言，居中放最自然；比画布大的图同样居中，
     /// 四周均匀溢出（之后可以拖 / 缩放手柄调整）。
     fn paste_foreign_image(mut self: Pin<&mut Self>, image: RgbaImage) -> bool {
+        let (w, h) = image.dimensions();
+        let on = self.as_mut().insert_image_layer(image);
+        if on {
+            self.as_mut().set_status(QString::from(
+                format!("已从剪贴板粘贴 {w}×{h} 为新图层").as_str(),
+            ));
+            println!(
+                "{{\"phase\":\"ui\",\"event\":\"pasted-image\",\"w\":{w},\"h\":{h}}}"
+            );
+        }
+        on
+    }
+
+    /// 把一张已解码的图片作为新图层插入**当前画布**（居中），供剪贴板粘贴
+    /// 与外部拖图共用。没有文档时返回 false。不碰 session 本身、不 bump
+    /// load_serial（那是「打开新文档窗口贴合」专用）。
+    pub(in crate::bridge) fn insert_image_layer(mut self: Pin<&mut Self>, image: RgbaImage) -> bool {
         let viewport = *self.viewport.borrow();
         let (w, h) = image.dimensions();
         let result: Result<usize, String> = {
@@ -473,11 +490,8 @@ impl qobject::Bridge {
                     }
                 }
                 self.as_mut().refresh_preview();
-                self.as_mut().set_status(QString::from(
-                    format!("已从剪贴板粘贴 {w}×{h} 为新图层").as_str(),
-                ));
                 println!(
-                    "{{\"phase\":\"ui\",\"event\":\"pasted-image\",\"index\":{index},\"w\":{w},\"h\":{h}}}"
+                    "{{\"phase\":\"ui\",\"event\":\"insert-image-layer\",\"index\":{index},\"w\":{w},\"h\":{h}}}"
                 );
                 true
             }

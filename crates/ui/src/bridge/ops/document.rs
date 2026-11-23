@@ -53,6 +53,43 @@ impl qobject::Bridge {
         self.as_mut().load_path(&path);
     }
 
+    /// 外部拖图进已有画布：异步解码后插成新图层，不替换当前文档。
+    /// QML 只在 `image_width > 0`（已有画布）时调它；无画布仍走 `open_file`。
+    pub fn insert_image_from_url(mut self: Pin<&mut Self>, url: &QUrl) {
+        let path = PathBuf::from(url.to_local_file_or_default().to_string());
+        // 会话不存在时（理论上 QML 不会走到这）回退成打开新文档。
+        if self.session.borrow().is_none() {
+            self.as_mut().load_path(&path);
+            return;
+        }
+        // 正在打开另一个文件时不抢它的 decode_job / pending_decode。
+        if self.decode_job.borrow().is_some() || self.pending_decode.borrow().is_some() {
+            self.as_mut().set_status(QString::from("正在打开图片，请稍候再拖入"));
+            return;
+        }
+        println!(
+            "{{\"phase\":\"ui\",\"event\":\"drop-insert-start\",\"file\":\"{}\"}}",
+            path.to_string_lossy().replace('\\', "/")
+        );
+        let (tx, rx) = mpsc::channel::<DecodeMsg>();
+        let thread_path = path.clone();
+        let opts = self.decode_opts();
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let result = decode_path(&thread_path, opts).map_err(|e| e.to_string());
+            let ms = t0.elapsed().as_millis().min(i32::MAX as u128) as i32;
+            let _ = tx.send(DecodeMsg {
+                path: thread_path,
+                result: result.map(|d| (d, ms)),
+                layer_job: None,
+                intent: DecodeIntent::InsertAsLayer,
+            });
+        });
+        *self.decode_job.borrow_mut() = Some(rx);
+        self.as_mut().set_loading(true);
+        self.as_mut().set_status(QString::from("正在插入图片…"));
+    }
+
     pub fn navigate(mut self: Pin<&mut Self>, dir: i32) {
         let current = self
             .session
@@ -524,7 +561,43 @@ impl qobject::Bridge {
         // A PSD stage-2 job travels with the stage-1 message. Take it BEFORE
         // consuming `msg.result` (both are partial moves of the same value).
         let layer_job = msg.layer_job;
+        let intent = msg.intent;
         self.as_mut().set_loading(false);
+        // 外部拖图进已有画布：不替换 session，只把解码结果插成新图层。
+        // 走异步解码（不冻结 UI），并复用 decode_opts 的 8192 降采样。
+        if intent == crate::bridge::session::DecodeIntent::InsertAsLayer {
+            let name = msg.path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            match msg.result {
+                Ok((decoded, _)) => {
+                    let (w, h) = decoded.image.dimensions();
+                    let on = self.as_mut().insert_image_layer(decoded.image);
+                    let status = if on {
+                        format!("已把 {name}（{w}×{h}）插入当前画布")
+                    } else {
+                        "当前没有打开的画布，无法插入图片".to_string()
+                    };
+                    self.as_mut().set_status(QString::from(status.as_str()));
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"dropped-insert\",\"name\":\"{}\",\
+                         \"w\":{w},\"h\":{h},\"ok\":{}}}",
+                        name.replace('\\', "/").replace('"', "'"), on
+                    );
+                }
+                Err(e) => {
+                    let safe = e.replace('\\', "/").replace('"', "'");
+                    self.as_mut().set_status(QString::from(
+                        format!("拖入的图片无法解码：{e}").as_str(),
+                    ));
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"dropped-insert-failed\",\"reason\":\"{}\"}}",
+                        safe
+                    );
+                }
+            }
+            return;
+        }
         match msg.result {
             Ok((decoded, decode_ms)) => {
                 let Decoded {

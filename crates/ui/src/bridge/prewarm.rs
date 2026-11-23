@@ -55,6 +55,7 @@ pub(in crate::bridge) fn spawn(path: &Path) {
             path: thread_path,
             result: result.map(|d| (d, ms)),
             layer_job,
+            intent: super::session::DecodeIntent::Open,
         });
     });
     println!(

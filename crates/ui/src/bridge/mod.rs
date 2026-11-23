@@ -312,6 +312,11 @@ pub mod qobject {
         #[qinvokable]
         fn open_file(self: Pin<&mut Self>, url: &QUrl);
 
+        /// 从资源管理器拖图片进已有画布：异步解码后插成新图层，不替换当前
+        /// 文档。QML 只在「已有画布」时调它；无画布仍走 open_file。
+        #[qinvokable]
+        fn insert_image_from_url(self: Pin<&mut Self>, url: &QUrl);
+
         // ---- 图片浏览 / 设置 ----
 
         /// Open the previous (-1) or next (+1) image in the same folder.
@@ -942,6 +947,23 @@ pub mod qobject {
 
         #[qinvokable]
         fn translate_selected(self: Pin<&mut Self>, dx: i32, dy: i32);
+
+        // ---- 方向键微调（nudge）：复用移动手势的 GPU 快路径 ----
+        // 方向键连按若每次都走 translate_selected，等于每次一次完整 CPU
+        // 合成 + BMP 落盘（复杂 PSD 实测 90~260ms），连按严重卡顿。
+        // 这三个 API 让连按期间只烘一次纹理、只改 offset（render 里
+        // gpu-skip 零合成零写盘），停手后一次性记历史 + 出落定帧。
+        /// 起手（第一次方向键）：烘一次 GPU 三明治纹理。返回是否启用快路径。
+        #[qinvokable]
+        fn nudge_begin(self: Pin<&mut Self>, disp_scale: f64) -> bool;
+
+        /// 推进：`(dx, dy)` 是相对起手的**累计**图像像素位移。
+        #[qinvokable]
+        fn nudge_step(self: Pin<&mut Self>, dx: i32, dy: i32);
+
+        /// 落定：结束 GPU、记一条历史、出真实帧。
+        #[qinvokable]
+        fn nudge_end(self: Pin<&mut Self>);
 
         // ---- 标记（markup annotations）----
 
@@ -2007,6 +2029,7 @@ impl qobject::Bridge {
                 path: thread_path,
                 result: result.map(|d| (d, ms)),
                 layer_job,
+                intent: crate::bridge::session::DecodeIntent::Open,
             });
         });
         // Dropping the previous receiver (if any) discards its result.

@@ -422,6 +422,10 @@ impl qobject::Bridge {
     ///
     /// 与「向下合并」的区别：这里只认**选中的那些**，不碰相邻层；结果落在
     /// 最高选中层的 z 位，名字 / 锁定沿用最高层。
+    ///
+    /// ★整组选中（`selected_group_id > 0`，即点了组行 / Ctrl 选满整组）时走
+    /// `merge_group`：组就地变成一个普通图层（组标题行消失），而不是在组里
+    /// 留一个合并层。否则用户看到「合并了，组还在，组里剩一层」，很困惑。
     pub fn merge_selected_layers(mut self: Pin<&mut Self>) {
         let selected = self.as_mut().selection_indices();
         let targets: Vec<usize> = selected.iter().copied().filter(|&i| i > 0).collect();
@@ -441,6 +445,23 @@ impl qobject::Bridge {
             self.as_mut().set_status(QString::from(message.as_str()));
             return;
         }
+        // 整组选中判定：`selected_group_id` 由 Rust 从 group_focus + 选中集合
+        // 派生。但要**额外要求选中集合恰好等于该组的整棵子树** —— 否则
+        // 「选中整组 + 组外某层」时 focus 仍指向组（成员都在集合里），若走
+        // merge_group 会悄悄丢掉组外那层。混合选择应走普通 merge_layers。
+        let gid = *self.selected_group_id();
+        let merge_group = gid > 0 && {
+            let guard = self.session.borrow();
+            guard.as_ref().map(|s| {
+                if s.doc.find_group(gid as u32).is_none() {
+                    return false;
+                }
+                let mut members = s.doc.group_subtree_layers(gid as u32);
+                members.retain(|&i| i > 0 && !s.doc.layers[i].synthetic);
+                members.sort_unstable();
+                members == targets // targets 已在上面过滤 i>0 且本身升序
+            }).unwrap_or(false)
+        };
         let viewport = *self.viewport.borrow();
         let result: Result<usize, String> = {
             let mut guard = self.session.borrow_mut();
@@ -453,7 +474,12 @@ impl qobject::Bridge {
                     {
                         Err("选中的图层里有锁定层，先解锁再合并".into())
                     } else {
-                        match session.doc.merge_layers(&targets) {
+                        let r = if merge_group {
+                            session.doc.merge_group(gid as u32)
+                        } else {
+                            session.doc.merge_layers(&targets)
+                        };
+                        match r {
                             Ok(at) => {
                                 session.dirty = true;
                                 Ok(at)
@@ -466,6 +492,11 @@ impl qobject::Bridge {
         };
         match result {
             Ok(at) => {
+                // 组已删除：清掉显式焦点，避免下一帧 derive_selected_group
+                // 拿旧 gid 去派生（虽会自愈，但显式清更稳）。
+                if merge_group {
+                    self.group_focus.set(0);
+                }
                 {
                     let mut guard = self.session.borrow_mut();
                     if let Some(s) = guard.as_mut() {
@@ -476,8 +507,9 @@ impl qobject::Bridge {
                 self.as_mut().refresh_preview();
                 self.as_mut().set_selection_indices(&[at]);
                 println!(
-                    "{{\"phase\":\"ui\",\"event\":\"layers-merged\",\"at\":{at},\"count\":{}}}",
-                    targets.len()
+                    "{{\"phase\":\"ui\",\"event\":\"layers-merged\",\"at\":{at},\
+                     \"count\":{},\"group\":{}}}",
+                    targets.len(), merge_group
                 );
             }
             Err(message) => self.as_mut().set_status(QString::from(message.as_str())),

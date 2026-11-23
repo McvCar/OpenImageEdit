@@ -1375,8 +1375,16 @@ StatusBar {
 DropArea {
     anchors.fill: parent
     onDropped: (drop) => {
-        if (drop.hasUrls && drop.urls.length > 0)
+        if (!drop.hasUrls || drop.urls.length === 0)
+            return
+        // 已有画布 → 把拖入的图片插成新图层（不替换当前文档，也不需要
+        // dirty 确认，因为插入不丢内容）；空窗口 → 维持原来的打开流程。
+        if (bridge.image_width > 0) {
+            bridge.insert_image_from_url(drop.urls[0])
+            root.forceActiveFocus()
+        } else {
             confirmThenOpen(drop.urls[0]);
+        }
     }
 }
 
@@ -2369,10 +2377,47 @@ Timer {
     onTriggered: root.applyRotateFrame()
 }
 
+// 方向键微调：连按复用 GPU 拖动手势，避免每次按键都全幅重合成 + BMP 落盘。
+// 第一次按键起手烘一次纹理；连按期间只累加位移、只改 offset（GPU 帧零合成）；
+// 停手 nudgeIdle 后一次落定 = 一条历史 + 一帧真实渲染。
+property int nudgeDX: 0
+property int nudgeDY: 0
+property bool nudging: false
+
+Timer {
+    id: nudgeIdle
+    interval: 260
+    repeat: false
+    onTriggered: {
+        if (!root.nudging)
+            return
+        bridge.nudge_end()
+        root.nudging = false
+    }
+}
+
 function nudgeLayer(dx, dy) {
-    if (bridge.selected_layer < 0)
+    if (bridge.selected_layer < 0 || bridge.editingLocked)
         return
-    bridge.translate_selected(dx, dy)
+    // 会话被换文件 / 撤销等外部操作打断后 gpuLive 会变 false，重置状态，
+    // 否则下面会拿旧累计值往一个不存在的 live 会话上推，方向键短暂失灵。
+    if (root.nudging && !bridge.gpuLive)
+        root.nudging = false
+    if (!root.nudging) {
+        // GPU 快路径不可用（非 Normal 混合 / 剪贴层等）时回退到逐次提交，
+        // 行为与修复前一致，只是那条路本来就少用。
+        if (!bridge.nudge_begin(toDispScale())) {
+            bridge.translate_selected(dx, dy)
+            return
+        }
+        root.nudging = true
+        root.nudgeDX = 0
+        root.nudgeDY = 0
+    }
+    root.nudgeDX += dx
+    root.nudgeDY += dy
+    bridge.nudge_step(root.nudgeDX, root.nudgeDY)
+    nudgeIdle.restart()
 }
 
 // Hidden helper: TextEdit.copy() puts the (selected) text on the system

@@ -289,6 +289,37 @@ impl Document {
         Ok(below)
     }
 
+    /// 把 `targets`（升序、已过滤）按 z 序合成成一个新位图层，元数据沿用
+    /// 最高层。范围取并集并做 1×1 退化保护 —— 细节见 `merge_layers` 注释。
+    /// `merge_layers` 与 `merge_group` 共用这一份，保证两条路的像素完全一致。
+    fn compose_merged_layer(&self, targets: &[usize]) -> Layer {
+        let (mut x0, mut y0) = (i32::MAX, i32::MAX);
+        let (mut x1, mut y1) = (i32::MIN, i32::MIN);
+        for &i in targets {
+            let b = self.layers[i].bounds();
+            x0 = x0.min(b.x);
+            y0 = y0.min(b.y);
+            x1 = x1.max(b.x + b.width as i32);
+            y1 = y1.max(b.y + b.height as i32);
+        }
+        let w = (x1 - x0).max(1) as u32;
+        let h = (y1 - y0).max(1) as u32;
+        let mut merged = RgbaImage::new(w, h);
+        for &i in targets {
+            draw_layer_into(&mut merged, (x0, y0), &self.layers[i]);
+        }
+        let top = *targets.last().unwrap();
+        let mut after = self.layers[top].clone();
+        after.content = LayerContent::Raster(RasterLayer {
+            image: merged,
+            offset: (x0, y0),
+            transform: None,
+        });
+        after.opacity = 1.0;
+        after.visible = true;
+        after
+    }
+
     /// 合并**选中的**图层（PS 的「合并图层」，菜单项只在多选时可用）。
     ///
     /// 结果落在最高那层的 z 位上，名字 / 锁定状态沿用最高层，内容按 z 序
@@ -307,38 +338,9 @@ impl Document {
         if targets.len() < 2 {
             return Err(EditError::BaseRequired);
         }
-        // 范围取所有目标的**并集**：图层可能各自偏出去，用单层尺寸会把多出来
-        // 的那块像素裁掉（视觉上「合并后少了东西」）。
-        let (mut x0, mut y0) = (i32::MAX, i32::MAX);
-        let (mut x1, mut y1) = (i32::MIN, i32::MIN);
-        for &i in &targets {
-            let b = self.layers[i].bounds();
-            x0 = x0.min(b.x);
-            y0 = y0.min(b.y);
-            x1 = x1.max(b.x + b.width as i32);
-            y1 = y1.max(b.y + b.height as i32);
-        }
-        // ★并集可能退化：两层都是空的（新建的空图层 0×0，或整体在画布外）
-        //   时 x1==x0 / y1==y0。这里不能报错 —— 「合并不了」是用户最没法
-        //   自救的反馈。按 1×1 透明块落定：层数照减，内容为空，可撤销。
-        let w = (x1 - x0).max(1) as u32;
-        let h = (y1 - y0).max(1) as u32;
-        let mut merged = RgbaImage::new(w, h);
-        // 由低到高叠：`draw_layer_into` 会把每层自己的不透明度烘焙进去。
-        for &i in &targets {
-            draw_layer_into(&mut merged, (x0, y0), &self.layers[i]);
-        }
-
         let top = *targets.last().unwrap();
         let before = self.layers[top].clone();
-        let mut after = before.clone();
-        after.content = LayerContent::Raster(RasterLayer {
-            image: merged,
-            offset: (x0, y0),
-            transform: None,
-        });
-        after.opacity = 1.0;
-        after.visible = true;
+        let after = self.compose_merged_layer(&targets);
 
         // 被删掉的都在 top 下面（targets 升序），所以先 Replace 再按降序删，
         // 每次删除都不会影响还没处理的那些下标。
@@ -347,6 +349,74 @@ impl Document {
             before,
             after,
         }];
+        for &i in targets.iter().rev() {
+            if i != top {
+                ops.push(EditOp::RemoveLayer {
+                    index: i,
+                    layer: self.layers[i].clone(),
+                });
+            }
+        }
+        self.execute(EditOp::Batch(ops))?;
+        Ok(top - (targets.len() - 1))
+    }
+
+    /// 把整组（含嵌套子组）就地合并成一个**普通图层**：组本身消失。
+    ///
+    /// 与 `merge_layers` 的区别：
+    /// * 目标取自 `group_subtree_layers`（整棵子树），并剔除背景/影子层；
+    /// * 结果层的 `group` 清成 `None`（不再属于任何组）；
+    /// * 一次 Batch 里同时移除该组及所有后代组（`SetGroups`），并把子组的
+    ///   parent 改挂到被合并组的父组，避免留下面板里渲染不出的孤儿组。
+    ///
+    /// 结果落在组内最高成员的 z 位 —— 那正是面板里组标题行的位置。像素用
+    /// `compose_merged_layer`，与 `merge_layers` 完全一致。一次撤销复原全部。
+    pub fn merge_group(&mut self, gid: GroupId) -> Result<usize, EditError> {
+        if self.find_group(gid).is_none() {
+            return Err(EditError::GroupNotFound(gid));
+        }
+        let parent = self.find_group(gid).and_then(|g| g.parent);
+        let mut targets: Vec<usize> = self
+            .group_subtree_layers(gid)
+            .into_iter()
+            .filter(|&i| i > 0 && !self.layers[i].background && !self.layers[i].synthetic)
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        if targets.len() < 2 {
+            return Err(EditError::GroupNeedsTwoLayers);
+        }
+        let top = *targets.last().unwrap();
+        let before = self.layers[top].clone();
+        let mut after = self.compose_merged_layer(&targets);
+        after.group = None; // ★组变成普通图层：不再带任何组归属
+
+        // 组表：移除 gid + 全部后代组；后代组的 parent 重挂到 gid 的 parent。
+        let removed: Vec<GroupId> = {
+            let mut v = self.descendant_groups(gid);
+            v.push(gid);
+            v
+        };
+        let mut groups = self.groups.clone();
+        groups.retain(|g| !removed.contains(&g.id));
+        for g in groups.iter_mut() {
+            if let Some(p) = g.parent {
+                if removed.contains(&p) {
+                    g.parent = parent;
+                }
+            }
+        }
+
+        // SetGroups 放第一：撤销时最后 revert，先恢复各层归属再恢复组表。
+        let mut ops: Vec<EditOp> = vec![EditOp::SetGroups {
+            from: self.groups.clone(),
+            to: groups,
+        }];
+        ops.push(EditOp::ReplaceLayer {
+            index: top,
+            before,
+            after,
+        });
         for &i in targets.iter().rev() {
             if i != top {
                 ops.push(EditOp::RemoveLayer {
