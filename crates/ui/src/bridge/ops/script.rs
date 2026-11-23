@@ -216,6 +216,59 @@ impl qobject::Bridge {
                         );
                     }
                 }
+                // `qsel-opt:radius,tol,grow,sample_all,auto_enhance`
+                // 写快速选择选项（对齐 PS 的「取样全部图层 / 自动增强」）。
+                other if other.starts_with("qsel-opt:") => {
+                    let spec = other.trim_start_matches("qsel-opt:");
+                    self.as_mut().save_sel_quick(&QString::from(spec));
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"qsel-opt\",\"spec\":\"{}\",\"saved\":\"{}\"}}",
+                        spec,
+                        self.sel_quick_saved().to_string()
+                    );
+                }
+                // `qsel-modes:x,y,mode x,y,mode ...|radius,tol,grow`
+                // 逐点给模式，用来回归「一笔中途按 Alt 改减选」。
+                other if other.starts_with("qsel-modes:") => {
+                    let rest = other.trim_start_matches("qsel-modes:");
+                    let (pts_part, args_part) = match rest.split_once('|') {
+                        Some((a, b)) => (a, Some(b)),
+                        None => (rest, None),
+                    };
+                    let args: Vec<f64> = args_part
+                        .map(|s| {
+                            s.split(',')
+                                .filter_map(|t| t.trim().parse::<f64>().ok())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let radius = args.first().copied().unwrap_or(24.0);
+                    let tol = args.get(1).copied().unwrap_or(40.0) as i32;
+                    let grow = args.get(2).copied().unwrap_or(160.0) as i32;
+                    for tok in pts_part.split_whitespace() {
+                        let n: Vec<f64> = tok
+                            .split(',')
+                            .filter_map(|v| v.trim().parse::<f64>().ok())
+                            .collect();
+                        if n.len() < 3 {
+                            continue;
+                        }
+                        self.as_mut().quick_select_brush(
+                            n[0], n[1], radius, tol, grow, n[2] as i32,
+                        );
+                    }
+                    self.as_mut().quick_select_commit();
+                    let area = self
+                        .session
+                        .borrow()
+                        .as_ref()
+                        .and_then(|s| s.doc.selection.as_ref().map(|st| st.mask().area()))
+                        .unwrap_or(0);
+                    println!(
+                        "{{\"phase\":\"ui\",\"event\":\"quick-select-modes\",\"area\":{}}}",
+                        area
+                    );
+                }
                 other if other.starts_with("sel-resize:") => {
                     let nums = parse_nums(other);
                     if nums.len() == 4 {

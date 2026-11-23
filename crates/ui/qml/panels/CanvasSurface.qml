@@ -635,11 +635,14 @@ Item {
                 return
             }
             // 快速选择涂抹：每一步都送一段过去，选区跟着笔尖长。
+            // ★修饰键按**当前帧**解（不是按下时锁存的 selMode）：PS 允许
+            // 一笔涂到一半按 Alt 改减选 / 松开回加选；Rust 侧把加减两段
+            // 各自累积后再合成。
             if (quickDrag) {
                 const pw = toImage(mouse.x, mouse.y)
                 bridge.quick_select_brush(pw[0], pw[1], host.quickRadius,
                                           host.quickTolerance, host.quickGrow,
-                                          selMode)
+                                          modeFrom(mouse.modifiers))
                 return
             }
             // 多边形套索的橡皮筋跟随光标（不需要按住）。
@@ -1651,16 +1654,12 @@ Item {
         }
     }
 
-    // 快速选择的笔刷轮廓：跟着光标画一个圈，直观表示这一笔有多粗。
-    // 直径 = 半径 × 2 × 显示比例（笔刷半径是画布像素，不是屏幕像素）。
+    // 修复笔的笔刷轮廓（快速选择改用下面 PS 同款光标）。
     Rectangle {
         id: quickBrushRing
-        visible: (host.selTool === "quick"
-                  || host.paintTool === "spot" || host.paintTool === "heal")
+        visible: (host.paintTool === "spot" || host.paintTool === "heal")
                  && canvasHoverHandler.hovered
-        readonly property real diam: Math.max(8, (host.selTool === "quick"
-                                                  ? host.quickRadius * 2
-                                                  : host.healSize) * host.toDispScale())
+        readonly property real diam: Math.max(8, host.healSize * host.toDispScale())
         width: diam
         height: diam
         radius: diam / 2
@@ -1672,6 +1671,76 @@ Item {
         opacity: 0.8
         antialiasing: true
         z: 500
+    }
+
+    // PS 快速选择光标：双层圆圈（深浅背景都看得清）+ 中心十字 + 加/减号。
+    // 直径按画布笔刷半径 × 显示比例换算；拖动时修饰键取实时掩码，悬停时
+    // 从 Win32 按键队列轮询（QML 的 HoverHandler 不带 modifiers）。
+    Item {
+        id: psQuickCursor
+        visible: host.selTool === "quick" && canvasHoverHandler.hovered
+        readonly property real diam: Math.max(8, host.quickRadius * 2 * host.toDispScale())
+        // 鼠标事件给的是 Qt 掩码；Win32 轮询给的是 bit0=Shift/bit2=Alt。
+        readonly property bool fromMouse: quickDrag || selDragMouse.pressed
+        readonly property bool shiftDown: fromMouse
+                                          ? (selDragMouse.liveMods & Qt.ShiftModifier) !== 0
+                                          : (hoverMods & 1) !== 0
+        readonly property bool altDown: fromMouse
+                                        ? (selDragMouse.liveMods & Qt.AltModifier) !== 0
+                                        : (hoverMods & 4) !== 0
+        property int hoverMods: 0
+        width: diam
+        height: diam
+        x: canvasHoverHandler.point.position.x - diam / 2
+        y: canvasHoverHandler.point.position.y - diam / 2
+        z: 501
+
+        Timer {
+            interval: 80
+            repeat: true
+            running: psQuickCursor.visible
+            onTriggered: psQuickCursor.hoverMods = bridge.modifier_bits()
+        }
+        Rectangle {
+            anchors.fill: parent
+            radius: parent.width / 2
+            color: "transparent"
+            border.color: "#000000"
+            border.width: 1
+            opacity: 0.55
+        }
+        Rectangle {
+            anchors.fill: parent
+            anchors.margins: 1
+            radius: width / 2
+            color: "transparent"
+            border.color: "#ffffff"
+            border.width: 1
+            opacity: 0.95
+        }
+        Rectangle {
+            width: 11; height: 1
+            anchors.centerIn: parent
+            color: "#ffffff"
+        }
+        Rectangle {
+            width: 1; height: 11
+            anchors.centerIn: parent
+            color: "#ffffff"
+        }
+        Text {
+            anchors.centerIn: parent
+            anchors.verticalCenterOffset: -12
+            text: (psQuickCursor.shiftDown && psQuickCursor.altDown) ? "∩"
+                  : psQuickCursor.shiftDown ? "+"
+                  : psQuickCursor.altDown ? "−"
+                  : (host.selMode === 1 ? "+" : host.selMode === 2 ? "−" : "")
+            color: "#ffffff"
+            font.pixelSize: 13
+            font.bold: true
+            style: Text.Outline
+            styleColor: "#000000"
+        }
     }
 
     // Authoritative canvas cursor: a HoverHandler's cursorShape beats

@@ -508,7 +508,9 @@ Item {
                     const p = mapToItem(previewImage, mouse.x, mouse.y)
                     startAngle = Math.atan2(p.y - pivotY, p.x - pivotX) * 180 / Math.PI
                     rotateMods = mouse.modifiers | host.rotateMagnetBit
-                    host.startLayerRotate()
+                    // 累计角交给 EditorContent：按下点之后的每一帧取最短角差
+                    // 累加，拖满一圈得到 360° 而不是回绕到 0°（吸角按累计角解）。
+                    host.beginLayerRotateAtPointer(startAngle, rotateMods)
                 }
                 onPositionChanged: (mouse) => {
                     if (!pressed)
@@ -518,11 +520,7 @@ Item {
                     rotateMods = mouse.modifiers | host.rotateMagnetBit
                     const p = mapToItem(previewImage, mouse.x, mouse.y)
                     const a = Math.atan2(p.y - pivotY, p.x - pivotX) * 180 / Math.PI
-                    let d = a - startAngle
-                    // 跨 ±180 时不要跳一整圈。
-                    while (d > 180) d -= 360
-                    while (d < -180) d += 360
-                    host.previewLayerRotate(d, rotateMods)
+                    host.moveLayerRotateAtPointer(a, rotateMods)
                 }
                 onReleased: {
                     host.finishLayerRotate(true, rotateMods)

@@ -284,6 +284,34 @@ Rectangle {
                     font.pixelSize: 10
                 }
             }
+            // PS 选项栏同款两项：取样范围 + 自动增强。和魔术棒的胶囊共用样式。
+            Row {
+                spacing: 4
+                Pill {
+                    label: "当前图层"
+                    checked: !host.quickSampleAll
+                    onClicked: host.setQuickSampleAll(false)
+                }
+                Pill {
+                    label: "全部图层"
+                    checked: host.quickSampleAll
+                    onClicked: host.setQuickSampleAll(true)
+                }
+            }
+            Row {
+                spacing: 4
+                Pill {
+                    label: "自动增强"
+                    checked: host.quickAutoEnhance
+                    onClicked: host.setQuickAutoEnhance(!host.quickAutoEnhance)
+                }
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "磨平边缘锯齿"
+                    color: "#6b7076"
+                    font.pixelSize: 10
+                }
+            }
         }
 
         Rectangle {
@@ -314,7 +342,7 @@ Rectangle {
                      : (host.selTool === "wand"
                         ? "点击取色选中一片 · Shift 加选 · Alt 减选"
                         : (host.selTool === "quick"
-                           ? "按住涂抹 · Shift 加选 · Alt 减选 · [ ] 改笔刷"
+                           ? "按住涂抹长出选区 · Shift 加选 · Alt 减选（笔迹中途也有效）· [ ] 改笔刷"
                            : "Shift 加选 · Alt 减选 · Shift+Alt 交集")))
             color: "#6b7076"
             font.pixelSize: 10

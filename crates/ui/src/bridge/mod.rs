@@ -255,6 +255,8 @@ pub mod qobject {
         #[qproperty(QString, sel_tool_saved, cxx_name = "selToolSaved")]
         /// 魔术棒参数（settings.ini）：`tol,contiguous,sample_all`。
         #[qproperty(QString, sel_wand_saved, cxx_name = "selWandSaved")]
+        /// 快速选择参数（settings.ini）：`radius,tol,grow,sample_all,auto_enhance`。
+        #[qproperty(QString, sel_quick_saved, cxx_name = "selQuickSaved")]
         /// 修复 / 油漆工具与参数（settings.ini，`|` 分隔）。
         #[qproperty(QString, paint_spec_saved, cxx_name = "paintSpecSaved")]
         // ---- P0-4 智能参考线 / P0-5 数值面板 ----
@@ -568,6 +570,12 @@ pub mod qobject {
         /// 记住魔术棒参数并写盘：`tol,contiguous,sample_all`（如 "32,1,0"）。
         #[qinvokable]
         fn save_sel_wand(self: Pin<&mut Self>, spec: &QString);
+
+        /// 记住快速选择参数并写盘：`radius,tol,grow,sample_all,auto_enhance`
+        /// （如 "24,40,160,1,1"）。后两项对应 PS 的「取样全部图层 /
+        /// 自动增强」。
+        #[qinvokable]
+        fn save_sel_quick(self: Pin<&mut Self>, spec: &QString);
 
         /// 记住修复 / 油漆工具与参数（`|` 分隔的 12 段，见 AppConfig）。
         #[qinvokable]
@@ -1340,6 +1348,7 @@ pub mod qobject {
             skew_x: f64,
             skew_y: f64,
         );
+
     }
 }
 
@@ -1357,6 +1366,7 @@ impl Default for AppConfig {
             sel_feather: 0,
             sel_tool: "rect".to_string(),
             sel_wand: "32,1,1".to_string(),
+            sel_quick: "24,40,160,1,1".to_string(),
             paint_spec: "none|40|70|20|100|2|32|1|100|0|0|100".to_string(),
             transform_panel_visible: false,
             show_guides: true,
@@ -1376,11 +1386,15 @@ pub(in crate::bridge) struct QuickDrag {
     pub from: Option<SelectionState>,
     /// 按下鼠标前选区的硬轮廓（加/减的基准）。
     pub base: Option<SelectionMask>,
-    /// 本次涂抹已累积的扩散结果。
-    pub accum: Option<SelectionMask>,
+    /// 本次涂抹累积的**加选**扩散结果（PS 允许一笔中途按 Alt 改减选，
+    /// 所以加减各自攒，最后合成，不能只攒一个）。
+    pub accum_add: Option<SelectionMask>,
+    /// 本次涂抹累积的**减选**扩散结果。
+    pub accum_sub: Option<SelectionMask>,
     /// 上一个笔迹点：下一段从它连到新位置。
     pub last: (f32, f32),
-    /// 0 替换 / 1 加选 / 2 减选。
+    /// 按下那一刻的模式：0 替换 / 1 加选 / 2 减选。笔迹中途的 Shift/Alt
+    /// 只改当前段的去向，不改这个基准。
     pub mode: i32,
 }
 
@@ -1536,6 +1550,8 @@ pub struct BridgeRust {
     sel_tool_saved: QString,
     /// 魔术棒参数 `tol,contiguous,sample_all`（settings.ini 里的原样字符串）。
     sel_wand_saved: QString,
+    /// 快速选择参数 `radius,tol,grow,sample_all,auto_enhance`。
+    sel_quick_saved: QString,
     /// 修复 / 油漆工具参数（settings.ini，`|` 分隔）。
     paint_spec_saved: QString,
     /// 快速选择涂抹中的临时状态；`None` = 当前没在涂。
@@ -1678,6 +1694,7 @@ impl Default for BridgeRust {
             quick_mask: false,
             sel_tool_saved: QString::from(cfg.sel_tool.as_str()),
             sel_wand_saved: QString::from(cfg.sel_wand.as_str()),
+            sel_quick_saved: QString::from(cfg.sel_quick.as_str()),
             paint_spec_saved: QString::from(cfg.paint_spec.as_str()),
             quick_drag: RefCell::new(None),
             sel_ops_default: std::cell::Cell::new(SelOps {
@@ -1727,6 +1744,7 @@ impl qobject::Bridge {
             sel_feather: self.sel_ops_default.get().feather,
             sel_tool: self.sel_tool_saved().to_string(),
             sel_wand: self.sel_wand_saved().to_string(),
+            sel_quick: self.sel_quick_saved().to_string(),
             paint_spec: self.paint_spec_saved().to_string(),
             transform_panel_visible: *self.transform_panel_visible(),
             show_guides: *self.show_guides(),

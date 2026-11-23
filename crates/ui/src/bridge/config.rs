@@ -28,6 +28,9 @@ pub(in crate::bridge) struct AppConfig {
     pub(in crate::bridge) sel_tool: String,
     /// 魔术棒参数，原样存 `容差,连续,取样全部图层`（如 "32,1,0"）。
     pub(in crate::bridge) sel_wand: String,
+    /// 快速选择参数，原样存 `笔刷半径,容差,扩散,取样全部图层,自动增强`
+    /// （如 "24,40,160,1,1"）。对齐 PS 选项栏的两项开关。
+    pub(in crate::bridge) sel_quick: String,
     /// 修复 / 油漆工具的参数，`|` 分隔：
     /// `工具|笔刷|硬度|间距|强度|扩散|容差|连续|不透明|径向|反向|渐变不透明`
     /// （如 "none|40|70|20|100|2|32|1|100|0|0|100"）。
@@ -101,6 +104,11 @@ impl AppConfig {
                                 cfg.sel_wand = v;
                             }
                         },
+                        "sel_quick" => {
+                            if let Some(v) = normalize_quick(value) {
+                                cfg.sel_quick = v;
+                            }
+                        },
                         "paint_spec" if !value.is_empty() => {
                             cfg.paint_spec = value.to_string()
                         }
@@ -130,7 +138,7 @@ impl AppConfig {
                 let _ = std::fs::create_dir_all(dir);
             }
             let text = format!(
-                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\nruler_bottom_up={}\nmax_dimension={}\nsel_border={}\nsel_smooth={}\nsel_feather={}\nsel_tool={}\nsel_wand={}\npaint_spec={}\ntransform_panel_visible={}\nshow_guides={}\nsnap_enabled={}\nlayer_scroll_speed={}\n",
+                "checker_light={}\nchecker_dark={}\nopen_in_new_window={}\nsave_quality={}\nruler_bottom_up={}\nmax_dimension={}\nsel_border={}\nsel_smooth={}\nsel_feather={}\nsel_tool={}\nsel_wand={}\nsel_quick={}\npaint_spec={}\ntransform_panel_visible={}\nshow_guides={}\nsnap_enabled={}\nlayer_scroll_speed={}\n",
                 self.checker_light,
                 self.checker_dark,
                 self.open_in_new_window,
@@ -142,6 +150,7 @@ impl AppConfig {
                 self.sel_feather,
                 self.sel_tool,
                 self.sel_wand,
+                self.sel_quick,
                 self.paint_spec,
                 self.transform_panel_visible,
                 self.show_guides,
@@ -162,6 +171,25 @@ pub(in crate::bridge) fn normalize_wand(spec: &str) -> Option<String> {
     let all = it.next().unwrap_or("1").trim();
     let flag = |s: &str| if s == "1" || s.eq_ignore_ascii_case("true") { 1 } else { 0 };
     Some(format!("{},{},{}", tol.clamp(0, 255), flag(contig), flag(all)))
+}
+
+/// 把 `笔刷,容差,扩散,取样全部图层,自动增强` 规范化成 "24,40,160,1,1"。
+pub(in crate::bridge) fn normalize_quick(spec: &str) -> Option<String> {
+    let mut it = spec.split(',');
+    let radius: i32 = it.next()?.trim().parse().ok()?;
+    let tol: i32 = it.next().unwrap_or("40").trim().parse().ok()?;
+    let grow: i32 = it.next().unwrap_or("160").trim().parse().ok()?;
+    let flag = |s: &str| if s == "1" || s.eq_ignore_ascii_case("true") { 1 } else { 0 };
+    let all = flag(it.next().unwrap_or("1").trim());
+    let enhance = flag(it.next().unwrap_or("1").trim());
+    Some(format!(
+        "{},{},{},{},{}",
+        radius.clamp(2, 200),
+        tol.clamp(0, 255),
+        grow.clamp(0, 1000),
+        all,
+        enhance
+    ))
 }
 
 pub(in crate::bridge) fn human_size(bytes: u64) -> String {

@@ -393,6 +393,14 @@ impl qobject::Bridge {
         self.persist_config();
     }
 
+    /// 记住快速选择参数并写盘（对齐 PS 选项栏的两项开关）。
+    pub fn save_sel_quick(mut self: Pin<&mut Self>, spec: &QString) {
+        let normalized = super::super::config::normalize_quick(&spec.to_string())
+            .unwrap_or_else(|| "24,40,160,1,1".to_string());
+        self.as_mut().set_sel_quick_saved(QString::from(normalized.as_str()));
+        self.persist_config();
+    }
+
     /// 魔术棒：按点击处的颜色选出一片区域。
     ///
     /// 采样源：`sample_all` = 可见合成（PS 的「取样全部图层」）；否则取当前
@@ -457,8 +465,13 @@ impl qobject::Bridge {
     ) {
         let p = (x as f32, y as f32);
         let r = radius.clamp(1.0, 400.0) as u32;
-        // 取样源跟随当前编辑目标：选中图层 → 该层；没选中 → 背景。和魔术棒
-        // 的「取样全部图层」开关互不影响（那个是显式勾选）。
+        // PS 选项栏两项：取样全部图层（合成图取色）/ 自动增强（磨平锯齿边）。
+        // 参数跟着 settings.ini 走，和魔术棒那套完全独立。
+        let (sample_all, auto_enhance) = {
+            let spec = self.sel_quick_saved().to_string();
+            let f = |i: usize| spec.split(',').nth(i).and_then(|v| v.trim().parse::<i32>().ok()).unwrap_or(0);
+            (f(3) != 0, f(4) != 0)
+        };
         let selected = *self.selected_layer();
 
         // 第一次调用：快照按下前的选区（撤销目标 + 加/减基准）。
@@ -475,14 +488,16 @@ impl qobject::Bridge {
             *self.quick_drag.borrow_mut() = Some(QuickDrag {
                 from,
                 base,
-                accum: None,
+                accum_add: None,
+                accum_sub: None,
                 last: p,
                 mode,
             });
         }
 
-        // 本段 = 上次的点 → 当前点。
-        let (seg, mode, base) = {
+        // 本段 = 上次的点 → 当前点。这里取 d.mode 作**基准**，当前帧的
+        // `mode` 只决定这一段归入加选还是减选。
+        let (seg, base_mode, base) = {
             let mut drag = self.quick_drag.borrow_mut();
             let Some(d) = drag.as_mut() else {
                 return;
@@ -499,45 +514,51 @@ impl qobject::Bridge {
             edge: (tolerance * 2).clamp(20, 120) as u8,
             grow: grow.clamp(0, 2000) as u32,
         };
-        let spread = {
+        let mut spread = {
             let guard = self.session.borrow();
             let Some(session) = guard.as_ref() else {
                 return;
             };
-            let target = super::paint::pick_target(&session.doc, selected);
+            // PS「取样全部图层」= 可见合成；否则以当前编辑层/背景为准。
+            let target = if sample_all {
+                None
+            } else {
+                super::paint::pick_target(&session.doc, selected)
+            };
             session.doc.quick_select_selection(&seg, r, opts, target)
         };
+        if auto_enhance {
+            spread = spread.smooth(1);
+        }
 
-        // 累积扩散结果，再按 mode 与按下前的选区合成。
+        // 加减两段各自累积，最后按按下时的模式与旧选区合成。
         let (result, from_ops) = {
             let mut drag = self.quick_drag.borrow_mut();
             let Some(d) = drag.as_mut() else {
                 return;
             };
-            let accum = match d.accum.take() {
-                Some(a) => a.union(&spread),
-                None => spread,
+            let pool = if mode == 2 {
+                d.accum_sub.get_or_insert_with(SelectionMask::empty)
+            } else {
+                d.accum_add.get_or_insert_with(SelectionMask::empty)
             };
-            d.accum = Some(accum.clone());
+            *pool = pool.union(&spread);
+            let add = d.accum_add.clone().unwrap_or_else(SelectionMask::empty);
+            let sub = d.accum_sub.clone().unwrap_or_else(SelectionMask::empty);
             let from_ops = d.from.as_ref().map(|st| st.ops);
-            let result = match mode {
-                1 => match &base {
-                    Some(b) => b.union(&accum),
-                    None => accum.clone(),
-                },
-                2 => match &base {
-                    Some(b) => b.subtract(&accum),
-                    None => SelectionMask::empty(),
-                },
-                _ => accum,
+            let start = match base_mode {
+                1 | 2 => base.clone().unwrap_or_else(SelectionMask::empty),
+                _ => SelectionMask::empty(),
             };
+            // 减选最后减：一次涂抹中途按 Alt 也要能剪掉刚涂出来的那部分。
+            let result = start.union(&add).subtract(&sub);
             (result, from_ops)
         };
 
         let defaults = self.sel_ops_default.get();
         let state = if result.is_empty() {
             None
-        } else if mode == 0 {
+        } else if base_mode == 0 {
             Some(SelectionState::new_with_ops(result, defaults))
         } else {
             // 加/减是从当前可见选区派生的：边界/平滑已经烘焙进那张 mask，

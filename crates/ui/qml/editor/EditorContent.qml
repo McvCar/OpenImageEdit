@@ -418,6 +418,9 @@ Item {
     property int quickRadius: 24
     property int quickTolerance: 40
     property int quickGrow: 160
+    // PS 选项栏同款两项：取样全部图层 / 自动增强（磨平锯齿边）。
+    property bool quickSampleAll: true
+    property bool quickAutoEnhance: true
     // 选区工具浮动面板（标记栏的「选区」按钮点开；原来那行固定工具条已取消）。
     property bool selPopoverOpen: false
     // 加选/减选/相交的粘滞模式（拖动时按住的 Shift/Alt 会临时覆盖它）：
@@ -1728,14 +1731,48 @@ function setWandSampleAll(v) {
 
 // 快速选择的笔刷半径：画布像素，[ / ] 各调 4。上限按 8192 长边的图算，
 // 200 已经能一次刷掉一大块；下限 2 保证还能点出一个小圆。
+function applyQuickSpec(spec) {
+    const parts = String(spec).split(",")
+    if (parts.length >= 1) {
+        const r = parseInt(parts[0], 10)
+        if (!isNaN(r)) root.quickRadius = Math.max(2, Math.min(200, r))
+    }
+    if (parts.length >= 2) {
+        const t = parseInt(parts[1], 10)
+        if (!isNaN(t)) root.quickTolerance = Math.max(0, Math.min(255, t))
+    }
+    if (parts.length >= 3) {
+        const g = parseInt(parts[2], 10)
+        if (!isNaN(g)) root.quickGrow = Math.max(0, Math.min(1000, g))
+    }
+    if (parts.length >= 4) root.quickSampleAll = parts[3].trim() !== "0"
+    if (parts.length >= 5) root.quickAutoEnhance = parts[4].trim() !== "0"
+}
+function saveQuickSpec() {
+    bridge.save_sel_quick(root.quickRadius + "," + root.quickTolerance + ","
+                          + root.quickGrow + ","
+                          + (root.quickSampleAll ? 1 : 0) + ","
+                          + (root.quickAutoEnhance ? 1 : 0))
+}
 function setQuickRadius(v) {
     root.quickRadius = Math.max(2, Math.min(200, Math.round(v)))
+    root.saveQuickSpec()
 }
 function setQuickTolerance(v) {
     root.quickTolerance = Math.max(0, Math.min(255, Math.round(v)))
+    root.saveQuickSpec()
 }
 function setQuickGrow(v) {
     root.quickGrow = Math.max(0, Math.min(1000, Math.round(v)))
+    root.saveQuickSpec()
+}
+function setQuickSampleAll(v) {
+    root.quickSampleAll = !!v
+    root.saveQuickSpec()
+}
+function setQuickAutoEnhance(v) {
+    root.quickAutoEnhance = !!v
+    root.saveQuickSpec()
 }
 
 // 切换选区工具。选区工具与标记工具互斥：markMa 盖在画布按下事件之上，
@@ -2328,6 +2365,32 @@ function previewLayerRotate(deg, mods) {
     root.rotateAnglePreview = deg
     // 首帧立即出（跟着鼠标起手），之后的帧交给定时器。
     root.applyRotateFrame()
+}
+
+// ---- 旋柄指针角度 → 累计角 --------------------------------------------
+// `atan2` 只能给出 (-180, 180] 的瞬时角，直接拿 `当前 - 按下` 当旋转量会在
+// 转过半圈时回绕：拖满一整圈最终角度又变回 0，Shift 15° / ±3° 磁吸看着就像
+// 「转到 360 之后失效了」。这里按下时记下指针角，之后每帧取**最短角差**累加，
+// 圈数被保留下来：转一圈得到 360°、两圈 720°，吸附按累计角求解就一直有效。
+property real rotatePointerAngle: 0
+property real rotateCumulative: 0
+
+function beginLayerRotateAtPointer(deg, mods) {
+    root.startLayerRotate()
+    root.rotatePointerAngle = deg
+    root.rotateCumulative = 0
+    root.rotateMods = mods || 0
+}
+
+function moveLayerRotateAtPointer(deg, mods) {
+    if (!root.rotating)
+        return
+    let step = deg - root.rotatePointerAngle
+    while (step > 180) step -= 360
+    while (step < -180) step += 360
+    root.rotatePointerAngle = deg
+    root.rotateCumulative += step
+    root.previewLayerRotate(root.rotateCumulative, mods)
 }
 
 function finishLayerRotate(apply, mods) {
@@ -3907,17 +3970,21 @@ Timer {
             if (!rotFirst && args.indexOf("--probe-frame-move") !== -1)
                 bridge.translate_selected(7, 3)
             rotFirst = false
-            const deg = parseFloat(args[i].substring("--probe-hand-rotate=".length)) || 45
+            const spec = args[i].substring("--probe-hand-rotate=".length).split(",")
+            const deg = parseFloat(spec[0]) || 45
+            // 第二参 = 修饰键位掩码（Shift / 角度磁吸），默认 0。
+            const mods = parseInt(spec[1], 10) || 0
             root.startLayerRotate()
-            root.previewLayerRotate(deg, 0)
-            root.finishLayerRotate(true, 0)
+            root.previewLayerRotate(deg, mods)
+            root.finishLayerRotate(true, mods)
             bridge.mark("hand-rotate: deg=" + deg + " base=" + root.rotateBase
                         + " angle=" + root.layerFrameAngle
                         + " rotated=" + root.layerFrameRotated
                         + " fw=" + root.layerFrameW + "x" + root.layerFrameH
                         + " box=" + (root.selLayerBox
                                      ? root.selLayerBox.w + "x" + root.selLayerBox.h : "null")
-                        + " handles=" + view.selectionViz.layerHandles.visible)
+                        + " handles=" + view.selectionViz.layerHandles.visible
+                        + " values=" + bridge.transformValuesJson)
             // --probe-frame-keep：转完切到别的图层再切回来，核对倾斜框
             // 记忆还在（以前切一次就退回轴对齐，看着像角度复位）。
             if (args.indexOf("--probe-frame-keep") !== -1) {
@@ -3929,6 +3996,24 @@ Timer {
                             + " rotated=" + root.layerFrameRotated
                             + " fw=" + root.layerFrameW + "x" + root.layerFrameH)
             }
+        }
+        // --probe-hand-rotate-path=mods:a0,a1,...,an：走**真实旋柄**的
+        // 指针角累加路径（beginLayerRotateAtPointer + moveLayerRotateAtPointer），
+        // 用来回归「转满 360°/720° 后 Shift 15° 与 ±3° 磁吸仍生效」。
+        for (let i = 0; i < args.length; ++i) {
+            if (args[i].indexOf("--probe-hand-rotate-path=") !== 0)
+                continue
+            const spec = args[i].substring("--probe-hand-rotate-path=".length).split(":")
+            const mods = parseInt(spec[0], 10) || 0
+            const pts = spec[1].split(",").map(function (v) { return parseFloat(v) || 0 })
+            if (pts.length < 2)
+                continue
+            root.beginLayerRotateAtPointer(pts[0], mods)
+            for (let k = 1; k < pts.length; ++k)
+                root.moveLayerRotateAtPointer(pts[k], mods)
+            root.finishLayerRotate(true, mods)
+            bridge.mark("hand-rotate-path: cumulative=" + root.rotateCumulative.toFixed(2)
+                        + " mods=" + mods + " values=" + bridge.transformValuesJson)
         }
     }
 }
@@ -4022,6 +4107,7 @@ Component.onCompleted: {
     root.toolKeysReady = true
     // 魔术棒参数：settings.ini 里的 "容差,连续,全部图层"。
     root.applyWandSpec(bridge.selWandSaved);
+    root.applyQuickSpec(bridge.selQuickSaved);
     // 修复 / 油漆工具参数（含上次使用的工具），`|` 分隔 12 段。
     // ★探针要用**干净的工具状态**：上次会话留下的 spot/heal 会让「点画布 =
     //   拾取图层」变成「点画布 = 落笔」，真鼠标探针里图层一动不动，看起来像
