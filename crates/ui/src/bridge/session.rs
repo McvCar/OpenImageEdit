@@ -1810,7 +1810,7 @@ impl Session {
         }
         let canvas = self.doc.canvas;
         // ★用 QML 传来的实际显示比例（见 [`display_from_scale`]），别用 zoom 重算。
-        let display = display_from_scale(canvas, disp_scale);
+        let display = display_from_scale(canvas, disp_scale, self.zoom, dpr);
         let target = preview_target(display, canvas, dpr);
         if target.pixels() == 0 {
             return false;
@@ -1883,6 +1883,8 @@ impl Session {
                     l.visible = *v;
                 }
             }
+            // 合成器输出是预乘 alpha，BMP → QML Image 按 straight 解释。
+            let img = render::straighten_texture(&img);
             let (w, h) = (img.width(), img.height());
             (img, w, h)
         };
@@ -1902,6 +1904,7 @@ impl Session {
         for &i in &flipped_below {
             self.doc.layers[i].visible = true;
         }
+        let static_img = render::straighten_texture(&static_img);
 
         // ★above 纹理必须**排除活动层自身**：只隐藏 [..index] 会把活动层
         // 原位置烘进上层纹理 —— 拖动时出现「两个图层」（移动中的活动层 +
@@ -1920,6 +1923,7 @@ impl Session {
         for &i in &flipped_above {
             self.doc.layers[i].visible = true;
         }
+        let above_img = render::straighten_texture(&above_img);
 
         let (Ok(bytes_s), Ok(bytes_a), Ok(bytes_o)) = (
             encode(&static_img, Format::Bmp, 90),
@@ -2044,7 +2048,7 @@ impl Session {
         }
         let canvas = self.doc.canvas;
         // ★同 `gpu_begin`：显示尺寸取 QML 的实际比例，不用 zoom 重算。
-        let display = display_from_scale(canvas, disp_scale);
+        let display = display_from_scale(canvas, disp_scale, self.zoom, dpr);
         let target = preview_target(display, canvas, dpr);
         if target.pixels() == 0 {
             return false;
@@ -2071,6 +2075,7 @@ impl Session {
         for &i in &hidden_outside {
             self.doc.layers[i].visible = true;
         }
+        let full = render::straighten_texture(&full);
 
         // static = 整组之下的栈（隐藏 [lo..]），above = 整组之上的栈（隐藏 [..=hi]）。
         let flipped_below: Vec<usize> = self.doc.layers[lo..]
@@ -2086,6 +2091,7 @@ impl Session {
         for &i in &flipped_below {
             self.doc.layers[i].visible = true;
         }
+        let static_img = render::straighten_texture(&static_img);
 
         let flipped_above: Vec<usize> = self.doc.layers[..=hi]
             .iter_mut()
@@ -2100,6 +2106,7 @@ impl Session {
         for &i in &flipped_above {
             self.doc.layers[i].visible = true;
         }
+        let above_img = render::straighten_texture(&above_img);
 
         let (Ok(bytes_s), Ok(bytes_a), Ok(bytes_o)) = (
             encode(&static_img, Format::Bmp, 90),
@@ -2420,16 +2427,28 @@ fn snap_phys(v: f64, dpr: f64) -> f64 {
 ///   两者差一点时，三明治纹理按旧比例烘好、却被铺到新尺寸的预览上 ——
 ///   整层被拉伸/压缩，松手后 CPU 帧按新比例重画，就成了用户报的
 ///   「拖动时图层缩放，松手才还原」。
-fn display_from_scale(canvas: Size, disp_scale: f64) -> Size {
+fn display_from_scale(canvas: Size, disp_scale: f64, zoom: f64, dpr: f64) -> Size {
     let s = if disp_scale.is_finite() && disp_scale > 0.0 {
         disp_scale
     } else {
         1.0
     };
-    Size::new(
-        ((canvas.width as f64 * s).round() as u32).max(1),
-        ((canvas.height as f64 * s).round() as u32).max(1),
-    )
+    // 宽度必须用 QML 传来的比例（QML 走预测值时 self.zoom 可能还是旧的）。
+    let w = ((canvas.width as f64 * s).round() as u32).max(1);
+    // ★高度不能也用同一个 s 反推：`toDispScale()` 只有横向比例，宽高各自
+    //   round 后的误差会被放大到另一轴 —— 750×1700 在 25% 下 QML 是
+    //   188×425，但 s=188/750 反推高度是 426。GPU 纹理比 CPU 预览多一行，
+    //   被铺到 425 行的 Image 上就整幅纵向拉伸（低缩放档「拖动放大」）。
+    //   self.zoom 算出的宽度若与 QML 宽度一致，说明它没过时，高度按它算；
+    //   不一致（预测窗口期）才退回 s，至少不会用旧 zoom 把两轴都算错。
+    let z = if dpr.is_finite() && dpr > 0.0 { zoom / dpr } else { zoom };
+    let z = if z.is_finite() && z > 0.0 { z } else { s };
+    let h = if ((canvas.width as f64 * z).round() as u32).max(1) == w {
+        ((canvas.height as f64 * z).round() as u32).max(1)
+    } else {
+        ((canvas.height as f64 * s).round() as u32).max(1)
+    };
+    Size::new(w, h)
 }
 
 /// 组样式跟随刷新的门控签名：epoch + 层表指纹（每层的 id / 位置 / 归组 /

@@ -205,6 +205,22 @@ fn premultiply(image: &RgbaImage) -> RgbaImage {
     out
 }
 
+/// 把 GPU 三明治纹理还原成 straight alpha 再交给 QML。
+///
+/// `PreviewComposer::blend` 的 Normal 快路径把 RGB 写成
+/// `src.rgb*sa + dst.rgb*inv`，alpha 写成 `sa + da*inv` —— 也就是**预乘**
+/// 表示。CPU 预览的最终底图不透明（alpha=255），预乘与直通一致，所以看
+/// 不出问题；但 GPU 拖动把 static/active/above 分别合成到**透明底**，这些
+/// 纹理的半透明像素 RGB 已经被 alpha 乘过一遍，BMP 交给 QML `Image` 后按
+/// straight alpha 解释 —— 半透明白色描边（rgb≈255、a≈80）显示成 rgb≈80
+/// 的深灰，就是用户看到的「拖动时描边变黑 / 文字像缩了一圈」。淡出帧里
+/// 这张偏暗的 GPU 图再和正确的 CPU 帧交叉，半透明处叠加变深。
+///
+/// 只在 GPU 纹理出口做这一步，不改合成器本身：CPU 路径的输出口径不能动。
+pub fn straighten_texture(image: &RgbaImage) -> RgbaImage {
+    unpremultiply(image)
+}
+
 /// Premultiplied alpha -> straight alpha.
 fn unpremultiply(image: &RgbaImage) -> RgbaImage {
     let mut out = image.clone();
