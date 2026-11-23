@@ -141,7 +141,7 @@ def main() -> int:
     if "--single" in sys.argv:
         sys.argv.remove("--single")
         SINGLE = True
-    zooms = [int(x) for x in ",".join(sys.argv[1:]).split(",")] or [25, 50, 100]
+    zooms = [int(x) for x in ",".join(sys.argv[1:]).split(",") if x.strip()] or [25, 50, 100]
     results = []
     for z in zooms:
         print("zoom", z)

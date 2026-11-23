@@ -185,6 +185,10 @@ impl Document {
         };
         let mut placed = Vec::with_capacity(layers.len());
         for mut layer in layers {
+            // ★剪贴板里的副本沿用源层 id（同一文档内复制时就是原层的 id）。
+            //   面板多选 / 组子树 / 缩略图缓存都按 id 认层，不换会「选中原层
+            //   时粘贴层一起高亮」，跨文档还会撞到别人的 id。
+            layer = layer.with_fresh_id();
             // 建组时强制归属新组；不带组时保留调用方给的归属（单层粘进组内）。
             if gid.is_some() {
                 layer.group = gid;
@@ -663,6 +667,27 @@ mod tests {
         doc.undo().unwrap();
         assert_eq!(doc.layers.len(), 2);
         assert!(doc.find_group(gid).is_none());
+    }
+
+    #[test]
+    fn paste_layers_at_assigns_fresh_layer_ids() {
+        // 复制出的 Layer 仍带源层的 id（同文档内复制粘贴时必然撞车）。面板
+        // 多选、组子树、缩略图缓存都按 id 认层，粘贴必须换发 id。
+        let mut doc = Document::from_image(blank(16, 16));
+        let src = dot(1, 1, 4, 4, [255, 0, 0, 255]);
+        let src_id = src.id;
+        doc.add_layer(dot(0, 0, 2, 2, [0, 255, 0, 255])).unwrap();
+        let copy = src.clone();
+        assert_eq!(copy.id, src_id); // 复现剪贴板里的形态
+        let placed = doc.paste_layers_at(vec![copy], 1, None).unwrap();
+        assert_eq!(placed, vec![1]);
+        assert_ne!(doc.layers[1].id, src_id, "粘贴层必须有独立 id");
+        assert!(
+            doc.layers.iter().enumerate().all(|(i, l)| i == 1 || l.id != doc.layers[1].id),
+            "id 必须全局唯一"
+        );
+        doc.undo().unwrap();
+        assert_eq!(doc.layers.len(), 2); // 背景 + 测试加的那一层
     }
 
     #[test]

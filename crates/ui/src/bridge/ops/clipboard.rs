@@ -348,9 +348,11 @@ impl qobject::Bridge {
         };
         let viewport = *self.viewport.borrow();
         const PASTE_SHIFT: i32 = 12;
-        // 单层粘贴**不继承**锚点图层的组归属（用户报的「复制图层把上级分组
-        // 也复制了」）；只有「选中分组」时锚点才给组，粘贴才进组。
-        let (anchor, anchor_group) = self.as_mut().insert_anchor(false);
+        // ★「复制不带走组」和「粘贴落到哪个组」是两件事：前者已经由
+        //   `copy_selected_layer` 把副本的 `group` 清成 None 保证了；这里
+        //   传 true 让单层粘贴沿用锚点图层的组归属 —— 用户复制组内图层粘贴，
+        //   期望新层就在**同一个组**里，而不是掉到组外面变成顶层孤立行。
+        let (anchor, anchor_group) = self.as_mut().insert_anchor(true);
         let is_group = clip.is_group();
         let result: Result<Vec<usize>, String> = {
             let mut guard = self.session.borrow_mut();
@@ -381,7 +383,8 @@ impl qobject::Bridge {
                     // 复制整组 → 粘贴也建一个组；组 id 由目标文档重新分配。
                     let group = match (clip.group.clone(), anchor_group) {
                         (Some(g), _) => Some(g),
-                        // 单层粘贴：沿用锚点所在组的归属（粘贴到组内就是组内）。
+                        // 单层粘贴：沿用锚点所在组的归属（`insert_anchor(true)`
+                        // 已给出），落到与原件同级的分组里。
                         (None, g) => {
                             if let Some(gid) = g {
                                 for l in layers.iter_mut() {

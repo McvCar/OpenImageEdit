@@ -69,8 +69,8 @@ OPS = [
     "select-layer:1",
     "new-layer",
     "layers-group-dump",
-    # ck9：复制组内单层 → 粘贴，不该把上级分组一起带出来（只多一层，
-    # 不新建组）。
+    # ck9：复制组内单层 → 粘贴，应落在**同组**（不新建组），且粘贴层
+    # 必须拿到独立 id —— 否则面板按 id 认层，选中原层时粘贴层跟着亮。
     "select-layer:1",
     "copy",
     "paste",
@@ -300,11 +300,25 @@ def main():
         want(len(rows) == 6, "ck9 粘贴后应有 6 层，实际 %d" % len(rows))
         pi = pasted[0].get("index")
         prow = next((r for r in rows if r.get("i") == pi), None)
-        print("ck9  粘贴层 i=%s 所属组=%s（应为 0：只复制当前图层）"
-              % (pi, prow.get("g") if prow else "?"))
-        want(prow is not None and prow.get("g") == 0,
-             "ck9 单层粘贴不该挂进原来的组，实际 g=%s"
+        print("ck9  粘贴层 i=%s 所属组=%s（应为 %d：与原件同组）"
+              % (pi, prow.get("g") if prow else "?", GID))
+        want(prow is not None and prow.get("g") == GID,
+             "ck9 组内单层粘贴应落进同一个组，实际 g=%s"
              % (prow.get("g") if prow else "?"))
+        # ★粘贴层必须有自己的 id，否则「选中图层38 时粘贴层跟着高亮」。
+        ids = [r.get("id") for r in rows]
+        want(len(ids) == len(set(ids)),
+             "ck9 图层 id 必须唯一，实际重复：%s"
+             % [x for x in ids if ids.count(x) > 1])
+        # 粘贴插在锚点**位置**（源层被推到下一行），源 id 要从粘贴前的
+        # dump 取 —— 从粘贴后的 rows 按 pi 取会取到粘贴层自己。
+        before = lg[0].get("layers") or []
+        src_row = next((r for r in before if r.get("i") == 1), None)
+        want(prow is not None and src_row is not None
+             and prow.get("id") != src_row.get("id"),
+             "ck9 粘贴层 id 不得与源层相同（源=%s 粘贴=%s）"
+             % (src_row.get("id") if src_row else "?",
+                prow.get("id") if prow else "?"))
 
     # ---- ck10 复制整组 → 粘贴新建同名组 ----
     if len(g9) < 3 or len(lg) < 3:
