@@ -1460,7 +1460,17 @@ impl Session {
         //   而选框（layers_json）实时跟进 → 「图层和选框位置不一致」，直到
         //   改尺寸等连续两次非 GPU 渲染打破循环。步长随 GPU 次数可取任意
         //   值，只有唯一文件名对一切步长稳健；旧文件延迟多帧删除（见下）。
-        let bytes = encode(&image, Format::Bmp, 90).map_err(|e| e.to_string())?;
+        // ★合成器输出**预乘** alpha。底图不透明时预乘与直通一致，看不出
+        //   差别；但画布有透明区、或半透明图层叠在透明底上时（如 50% 层 +
+        //   透明画布），落盘 RGB 已被 alpha 乘过（例：50% 洋红 = (128,0,128,
+        //   128)）。BMP 交给 QML `Image` 按 **straight** 解释，于是显示成
+        //   rgb=128 的暗紫。GPU 拖动纹理出口早有 straighten_texture，拖的时候
+        //   是对的（(255,0,255,128)）；一放手落定帧换回未 straighten 的 CPU
+        //   BMP，半透明层突然变暗/变淡 —— 用户看到的「放手瞬间图层变透明」。
+        //   这里在**落盘前**统一做直通转换，不改内存里的 `image`（直方图 /
+        //   quick-mask / 合成口径全部保持原样），只修 QML 看到的那一帧。
+        let bytes = encode(&render::straighten_texture(&image), Format::Bmp, 90)
+            .map_err(|e| e.to_string())?;
         let encode_ms = prof_t0.elapsed().as_millis();
         self.render_count = self.render_count.wrapping_add(1);
         let path = std::env::temp_dir().join(format!(

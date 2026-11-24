@@ -657,7 +657,12 @@ Item {
         height: gpuLayer.height
         x: gpuLayer.rect.x || 0
         y: gpuLayer.rect.y || 0
-        opacity: gpuLayer.rect.o === undefined ? 1 : gpuLayer.rect.o
+        // ★纹理里已经 baked 了 layer.opacity（composite_adjusted 绘制时乘、
+        //   剪贴路径手写 a*=opacity，再 straighten_texture 还原成 straight）。
+        //   这里若再乘 rect.o 就是第二次 applied —— 半透明层拖动期被压成
+        //   opacity²（50% → 25%），放手落定帧只有一次（50%），于是用户看到
+        //   「放手瞬间图层突然变透明」。纹理即最终外观，不透明度恒为 1。
+        opacity: 1.0
         source: view.bridge.gpuActiveUrl
         // 纹理在 Rust 侧已按 target 分辨率（物理像素）烘好：1:1 时用
         // `Image.Pad` 走「原样贴」快路径，别让 Stretch 的缩放采样把边界
