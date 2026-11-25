@@ -315,14 +315,25 @@ def main() -> int:
           0.85 <= consist <= 1.15,
           "drag=%.0f settled=%.0f ratio=%.2f" % (drag_mass, settled, consist))
 
-    # 不透明场景额外查双份（alpha 模式交叉淡出期双层叠加是固有现象，跳过）
-    if not ("--alpha" in sys.argv):
-        peak = max(rel, key=lambda x: x[1]) if rel else (0, 0, 0)
-        peak_ratio = peak[1] / settled if settled else 999
-        check("松手后没有新旧两份同时可见（每帧 mass ≤ 1.4×基准）",
-              peak_ratio <= 1.4,
-              "max_mass=%.0f@%.3fs settled=%.0f ratio=%.2f" % (
-                  peak[1], peak[0], settled, peak_ratio))
+    # ★★核心回归：松手后的**中间帧**不允许出现 mass 尖峰。
+    #   2026-11-25 用户报「放手瞬间混合区闪一下」：交叉淡出让 CPU 帧和 GPU
+    #   三明治同显 90ms，半透明内容被 source-over 叠两次 —— mass 从 56921
+    #   尖到 143738（2.5×）、像素数翻倍。旧判据只比 drag/settled 首尾（ratio
+    #   =1.00）完全漏掉这个中间尖峰。这里改为检查每一帧，半透明场景尤其严。
+    peak = max(rel, key=lambda x: x[1]) if rel else (0, 0, 0)
+    peak_ratio = peak[1] / settled if settled else 999
+    limit = 1.25 if "--alpha" in sys.argv else 1.4
+    check("松手后每一帧 mass 都不超过基准（无交叉淡出双叠尖峰）",
+          peak_ratio <= limit,
+          "max_mass=%.0f@%.3fs settled=%.0f ratio=%.2f (limit=%.2f)" % (
+              peak[1], peak[0], settled, peak_ratio, limit))
+    # 半透明场景额外查像素数：双叠会让覆盖面积也翻倍（不只是变浓）
+    if "--alpha" in sys.argv and rel:
+        peak_n = max(n for _, _, n in rel)
+        base_n = int(np.median([n for t, _, n in rel if t > 0.4])) if any(t > 0.4 for t, _, _ in rel) else peak_n
+        check("松手后没有两份半透明内容同时可见（像素数不翻倍）",
+              base_n == 0 or peak_n <= base_n * 1.3,
+              "peak_n=%d base_n=%d" % (peak_n, base_n))
 
     print("\nsamples (phase, t, mass, count):")
     for p, t, m, n in samples:

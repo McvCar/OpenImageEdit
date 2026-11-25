@@ -492,19 +492,20 @@ Item {
     y: previewImage.y
     width: previewImage.width
     height: previewImage.height
-    // P1-A（R11 观感一致）：落定帧（CPU HQ）比拖动帧（GPU 双线性）锐，
-    // 直接切换会有一次「突然变锐」的跳变。落定时 GPU 层淡出 ~90ms，下面的
-    // HQ 预览同时露出来 —— 交叉过渡消除突变。
+    // ★落定必须是**硬切**（同帧 CPU 帧上屏 + GPU 层撤掉），绝不能 opacity
+    //   交叉淡出：两层会在 90ms 里同时显示同一幅半透明内容，source-over
+    //   叠两次把 alpha 0.5 变成 0.75（实测松手 106ms 处洋红 mass 尖峰 2.5×、
+    //   像素数翻倍）—— 用户看到的「放手瞬间混合区变浓/变透明闪一下」。
+    //   整块不透明的内容叠两次不变，只有半透明混合区露馅 —— 正好对应
+    //   「压在透明区不闪、压在其它图上才闪」。GPU 纹理和落定帧都在同一
+    //   target 分辨率烘的，锐度差可忽略，硬切无感（见 beginFade）。
     //
-    // ★★可见性只跟 `gpuLive` 走，**不要**再写成 `gpuLive || 淡出计时器在跑`：
-    //   11-08 用户复测「拖动时图层像被背景盖住、松手也不变大、再移动一下
-    //   才正常」就是这里 —— 旧写法用 16ms 定时器逐帧减 opacity 来做淡出，
-    //   一旦 `onVisibleChanged` 里把计时器 stop 掉、把 opacity 复位成 1，
-    //   计时器就再也不跑，`visible` 恒为 true。于是 Tier 1 的两张**旧**纹理
-    //   （静态背景 + 活动层停在旧矩形）永久压在 CPU 预览之上：拖动时看到
-    //   的是背景和旧图层，落定后的新帧被完全遮住，只有再起一次移动手势
-    //   （重新 gpu_begin 换纹理）才「突然正常」。淡出改用一条 NumberAnimation
-    //   跑完自己结束，不可能卡住。
+    // ★visible 用 `gpuLive || fadeOpacity>0.01`：落定后 CPU 新帧还没上屏的
+    //   等待期（fadeArmed=true、fadeOpacity=1）GPU 层必须继续顶着，否则会
+    //   露出起手前那一帧（图层在原位）。beginFade 把它置 0 → 同帧彻底撤掉。
+    //   ★绝不要用「16ms 定时器逐帧减 opacity」做淡出：11-08 的 bug 就是
+    //   `onVisibleChanged` 里 stop 掉计时器、opacity 复位 1，计时器再也不跑，
+    //   visible 恒 true，两张旧纹理永久压住 CPU 新帧（再起一次手势才正常）。
     visible: view.bridge.gpuLive || fadeOpacity > 0.01
     // 纹理没解好之前整层透明：三张 Image 各自异步解码，谁先好谁先上屏，
     // 先上 static 就会出现「上层栈消失」的一两帧 —— 宁可等齐了一次性换。
@@ -566,17 +567,13 @@ Item {
         gpuFadeFallback.stop()
         gpuLayer.fadeArmed = false
         gpuLayer.fallbackHits = 0
-        gpuLayer.fadeOpacity = 1.0
-        gpuFade.restart()
-    }
-    NumberAnimation {
-        id: gpuFade
-        target: gpuLayer
-        property: "fadeOpacity"
-        from: 1.0
-        to: 0.0
-        duration: 90
-        easing.type: Easing.OutCubic
+        // ★硬切：CPU 新帧已 adopt（见 onAdoptCountChanged），previewImage
+        //   因 fadeArmed=false 立刻变不透明；这里同帧把 GPU 层撤掉（visible
+        //   跟 fadeOpacity>0.01 走），两者绝不重叠。旧版在这里起一条 90ms
+        //   opacity 交叉动画，CPU 帧和 GPU 三明治同显，半透明区被叠两次
+        //   → 松手瞬间「变浓/变透明闪一下」。锐度突变用 GPU 纹理与落定帧
+        //   同源的 target 分辨率抵消，实测无可见跳变。
+        gpuLayer.fadeOpacity = 0.0
     }
     Timer {
         id: gpuFadeFallback
@@ -607,7 +604,6 @@ Item {
         target: view.bridge
         function onGpuLiveChanged() {
             if (view.bridge.gpuLive) {
-                gpuFade.stop()
                 gpuFadeFallback.stop()
                 gpuLayer.fadeArmed = false
                 gpuLayer.fallbackHits = 0
